@@ -1,0 +1,20 @@
+[package]
+name = "promql-sync"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "Developer-invoked upstream sync tool for promql-parser"
+
+[[bin]]
+name = "promql-sync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+toml = "0.9"

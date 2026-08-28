@@ -1,0 +1,1459 @@
+{
+  "_generated": "by scripts/gen-conformance — DO NOT EDIT",
+  "upstream_sha": "83962c35a4ab0c9988bc469aa8165014fc065d34",
+  "source": "prometheus/prometheus promql/parser/parse_test.go",
+  "cases": [
+    {
+      "input": "1",
+      "fail": false
+    },
+    {
+      "input": "+Inf",
+      "fail": false
+    },
+    {
+      "input": "-Inf",
+      "fail": false
+    },
+    {
+      "input": ".5",
+      "fail": false
+    },
+    {
+      "input": "5.",
+      "fail": false
+    },
+    {
+      "input": "123.4567",
+      "fail": false
+    },
+    {
+      "input": "5e-3",
+      "fail": false
+    },
+    {
+      "input": "5e3",
+      "fail": false
+    },
+    {
+      "input": "0xc",
+      "fail": false
+    },
+    {
+      "input": "0755",
+      "fail": false
+    },
+    {
+      "input": "+5.5e-3",
+      "fail": false
+    },
+    {
+      "input": "-0755",
+      "fail": false
+    },
+    {
+      "input": "1 + 1",
+      "fail": false
+    },
+    {
+      "input": "1 - 1",
+      "fail": false
+    },
+    {
+      "input": "1 * 1",
+      "fail": false
+    },
+    {
+      "input": "1 % 1",
+      "fail": false
+    },
+    {
+      "input": "1 / 1",
+      "fail": false
+    },
+    {
+      "input": "1 == bool 1",
+      "fail": false
+    },
+    {
+      "input": "1 != bool 1",
+      "fail": false
+    },
+    {
+      "input": "1 \u003e bool 1",
+      "fail": false
+    },
+    {
+      "input": "1 \u003e= bool 1",
+      "fail": false
+    },
+    {
+      "input": "1 \u003c bool 1",
+      "fail": false
+    },
+    {
+      "input": "1 \u003c= bool 1",
+      "fail": false
+    },
+    {
+      "input": "-1^2",
+      "fail": false
+    },
+    {
+      "input": "-1*2",
+      "fail": false
+    },
+    {
+      "input": "-1+2",
+      "fail": false
+    },
+    {
+      "input": "-1^-2",
+      "fail": false
+    },
+    {
+      "input": "+1 + -2 * 1",
+      "fail": false
+    },
+    {
+      "input": "1 + 2/(3*1)",
+      "fail": false
+    },
+    {
+      "input": "1 \u003c bool 2 - 1 * 2",
+      "fail": false
+    },
+    {
+      "input": "-some_metric",
+      "fail": false
+    },
+    {
+      "input": "+some_metric",
+      "fail": false
+    },
+    {
+      "input": " +some_metric",
+      "fail": false
+    },
+    {
+      "input": " +{\"some_metric\"}",
+      "fail": false
+    },
+    {
+      "input": "# just a comment\n\n",
+      "fail": true
+    },
+    {
+      "input": "1+",
+      "fail": true
+    },
+    {
+      "input": ".",
+      "fail": true
+    },
+    {
+      "input": "2.5.",
+      "fail": true
+    },
+    {
+      "input": "100..4",
+      "fail": true
+    },
+    {
+      "input": "0deadbeef",
+      "fail": true
+    },
+    {
+      "input": "1 /",
+      "fail": true
+    },
+    {
+      "input": "*1",
+      "fail": true
+    },
+    {
+      "input": "(1))",
+      "fail": true
+    },
+    {
+      "input": "((1)",
+      "fail": true
+    },
+    {
+      "input": "999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+      "fail": true
+    },
+    {
+      "input": "(",
+      "fail": true
+    },
+    {
+      "input": "1 and 1",
+      "fail": true
+    },
+    {
+      "input": "1 == 1",
+      "fail": true
+    },
+    {
+      "input": "1 or 1",
+      "fail": true
+    },
+    {
+      "input": "1 unless 1",
+      "fail": true
+    },
+    {
+      "input": "1 !~ 1",
+      "fail": true
+    },
+    {
+      "input": "1 =~ 1",
+      "fail": true
+    },
+    {
+      "input": "-\"string\"",
+      "fail": true
+    },
+    {
+      "input": "-test[5m]",
+      "fail": true
+    },
+    {
+      "input": "*test",
+      "fail": true
+    },
+    {
+      "input": "@@",
+      "fail": true
+    },
+    {
+      "input": "1 offset 1d",
+      "fail": true
+    },
+    {
+      "input": "foo offset 1s offset 2s",
+      "fail": true
+    },
+    {
+      "input": "a - on(b) ignoring(c) d",
+      "fail": true
+    },
+    {
+      "input": "offset{step=\"1s\"}[5m]",
+      "fail": false
+    },
+    {
+      "input": "step{offset=\"1s\"}[5m]",
+      "fail": false
+    },
+    {
+      "input": "anchored{job=\"test\"}",
+      "fail": false
+    },
+    {
+      "input": "smoothed{job=\"test\"}",
+      "fail": false
+    },
+    {
+      "input": "foo * bar",
+      "fail": false
+    },
+    {
+      "input": "foo * sum",
+      "fail": false
+    },
+    {
+      "input": "foo == 1",
+      "fail": false
+    },
+    {
+      "input": "foo == bool 1",
+      "fail": false
+    },
+    {
+      "input": "2.5 / bar",
+      "fail": false
+    },
+    {
+      "input": "foo and bar",
+      "fail": false
+    },
+    {
+      "input": "foo or bar",
+      "fail": false
+    },
+    {
+      "input": "foo unless bar",
+      "fail": false
+    },
+    {
+      "input": "foo + bar or bla and blub",
+      "fail": false
+    },
+    {
+      "input": "foo and bar unless baz or qux",
+      "fail": false
+    },
+    {
+      "input": "bar + on(foo) bla / on(baz, buz) group_right(test) blub",
+      "fail": false
+    },
+    {
+      "input": "foo * on(test,blub) bar",
+      "fail": false
+    },
+    {
+      "input": "foo * on(test,blub) group_left bar",
+      "fail": false
+    },
+    {
+      "input": "foo and on(test,blub) bar",
+      "fail": false
+    },
+    {
+      "input": "foo and on() bar",
+      "fail": false
+    },
+    {
+      "input": "foo and ignoring(test,blub) bar",
+      "fail": false
+    },
+    {
+      "input": "foo and ignoring() bar",
+      "fail": false
+    },
+    {
+      "input": "foo unless on(bar) baz",
+      "fail": false
+    },
+    {
+      "input": "foo / on(test,blub) group_left(bar) bar",
+      "fail": false
+    },
+    {
+      "input": "foo / ignoring(test,blub) group_left(blub) bar",
+      "fail": false
+    },
+    {
+      "input": "foo / ignoring(test,blub) group_left(bar) bar",
+      "fail": false
+    },
+    {
+      "input": "foo - on(test,blub) group_right(bar,foo) bar",
+      "fail": false
+    },
+    {
+      "input": "foo - ignoring(test,blub) group_right(bar,foo) bar",
+      "fail": false
+    },
+    {
+      "input": "foo and 1",
+      "fail": true
+    },
+    {
+      "input": "1 and foo",
+      "fail": true
+    },
+    {
+      "input": "foo or 1",
+      "fail": true
+    },
+    {
+      "input": "1 or foo",
+      "fail": true
+    },
+    {
+      "input": "foo unless 1",
+      "fail": true
+    },
+    {
+      "input": "1 unless foo",
+      "fail": true
+    },
+    {
+      "input": "1 or on(bar) foo",
+      "fail": true
+    },
+    {
+      "input": "foo == on(bar) 10",
+      "fail": true
+    },
+    {
+      "input": "foo + group_left(baz) bar",
+      "fail": true
+    },
+    {
+      "input": "foo and on(bar) group_left(baz) bar",
+      "fail": true
+    },
+    {
+      "input": "foo and on(bar) group_right(baz) bar",
+      "fail": true
+    },
+    {
+      "input": "foo or on(bar) group_left(baz) bar",
+      "fail": true
+    },
+    {
+      "input": "foo or on(bar) group_right(baz) bar",
+      "fail": true
+    },
+    {
+      "input": "foo unless on(bar) group_left(baz) bar",
+      "fail": true
+    },
+    {
+      "input": "foo unless on(bar) group_right(baz) bar",
+      "fail": true
+    },
+    {
+      "input": "http_requests{group=\"production\"} + on(instance) group_left(job,instance) cpu_count{type=\"smp\"}",
+      "fail": true
+    },
+    {
+      "input": "foo + bool bar",
+      "fail": true
+    },
+    {
+      "input": "foo + bool 10",
+      "fail": true
+    },
+    {
+      "input": "foo and bool 10",
+      "fail": true
+    },
+    {
+      "input": "foo",
+      "fail": false
+    },
+    {
+      "input": "min",
+      "fail": false
+    },
+    {
+      "input": "foo offset 5m",
+      "fail": false
+    },
+    {
+      "input": "foo offset -7m",
+      "fail": false
+    },
+    {
+      "input": "http_requests{group=\"production\"} + on(instance) group_left(job,instance) cpu_count{type=\"smp\"}",
+      "fail": true
+    },
+    {
+      "input": "foo OFFSET 1h30m",
+      "fail": false
+    },
+    {
+      "input": "foo OFFSET 1m30ms",
+      "fail": false
+    },
+    {
+      "input": "foo @ 1603774568",
+      "fail": false
+    },
+    {
+      "input": "foo @ -100",
+      "fail": false
+    },
+    {
+      "input": "foo @ .3",
+      "fail": false
+    },
+    {
+      "input": "foo @ 3.",
+      "fail": false
+    },
+    {
+      "input": "foo @ 3.33",
+      "fail": false
+    },
+    {
+      "input": "foo @ 3.3333",
+      "fail": false
+    },
+    {
+      "input": "foo @ 3.3335",
+      "fail": false
+    },
+    {
+      "input": "foo @ 3e2",
+      "fail": false
+    },
+    {
+      "input": "foo @ 3e-1",
+      "fail": false
+    },
+    {
+      "input": "foo @ 0xA",
+      "fail": false
+    },
+    {
+      "input": "foo @ -3.3e1",
+      "fail": false
+    },
+    {
+      "input": "foo @ +Inf",
+      "fail": true
+    },
+    {
+      "input": "foo @ -Inf",
+      "fail": true
+    },
+    {
+      "input": "foo @ NaN",
+      "fail": true
+    },
+    {
+      "input": "foo:bar{a=\"bc\"}",
+      "fail": false
+    },
+    {
+      "input": "{\"foo\"}",
+      "fail": false
+    },
+    {
+      "input": "{'foo\\'bar', 'a\\\\dos\\\\path'='boo\\\\urns'}",
+      "fail": false
+    },
+    {
+      "input": "{\"foo\", a=\"bc\"}",
+      "fail": false
+    },
+    {
+      "input": "foo{NaN='bc'}",
+      "fail": false
+    },
+    {
+      "input": "foo{bar='}'}",
+      "fail": false
+    },
+    {
+      "input": "foo{a=\"b\", foo!=\"bar\", test=~\"test\", bar!~\"baz\"}",
+      "fail": false
+    },
+    {
+      "input": "{a=\"b\", foo!=\"bar\", \"foo\", test=~\"test\", bar!~\"baz\"}",
+      "fail": false
+    },
+    {
+      "input": "foo{a=\"b\", foo!=\"bar\", test=~\"test\", bar!~\"baz\",}",
+      "fail": false
+    },
+    {
+      "input": "{__name__=~\"bar\", __name__!~\"baz\"}",
+      "fail": false
+    },
+    {
+      "input": "{__name__=\"bar\", __name__=\"baz\"}",
+      "fail": false
+    },
+    {
+      "input": "{\"bar\", __name__=\"baz\"}",
+      "fail": false
+    },
+    {
+      "input": "{",
+      "fail": true
+    },
+    {
+      "input": "}",
+      "fail": true
+    },
+    {
+      "input": "some{",
+      "fail": true
+    },
+    {
+      "input": "some}",
+      "fail": true
+    },
+    {
+      "input": "some_metric{a=b}",
+      "fail": true
+    },
+    {
+      "input": "some_metric{a:b=\"b\"}",
+      "fail": true
+    },
+    {
+      "input": "foo{a*\"b\"}",
+      "fail": true
+    },
+    {
+      "input": "foo{a\u003e=\"b\"}",
+      "fail": true
+    },
+    {
+      "input": "some_metric{a=\"\ufffd\"}",
+      "fail": true
+    },
+    {
+      "input": "foo{gibberish}",
+      "fail": true
+    },
+    {
+      "input": "foo{1}",
+      "fail": true
+    },
+    {
+      "input": "{}",
+      "fail": true
+    },
+    {
+      "input": "{x=\"\"}",
+      "fail": true
+    },
+    {
+      "input": "{x=~\".*\"}",
+      "fail": true
+    },
+    {
+      "input": "{x!~\".+\"}",
+      "fail": true
+    },
+    {
+      "input": "{x!=\"a\"}",
+      "fail": true
+    },
+    {
+      "input": "foo{__name__=\"bar\"}",
+      "fail": true
+    },
+    {
+      "input": "foo{__name__= =}",
+      "fail": true
+    },
+    {
+      "input": "foo{,}",
+      "fail": true
+    },
+    {
+      "input": "foo{__name__ == \"bar\"}",
+      "fail": true
+    },
+    {
+      "input": "foo{__name__=\"bar\" lol}",
+      "fail": true
+    },
+    {
+      "input": "foo{\"a\"=}",
+      "fail": true
+    },
+    {
+      "input": "test[1000ms]",
+      "fail": false
+    },
+    {
+      "input": "test[1001ms]",
+      "fail": false
+    },
+    {
+      "input": "test[1002ms]",
+      "fail": false
+    },
+    {
+      "input": "test[5s]",
+      "fail": false
+    },
+    {
+      "input": "test[5m]",
+      "fail": false
+    },
+    {
+      "input": "foo[5m30s]",
+      "fail": false
+    },
+    {
+      "input": "test[5h] OFFSET 5m",
+      "fail": false
+    },
+    {
+      "input": "test[5d] OFFSET 10s",
+      "fail": false
+    },
+    {
+      "input": "test[5w] offset 2w",
+      "fail": false
+    },
+    {
+      "input": "test{a=\"b\"}[5y] OFFSET 3d",
+      "fail": false
+    },
+    {
+      "input": "test{a=\"b\"}[5m] OFFSET 3600",
+      "fail": false
+    },
+    {
+      "input": "foo[3ms] @ 2.345",
+      "fail": false
+    },
+    {
+      "input": "foo[4s180ms] @ 2.345",
+      "fail": false
+    },
+    {
+      "input": "foo[4.18] @ 2.345",
+      "fail": false
+    },
+    {
+      "input": "foo[4s18ms] @ 2.345",
+      "fail": false
+    },
+    {
+      "input": "foo[4.018] @ 2.345",
+      "fail": false
+    },
+    {
+      "input": "test{a=\"b\"}[5y] @ 1603774699",
+      "fail": false
+    },
+    {
+      "input": "test[5]",
+      "fail": false
+    },
+    {
+      "input": "some_metric[5m] @ 1m",
+      "fail": false
+    },
+    {
+      "input": "foo[5mm]",
+      "fail": true
+    },
+    {
+      "input": "foo[5m1]",
+      "fail": true
+    },
+    {
+      "input": "foo[5m:1m1]",
+      "fail": true
+    },
+    {
+      "input": "foo[5y1hs]",
+      "fail": true
+    },
+    {
+      "input": "foo[5m1h]",
+      "fail": true
+    },
+    {
+      "input": "foo[5m1m]",
+      "fail": true
+    },
+    {
+      "input": "foo[0m]",
+      "fail": true
+    },
+    {
+      "input": "foo[\"5m\"]",
+      "fail": true
+    },
+    {
+      "input": "foo[]",
+      "fail": true
+    },
+    {
+      "input": "foo[-1]",
+      "fail": true
+    },
+    {
+      "input": "some_metric[5m] OFFSET 1mm",
+      "fail": true
+    },
+    {
+      "input": "some_metric[5m] OFFSET",
+      "fail": true
+    },
+    {
+      "input": "some_metric OFFSET 1m[5m]",
+      "fail": true
+    },
+    {
+      "input": "some_metric[5m] @",
+      "fail": true
+    },
+    {
+      "input": "some_metric @ 1234 [5m]",
+      "fail": true
+    },
+    {
+      "input": "(foo + bar)[5m]",
+      "fail": true
+    },
+    {
+      "input": "sum by (foo)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum by (anchored)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum by (smoothed)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum by (\"foo bar\")({\"some.metric\"})",
+      "fail": false
+    },
+    {
+      "input": "sum by (\"foo)(some_metric{})",
+      "fail": true
+    },
+    {
+      "input": "sum by (\"foo\", bar, 'baz')({\"some.metric\"})",
+      "fail": false
+    },
+    {
+      "input": "avg by (foo)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "max by (foo)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum without (foo) (some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum (some_metric) without (foo)",
+      "fail": false
+    },
+    {
+      "input": "stddev(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "stdvar by (foo)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum by ()(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum by (foo,bar,)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum by (foo,)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "topk(5, some_metric)",
+      "fail": false
+    },
+    {
+      "input": "count_values(\"value\", some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum without(and, by, avg, count, alert, annotations)(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "sum without(==)(some_metric)",
+      "fail": true
+    },
+    {
+      "input": "sum without(,)(some_metric)",
+      "fail": true
+    },
+    {
+      "input": "sum without(foo,,)(some_metric)",
+      "fail": true
+    },
+    {
+      "input": "sum some_metric by (test)",
+      "fail": true
+    },
+    {
+      "input": "sum (some_metric) by test",
+      "fail": true
+    },
+    {
+      "input": "sum () by (test)",
+      "fail": true
+    },
+    {
+      "input": "MIN keep_common (some_metric)",
+      "fail": true
+    },
+    {
+      "input": "MIN (some_metric) keep_common",
+      "fail": true
+    },
+    {
+      "input": "sum (some_metric) without (test) by (test)",
+      "fail": true
+    },
+    {
+      "input": "sum without (test) (some_metric) by (test)",
+      "fail": true
+    },
+    {
+      "input": "topk(some_metric)",
+      "fail": true
+    },
+    {
+      "input": "topk(some_metric,)",
+      "fail": true
+    },
+    {
+      "input": "topk(some_metric, other_metric)",
+      "fail": true
+    },
+    {
+      "input": "count_values(5, other_metric)",
+      "fail": true
+    },
+    {
+      "input": "rate(some_metric[5m]) @ 1234",
+      "fail": true
+    },
+    {
+      "input": "time()",
+      "fail": false
+    },
+    {
+      "input": "floor(some_metric{foo!=\"bar\"})",
+      "fail": false
+    },
+    {
+      "input": "rate(some_metric[5m])",
+      "fail": false
+    },
+    {
+      "input": "round(some_metric)",
+      "fail": false
+    },
+    {
+      "input": "round(some_metric, 5)",
+      "fail": false
+    },
+    {
+      "input": "floor()",
+      "fail": true
+    },
+    {
+      "input": "floor(some_metric, other_metric)",
+      "fail": true
+    },
+    {
+      "input": "floor(some_metric, 1)",
+      "fail": true
+    },
+    {
+      "input": "floor(1)",
+      "fail": true
+    },
+    {
+      "input": "hour(some_metric, some_metric, some_metric)",
+      "fail": true
+    },
+    {
+      "input": "time(some_metric)",
+      "fail": true
+    },
+    {
+      "input": "non_existent_function_far_bar()",
+      "fail": true
+    },
+    {
+      "input": "rate(some_metric)",
+      "fail": true
+    },
+    {
+      "input": "label_replace(a, `b`, `c\ufffd`, `d`, `.*`)",
+      "fail": true
+    },
+    {
+      "input": "*1",
+      "fail": true
+    },
+    {
+      "input": "-=",
+      "fail": true
+    },
+    {
+      "input": "++-++-+-+-\u003c",
+      "fail": true
+    },
+    {
+      "input": "e-+=/(0)",
+      "fail": true
+    },
+    {
+      "input": "a\u003eb()",
+      "fail": true
+    },
+    {
+      "input": "rate(avg)",
+      "fail": true
+    },
+    {
+      "input": "sum(sum)",
+      "fail": false
+    },
+    {
+      "input": "a + sum",
+      "fail": false
+    },
+    {
+      "input": "\"double-quoted string \\\" with escaped quote\"",
+      "fail": false
+    },
+    {
+      "input": "'single-quoted string \\' with escaped quote'",
+      "fail": false
+    },
+    {
+      "input": "`backtick-quoted string`",
+      "fail": false
+    },
+    {
+      "input": "\"\\a\\b\\f\\n\\r\\t\\v\\\\\\\" - \\xFF\\377\\u1234\\U00010111\\U0001011111☺\"",
+      "fail": false
+    },
+    {
+      "input": "'\\a\\b\\f\\n\\r\\t\\v\\\\\\' - \\xFF\\377\\u1234\\U00010111\\U0001011111☺'",
+      "fail": false
+    },
+    {
+      "input": "`\\``",
+      "fail": true
+    },
+    {
+      "input": "\"\\",
+      "fail": true
+    },
+    {
+      "input": "\"\\c\"",
+      "fail": true
+    },
+    {
+      "input": "\"\\x.\"",
+      "fail": true
+    },
+    {
+      "input": "foo{bar=\"baz\"}[",
+      "fail": true
+    },
+    {
+      "input": "foo{bar=\"baz\"}[10m:6s]",
+      "fail": false
+    },
+    {
+      "input": "foo{bar=\"baz\"}[10m5s:1h6ms]",
+      "fail": false
+    },
+    {
+      "input": "foo[10m:]",
+      "fail": false
+    },
+    {
+      "input": "min_over_time(rate(foo{bar=\"baz\"}[2s])[5m:5s])",
+      "fail": false
+    },
+    {
+      "input": "min_over_time(rate(foo{bar=\"baz\"}[2s])[5m:])[4m:3s]",
+      "fail": false
+    },
+    {
+      "input": "min_over_time(rate(foo{bar=\"baz\"}[2s])[5m:] offset 4m)[4m:3s]",
+      "fail": false
+    },
+    {
+      "input": "min_over_time(rate(foo{bar=\"baz\"}[2s])[5m:] @ 1603775091)[4m:3s]",
+      "fail": false
+    },
+    {
+      "input": "min_over_time(rate(foo{bar=\"baz\"}[2s])[5m:] @ -160377509)[4m:3s]",
+      "fail": false
+    },
+    {
+      "input": "sum without(and, by, avg, count, alert, annotations)(some_metric) [30m:10s]",
+      "fail": false
+    },
+    {
+      "input": "some_metric OFFSET 1m [10m:5s]",
+      "fail": false
+    },
+    {
+      "input": "some_metric @ 123 [10m:5s]",
+      "fail": false
+    },
+    {
+      "input": "some_metric @ 123 offset 1m [10m:5s]",
+      "fail": false
+    },
+    {
+      "input": "some_metric offset 1m @ 123 [10m:5s]",
+      "fail": false
+    },
+    {
+      "input": "some_metric[10m:5s] offset 1m @ 123",
+      "fail": false
+    },
+    {
+      "input": "(foo + bar{nm=\"val\"})[5m:]",
+      "fail": false
+    },
+    {
+      "input": "(foo + bar{nm=\"val\"})[5m:] offset 10m",
+      "fail": false
+    },
+    {
+      "input": "(foo + bar{nm=\"val\"} @ 1234)[5m:] @ 1603775019",
+      "fail": false
+    },
+    {
+      "input": "test[5d] OFFSET 10s [10m:5s]",
+      "fail": true
+    },
+    {
+      "input": "(foo + bar{nm=\"val\"})[5m:][10m:5s]",
+      "fail": true
+    },
+    {
+      "input": "rate(food[1m])[1h] offset 1h",
+      "fail": true
+    },
+    {
+      "input": "rate(food[1m])[1h] @ 100",
+      "fail": true
+    },
+    {
+      "input": "foo @ start()",
+      "fail": false
+    },
+    {
+      "input": "foo @ end()",
+      "fail": false
+    },
+    {
+      "input": "test[5y] @ start()",
+      "fail": false
+    },
+    {
+      "input": "test[5y] @ end()",
+      "fail": false
+    },
+    {
+      "input": "foo[10m:6s] @ start()",
+      "fail": false
+    },
+    {
+      "input": "foo[10m:6s] @ end()",
+      "fail": false
+    },
+    {
+      "input": "start()",
+      "fail": false
+    },
+    {
+      "input": "end()",
+      "fail": false
+    },
+    {
+      "input": "start",
+      "fail": false
+    },
+    {
+      "input": "end",
+      "fail": false
+    },
+    {
+      "input": "start{end=\"foo\"}",
+      "fail": false
+    },
+    {
+      "input": "end{start=\"foo\"}",
+      "fail": false
+    },
+    {
+      "input": "foo unless on(start) bar",
+      "fail": false
+    },
+    {
+      "input": "foo unless on(end) bar",
+      "fail": false
+    },
+    {
+      "input": "info(rate(http_request_counter_total{}[5m]))",
+      "fail": false
+    },
+    {
+      "input": "info(rate(http_request_counter_total{}[5m]), target_info{foo=\"bar\"})",
+      "fail": true
+    },
+    {
+      "input": "info(http_request_counter_total{namespace=\"zzz\"}, {foo=\"bar\", bar=\"baz\"})",
+      "fail": false
+    },
+    {
+      "input": "info(http_request_counter_total{namespace=\"zzz\"}, {foo=\"bar\"} == 1)",
+      "fail": true
+    },
+    {
+      "input": "foo[11s+10s-5*2^2]",
+      "fail": false
+    },
+    {
+      "input": "foo[-(10s-5s)+20s]",
+      "fail": false
+    },
+    {
+      "input": "foo[-10s+15s]",
+      "fail": false
+    },
+    {
+      "input": "foo[step()]",
+      "fail": false
+    },
+    {
+      "input": "foo[  -  step  (  )  ]",
+      "fail": false
+    },
+    {
+      "input": "foo[   step  (  )  ]",
+      "fail": false
+    },
+    {
+      "input": "foo[-step()]",
+      "fail": false
+    },
+    {
+      "input": "foo offset step()",
+      "fail": false
+    },
+    {
+      "input": "foo offset -step()",
+      "fail": false
+    },
+    {
+      "input": "foo[max(step(),5s)]",
+      "fail": false
+    },
+    {
+      "input": "foo offset max(step(),5s)",
+      "fail": false
+    },
+    {
+      "input": "foo offset -min(5s,step()+8s)",
+      "fail": false
+    },
+    {
+      "input": "foo[range()]",
+      "fail": false
+    },
+    {
+      "input": "foo[-range()]",
+      "fail": false
+    },
+    {
+      "input": "foo offset range()",
+      "fail": false
+    },
+    {
+      "input": "foo offset -range()",
+      "fail": false
+    },
+    {
+      "input": "foo[max(range(),5s)]",
+      "fail": false
+    },
+    {
+      "input": "foo[4s+4s:1s*2] offset (5s-8)",
+      "fail": false
+    },
+    {
+      "input": "foo offset 5s-8",
+      "fail": false
+    },
+    {
+      "input": "rate(foo[2m+2m])",
+      "fail": false
+    },
+    {
+      "input": "foo offset -1^1",
+      "fail": false
+    },
+    {
+      "input": "foo offset -(1^2)",
+      "fail": false
+    },
+    {
+      "input": "foo offset (-1^2)",
+      "fail": false
+    },
+    {
+      "input": "foo[-2^2]",
+      "fail": false
+    },
+    {
+      "input": "foo[0+-2^2]",
+      "fail": false
+    },
+    {
+      "input": "foo[step]",
+      "fail": true
+    },
+    {
+      "input": "foo[step()/0d]",
+      "fail": true
+    },
+    {
+      "input": "foo[5s/0d]",
+      "fail": true
+    },
+    {
+      "input": "foo offset (4d/0)",
+      "fail": true
+    },
+    {
+      "input": "foo[5s%0d]",
+      "fail": true
+    },
+    {
+      "input": "foo offset 9.5e10",
+      "fail": true
+    },
+    {
+      "input": "foo[9.5e10]",
+      "fail": true
+    },
+    {
+      "input": "(sum(foo))",
+      "fail": false
+    },
+    {
+      "input": "(sum(foo) )",
+      "fail": false
+    },
+    {
+      "input": "(sum(foo) by (bar))",
+      "fail": false
+    },
+    {
+      "input": "(sum by (bar) (foo))",
+      "fail": false
+    },
+    {
+      "input": "sum by (job)(rate(http_requests_total[30m]))",
+      "fail": false
+    },
+    {
+      "input": "sum(",
+      "fail": true
+    },
+    {
+      "input": "sum(rate(",
+      "fail": true
+    },
+    {
+      "input": "foo[5s x 5s]",
+      "fail": true
+    },
+    {
+      "input": "foo[5s s 5s]",
+      "fail": true
+    },
+    {
+      "input": "{} 1 2 3",
+      "fail": false
+    },
+    {
+      "input": "{a=\"b\"} -1 2 3",
+      "fail": false
+    },
+    {
+      "input": "my_metric 1 2 3",
+      "fail": false
+    },
+    {
+      "input": "my_metric{} 1 2 3",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 2 3",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 2 3-10x4",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 2 3-0x4",
+      "fail": false
+    },
+    {
+      "input": "{} 1+1",
+      "fail": true
+    },
+    {
+      "input": "{} 1x0",
+      "fail": false
+    },
+    {
+      "input": "{} 1+1x0",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 3 _ 5 _x4",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 3 _ 5 _a4",
+      "fail": true
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 -1",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 +1",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 -1 -3-10x4 7 9 +5",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 +1 +4 -6 -2 8",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} 1 2 3    ",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"\\u70ac\"} 1 2 3",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"\\u70ac = torch\"} 1 2 3",
+      "fail": false
+    },
+    {
+      "input": "my_metric{a=\"b\"} -3-3 -3",
+      "fail": true
+    },
+    {
+      "input": "my_metric{a=\"b\"} -3 -3-3",
+      "fail": true
+    },
+    {
+      "input": "my_metric{a=\"b\"} -3 _-2",
+      "fail": true
+    },
+    {
+      "input": "my_metric{a=\"b\"} -3 3+3x4-4",
+      "fail": true
+    }
+  ]
+}

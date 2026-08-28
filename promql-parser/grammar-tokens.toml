@@ -1,0 +1,22 @@
+# Token rename map used by `promql-sync generate-grammar`.
+#
+# Upstream (goyacc) uses verbose token names like LEFT_PAREN / RIGHT_BRACKET.
+# grmtools' grammar tends to use shorter spellings, matching what
+# `src/lexer.rs` emits via its `NonStreamingLexer` implementation.
+#
+# Any upstream token without an entry here is passed through verbatim.
+# The generator quotes every token (`'LPAREN'`) so keys here are the
+# bare goyacc name and values are the bare grmtools name.
+
+[renames]
+LEFT_PAREN = "LPAREN"
+RIGHT_PAREN = "RPAREN"
+LEFT_BRACE = "LBRACE"
+RIGHT_BRACE = "RBRACE"
+LEFT_BRACKET = "LBRACKET"
+RIGHT_BRACKET = "RBRACKET"
+IDENTIFIER = "IDENT"
+# Upstream uses EQL for `=`; our lexer emits EQ. Keep the lexer
+# name — consistent with all other short-form single-char tokens
+# (EQ/NEQ/LTE/GTE vs upstream's EQL/NEQ_REGEX/LTE/GTE).
+EQL = "EQ"

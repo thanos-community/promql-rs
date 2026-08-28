@@ -1,0 +1,15 @@
+# SHA-256 of every vendored upstream file.
+#
+# The promql-sync tool verifies these hashes on startup and after a sync,
+# catching accidental manual edits to files that are meant to be verbatim
+# copies from prometheus/prometheus. A mismatch is not fatal on its own,
+# but the sync tool refuses to proceed until the discrepancy is resolved
+# (either revert the local edit or re-vendor).
+
+[file_hashes]
+"generated_parser.y" = "sha256:52d56642084b4e967b514a47e38ff885fd9d26b9cf2038009521efb4462fb1c1"
+"lex.go"             = "sha256:3b9b36c6f463c532d3e67454fcb20d0a0b1baea19465ae5a51df1812eca11097"
+"ast.go"             = "sha256:2499112c83ae28de126e3227973827083f79c1acb6c54a6ea303c408eaaade17"
+"parse.go"           = "sha256:6165459fa88ccc1f3557d990ab22917d9b70a55f032983d6a50b6c2844937f0a"
+"functions.go"       = "sha256:573eaf39ffb88969d08932775a26048442f9f428b223c91000d54a77289cf5df"
+"printer.go"         = "sha256:430cb229f4d9c7b41a2798f30d2fc9b60a2ddc87b4ceb25d871f1cc01ab06b74"

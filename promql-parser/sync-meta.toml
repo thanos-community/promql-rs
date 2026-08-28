@@ -1,0 +1,23 @@
+# Machine-readable state for the promql-sync tool.
+#
+# pinned_upstream_sha identifies the upstream revision the vendored files
+# under upstream/ are known to match. last_sync_date is advisory.
+#
+# Per-file hashes are maintained in upstream/MANIFEST.toml so that
+# accidental manual edits to vendored files are caught by CI. Per-rule /
+# per-struct / per-lexer-state translation hashes land here as the grammar
+# and lexer ports come online; until then the [translations.*] tables are
+# empty.
+
+pinned_upstream_sha = "83962c35a4ab0c9988bc469aa8165014fc065d34"
+last_sync_date = "2026-04-21"
+
+[translations.productions]
+# key = rule_name.rule_index, value = { action_body_hash = "sha256:..." }
+# Populated as grammar.y actions are ported from upstream.
+
+[translations.ast_types]
+# key = TypeName, value = { field_set_hash = "...", method_set_hash = "..." }
+
+[translations.lexer_states]
+# key = state_function_name, value = { body_hash = "..." }
