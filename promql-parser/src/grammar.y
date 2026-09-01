@@ -4,12 +4,12 @@
 //   cargo run -p promql-sync -- generate-grammar
 //
 // Source material:
-//   src/promql-parser/upstream/generated_parser.y  (vendored from
+//   promql-parser/upstream/generated_parser.y  (vendored from
 //     prometheus/prometheus — see upstream/MANIFEST.toml for the
 //     pinned sha)
-//   src/promql-parser/grammar-actions.toml          (return types
+//   promql-parser/grammar-actions.toml          (return types
 //     + per-alt Rust action bodies, hand-maintained)
-//   src/promql-parser/grammar-tokens.toml           (upstream →
+//   promql-parser/grammar-tokens.toml           (upstream →
 //     grmtools token rename table)
 
 %start expr
@@ -51,54 +51,54 @@ aggregate_modifier -> Result<(bool, Vec<String>), ()>:
   ;
 
 binary_expr -> Result<Expr, ()>:
-    expr 'ADD' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'ATAN2' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'DIV' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'EQLC' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'GTE' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'GTR' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'TRIM_UPPER' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'TRIM_LOWER' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'LAND' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'LOR' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'LSS' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'LTE' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'LUNLESS' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'MOD' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'MUL' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'NEQ' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'POW' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
-  | expr 'SUB' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $1, $4) }
+    expr 'ADD' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'ATAN2' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'DIV' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'EQLC' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'GTE' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'GTR' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'TRIM_UPPER' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'TRIM_LOWER' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LAND' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LOR' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LSS' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LTE' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LUNLESS' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'MOD' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'MUL' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'NEQ' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'POW' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'SUB' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
   ;
 
-bin_modifier -> Result<(), ()>:
+bin_modifier -> Result<Option<actions::BinModifiers>, ()>:
     fill_modifiers { $1 }
   ;
 
-bool_modifier -> Result<(), ()>:
-    /* empty */ { Ok(()) }
-  | 'BOOL' { Ok(()) }
+bool_modifier -> Result<Option<actions::BinModifiers>, ()>:
+    /* empty */ { actions::bool_modifier_empty() }
+  | 'BOOL' { actions::bool_modifier_bool() }
   ;
 
-on_or_ignoring -> Result<(), ()>:
-    bool_modifier 'IGNORING' grouping_labels { Ok(()) }
-  | bool_modifier 'ON' grouping_labels { Ok(()) }
+on_or_ignoring -> Result<Option<actions::BinModifiers>, ()>:
+    bool_modifier 'IGNORING' grouping_labels { actions::on_or_ignoring_ignoring($1, $3) }
+  | bool_modifier 'ON' grouping_labels { actions::on_or_ignoring_on($1, $3) }
   ;
 
-group_modifiers -> Result<(), ()>:
-    bool_modifier { $1 }
-  | on_or_ignoring { $1 }
-  | on_or_ignoring 'GROUP_LEFT' maybe_grouping_labels { $1 }
-  | on_or_ignoring 'GROUP_RIGHT' maybe_grouping_labels { $1 }
+group_modifiers -> Result<Option<actions::BinModifiers>, ()>:
+    bool_modifier { actions::group_modifiers_pass($1) }
+  | on_or_ignoring { actions::group_modifiers_pass($1) }
+  | on_or_ignoring 'GROUP_LEFT' maybe_grouping_labels { actions::group_modifiers_left($1, $3) }
+  | on_or_ignoring 'GROUP_RIGHT' maybe_grouping_labels { actions::group_modifiers_right($1, $3) }
   ;
 
-fill_modifiers -> Result<(), ()>:
-    group_modifiers { $1 }
-  | group_modifiers 'FILL' fill_value { $1 }
-  | group_modifiers 'FILL_LEFT' fill_value { $1 }
-  | group_modifiers 'FILL_RIGHT' fill_value { $1 }
-  | group_modifiers 'FILL_LEFT' fill_value 'FILL_RIGHT' fill_value { Err(()) }
-  | group_modifiers 'FILL_RIGHT' fill_value 'FILL_LEFT' fill_value { Err(()) }
+fill_modifiers -> Result<Option<actions::BinModifiers>, ()>:
+    group_modifiers { actions::fill_modifiers_pass($1) }
+  | group_modifiers 'FILL' fill_value { actions::fill_modifiers_fill($1, $3) }
+  | group_modifiers 'FILL_LEFT' fill_value { actions::fill_modifiers_fill_left($1, $3) }
+  | group_modifiers 'FILL_RIGHT' fill_value { actions::fill_modifiers_fill_right($1, $3) }
+  | group_modifiers 'FILL_LEFT' fill_value 'FILL_RIGHT' fill_value { actions::fill_modifiers_fill_left_right($1, $3, $5) }
+  | group_modifiers 'FILL_RIGHT' fill_value 'FILL_LEFT' fill_value { actions::fill_modifiers_fill_right_left($1, $3, $5) }
   ;
 
 grouping_labels -> Result<Vec<String>, ()>:
@@ -117,9 +117,9 @@ grouping_label -> Result<String, ()>:
   | 'STRING' { Ok(actions::string_literal_value($lexer, $1.map_err(|_| ())?.span())?) }
   ;
 
-fill_value -> Result<(), ()>:
-    'LPAREN' number_duration_literal 'RPAREN' { Ok(()) }
-  | 'LPAREN' unary_op number_duration_literal 'RPAREN' { Err(()) }
+fill_value -> Result<f64, ()>:
+    'LPAREN' number_duration_literal 'RPAREN' { actions::fill_value_extract($2) }
+  | 'LPAREN' unary_op number_duration_literal 'RPAREN' { actions::fill_value_unary($2, $3) }
   ;
 
 function_call -> Result<Expr, ()>:
@@ -329,7 +329,7 @@ string_identifier -> Result<String, ()>:
   ;
 
 maybe_grouping_labels -> Result<Vec<String>, ()>:
-    /* empty */ { Err(()) }
+    /* empty */ { Ok(Vec::new()) }
   | grouping_labels { $1 }
   ;
 
