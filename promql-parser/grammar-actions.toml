@@ -75,12 +75,12 @@ expr = "Result<Expr, ()>"
 aggregate_expr = "Result<Expr, ()>"
 aggregate_modifier = "Result<(bool, Vec<String>), ()>"
 binary_expr = "Result<Expr, ()>"
-bin_modifier = "Result<(), ()>"
-bool_modifier = "Result<(), ()>"
-on_or_ignoring = "Result<(), ()>"
-group_modifiers = "Result<(), ()>"
-fill_modifiers = "Result<(), ()>"
-fill_value = "Result<(), ()>"
+bin_modifier = "Result<Option<actions::BinModifiers>, ()>"
+bool_modifier = "Result<Option<actions::BinModifiers>, ()>"
+on_or_ignoring = "Result<Option<actions::BinModifiers>, ()>"
+group_modifiers = "Result<Option<actions::BinModifiers>, ()>"
+fill_modifiers = "Result<Option<actions::BinModifiers>, ()>"
+fill_value = "Result<f64, ()>"
 function_call = "Result<Expr, ()>"
 function_call_args = "Result<Vec<Expr>, ()>"
 function_call_body = "Result<Vec<Expr>, ()>"
@@ -220,92 +220,92 @@ action = "$1"
 [[actions]]
 rule = "binary_expr"
 alt = "expr ADD bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr SUB bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr MUL bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr DIV bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr MOD bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr POW bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr ATAN2 bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LAND bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LOR bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LUNLESS bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr EQLC bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr NEQ bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LSS bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LTE bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr GTR bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr GTE bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr TRIM_UPPER bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr TRIM_LOWER bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $1, $4)"
+action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
 
 # --- unary_expr ---
 
@@ -408,6 +408,93 @@ rule = "aggregate_op"
 alt = "LIMIT_RATIO"
 action = "Ok(ItemType::LimitRatio)"
 
+# --- binary modifiers ---
+
+[[actions]]
+rule = "bin_modifier"
+alt = "fill_modifiers"
+action = "$1"
+
+[[actions]]
+rule = "bool_modifier"
+alt = ""
+action = "actions::bool_modifier_empty()"
+
+[[actions]]
+rule = "bool_modifier"
+alt = "BOOL"
+action = "actions::bool_modifier_bool()"
+
+[[actions]]
+rule = "on_or_ignoring"
+alt = "bool_modifier IGNORING grouping_labels"
+action = "actions::on_or_ignoring_ignoring($1, $3)"
+
+[[actions]]
+rule = "on_or_ignoring"
+alt = "bool_modifier ON grouping_labels"
+action = "actions::on_or_ignoring_on($1, $3)"
+
+[[actions]]
+rule = "group_modifiers"
+alt = "bool_modifier"
+action = "actions::group_modifiers_pass($1)"
+
+[[actions]]
+rule = "group_modifiers"
+alt = "on_or_ignoring"
+action = "actions::group_modifiers_pass($1)"
+
+[[actions]]
+rule = "group_modifiers"
+alt = "on_or_ignoring GROUP_LEFT maybe_grouping_labels"
+action = "actions::group_modifiers_left($1, $3)"
+
+[[actions]]
+rule = "group_modifiers"
+alt = "on_or_ignoring GROUP_RIGHT maybe_grouping_labels"
+action = "actions::group_modifiers_right($1, $3)"
+
+[[actions]]
+rule = "fill_modifiers"
+alt = "group_modifiers"
+action = "actions::fill_modifiers_pass($1)"
+
+[[actions]]
+rule = "fill_modifiers"
+alt = "group_modifiers FILL fill_value"
+action = "actions::fill_modifiers_fill($1, $3)"
+
+[[actions]]
+rule = "fill_modifiers"
+alt = "group_modifiers FILL_LEFT fill_value"
+action = "actions::fill_modifiers_fill_left($1, $3)"
+
+[[actions]]
+rule = "fill_modifiers"
+alt = "group_modifiers FILL_RIGHT fill_value"
+action = "actions::fill_modifiers_fill_right($1, $3)"
+
+[[actions]]
+rule = "fill_modifiers"
+alt = "group_modifiers FILL_LEFT fill_value FILL_RIGHT fill_value"
+action = "actions::fill_modifiers_fill_left_right($1, $3, $5)"
+
+[[actions]]
+rule = "fill_modifiers"
+alt = "group_modifiers FILL_RIGHT fill_value FILL_LEFT fill_value"
+action = "actions::fill_modifiers_fill_right_left($1, $3, $5)"
+
+[[actions]]
+rule = "fill_value"
+alt = "LEFT_PAREN number_duration_literal RIGHT_PAREN"
+action = "actions::fill_value_extract($2)"
+
+[[actions]]
+rule = "fill_value"
+alt = "LEFT_PAREN unary_op number_duration_literal RIGHT_PAREN"
+action = "actions::fill_value_unary($2, $3)"
+
 # --- grouping_label / grouping_labels ---
 
 [[actions]]
@@ -454,6 +541,11 @@ action = "Ok(actions::span_str($lexer, $1.map_err(|_| ())?.span()).to_string())"
 rule = "maybe_grouping_labels"
 alt = "grouping_labels"
 action = "$1"
+
+[[actions]]
+rule = "maybe_grouping_labels"
+alt = ""
+action = "Ok(Vec::new())"
 
 # --- function_call + args ---
 

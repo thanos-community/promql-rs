@@ -23,7 +23,7 @@ use lrpar::{Lexeme, NonStreamingLexer};
 use crate::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, FunctionRef, LabelMatcher, MatchOp,
     MatrixSelector, NumberLiteral, ParenExpr, StringLiteral, SubqueryExpr, UnaryExpr, ValueType,
-    VectorSelector,
+    VectorMatchCardinality, VectorMatching, VectorSelector,
 };
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
@@ -43,6 +43,27 @@ pub fn span_str<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, span: Span) -> &'i str {
 
 fn to_pos_range(span: Span) -> PositionRange {
     PositionRange::new(span.start() as Pos, span.end() as Pos)
+}
+
+// -------- binary modifiers --------
+
+/// Intermediate struct for building up binary modifiers through the
+/// grammar's left-recursive modifier rules. Mirrors upstream's approach
+/// of threading a partial BinaryExpr through bool_modifier →
+/// on_or_ignoring → group_modifiers → fill_modifiers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinModifiers {
+    pub vector_matching: VectorMatching,
+    pub return_bool: bool,
+}
+
+impl Default for BinModifiers {
+    fn default() -> Self {
+        BinModifiers {
+            vector_matching: VectorMatching::default(),
+            return_bool: false,
+        }
+    }
 }
 
 // -------- literals --------
@@ -106,16 +127,21 @@ pub fn paren<'l, 'i: 'l>(
 pub fn binary<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
     op_lx: Lx,
+    modifiers: Result<Option<BinModifiers>, ()>,
     lhs: Result<Expr, ()>,
     rhs: Result<Expr, ()>,
 ) -> Result<Expr, ()> {
     let op = op_item_type_from_lex(lexer, op_lx)?;
+    let (vector_matching, return_bool) = match modifiers? {
+        Some(mods) => (Some(mods.vector_matching), mods.return_bool),
+        None => (None, false),
+    };
     Ok(Expr::Binary(BinaryExpr {
         op,
         lhs: Box::new(lhs?),
         rhs: Box::new(rhs?),
-        vector_matching: None,
-        return_bool: false,
+        vector_matching,
+        return_bool,
     }))
 }
 
@@ -171,6 +197,158 @@ fn op_item_type_from_lex<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Ite
         _ => return Err(()),
     };
     Ok(ty)
+}
+
+// -------- binary modifier helpers --------
+
+/// Empty bool_modifier: no modifier, no allocation.
+pub fn bool_modifier_empty() -> Result<Option<BinModifiers>, ()> {
+    Ok(None)
+}
+
+/// Bool modifier: sets return_bool flag.
+pub fn bool_modifier_bool() -> Result<Option<BinModifiers>, ()> {
+    Ok(Some(BinModifiers {
+        vector_matching: VectorMatching::default(),
+        return_bool: true,
+    }))
+}
+
+/// on_or_ignoring with IGNORING: takes bool_modifier and adds matching labels.
+pub fn on_or_ignoring_ignoring(
+    mods: Result<Option<BinModifiers>, ()>,
+    labels: Result<Vec<String>, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.matching_labels = labels?;
+    m.vector_matching.on = false;
+    Ok(Some(m))
+}
+
+/// on_or_ignoring with ON: takes bool_modifier and adds matching labels + on flag.
+pub fn on_or_ignoring_on(
+    mods: Result<Option<BinModifiers>, ()>,
+    labels: Result<Vec<String>, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.matching_labels = labels?;
+    m.vector_matching.on = true;
+    Ok(Some(m))
+}
+
+/// group_modifiers: pass through bool_modifier or on_or_ignoring unchanged.
+pub fn group_modifiers_pass(
+    mods: Result<Option<BinModifiers>, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    mods
+}
+
+/// group_modifiers with GROUP_LEFT: sets ManyToOne cardinality and include labels.
+pub fn group_modifiers_left(
+    mods: Result<Option<BinModifiers>, ()>,
+    labels: Result<Vec<String>, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.card = VectorMatchCardinality::ManyToOne;
+    m.vector_matching.include = labels?;
+    Ok(Some(m))
+}
+
+/// group_modifiers with GROUP_RIGHT: sets OneToMany cardinality and include labels.
+pub fn group_modifiers_right(
+    mods: Result<Option<BinModifiers>, ()>,
+    labels: Result<Vec<String>, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.card = VectorMatchCardinality::OneToMany;
+    m.vector_matching.include = labels?;
+    Ok(Some(m))
+}
+
+/// fill_modifiers: pass through group_modifiers unchanged.
+pub fn fill_modifiers_pass(
+    mods: Result<Option<BinModifiers>, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    mods
+}
+
+/// fill_modifiers with FILL: sets both LHS and RHS to the same fill value.
+pub fn fill_modifiers_fill(
+    mods: Result<Option<BinModifiers>, ()>,
+    value: Result<f64, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    let v = value?;
+    m.vector_matching.fill_values.lhs = Some(v);
+    m.vector_matching.fill_values.rhs = Some(v);
+    Ok(Some(m))
+}
+
+/// fill_modifiers with FILL_LEFT: sets only LHS fill value.
+pub fn fill_modifiers_fill_left(
+    mods: Result<Option<BinModifiers>, ()>,
+    value: Result<f64, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.fill_values.lhs = Some(value?);
+    Ok(Some(m))
+}
+
+/// fill_modifiers with FILL_RIGHT: sets only RHS fill value.
+pub fn fill_modifiers_fill_right(
+    mods: Result<Option<BinModifiers>, ()>,
+    value: Result<f64, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.fill_values.rhs = Some(value?);
+    Ok(Some(m))
+}
+
+/// fill_modifiers with FILL_LEFT then FILL_RIGHT: sets both fill values.
+pub fn fill_modifiers_fill_left_right(
+    mods: Result<Option<BinModifiers>, ()>,
+    left_val: Result<f64, ()>,
+    right_val: Result<f64, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.fill_values.lhs = Some(left_val?);
+    m.vector_matching.fill_values.rhs = Some(right_val?);
+    Ok(Some(m))
+}
+
+/// fill_modifiers with FILL_RIGHT then FILL_LEFT: sets both fill values.
+pub fn fill_modifiers_fill_right_left(
+    mods: Result<Option<BinModifiers>, ()>,
+    right_val: Result<f64, ()>,
+    left_val: Result<f64, ()>,
+) -> Result<Option<BinModifiers>, ()> {
+    let mut m = mods?.unwrap_or_default();
+    m.vector_matching.fill_values.lhs = Some(left_val?);
+    m.vector_matching.fill_values.rhs = Some(right_val?);
+    Ok(Some(m))
+}
+
+/// Extract the numeric value from a fill_value production (number_duration_literal wrapped in parens).
+pub fn fill_value_extract(expr: Result<Expr, ()>) -> Result<f64, ()> {
+    match expr? {
+        Expr::NumberLiteral(nl) => Ok(nl.val),
+        _ => Err(()),
+    }
+}
+
+/// Extract negated numeric value from a fill_value production with unary minus.
+pub fn fill_value_unary(op: Result<ItemType, ()>, expr: Result<Expr, ()>) -> Result<f64, ()> {
+    let op_ty = op?;
+    match expr? {
+        Expr::NumberLiteral(nl) => {
+            if op_ty == ItemType::Sub {
+                Ok(-nl.val)
+            } else {
+                Ok(nl.val)
+            }
+        }
+        _ => Err(()),
+    }
 }
 
 // -------- selectors --------
