@@ -33,7 +33,8 @@ It’ll consist of virtual table per series `__name__`, and one additional speci
 Logically each table has fully expanded columns for each label; that is, it’s column per label. It’s nested structure where some timeblock is encoded per row
 
 ```sql
-TABLE {{ metric name }} (	label_a    STRING  -- it should only use labels this metric has
+TABLE {{ metric name }} (
+    label_a    STRING  -- it should only use labels this metric has
 	label_b    STRING
 	min_time   TIMESTAMP
 	max_time   TIMESTAMP
@@ -58,7 +59,8 @@ For now downsampling and preaggregations are excluded from the spec.
 Having fully flat-out schema, like:
 
 ```sql
-TABLE {{ metric name }} (	label_a    STRING  -- it should only use labels this metric has
+TABLE {{ metric name }} (
+    label_a    STRING  -- it should only use labels this metric has
 	label_b    STRING
 timestamp TIMESTAMP
 	value_f   float64 -- for counters / gauges
