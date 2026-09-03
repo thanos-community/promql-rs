@@ -28,7 +28,7 @@ Focus is on abstraction, a virtual table from which initial logical query can be
 
 # High level design
 
-It’ll consist of virtual table per series `__name__`, and one additional special table called `__all__` to power queries without `__name__` specified like `count{job=”example”}`
+It’ll consist of virtual table per series `__name__`, and one additional special table called `__all__` to power queries without `__name__` specified like `count({job=”example”})`
 
 Logically each table has fully expanded columns for each label; that is, it’s column per label. It’s nested structure where some timeblock is encoded per row
 
