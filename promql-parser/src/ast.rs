@@ -50,6 +50,48 @@ pub struct LabelMatcher {
     pub pos_range: PositionRange,
 }
 
+/// One point of a series description's value sequence. Mirrors
+/// upstream `parse.go`'s `SequenceValue`.
+///
+/// Upstream also carries an optional `Histogram`; native-histogram
+/// descriptors (`{{schema:1 ...}}`) aren't ported yet, so this is
+/// float-only for now.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SequenceValue {
+    pub value: f64,
+    pub omitted: bool,
+}
+
+impl SequenceValue {
+    pub fn value(value: f64) -> Self {
+        Self {
+            value,
+            omitted: false,
+        }
+    }
+
+    /// The `_` placeholder: a gap in the sequence.
+    pub fn omitted() -> Self {
+        Self {
+            value: 0.0,
+            omitted: true,
+        }
+    }
+}
+
+/// A parsed series description — one `metric{...} <values>` line of a
+/// promqltest load block. Mirrors upstream `parse.go`'s
+/// `seriesDescription`.
+///
+/// `labels` are the metric's label set, carried as `Equal` matchers
+/// (including `__name__`) so the shape matches
+/// [`crate::parse_metric_selector`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SeriesDescription {
+    pub labels: Vec<LabelMatcher>,
+    pub values: Vec<SequenceValue>,
+}
+
 /// Vector-matching cardinality. Mirrors upstream `VectorMatchCardinality`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum VectorMatchCardinality {

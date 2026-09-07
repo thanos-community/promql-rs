@@ -12,7 +12,7 @@
 //   promql-parser/grammar-tokens.toml           (upstream →
 //     grmtools token rename table)
 
-%start expr
+%start start
 %left 'LOR'
 %left 'LAND' 'LUNLESS'
 %left 'EQLC' 'GTE' 'GTR' 'LSS' 'LTE' 'NEQ' 'TRIM_UPPER' 'TRIM_LOWER'
@@ -22,6 +22,13 @@
 %nonassoc 'OFFSET'
 %right 'LBRACKET'
 %%
+
+start -> Result<actions::ParseResult, ()>:
+    'START_METRIC' metric { Ok(actions::ParseResult::Metric($2?)) }
+  | 'START_SERIES_DESCRIPTION' series_description { Ok(actions::ParseResult::SeriesDescription($2?)) }
+  | 'START_EXPRESSION' expr { Ok(actions::ParseResult::Expr($2?)) }
+  | 'START_METRIC_SELECTOR' vector_selector { Ok(actions::ParseResult::Expr($2?)) }
+  ;
 
 expr -> Result<Expr, ()>:
     aggregate_expr { $1 }
@@ -198,6 +205,11 @@ label_matcher -> Result<LabelMatcher, ()>:
   | string_identifier { actions::quoted_metric_name_matcher_from_ident($lexer, $span, $1?) }
   ;
 
+metric -> Result<Vec<LabelMatcher>, ()>:
+    metric_identifier label_set { actions::metric_with_name($span, $1?, $2?) }
+  | label_set { $1 }
+  ;
+
 metric_identifier -> Result<String, ()>:
     'AVG' { Ok(actions::span_str($lexer, $1.map_err(|_| ())?.span()).to_string()) }
   | 'BOTTOMK' { Ok(actions::span_str($lexer, $1.map_err(|_| ())?.span()).to_string()) }
@@ -230,6 +242,48 @@ metric_identifier -> Result<String, ()>:
   | 'RANGE' { Ok(actions::span_str($lexer, $1.map_err(|_| ())?.span()).to_string()) }
   | 'ANCHORED' { Ok(actions::span_str($lexer, $1.map_err(|_| ())?.span()).to_string()) }
   | 'SMOOTHED' { Ok(actions::span_str($lexer, $1.map_err(|_| ())?.span()).to_string()) }
+  ;
+
+label_set -> Result<Vec<LabelMatcher>, ()>:
+    'LBRACE' label_set_list 'RBRACE' { $2 }
+  | 'LBRACE' label_set_list 'COMMA' 'RBRACE' { $2 }
+  | 'LBRACE' 'RBRACE' { Ok(Vec::new()) }
+  | /* empty */ { Ok(Vec::new()) }
+  ;
+
+label_set_list -> Result<Vec<LabelMatcher>, ()>:
+    label_set_list 'COMMA' label_set_item { actions::push_label($1?, $3?) }
+  | label_set_item { Ok(vec![$1?]) }
+  ;
+
+label_set_item -> Result<LabelMatcher, ()>:
+    'IDENT' 'EQ' 'STRING' { actions::label_from_ident($lexer, $span, $1, $3) }
+  | string_identifier 'EQ' 'STRING' { actions::label_from_string_ident($lexer, $span, $1?, $3) }
+  | string_identifier { actions::label_metric_name($span, $1?) }
+  ;
+
+series_description -> Result<SeriesDescription, ()>:
+    metric series_values { actions::series_description($1?, $2?) }
+  ;
+
+series_values -> Result<Vec<SequenceValue>, ()>:
+    /* empty */ { Ok(Vec::new()) }
+  | series_values 'SPACE' series_item { actions::extend_values($1?, $3?) }
+  | series_values 'SPACE' { $1 }
+  ;
+
+series_item -> Result<Vec<SequenceValue>, ()>:
+    'BLANK' { Ok(vec![SequenceValue::omitted()]) }
+  | 'BLANK' 'TIMES' uint { Ok(actions::repeat_omitted($3?)) }
+  | series_value { Ok(vec![SequenceValue::value($1?)]) }
+  | series_value 'TIMES' uint { Ok(actions::series_repeat($1?, 0.0, $3?)) }
+  | series_value signed_number 'TIMES' uint { Ok(actions::series_repeat($1?, $2?, $4?)) }
+  ;
+
+series_value -> Result<f64, ()>:
+    'IDENT' { actions::stale_value($lexer, $1) }
+  | number { $1 }
+  | signed_number { $1 }
   ;
 
 aggregate_op -> Result<ItemType, ()>:
@@ -320,6 +374,10 @@ signed_or_unsigned_number -> Result<f64, ()>:
   | signed_number { $1 }
   ;
 
+uint -> Result<u64, ()>:
+    'NUMBER' { actions::parse_uint($lexer, $1) }
+  ;
+
 string_literal -> Result<Expr, ()>:
     'STRING' { actions::string_literal($lexer, $1.map_err(|_| ())?) }
   ;
@@ -372,6 +430,6 @@ paren_duration_expr -> Result<Expr, ()>:
 
 %%
 
-use crate::ast::{AtModifier, Expr, LabelMatcher, MatchOp};
+use crate::ast::{AtModifier, Expr, LabelMatcher, MatchOp, SequenceValue, SeriesDescription};
 use crate::token::ItemType;
 use crate::actions;
