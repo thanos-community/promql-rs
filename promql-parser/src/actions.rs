@@ -930,7 +930,13 @@ fn parse_number_literal(raw: &str) -> Result<f64, ()> {
     s.parse::<f64>().map_err(|_| ())
 }
 
-fn parse_duration_seconds(raw: &str) -> Result<f64, ()> {
+/// Parse a PromQL duration literal (`30s`, `1h30m`, `500ms`) into
+/// seconds. Mirrors upstream's `model.ParseDuration`, which the lexer
+/// and the promqltest `load <interval>` directive both lean on.
+///
+/// Exposed so callers that read Prometheus test scripts don't grow a
+/// second implementation of this; see `promql-testcases`.
+pub fn parse_duration_seconds(raw: &str) -> Result<f64, ()> {
     let mut total = 0f64;
     let mut chars = raw.chars().peekable();
     let mut had_any = false;

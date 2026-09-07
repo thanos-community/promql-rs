@@ -50,6 +50,7 @@ lrlex_mod!("lexer.l");
 lrlex_mod!("series.l");
 lrpar_mod!("grammar.y");
 
+pub use crate::actions::parse_duration_seconds;
 pub use crate::ast::Expr;
 pub use crate::ast::{SequenceValue, SeriesDescription};
 pub use crate::error::{ParseError, ParseErrors};
