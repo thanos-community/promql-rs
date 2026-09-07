@@ -28,8 +28,8 @@ use lrpar::{Lexeme, NonStreamingLexer};
 
 use crate::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, FunctionRef, LabelMatcher, MatchOp,
-    MatrixSelector, NumberLiteral, ParenExpr, StringLiteral, SubqueryExpr, UnaryExpr, ValueType,
-    VectorMatchCardinality, VectorMatching, VectorSelector,
+    MatrixSelector, NumberLiteral, ParenExpr, SequenceValue, SeriesDescription, StringLiteral,
+    SubqueryExpr, UnaryExpr, ValueType, VectorMatchCardinality, VectorMatching, VectorSelector,
 };
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
@@ -735,6 +735,164 @@ fn aggregator_takes_param(op: ItemType) -> bool {
             | ItemType::Limitk
             | ItemType::LimitRatio
     )
+}
+
+// -------- start-symbol dispatch --------
+
+/// Result of the `start` rule, one variant per parse mode. Upstream
+/// stores this in `parser.generatedParserResult` as an `any` and type-
+/// asserts per entry point (`parse.go`); grmtools needs a single
+/// concrete return type, so the modes become an enum.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseResult {
+    /// `START_EXPRESSION` / `START_METRIC_SELECTOR`.
+    Expr(Expr),
+    /// `START_METRIC` — a bare label set.
+    Metric(Vec<LabelMatcher>),
+    /// `START_SERIES_DESCRIPTION`.
+    SeriesDescription(SeriesDescription),
+}
+
+// -------- label sets (series descriptions & START_METRIC) --------
+
+/// `metric : metric_identifier label_set`. Upstream sets `__name__` on
+/// a `labels.Builder`; we prepend the equivalent `Equal` matcher.
+///
+/// Going through a Builder has an observable side effect that the bare
+/// `metric : label_set` alternative does not share: `Builder.Reset`
+/// treats an empty value as a deletion, so `foo{bar=""} 1` yields just
+/// `__name__="foo"`. Dropping empties here — and only here — keeps us
+/// byte-identical with upstream on the promqltest corpus.
+pub fn metric_with_name(
+    span: Span,
+    name: String,
+    mut labels: Vec<LabelMatcher>,
+) -> Result<Vec<LabelMatcher>, ()> {
+    labels.retain(|l| !l.value.is_empty());
+    labels.insert(
+        0,
+        LabelMatcher {
+            name: "__name__".to_string(),
+            op: MatchOp::Equal,
+            value: name,
+            pos_range: to_pos_range(span),
+        },
+    );
+    Ok(labels)
+}
+
+pub fn push_label(mut acc: Vec<LabelMatcher>, item: LabelMatcher) -> Result<Vec<LabelMatcher>, ()> {
+    acc.push(item);
+    Ok(acc)
+}
+
+/// `label_set_item : IDENTIFIER EQL STRING`. Unlike `label_matcher`,
+/// a label set only ever has `=`.
+pub fn label_from_ident<'l, 'i: 'l>(
+    lexer: &'l L<'l, 'i>,
+    span: Span,
+    name: Result<Lx, Lx>,
+    value: Result<Lx, Lx>,
+) -> Result<LabelMatcher, ()> {
+    let name = lexer.span_str(name.map_err(|_| ())?.span()).to_string();
+    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    Ok(LabelMatcher {
+        name,
+        op: MatchOp::Equal,
+        value: unquote_string(raw)?,
+        pos_range: to_pos_range(span),
+    })
+}
+
+/// `label_set_item : string_identifier EQL STRING` — quoted UTF-8
+/// label name.
+pub fn label_from_string_ident<'l, 'i: 'l>(
+    lexer: &'l L<'l, 'i>,
+    span: Span,
+    name: String,
+    value: Result<Lx, Lx>,
+) -> Result<LabelMatcher, ()> {
+    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    Ok(LabelMatcher {
+        name,
+        op: MatchOp::Equal,
+        value: unquote_string(raw)?,
+        pos_range: to_pos_range(span),
+    })
+}
+
+/// `label_set_item : string_identifier` — a bare quoted string in a
+/// label set is the metric name.
+pub fn label_metric_name(span: Span, value: String) -> Result<LabelMatcher, ()> {
+    Ok(LabelMatcher {
+        name: "__name__".to_string(),
+        op: MatchOp::Equal,
+        value,
+        pos_range: to_pos_range(span),
+    })
+}
+
+// -------- series descriptions --------
+
+/// Upstream's stale marker: `math.Float64frombits(value.StaleNaN)`,
+/// a quiet NaN with a distinguishing low bit.
+const STALE_NAN: u64 = 0x7ff0_0000_0000_0002;
+
+pub fn series_description(
+    labels: Vec<LabelMatcher>,
+    values: Vec<SequenceValue>,
+) -> Result<SeriesDescription, ()> {
+    Ok(SeriesDescription { labels, values })
+}
+
+pub fn extend_values(
+    mut acc: Vec<SequenceValue>,
+    item: Vec<SequenceValue>,
+) -> Result<Vec<SequenceValue>, ()> {
+    acc.extend(item);
+    Ok(acc)
+}
+
+/// `_ x<count>` — a run of gaps.
+///
+/// Note the asymmetry with [`series_repeat`]: upstream's `BLANK TIMES
+/// uint` loop is `i < $3`, not `i <= $3`, so `_x5` yields exactly 5
+/// omitted points while `1x5` yields 6.
+pub fn repeat_omitted(count: u64) -> Vec<SequenceValue> {
+    vec![SequenceValue::omitted(); count as usize]
+}
+
+/// `<value>[<step>]x<count>` — an arithmetic run.
+///
+/// Upstream loops `for i := 0; i <= count; i++`, i.e. it emits
+/// `count + 1` points: "Add an additional value for time 0, which we
+/// ignore in tests". So `46.00+13.00x40` is 41 values, not 40.
+pub fn series_repeat(start: f64, step: f64, count: u64) -> Vec<SequenceValue> {
+    let mut out = Vec::with_capacity(count as usize + 1);
+    let mut val = start;
+    for _ in 0..=count {
+        out.push(SequenceValue::value(val));
+        val += step;
+    }
+    out
+}
+
+/// `series_value : IDENTIFIER` — the only identifier a value sequence
+/// accepts is `stale`.
+pub fn stale_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Result<f64, ()> {
+    let raw = lexer.span_str(lx.map_err(|_| ())?.span());
+    if raw != "stale" {
+        return Err(());
+    }
+    Ok(f64::from_bits(STALE_NAN))
+}
+
+/// `uint : NUMBER` — the repetition count after `x`.
+pub fn parse_uint<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Result<u64, ()> {
+    lexer
+        .span_str(lx.map_err(|_| ())?.span())
+        .parse::<u64>()
+        .map_err(|_| ())
 }
 
 // -------- shared parsers (number, duration, string) --------
