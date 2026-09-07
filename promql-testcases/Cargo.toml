@@ -1,0 +1,17 @@
+[package]
+name = "promql-testcases"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "Loader for the shared PromQL engine test cases kept in YAML by thanos-io/promql-engine"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+promql-parser = { path = "../promql-parser" }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_norway = { workspace = true }
+thiserror = { workspace = true }

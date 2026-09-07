@@ -61,6 +61,7 @@ mod grammar {
     pub use grammar_y::parse;
 }
 
+pub use crate::actions::parse_duration_seconds;
 pub use crate::ast::Expr;
 pub use crate::ast::{SequenceValue, SeriesDescription};
 pub use crate::error::{ParseError, ParseErrors};
