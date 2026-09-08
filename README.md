@@ -1,14 +1,15 @@
 # promql-rs
 
-A standalone Rust PromQL parser: a structural hand-port of
-[`prometheus/prometheus`](https://github.com/prometheus/prometheus)'s
-`promql/parser` package, plus the tooling that keeps the port in sync
+Standalone Rust PromQL components derived from
+[`prometheus/prometheus`](https://github.com/prometheus/prometheus): a PromQL
+parser, native histogram operations, and tooling that keeps the parser in sync
 with upstream as Prometheus evolves.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
+| `promql-histogram/` | Prometheus-compatible native histogram types, validation, arithmetic, statistics, and trimming. |
 | `promql-parser/` | The parser crate. Grammar, lexer, AST, and error types ported from upstream. |
 | `promql-parser/upstream/` | Verbatim vendored copies of the upstream Go source the port is derived from. |
 | `promql-sync/` | Developer-invoked CLI that checks, pulls, and regenerates the port against upstream. |
@@ -74,7 +75,7 @@ reviews the resulting `git diff`, does the translation work the report
 calls out, and commits when tests pass. That keeps upstream sync a
 routine, low-ceremony task instead of a rare, dreaded one.
 
-## Status
+## Parser status
 
 Not yet complete. What's missing:
 
@@ -112,7 +113,9 @@ cargo test --workspace
 
 ## License
 
-Apache-2.0, see [LICENSE](LICENSE). The vendored files under
-`promql-parser/upstream/` are copied verbatim from
+Apache-2.0, see [LICENSE](LICENSE). The histogram implementation is derived
+from Prometheus as documented in
+[`promql-histogram/UPSTREAM.md`](promql-histogram/UPSTREAM.md). The vendored
+files under `promql-parser/upstream/` are copied verbatim from
 [`prometheus/prometheus`](https://github.com/prometheus/prometheus),
 also Apache-2.0; their upstream copyright headers are retained.

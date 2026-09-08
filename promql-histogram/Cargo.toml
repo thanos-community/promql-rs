@@ -1,0 +1,13 @@
+[package]
+name = "promql-histogram"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "Prometheus-compatible native histogram types and operations"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
