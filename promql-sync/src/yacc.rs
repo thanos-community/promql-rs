@@ -311,7 +311,7 @@ impl<'a> Parser<'a> {
                     }
                     break;
                 }
-                Some(b) if b == b'\'' => {
+                Some(b'\'') => {
                     // Character literal token: `'+'` etc. Upstream
                     // goyacc accepts them; our subset doesn't use them,
                     // but pass through verbatim.

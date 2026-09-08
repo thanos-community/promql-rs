@@ -33,10 +33,21 @@ pub mod posrange;
 pub mod token;
 
 use lrlex::lrlex_mod;
-use lrpar::lrpar_mod;
 
 lrlex_mod!("lexer.l");
-lrpar_mod!("grammar.y");
+
+/// Wrapper around the generated parser module so clippy lints that only
+/// fire on grmtools' generated code can be silenced here rather than
+/// crate-wide.
+mod grammar {
+    #![allow(clippy::needless_question_mark)]
+
+    use lrpar::lrpar_mod;
+
+    lrpar_mod!("grammar.y");
+
+    pub use grammar_y::parse;
+}
 
 pub use crate::ast::Expr;
 pub use crate::error::{ParseError, ParseErrors};

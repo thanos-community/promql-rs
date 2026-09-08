@@ -171,8 +171,8 @@ fn paren_preserves_structure() {
 
 #[test]
 fn unary_negation_of_literal_collapses() {
-    match must_parse("-3.14") {
-        Expr::NumberLiteral(n) => assert!((n.val - -3.14).abs() < 1e-12),
+    match must_parse("-2.75") {
+        Expr::NumberLiteral(n) => assert!((n.val - -2.75).abs() < 1e-12),
         other => panic!("expected NumberLiteral (collapsed), got {other:?}"),
     }
 }

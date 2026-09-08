@@ -500,10 +500,7 @@ impl<'a> Lexer<'a> {
             }
             self.accept("s");
         }
-        match self.next() {
-            Some(c) if is_alphanumeric(c) => false,
-            _ => true,
-        }
+        !matches!(self.next(), Some(c) if is_alphanumeric(c))
     }
 
     /// Upstream `scanNumber`. Faithful port.
@@ -534,17 +531,13 @@ impl<'a> Lexer<'a> {
             if !self.is(&[digit_pattern, DOT, UNDER, EXP].concat()) {
                 break;
             }
-            if self.is(DOT) {
-                if dot_consumed {
-                    self.accept(DOT);
-                    return false;
-                }
+            if self.is(DOT) && dot_consumed {
+                self.accept(DOT);
+                return false;
             }
-            if self.is(EXP) {
-                if exp_consumed {
-                    self.accept(EXP);
-                    return false;
-                }
+            if self.is(EXP) && exp_consumed {
+                self.accept(EXP);
+                return false;
             }
             if self.accept(DOT) {
                 dot_consumed = true;
@@ -637,7 +630,7 @@ impl<'a> Lexer<'a> {
             {
                 return State::String_;
             }
-            Some(c) if matches!(c, '0'..='7') => (3, 8, 255),
+            Some('0'..='7') => (3, 8, 255),
             Some('x') => {
                 self.next();
                 (2, 16, 255)
