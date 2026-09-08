@@ -16,6 +16,12 @@
 //! series descriptions, histogram descriptors, fill modifiers, and
 //! duration-expression arithmetic are not yet implemented.
 
+// Every action returns `Result<T, ()>`: that is grmtools' convention for
+// the grammar's `%actiontype`, where `Err(())` signals "this production
+// failed, error recovery takes over". The error type is fixed by the
+// generated parser, so there is nothing richer to return here.
+#![allow(clippy::result_unit_err)]
+
 use cfgrammar::Span;
 use lrlex::{DefaultLexeme, DefaultLexerTypes};
 use lrpar::{Lexeme, NonStreamingLexer};
@@ -51,19 +57,10 @@ fn to_pos_range(span: Span) -> PositionRange {
 /// grammar's left-recursive modifier rules. Mirrors upstream's approach
 /// of threading a partial BinaryExpr through bool_modifier →
 /// on_or_ignoring → group_modifiers → fill_modifiers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BinModifiers {
     pub vector_matching: VectorMatching,
     pub return_bool: bool,
-}
-
-impl Default for BinModifiers {
-    fn default() -> Self {
-        BinModifiers {
-            vector_matching: VectorMatching::default(),
-            return_bool: false,
-        }
-    }
 }
 
 // -------- literals --------

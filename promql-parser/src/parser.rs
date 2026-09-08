@@ -12,7 +12,7 @@ use crate::posrange::{Pos, PositionRange};
 pub fn parse_expr(input: &str) -> Result<Expr, ParseErrors> {
     let lexerdef = crate::lexer_l::lexerdef();
     let lexer = lexerdef.lexer(input);
-    let (ast, errs) = crate::grammar_y::parse(&lexer);
+    let (ast, errs) = crate::grammar::parse(&lexer);
     if !errs.is_empty() {
         let mut out = Vec::with_capacity(errs.len());
         for e in errs {
