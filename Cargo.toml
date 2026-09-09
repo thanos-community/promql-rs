@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["promql-parser", "promql-sync", "promql-testcases"]
+members = [
+    "promql-conformance",
+    "promql-parser",
+    "promql-sync",
+    "promql-testcases",
+]
 
 [workspace.package]
 edition = "2021"

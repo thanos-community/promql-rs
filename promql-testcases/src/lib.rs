@@ -111,6 +111,14 @@ impl Case {
 /// A parsed `load <interval>` block.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadBlock {
+    /// The block exactly as it appeared in the YAML.
+    ///
+    /// Kept because a differential test has to hand the verbatim text to
+    /// the reference implementation so that it does its own parsing.
+    /// Reconstructing the block from the parsed form below would compare
+    /// against our reading of the input rather than upstream's, which is
+    /// the one thing such a test must not do.
+    pub raw: String,
     /// The sample interval from the directive line, in seconds.
     pub interval_secs: f64,
     /// Whether the directive was `load_with_nhcb` rather than `load`.
@@ -275,6 +283,7 @@ fn parse_load_block(case: &str, raw: &str) -> Result<LoadBlock, Error> {
         .collect();
 
     Ok(LoadBlock {
+        raw: raw.to_string(),
         interval_secs,
         with_nhcb,
         series,
