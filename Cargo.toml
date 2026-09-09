@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "promql-conformance",
+    "promql-engine",
     "promql-parser",
     "promql-sync",
     "promql-testcases",
@@ -14,8 +15,13 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 cfgrammar = "0.13"
 clap = { version = "4.5", features = ["derive"] }
+# The major great lakes patches to its DataFusion fork. Engine code must
+# reach Arrow only through `datafusion::arrow`, never a direct `arrow`
+# dependency, or a consumer's patch cannot apply and two Arrows collide.
+datafusion = "54"
 insta = { version = "1", features = ["filters"] }
 lrlex = "0.13"
 lrpar = "0.13"
@@ -28,3 +34,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_norway = "0.9"
 thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

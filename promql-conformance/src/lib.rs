@@ -15,29 +15,32 @@
 //!
 //! # Current state
 //!
-//! There is no Rust execution engine yet, so [`result::Unimplemented`]
-//! fills the [`result::Engine`] seam and every differential case fails
-//! with [`result::EngineError::NotImplemented`]. That is the intended
-//! state: the failing tests are the engine's specification, and the
-//! passing count is the progress meter.
+//! [`datafusion::DataFusionEngine`] fills the [`result::Engine`] seam
+//! with the `promql-engine` crate. It evaluates bare instant-vector
+//! selectors; every other expression fails with
+//! [`result::EngineError::Unsupported`], and those failures are the
+//! specification for what to build next. The passing count is the
+//! progress meter.
 //!
-//! Because of that, the suite is split in two, and the split is the
-//! point:
+//! The suite is split in two, and the split is the point:
 //!
 //! - **Harness self-checks** (`tests/selfcheck.rs`) must pass. They
 //!   prove the oracle is reachable, the protocol round-trips, and the
 //!   comparer is correct.
-//! - **Differential cases** (`tests/differential.rs`) must fail, with
-//!   `NotImplemented` and nothing else.
+//! - **Differential cases** (`tests/differential.rs`) pass where the
+//!   engine agrees with Prometheus, fail where it disagrees, and are
+//!   collapsed into one failure where the engine has nothing to say yet.
 //!
 //! A red test is only useful when it is red for the right reason. If a
 //! self-check fails, the plumbing is broken and no differential failure
 //! means anything.
 
 pub mod compare;
+pub mod datafusion;
 pub mod oracle;
 pub mod result;
 
 pub use compare::{compare, floats_equal, Mismatch};
+pub use datafusion::DataFusionEngine;
 pub use oracle::{Oracle, OracleError};
 pub use result::{Engine, EngineError, Labels, Point, QueryResult, Sample, Series, Unimplemented};

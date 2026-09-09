@@ -1,24 +1,25 @@
-//! The differential suite: one test per corpus case. **These are
-//! expected to fail.**
+//! The differential suite: one test per corpus case.
 //!
 //! Each case asks the Go oracle what Prometheus returns, asks the Rust
-//! engine the same thing, and compares. No Rust engine exists yet, so
-//! every case fails — and those failures are the specification. As PR
-//! #4's `TableProvider` and an execution layer land, cases turn green
-//! one at a time.
+//! engine the same thing, and compares. The engine is young, so most
+//! cases cannot be evaluated yet; those are the specification for what
+//! to build next, and the passing count is the progress meter.
 //!
 //! Because the corpus drives the tests, they are registered at runtime
 //! with `libtest-mimic` rather than written as `#[test]` functions. That
 //! buys per-case names, so `cargo test -p promql-conformance topk`
 //! selects exactly the cases you are working on.
 //!
-//! # Output while no engine exists
+//! # Output
 //!
-//! 244 failures that all say "not implemented" are ~2000 lines of
-//! output conveying one fact, so the suite collapses them into a single
-//! failure until the engine seam does something. It probes the engine to
-//! decide, which means the collapse needs no configuration and undoes
-//! itself as soon as `Engine` is implemented.
+//! A case the engine cannot evaluate fails with
+//! `EngineError::Unsupported`, naming the missing feature. Hundreds of
+//! those, each saying "an aggregation is not supported yet", are pages of
+//! output conveying one table, so the suite collapses them into a single
+//! failing trial that prints the table: how many cases each missing
+//! feature blocks. Cases the engine *does* evaluate get their own trial
+//! and their own verdict. As features land, cases move from the table to
+//! named trials on their own.
 //!
 //! Set `PROMQL_CONFORMANCE_PER_CASE=1` to get one test per case
 //! regardless.
@@ -26,11 +27,13 @@
 //! Whether the plumbing itself works is `selfcheck.rs`'s job. If those
 //! fail, nothing here means anything.
 
+use std::collections::BTreeMap;
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use promql_conformance::{
-    compare, oracle, result::Engine, EngineError, QueryResult, Unimplemented,
+    compare, oracle, result::Engine, DataFusionEngine, EngineError, QueryResult,
 };
 use promql_testcases::{range_queries_in, testcases_dir, Case, SeriesLine};
 
@@ -63,36 +66,39 @@ fn main() -> ExitCode {
         }
     };
 
-    // While no engine exists at all, every case fails for the same
-    // reason, and 244 identical failures cost about 2000 lines of output
-    // that say one thing. Collapse them into a single failure until
-    // there is something to differentiate.
-    //
-    // The probe means this needs no configuration and undoes itself:
-    // implement `Engine` and the per-case trials appear on their own.
-    if engine_is_absent() && !per_case_requested() {
-        let (runnable, skipped) = partition(&cases);
-        let trial = Trial::test("engine_not_implemented", move || {
-            Err(Failed::from(format!(
-                "no Rust execution engine exists yet\n\n  \
-                 {runnable} corpus cases are ready and the oracle answers every one.\n  \
-                 {skipped} skipped (native histograms).\n\n  \
-                 Implement `Engine` and replace `Unimplemented` in \
-                 tests/differential.rs;\n  \
-                 the per-case tests then appear automatically.\n  \
-                 Set {PER_CASE_ENV}=1 to list them individually now."
-            )))
-        });
-        return libtest_mimic::run(&args, vec![trial]).exit_code();
+    let mut trials = Vec::new();
+    let mut unsupported: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for case in cases {
+        // The engine is cheap to ask; the oracle is not, and does not need
+        // to be asked for a case the engine cannot evaluate anyway.
+        match (!per_case_requested())
+            .then(|| unsupported_feature(&case))
+            .flatten()
+        {
+            Some(feature) => unsupported.entry(feature).or_default().push(case.name),
+            None => {
+                let name = case.name.clone();
+                trials.push(Trial::test(name, move || run(case)));
+            }
+        }
     }
 
-    let trials: Vec<Trial> = cases
-        .into_iter()
-        .map(|case| {
-            let name = case.name.clone();
-            Trial::test(name, move || run(case))
-        })
-        .collect();
+    if !unsupported.is_empty() {
+        let total: usize = unsupported.values().map(Vec::len).sum();
+        let mut table = String::new();
+        for (feature, names) in &unsupported {
+            table.push_str(&format!("\n  {:>4}  {feature}", names.len()));
+        }
+        trials.push(Trial::test("unsupported_expressions", move || {
+            Err(Failed::from(format!(
+                "{total} corpus cases use expressions the engine does not implement yet:\
+                 {table}\n\n  \
+                 Each becomes its own test as soon as the engine evaluates it.\n  \
+                 Set {PER_CASE_ENV}=1 to list them individually now."
+            )))
+        }));
+    }
 
     libtest_mimic::run(&args, trials).exit_code()
 }
@@ -105,23 +111,37 @@ fn per_case_requested() -> bool {
     std::env::var_os(PER_CASE_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Whether the engine seam is entirely unimplemented, as opposed to
-/// implemented and merely wrong. Asked with a query that needs no data.
-fn engine_is_absent() -> bool {
-    matches!(
-        Unimplemented.range_query(&[], 0.0, "vector(1)", 0, 0, 30_000),
-        Err(EngineError::NotImplemented)
-    )
+fn engine() -> &'static DataFusionEngine {
+    static ENGINE: OnceLock<DataFusionEngine> = OnceLock::new();
+    ENGINE.get_or_init(|| DataFusionEngine::new().expect("the engine constructs"))
 }
 
-/// Split the corpus into cases that hold the engine to something and
-/// cases skipped because the Rust parser cannot represent their input.
-fn partition(cases: &[Case]) -> (usize, usize) {
-    let skipped = cases
-        .iter()
-        .filter(|c| c.load.as_ref().is_some_and(|l| !l.is_fully_supported()))
-        .count();
-    (cases.len() - skipped, skipped)
+/// Ask the engine about a case and report the missing feature if it has
+/// one. Any other outcome — a result, an error, a bug — is a case worth
+/// its own trial.
+fn unsupported_feature(case: &Case) -> Option<String> {
+    let (series, interval) = seed(case);
+    match engine().range_query(
+        &series,
+        interval,
+        &case.query,
+        case.start_ms,
+        case.end_ms,
+        case.step_ms,
+    ) {
+        Err(EngineError::Unsupported(feature)) => Some(feature),
+        _ => None,
+    }
+}
+
+fn seed(case: &Case) -> (Vec<promql_parser::SeriesDescription>, f64) {
+    let series = case
+        .load
+        .as_ref()
+        .map(|l| l.parsed().cloned().collect())
+        .unwrap_or_default();
+    let interval = case.load.as_ref().map(|l| l.interval_secs).unwrap_or(0.0);
+    (series, interval)
 }
 
 fn run(case: Case) -> Result<(), Failed> {
@@ -167,15 +187,8 @@ fn run(case: Case) -> Result<(), Failed> {
         return Ok(());
     }
 
-    let series: Vec<_> = case
-        .load
-        .as_ref()
-        .map(|l| l.parsed().cloned().collect())
-        .unwrap_or_default();
-    let interval = case.load.as_ref().map(|l| l.interval_secs).unwrap_or(0.0);
-
-    let engine = Unimplemented;
-    let actual = match engine.range_query(
+    let (series, interval) = seed(&case);
+    let actual = match engine().range_query(
         &series,
         interval,
         &case.query,
