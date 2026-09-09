@@ -13,7 +13,9 @@ with upstream as Prometheus evolves.
 | `promql-parser/upstream/` | Verbatim vendored copies of the upstream Go source the port is derived from. |
 | `promql-sync/` | Developer-invoked CLI that checks, pulls, and regenerates the port against upstream. |
 | `scripts/gen-conformance/` | Go tool that turns upstream's own parser test suite into a JSON fixture. |
+| `promql-layout-bench/` | Benchmark behind the series-representation decision: two Arrow layouts, one series-aware operator, real DataFusion plans. Results in `RESULTS.md`. |
 | `docs/parser-sync.md` | Design rationale for the parser and the sync tooling. |
+| `docs/series-representation.md` | What the PromQL layer is handed: the in-memory series representation, and why one row per series. |
 
 ## Why hand-porting a parser needs its own tooling
 
