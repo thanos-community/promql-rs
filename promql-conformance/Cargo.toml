@@ -1,0 +1,23 @@
+[package]
+name = "promql-conformance"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+promql-parser = { path = "../promql-parser" }
+promql-testcases = { path = "../promql-testcases" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+libtest-mimic = "0.8"
+
+# The differential suite registers one test per corpus case at runtime,
+# so it needs its own harness rather than #[test] attributes.
+[[test]]
+name = "differential"
+harness = false
