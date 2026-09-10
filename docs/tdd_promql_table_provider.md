@@ -28,9 +28,31 @@ Focus is on abstraction, a virtual table from which initial logical query can be
 
 # High level design
 
-It’ll consist of virtual table per series `__name__`, and one additional special table called `__all__` to power queries without `__name__` specified like `count({job=”example”})`
+It’ll consist of virtual table per series `__name__`. For nameless queries such as `count({job=”example”})` we'd implement [UDTF](https://datafusion.apache.org/python/user-guide/common-operations/udf-and-udfa.html#table-functions) such as `all_series('job=”example”')`.
 
-Logically each table has fully expanded columns for each label; that is, it’s column per label. It’s nested structure where some timeblock is encoded per row
+Logically each table has fully expanded columns for each label; that is, it’s column per label. One sample per row
+
+```sql
+TABLE {{ metric name }} (
+    label_a    STRING  -- it should only use labels this metric has
+	label_b    STRING
+timestamp TIMESTAMP
+	value_f   float64 -- for counters / gauges
+	value_nh  NATIVE_HISTOGRAM -- for native histogram. TBD how we encode this
+)
+```
+
+To efficiently support window functions like `rate` we'll implement them via [UDWF](https://datafusion.apache.org/python/user-guide/common-operations/udf-and-udfa.html#window-functions). Thus Table provider should within each timestamp [Range Partition](https://datafusion.apache.org/blog/output/2026/08/25/datafusion-55.0.0/#range-partitioning) be ordered by labelset and timestamp. Thus when window function ([df blogpost](https://datafusion.apache.org/blog/2025/04/19/user-defined-window-functions/)) are partitioned by lableset, and ordered by timestamp we'll avoid unnecessary sorting step due to presorted data. 
+
+Exact ordering wrt labels is depending on usecase, and up to the operator. 
+
+This doesn’t preclude underlying tables storing timeseries batches (e.g. 2h samples per row). This is optimisable during logical query optimization, and it’ll be common for `rate` like operations.
+
+For now downsampling and preaggregations are excluded from the spec.
+
+# Alternatives considered
+
+Having batched rows, where multiple samples for same labelset per row, like:
 
 ```sql
 TABLE {{ metric name }} (
@@ -44,30 +66,6 @@ timestamps []TIMESTAMP
 )
 ```
 
-Table providers must return non-overlapping time-ranges for each labelset. 
-
-There's a single strong requirement for sort ordering within each timestamp [Range Partition](https://datafusion.apache.org/blog/output/2026/08/25/datafusion-55.0.0/#range-partitioning). It must return all samples for specific labelset in ascending timestamp order. 
-
-Exact ordering wrt labels is depending on usecase, and up to the operator. 
-
-This doesn’t preclude underlying tables storing timeseries batches (e.g. 2h samples per row). This is optimisable during logical query optimization, and it’ll be common for `rate` like operations.
-
-For now downsampling and preaggregations are excluded from the spec.
-
-# Alternatives considered
-
-Having fully flat-out schema, like:
-
-```sql
-TABLE {{ metric name }} (
-    label_a    STRING  -- it should only use labels this metric has
-	label_b    STRING
-timestamp TIMESTAMP
-	value_f   float64 -- for counters / gauges
-	value_nh  NATIVE_HISTOGRAM -- for native histogram. TBD how we encode this
-)
-```
-
-Conversion between this format, and the batched up version is straightforward. Ideally we’d test both versions, and based on benchmarking determine which one is easier to optimise for. It’s kinda CISC vs. RISC. 
+Conversion between this format, and the flat version is straightforward. Ideally we’d test both versions, and based on benchmarking determine which one is easier to optimise for. It’s kinda CISC vs. RISC. 
 
 It’s open-ended how should native histograms should be represented.
