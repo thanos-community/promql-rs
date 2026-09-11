@@ -11,18 +11,25 @@
 //! is particular about (see [`crate::math`]).
 //!
 //! Every input series is already on the query's step grid — it came
-//! through `promql_instant_vector` or a range function — so a group's
-//! state is simply a map from step timestamp to a running value, and
-//! merging two partial states is merging two maps. A step no series
-//! contributed to is absent from the map and therefore from the output,
-//! which is what Prometheus does too.
+//! through `promql_instant_vector` or a range function, both of which
+//! emit at `start + i * step` — so a timestamp *is* an array index, and
+//! the group's state is a flat array with one slot per step rather than
+//! a map. That is what lets this work on slices: Prometheus sees one
+//! sample at a time through an iterator and has no choice but to fold
+//! per sample, whereas here a whole series arrives as a contiguous
+//! `&[f64]` along time, and folding it into the group is one pass over
+//! two slices with an independent accumulator per step. No loop-carried
+//! dependency, so the compiler can vectorize it; see [`crate::math`].
+//!
+//! A step no series contributed to is absent from the output, which is
+//! what Prometheus does too, so the array is paired with a `seen` bitmap
+//! rather than relying on a sentinel value.
 //!
 //! The operator is a literal argument rather than eight registered
 //! functions: one name to register, one plan to serialize, and the
 //! same reasoning as the parameters of `promql_instant_vector`.
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -42,7 +49,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_expr::expressions::Literal;
 
-use crate::math::{max_nan_loses, min_nan_loses, KahanSum, Mean, Welford};
+use crate::math::{self, max_nan_loses, min_nan_loses, KahanSum, Mean, Welford};
 use crate::series;
 
 pub const NAME: &str = "promql_aggregate";
@@ -193,40 +200,315 @@ impl State {
     }
 }
 
+/// The query's step grid, which is what makes a timestamp an index.
+///
+/// Everything an aggregation can sit on top of — a selector, a range
+/// function, another aggregation — emits at `start + i * step` and
+/// nowhere else, so a step is an array position and the accumulator can
+/// be a flat array rather than a map.
+#[derive(Debug, Clone, Copy)]
+struct Grid {
+    start_ms: i64,
+    step_ms: i64,
+    len: usize,
+}
+
+impl Grid {
+    fn new(start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
+        if step_ms <= 0 {
+            return Err(DataFusionError::Execution(format!(
+                "{NAME}: step must be positive, got {step_ms}ms"
+            )));
+        }
+        let len = if end_ms < start_ms {
+            0
+        } else {
+            usize::try_from((end_ms - start_ms) / step_ms + 1).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "{NAME}: {start_ms}..{end_ms} has too many steps"
+                ))
+            })?
+        };
+        Ok(Self {
+            start_ms,
+            step_ms,
+            len,
+        })
+    }
+
+    fn timestamp(&self, index: usize) -> i64 {
+        self.start_ms + index as i64 * self.step_ms
+    }
+
+    fn index(&self, ts: i64) -> Result<usize> {
+        let offset = ts - self.start_ms;
+        let index = offset / self.step_ms;
+        if offset < 0 || offset % self.step_ms != 0 || index as usize >= self.len {
+            return Err(DataFusionError::Execution(format!(
+                "{NAME}: sample at {ts}ms is not on the step grid {}..{} every {}ms",
+                self.start_ms,
+                self.timestamp(self.len.saturating_sub(1)),
+                self.step_ms
+            )));
+        }
+        Ok(index as usize)
+    }
+}
+
+/// One group's running state, held as parallel `f64` arrays rather than
+/// an array of [`State`]s.
+///
+/// This is the shape that lets a whole series be folded in with slice
+/// arithmetic: adding series `s` to the group means running the op's
+/// kernel over `lanes[i0..i0+n]` and `s.values[..n]` in lockstep. Only
+/// the lanes the operator actually uses are allocated.
+#[derive(Debug)]
+enum Lanes {
+    Sum {
+        sum: Vec<f64>,
+        c: Vec<f64>,
+    },
+    Avg {
+        value: Vec<f64>,
+        c: Vec<f64>,
+        count: Vec<f64>,
+        incremental: Vec<bool>,
+    },
+    Count {
+        n: Vec<f64>,
+    },
+    Min(Vec<f64>),
+    Max(Vec<f64>),
+    Group,
+    Var {
+        mean: Vec<f64>,
+        m2: Vec<f64>,
+        count: Vec<f64>,
+    },
+}
+
+impl Lanes {
+    /// Lanes for `len` steps, every position holding [`State::new`].
+    fn new(op: Op, len: usize) -> Self {
+        let zeros = || vec![0.0; len];
+        match op {
+            Op::Sum => Lanes::Sum {
+                sum: zeros(),
+                c: zeros(),
+            },
+            Op::Avg => Lanes::Avg {
+                value: zeros(),
+                c: zeros(),
+                count: zeros(),
+                incremental: vec![false; len],
+            },
+            Op::Count => Lanes::Count { n: zeros() },
+            Op::Min => Lanes::Min(vec![f64::NAN; len]),
+            Op::Max => Lanes::Max(vec![f64::NAN; len]),
+            Op::Group => Lanes::Group,
+            Op::Stddev | Op::Stdvar => Lanes::Var {
+                mean: zeros(),
+                m2: zeros(),
+                count: zeros(),
+            },
+        }
+    }
+
+    /// Fold one series' values into the steps starting at `index`. The
+    /// values are consecutive steps, so this is the slice work: one
+    /// pass, one accumulator per position, no interaction between them.
+    fn add_run(&mut self, index: usize, values: &[f64]) {
+        let r = index..index + values.len();
+        match self {
+            Lanes::Sum { sum, c } => math::kahan_add_each(&mut sum[r.clone()], &mut c[r], values),
+            Lanes::Avg {
+                value,
+                c,
+                count,
+                incremental,
+            } => math::mean_add_each(
+                &mut value[r.clone()],
+                &mut c[r.clone()],
+                &mut count[r.clone()],
+                &mut incremental[r],
+                values,
+            ),
+            Lanes::Count { n } => math::count_add_each(&mut n[r]),
+            Lanes::Min(cur) => math::min_add_each(&mut cur[r], values),
+            Lanes::Max(cur) => math::max_add_each(&mut cur[r], values),
+            Lanes::Group => {}
+            Lanes::Var { mean, m2, count } => math::welford_add_each(
+                &mut mean[r.clone()],
+                &mut m2[r.clone()],
+                &mut count[r],
+                values,
+            ),
+        }
+    }
+
+    /// One step's state as a value, for merging and for the result.
+    fn get(&self, i: usize) -> State {
+        match self {
+            Lanes::Sum { sum, c } => State::Sum(KahanSum::new(sum[i], c[i])),
+            Lanes::Avg {
+                value,
+                c,
+                count,
+                incremental,
+            } => State::Avg(Mean {
+                value: value[i],
+                c: c[i],
+                count: count[i],
+                incremental: incremental[i],
+            }),
+            Lanes::Count { n } => State::Count(n[i]),
+            Lanes::Min(cur) => State::Min(cur[i]),
+            Lanes::Max(cur) => State::Max(cur[i]),
+            Lanes::Group => State::Group,
+            Lanes::Var { mean, m2, count } => State::Var(Welford {
+                mean: mean[i],
+                m2: m2[i],
+                count: count[i],
+            }),
+        }
+    }
+
+    fn set(&mut self, i: usize, s: State) {
+        match (self, s) {
+            (Lanes::Sum { sum, c }, State::Sum(k)) => {
+                sum[i] = k.sum;
+                c[i] = k.c;
+            }
+            (
+                Lanes::Avg {
+                    value,
+                    c,
+                    count,
+                    incremental,
+                },
+                State::Avg(m),
+            ) => {
+                value[i] = m.value;
+                c[i] = m.c;
+                count[i] = m.count;
+                incremental[i] = m.incremental;
+            }
+            (Lanes::Count { n }, State::Count(v)) => n[i] = v,
+            (Lanes::Min(cur), State::Min(v)) | (Lanes::Max(cur), State::Max(v)) => cur[i] = v,
+            (Lanes::Group, State::Group) => {}
+            (Lanes::Var { mean, m2, count }, State::Var(w)) => {
+                mean[i] = w.mean;
+                m2[i] = w.m2;
+                count[i] = w.count;
+            }
+            _ => unreachable!("one accumulator, one operator"),
+        }
+    }
+
+    /// Bytes of lane storage, for DataFusion's memory accounting.
+    fn size(&self) -> usize {
+        let f = |v: &Vec<f64>| v.capacity() * std::mem::size_of::<f64>();
+        match self {
+            Lanes::Sum { sum, c } => f(sum) + f(c),
+            Lanes::Avg {
+                value,
+                c,
+                count,
+                incremental,
+            } => f(value) + f(c) + f(count) + incremental.capacity(),
+            Lanes::Count { n } => f(n),
+            Lanes::Min(cur) | Lanes::Max(cur) => f(cur),
+            Lanes::Group => 0,
+            Lanes::Var { mean, m2, count } => f(mean) + f(m2) + f(count),
+        }
+    }
+}
+
 /// The accumulator for one group.
 #[derive(Debug)]
 pub struct Steps {
     op: Op,
-    steps: BTreeMap<i64, State>,
+    grid: Grid,
+    /// Whether any series contributed at each step. A step nobody
+    /// reached is absent from the result, which is not the same as a
+    /// step that summed to zero.
+    seen: Vec<bool>,
+    lanes: Lanes,
 }
 
 impl Steps {
-    pub fn new(op: Op) -> Self {
-        Self {
+    pub fn new(op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
+        let grid = Grid::new(start_ms, end_ms, step_ms)?;
+        Ok(Self {
             op,
-            steps: BTreeMap::new(),
+            seen: vec![false; grid.len],
+            lanes: Lanes::new(op, grid.len),
+            grid,
+        })
+    }
+
+    /// Fold one whole series in. Its timestamps are ascending and on the
+    /// grid, so they form one contiguous run of steps unless the series
+    /// has gaps; each maximal run is one slice operation.
+    pub fn add_series(&mut self, timestamps: &[i64], values: &[f64]) -> Result<()> {
+        debug_assert_eq!(timestamps.len(), values.len());
+        if timestamps.is_empty() {
+            return Ok(());
         }
-    }
+        let grid = self.grid;
+        let first = grid.index(timestamps[0])?;
+        let last = grid.index(timestamps[timestamps.len() - 1])?;
 
-    pub fn add(&mut self, ts: i64, f: f64) {
-        self.steps
-            .entry(ts)
-            .or_insert_with(|| State::new(self.op))
-            .add(f);
-    }
+        // The common case: no gaps, so the whole series is one run.
+        if last - first + 1 == timestamps.len() {
+            self.add_run(first, values);
+            return Ok(());
+        }
 
-    fn merge(&mut self, ts: i64, other: &State) {
-        match self.steps.get_mut(&ts) {
-            Some(s) => s.merge(other),
-            None => {
-                self.steps.insert(ts, *other);
+        let mut run_start = 0;
+        let mut run_index = first;
+        let mut previous = first;
+        for k in 1..timestamps.len() {
+            let index = grid.index(timestamps[k])?;
+            if index != previous + 1 {
+                self.add_run(run_index, &values[run_start..k]);
+                run_start = k;
+                run_index = index;
             }
+            previous = index;
         }
+        self.add_run(run_index, &values[run_start..]);
+        Ok(())
+    }
+
+    fn add_run(&mut self, index: usize, values: &[f64]) {
+        self.seen[index..index + values.len()].fill(true);
+        self.lanes.add_run(index, values);
+    }
+
+    fn merge_at(&mut self, index: usize, incoming: &State) {
+        if self.seen[index] {
+            let mut current = self.lanes.get(index);
+            current.merge(incoming);
+            self.lanes.set(index, current);
+        } else {
+            self.lanes.set(index, *incoming);
+            self.seen[index] = true;
+        }
+    }
+
+    /// The steps that were reached, in order.
+    fn occupied(&self) -> impl Iterator<Item = usize> + '_ {
+        self.seen
+            .iter()
+            .enumerate()
+            .filter_map(|(i, seen)| seen.then_some(i))
     }
 
     /// The group's series, in step order.
     pub fn samples(&self) -> impl Iterator<Item = (i64, f64)> + '_ {
-        self.steps.iter().map(|(t, s)| (*t, s.result(self.op)))
+        self.occupied()
+            .map(move |i| (self.grid.timestamp(i), self.lanes.get(i).result(self.op)))
     }
 }
 
@@ -289,14 +571,14 @@ impl Accumulator for Steps {
             .as_primitive::<Float64Type>()
             .values();
         let offsets = list.offsets();
+        // One row is one whole series, so each iteration hands a
+        // contiguous slice of timestamps and values to the kernels.
         for row in 0..list.len() {
             if list.is_null(row) {
                 continue;
             }
             let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            for i in a..b {
-                self.add(ts[i], vs[i]);
-            }
+            self.add_series(&ts[a..b], &vs[a..b])?;
         }
         Ok(())
     }
@@ -315,12 +597,11 @@ impl Accumulator for Steps {
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.steps.len() * (std::mem::size_of::<i64>() + std::mem::size_of::<State>())
+        std::mem::size_of::<Self>() + self.seen.capacity() + self.lanes.size()
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let n = self.steps.len();
+        let n = self.seen.iter().filter(|s| **s).count();
         let mut ts = Vec::with_capacity(n);
         let (mut a, mut b, mut c) = (
             Vec::with_capacity(n),
@@ -328,9 +609,12 @@ impl Accumulator for Steps {
             Vec::with_capacity(n),
         );
         let mut m = Vec::with_capacity(n);
-        for (t, s) in &self.steps {
-            let (ra, rb, rn, rm) = s.to_row();
-            ts.push(*t);
+        for i in 0..self.seen.len() {
+            if !self.seen[i] {
+                continue;
+            }
+            let (ra, rb, rn, rm) = self.lanes.get(i).to_row();
+            ts.push(self.grid.timestamp(i));
             a.push(ra);
             b.push(rb);
             c.push(rn);
@@ -372,7 +656,8 @@ impl Accumulator for Steps {
             }
             for i in offsets[row] as usize..offsets[row + 1] as usize {
                 let s = State::from_row(self.op, a[i], b[i], n[i], m.value(i));
-                self.merge(ts[i], &s);
+                let index = self.grid.index(ts[i])?;
+                self.merge_at(index, &s);
             }
         }
         Ok(())
@@ -389,7 +674,13 @@ impl Default for Aggregate {
     fn default() -> Self {
         Self {
             signature: Signature::exact(
-                vec![series::samples_type(), DataType::Utf8],
+                vec![
+                    series::samples_type(),
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                ],
                 Volatility::Immutable,
             ),
         }
@@ -400,9 +691,18 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(Aggregate::default())
 }
 
-/// `promql_aggregate(samples, '<op>')`.
-pub fn call(samples: Expr, op: Op) -> Expr {
-    udaf().call(vec![samples, lit(op.as_str())])
+/// `promql_aggregate(samples, '<op>', start, end, step)`.
+///
+/// The step grid is passed in because it is what turns a timestamp into
+/// an array index; see [`Grid`].
+pub fn call(samples: Expr, op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Expr {
+    udaf().call(vec![
+        samples,
+        lit(op.as_str()),
+        lit(start_ms),
+        lit(end_ms),
+        lit(step_ms),
+    ])
 }
 
 impl AggregateUDFImpl for Aggregate {
@@ -431,11 +731,14 @@ impl AggregateUDFImpl for Aggregate {
     }
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        let op = args
-            .exprs
-            .get(1)
-            .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
-            .and_then(|l| match l.value() {
+        let literal = |i: usize| {
+            args.exprs
+                .get(i)
+                .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
+                .map(Literal::value)
+        };
+        let op = literal(1)
+            .and_then(|v| match v {
                 ScalarValue::Utf8(Some(s)) => Op::parse(s.as_str()),
                 _ => None,
             })
@@ -444,7 +747,22 @@ impl AggregateUDFImpl for Aggregate {
                     "{NAME}: second argument must be one of sum, avg, count, min, max, group, stddev, stdvar as a string literal"
                 ))
             })?;
-        Ok(Box::new(Steps::new(op)))
+        let grid = |i: usize, what: &str| {
+            literal(i)
+                .and_then(|v| match v {
+                    ScalarValue::Int64(Some(n)) => Some(*n),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!("{NAME}: {what} must be an Int64 literal"))
+                })
+        };
+        Ok(Box::new(Steps::new(
+            op,
+            grid(2, "start")?,
+            grid(3, "end")?,
+            grid(4, "step")?,
+        )?))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -465,14 +783,19 @@ impl AggregateUDFImpl for Aggregate {
 mod tests {
     use super::*;
 
-    fn run(op: Op, series: &[&[(i64, f64)]]) -> Vec<(i64, f64)> {
-        let mut acc = Steps::new(op);
+    /// Fold `series` in through the slice path, on a grid wide enough
+    /// for every timestamp used.
+    fn accumulate(op: Op, series: &[&[(i64, f64)]], start: i64, end: i64, step: i64) -> Steps {
+        let mut acc = Steps::new(op, start, end, step).unwrap();
         for s in series {
-            for (t, v) in *s {
-                acc.add(*t, *v);
-            }
+            let (ts, vs): (Vec<i64>, Vec<f64>) = s.iter().copied().unzip();
+            acc.add_series(&ts, &vs).unwrap();
         }
-        acc.samples().collect()
+        acc
+    }
+
+    fn run(op: Op, series: &[&[(i64, f64)]]) -> Vec<(i64, f64)> {
+        accumulate(op, series, 0, 3, 1).samples().collect()
     }
 
     #[test]
@@ -512,6 +835,92 @@ mod tests {
         assert!((run(Op::Stddev, &series)[0].1 - 2.0).abs() < 1e-12);
     }
 
+    /// The lane kernels and the one-value-at-a-time [`State`] must agree
+    /// bit for bit. [`State`] is the readable definition of each
+    /// operator's arithmetic; the lanes are the fast restatement of it,
+    /// and this is what pins them together.
+    #[test]
+    fn the_slice_path_matches_the_sample_at_a_time_path_exactly() {
+        let values: Vec<Vec<f64>> = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![1e16, 1.0, -1e16, 0.5],
+            vec![f64::NAN, 7.0, -0.0, 1e308],
+            vec![-3.5, f64::INFINITY, 2.0, 1e-320],
+            vec![0.1, 0.2, 0.3, 0.4],
+        ];
+        for op in [
+            Op::Sum,
+            Op::Avg,
+            Op::Count,
+            Op::Min,
+            Op::Max,
+            Op::Group,
+            Op::Stddev,
+            Op::Stdvar,
+        ] {
+            let series: Vec<Vec<(i64, f64)>> = values
+                .iter()
+                .map(|vs| {
+                    vs.iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(i, v)| (i as i64, v))
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[(i64, f64)]> = series.iter().map(|s| s.as_slice()).collect();
+            let lanes: Vec<(i64, f64)> = accumulate(op, &refs, 0, 3, 1).samples().collect();
+
+            // The same numbers, one at a time, through `State`.
+            let mut scalar: Vec<State> = (0..4).map(|_| State::new(op)).collect();
+            for vs in &values {
+                for (i, v) in vs.iter().enumerate() {
+                    scalar[i].add(*v);
+                }
+            }
+            for (i, s) in scalar.iter().enumerate() {
+                assert_eq!(
+                    lanes[i].1.to_bits(),
+                    s.result(op).to_bits(),
+                    "{op:?} step {i}: {} vs {}",
+                    lanes[i].1,
+                    s.result(op)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_gap_in_a_series_splits_it_into_runs() {
+        // Steps 0 and 2 present, 1 missing: two runs, and step 1 stays
+        // unreached rather than being counted as a zero contribution.
+        let a: &[(i64, f64)] = &[(0, 1.0), (2, 3.0)];
+        let b: &[(i64, f64)] = &[(0, 10.0), (1, 20.0), (2, 30.0)];
+        assert_eq!(
+            accumulate(Op::Count, &[a], 0, 3, 1)
+                .samples()
+                .collect::<Vec<_>>(),
+            vec![(0, 1.0), (2, 1.0)]
+        );
+        assert_eq!(
+            accumulate(Op::Sum, &[a, b], 0, 3, 1)
+                .samples()
+                .collect::<Vec<_>>(),
+            vec![(0, 11.0), (1, 20.0), (2, 33.0)]
+        );
+    }
+
+    #[test]
+    fn a_sample_off_the_step_grid_is_an_error() {
+        let mut acc = Steps::new(Op::Sum, 0, 60_000, 30_000).unwrap();
+        assert!(acc.add_series(&[15_000], &[1.0]).is_err());
+        assert!(acc.add_series(&[90_000], &[1.0]).is_err());
+        assert!(acc.add_series(&[-30_000], &[1.0]).is_err());
+        assert!(acc
+            .add_series(&[0, 30_000, 60_000], &[1.0, 2.0, 3.0])
+            .is_ok());
+    }
+
     #[test]
     fn partial_states_round_trip_and_merge() {
         for op in [
@@ -524,18 +933,13 @@ mod tests {
             Op::Stddev,
             Op::Stdvar,
         ] {
-            let mut whole = Steps::new(op);
-            let mut left = Steps::new(op);
-            let mut right = Steps::new(op);
-            for (t, v) in [(0, 1.0), (1, 5.0), (0, 3.0)] {
-                whole.add(t, v);
-                left.add(t, v);
-            }
-            for (t, v) in [(0, 8.0), (2, 2.0)] {
-                whole.add(t, v);
-                right.add(t, v);
-            }
-            let mut merged = Steps::new(op);
+            let left_series: &[&[(i64, f64)]] = &[&[(0, 1.0), (1, 5.0)], &[(0, 3.0)]];
+            let right_series: &[&[(i64, f64)]] = &[&[(0, 8.0), (1, 4.0), (2, 2.0)]];
+            let all: Vec<&[(i64, f64)]> = left_series.iter().chain(right_series).copied().collect();
+            let whole = accumulate(op, &all, 0, 2, 1);
+            let mut left = accumulate(op, left_series, 0, 2, 1);
+            let mut right = accumulate(op, right_series, 0, 2, 1);
+            let mut merged = Steps::new(op, 0, 2, 1).unwrap();
             let mut states: Vec<ArrayRef> = Vec::new();
             for acc in [&mut left, &mut right] {
                 let s = acc.state().unwrap().remove(0);
@@ -556,9 +960,9 @@ mod tests {
 
     #[test]
     fn evaluate_is_a_canonical_samples_list() {
-        let mut acc = Steps::new(Op::Sum);
-        acc.add(30_000, 1.0);
-        acc.add(0, 2.0);
+        let mut acc = Steps::new(Op::Sum, 0, 60_000, 30_000).unwrap();
+        acc.add_series(&[30_000], &[1.0]).unwrap();
+        acc.add_series(&[0], &[2.0]).unwrap();
         let out = acc.evaluate().unwrap();
         let arr = out.to_array().unwrap();
         assert_eq!(arr.data_type(), &series::samples_type());

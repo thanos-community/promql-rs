@@ -30,7 +30,7 @@ use datafusion::logical_expr::{
 };
 
 use crate::instant::{int_arg, is_stale};
-use crate::math::{max_nan_loses, min_nan_loses, KahanSum, Mean};
+use crate::math;
 use crate::series;
 
 pub const NAME: &str = "promql_range_function";
@@ -157,21 +157,16 @@ pub fn evaluate(func: Func, w: &Window) -> Option<f64> {
         Func::Irate => instant_value(w, true),
         Func::Idelta => instant_value(w, false),
         Func::SumOverTime => {
-            let mut k = KahanSum::default();
-            w.vs.iter().for_each(|v| k.add(*v));
+            let k = math::kahan_sum(w.vs);
             Some(if k.sum.is_infinite() {
                 k.sum
             } else {
                 k.value()
             })
         }
-        Func::AvgOverTime => {
-            let mut m = Mean::default();
-            w.vs.iter().for_each(|v| m.add(*v));
-            Some(m.result())
-        }
-        Func::MinOverTime => Some(w.vs.iter().copied().fold(w.vs[0], min_nan_loses)),
-        Func::MaxOverTime => Some(w.vs.iter().copied().fold(w.vs[0], max_nan_loses)),
+        Func::AvgOverTime => Some(math::mean_of(w.vs)),
+        Func::MinOverTime => math::min_of(w.vs),
+        Func::MaxOverTime => math::max_of(w.vs),
         Func::CountOverTime => Some(w.vs.len() as f64),
         Func::LastOverTime => Some(w.vs[w.vs.len() - 1]),
         Func::PresentOverTime => Some(1.0),

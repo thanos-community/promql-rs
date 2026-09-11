@@ -198,7 +198,7 @@ async fn the_plan_is_an_aggregate_over_string_group_keys() {
     let rendered = plan.display_indent().to_string();
     assert!(
         rendered.starts_with(
-            "Projection: promql_labels(Utf8(\"route\"), route) AS labels, samples\n  Aggregate: groupBy=[[CAST(get_field(selector_0.labels, Utf8(\"route\")) AS Utf8) AS route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\")) AS samples]]"
+            "Projection: promql_labels(Utf8(\"route\"), route) AS labels, samples\n  Aggregate: groupBy=[[CAST(get_field(selector_0.labels, Utf8(\"route\")) AS Utf8) AS route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\"), Int64(0), Int64(60000), Int64(30000)) AS samples]]"
         ),
         "{rendered}"
     );

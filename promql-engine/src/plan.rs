@@ -249,7 +249,14 @@ impl Planner<'_> {
         let plan = LogicalPlanBuilder::from(input.plan)
             .aggregate(
                 labels::group_exprs(&keys),
-                vec![aggregate::call(col(SAMPLES), op).alias(SAMPLES)],
+                vec![aggregate::call(
+                    col(SAMPLES),
+                    op,
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
             )?
             .project(vec![labels::regroup(&keys).alias(LABELS), col(SAMPLES)])?
             .build()?;
