@@ -244,7 +244,7 @@ fn missing(what: &str) -> DataFusionError {
 }
 
 /// Read literal argument `i` as an `Int64`, `None` for SQL NULL.
-fn int_arg(args: &ScalarFunctionArgs, i: usize) -> Result<Option<i64>> {
+pub(crate) fn int_arg(args: &ScalarFunctionArgs, i: usize) -> Result<Option<i64>> {
     match &args.args[i] {
         ColumnarValue::Scalar(ScalarValue::Int64(v)) => Ok(*v),
         ColumnarValue::Scalar(ScalarValue::Null) => Ok(None),

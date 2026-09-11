@@ -171,7 +171,10 @@ fn parameterized_aggregations_are_named_as_unsupported() {
             "quantile(0.5, http_requests_total)",
             "the quantile aggregation",
         ),
-        ("rate(http_requests_total[5m])", "the rate function"),
+        (
+            "count_values(\"v\", http_requests_total)",
+            "the count_values aggregation",
+        ),
     ] {
         match engine.range_query(source(), q, &RangeQuery::new(0, 0, 30_000)) {
             Err(EngineError::Unsupported(f)) => assert_eq!(f, what, "{q}"),

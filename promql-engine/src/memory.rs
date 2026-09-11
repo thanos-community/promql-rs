@@ -45,23 +45,30 @@ impl MemorySeriesSource {
     /// `load` does: value `i` sits at `i * interval` from the epoch, an
     /// omitted value (`_`) emits no sample, and `stale` is already a
     /// StaleNaN payload courtesy of the parser.
+    ///
+    /// Two lines with the same labels are one series — the corpus repeats
+    /// lines on purpose — so they are merged, the later line winning any
+    /// timestamp both define. That is obligation 2, partition, applied at
+    /// load time.
     pub fn from_descriptions(series: &[SeriesDescription], interval_secs: f64) -> Self {
         let interval_ms = (interval_secs * 1000.0).round() as i64;
-        let stored = series
-            .iter()
-            .map(|sd| StoredSeries {
-                labels: sd
-                    .labels
-                    .iter()
-                    .map(|l| (l.name.clone(), l.value.clone()))
-                    .collect(),
-                samples: sd
-                    .values
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, v)| !v.omitted)
-                    .map(|(i, v)| (i as i64 * interval_ms, v.value))
-                    .collect(),
+        let mut merged: BTreeMap<BTreeMap<String, String>, BTreeMap<i64, f64>> = BTreeMap::new();
+        for sd in series {
+            let labels: BTreeMap<String, String> = sd
+                .labels
+                .iter()
+                .map(|l| (l.name.clone(), l.value.clone()))
+                .collect();
+            let samples = merged.entry(labels).or_default();
+            for (i, v) in sd.values.iter().enumerate().filter(|(_, v)| !v.omitted) {
+                samples.insert(i as i64 * interval_ms, v.value);
+            }
+        }
+        let stored = merged
+            .into_iter()
+            .map(|(labels, samples)| StoredSeries {
+                labels,
+                samples: samples.into_iter().collect(),
             })
             .collect();
         Self::new(stored)
@@ -178,6 +185,25 @@ mod tests {
         // nginx-1's decoded labels because it decodes as "".
         assert!(!decoded[0].labels.contains_key("route"));
         assert_eq!(decoded[1].labels["route"], "/");
+    }
+
+    #[test]
+    fn repeated_lines_for_one_series_are_one_series() {
+        let load = [
+            r#"x{a="1"} 1 2 3"#,
+            r#"x{a="1"} 1 2 3"#,
+            r#"x{a="1"} _ _ _ 4"#,
+        ];
+        let series: Vec<SeriesDescription> = load
+            .iter()
+            .map(|l| promql_parser::parse_series_desc(l).unwrap())
+            .collect();
+        let src = MemorySeriesSource::from_descriptions(&series, 1.0);
+        assert_eq!(src.series().len(), 1);
+        assert_eq!(
+            src.series()[0].samples,
+            vec![(0, 1.0), (1000, 2.0), (2000, 3.0), (3000, 4.0)]
+        );
     }
 
     #[tokio::test]

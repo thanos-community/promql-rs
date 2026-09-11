@@ -27,13 +27,14 @@ use std::sync::Arc;
 use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
-use promql_parser::ast::{AggregateExpr, AtModifier, Expr, VectorSelector};
+use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
 
 use crate::aggregate::{self, Op};
 use crate::error::EngineError;
 use crate::instant::{self, Params};
 use crate::labels;
-use crate::matcher::effective_matchers;
+use crate::matcher::{effective_matchers, METRIC_NAME};
+use crate::range::{self, Func};
 use crate::series::{LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
 
@@ -107,28 +108,21 @@ impl Planner<'_> {
                 Expr::VectorSelector(vs) => self.selector(vs, grouping).await,
                 Expr::Paren(p) => self.expr(&p.expr, grouping).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
+                Expr::Call(c) => self.call(c, grouping).await,
                 other => Err(EngineError::Unsupported(describe(other))),
             }
         })
     }
 
-    async fn selector(
+    /// Ask the store for `vs` over `[start_ms, end_ms]` and start a plan
+    /// on the resulting table.
+    async fn scan(
         &mut self,
         vs: &VectorSelector,
+        (start_ms, end_ms): (i64, i64),
         grouping: Option<&Grouping>,
-    ) -> Result<Planned, EngineError> {
+    ) -> Result<(LogicalPlanBuilder, Vec<String>), EngineError> {
         reject_unsupported_modifiers(vs)?;
-
-        let params = Params {
-            start_ms: self.query.start_ms,
-            end_ms: self.query.end_ms,
-            step_ms: self.query.step_ms,
-            lookback_ms: self.query.lookback_ms,
-            offset_ms: (vs.original_offset_secs * 1000.0).round() as i64,
-            at_ms: resolve_at(vs, self.query),
-        };
-        let (start_ms, end_ms) = params.select_range();
-
         let table = SelectorTable::try_new(
             self.state,
             self.source,
@@ -141,19 +135,98 @@ impl Planner<'_> {
         )
         .await?;
         let label_names = table.label_names();
-
         let index = self.selectors;
         self.selectors += 1;
-        let plan = LogicalPlanBuilder::scan(
+        let builder = LogicalPlanBuilder::scan(
             format!("selector_{index}"),
             provider_as_source(Arc::new(table)),
             None,
-        )?
-        .project(vec![
-            col(LABELS),
-            instant::call(col(SAMPLES), &params).alias(SAMPLES),
-        ])?
-        .build()?;
+        )?;
+        Ok((builder, label_names))
+    }
+
+    async fn selector(
+        &mut self,
+        vs: &VectorSelector,
+        grouping: Option<&Grouping>,
+    ) -> Result<Planned, EngineError> {
+        let params = Params {
+            start_ms: self.query.start_ms,
+            end_ms: self.query.end_ms,
+            step_ms: self.query.step_ms,
+            lookback_ms: self.query.lookback_ms,
+            offset_ms: offset_ms(vs),
+            at_ms: resolve_at(vs, self.query),
+        };
+        let (builder, label_names) = self.scan(vs, params.select_range(), grouping).await?;
+        let plan = builder
+            .project(vec![
+                col(LABELS),
+                instant::call(col(SAMPLES), &params).alias(SAMPLES),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// A function of one range selector: `rate(x[5m])` and its family.
+    async fn call(
+        &mut self,
+        call: &Call,
+        grouping: Option<&Grouping>,
+    ) -> Result<Planned, EngineError> {
+        let name = call.func.name.as_str();
+        let func = Func::parse(name)
+            .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
+        let (ms, vs) = match call.args.as_slice() {
+            [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
+                Expr::VectorSelector(vs) => (ms, vs),
+                other => {
+                    return Err(EngineError::Unsupported(format!(
+                        "a range selector over {}",
+                        describe(other)
+                    )))
+                }
+            },
+            [Expr::Subquery(_)] => return Err(EngineError::Unsupported("a subquery".into())),
+            [other] => {
+                return Err(EngineError::Unsupported(format!(
+                    "the {name} function over {}",
+                    describe(other)
+                )))
+            }
+            _ => {
+                return Err(EngineError::Query(format!(
+                    "{name} expects exactly one argument, got {}",
+                    call.args.len()
+                )))
+            }
+        };
+        if ms.range_expr.is_some() {
+            return Err(EngineError::Unsupported(
+                "a range given as a duration expression".into(),
+            ));
+        }
+
+        let params = range::Params {
+            start_ms: self.query.start_ms,
+            end_ms: self.query.end_ms,
+            step_ms: self.query.step_ms,
+            range_ms: (ms.range_secs * 1000.0).round() as i64,
+            offset_ms: offset_ms(vs),
+            at_ms: resolve_at(vs, self.query),
+        };
+        let (builder, input_names) = self.scan(vs, params.select_range(), grouping).await?;
+        let (labels_expr, label_names) = if func.drops_metric_name() {
+            labels::keep(&input_names, |n| n != METRIC_NAME)
+        } else {
+            (col(LABELS), input_names)
+        };
+        let plan = builder
+            .project(vec![
+                labels_expr.alias(LABELS),
+                range::call(col(SAMPLES), func, &params).alias(SAMPLES),
+            ])?
+            .build()?;
         Ok(Planned { plan, label_names })
     }
 
@@ -185,6 +258,10 @@ impl Planner<'_> {
             label_names: keys,
         })
     }
+}
+
+fn offset_ms(vs: &VectorSelector) -> i64 {
+    (vs.original_offset_secs * 1000.0).round() as i64
 }
 
 /// The `@` modifier's timestamp, with `start()`/`end()` resolved against

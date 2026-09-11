@@ -32,6 +32,7 @@ pub mod matcher;
 pub mod math;
 pub mod memory;
 pub mod plan;
+pub mod range;
 pub mod series;
 pub mod source;
 
