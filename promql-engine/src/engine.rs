@@ -13,10 +13,10 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::error::EngineError;
-use crate::instant;
 pub use crate::plan::RangeQuery;
 use crate::series::{self, DecodedSeries};
 use crate::source::SeriesSource;
+use crate::{aggregate, instant, labels};
 
 pub struct Engine {
     ctx: SessionContext,
@@ -28,6 +28,8 @@ impl Engine {
     pub fn new() -> Self {
         let ctx = SessionContext::new_with_config(SessionConfig::new());
         ctx.register_udf(instant::udf());
+        ctx.register_udf(labels::udf());
+        ctx.register_udaf(aggregate::udaf());
         Self { ctx, rt: None }
     }
 

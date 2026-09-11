@@ -165,10 +165,7 @@ mod tests {
             .select(
                 &ctx.state(),
                 &[matcher("__name__", MatchOp::Equal, "http_requests_total")],
-                SelectHints {
-                    start_ms: 30_000,
-                    end_ms: 60_000,
-                },
+                SelectHints::range(30_000, 60_000),
             )
             .await
             .unwrap();
@@ -190,10 +187,7 @@ mod tests {
             .select(
                 &ctx.state(),
                 &[matcher("pod", MatchOp::Equal, "nginx-3")],
-                SelectHints {
-                    start_ms: 0,
-                    end_ms: 1_000_000,
-                },
+                SelectHints::range(0, 1_000_000),
             )
             .await
             .unwrap();

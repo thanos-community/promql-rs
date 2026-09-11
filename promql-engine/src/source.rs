@@ -41,13 +41,35 @@ use crate::series;
 /// What the engine wants from a scan, beyond the matchers.
 ///
 /// Both bounds are inclusive milliseconds and already account for
-/// lookback, `offset` and `@`: the store does not need to know any PromQL
-/// to honour them. Named after Prometheus's `SelectHints`; more fields
-/// (step, function, grouping) arrive as operators need them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// lookback, `offset`, `@` and range windows: the store does not need to
+/// know any PromQL to honour them. Named after Prometheus's `SelectHints`;
+/// more fields (step, function) arrive as operators need them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectHints {
     pub start_ms: i64,
     pub end_ms: i64,
+    /// The aggregation directly above this selector, if any. Advisory: a
+    /// store that partitions its output by these labels and declares
+    /// `Partitioning::Hash` on its plan lets DataFusion aggregate in one
+    /// phase without a shuffle. A store may ignore it entirely.
+    pub grouping: Option<Grouping>,
+}
+
+impl SelectHints {
+    pub fn range(start_ms: i64, end_ms: i64) -> Self {
+        Self {
+            start_ms,
+            end_ms,
+            grouping: None,
+        }
+    }
+}
+
+/// `by (labels…)` or `without (labels…)` of an enclosing aggregation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grouping {
+    pub labels: Vec<String>,
+    pub without: bool,
 }
 
 /// A store of series, as the engine sees it.

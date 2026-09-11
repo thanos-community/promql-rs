@@ -23,10 +23,13 @@
 //! consumer that patches DataFusion to a fork, and every `RecordBatch`
 //! crossing the seam would then be a type mismatch.
 
+pub mod aggregate;
 pub mod engine;
 pub mod error;
 pub mod instant;
+pub mod labels;
 pub mod matcher;
+pub mod math;
 pub mod memory;
 pub mod plan;
 pub mod series;
@@ -36,4 +39,4 @@ pub use engine::{Engine, RangeQuery};
 pub use error::EngineError;
 pub use memory::MemorySeriesSource;
 pub use series::DecodedSeries;
-pub use source::{SelectHints, SelectorTable, SeriesSource};
+pub use source::{Grouping, SelectHints, SelectorTable, SeriesSource};

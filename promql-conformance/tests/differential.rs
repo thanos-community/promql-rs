@@ -68,8 +68,16 @@ fn main() -> ExitCode {
 
     let mut trials = Vec::new();
     let mut unsupported: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // The corpus reuses a few names (`abs`, `count_over_time`); trials
+    // need distinct ones, and `#2` still matches a substring filter.
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
 
-    for case in cases {
+    for mut case in cases {
+        let n = seen.entry(case.name.clone()).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            case.name = format!("{} #{n}", case.name);
+        }
         // The engine is cheap to ask; the oracle is not, and does not need
         // to be asked for a case the engine cannot evaluate anyway.
         match (!per_case_requested())

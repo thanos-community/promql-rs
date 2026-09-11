@@ -122,10 +122,13 @@ fn matchers_reach_the_source() {
 fn anything_but_a_selector_is_unsupported_by_name() {
     let engine = Engine::blocking().unwrap();
     for (query, what) in [
-        ("sum(http_requests_total)", "an aggregation"),
-        ("rate(http_requests_total[5m])", "a function call"),
+        ("topk(2, http_requests_total)", "the topk aggregation"),
+        (
+            "absent_over_time(http_requests_total[5m])",
+            "the absent_over_time function",
+        ),
         ("http_requests_total + 1", "a binary operator"),
-        ("(http_requests_total)", "a parenthesized expression"),
+        ("http_requests_total[5m]", "a range selector"),
     ] {
         let err = engine
             .range_query(nginx(), query, &RangeQuery::new(0, 60_000, 30_000))
