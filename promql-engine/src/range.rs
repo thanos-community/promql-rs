@@ -2,7 +2,7 @@
 //! `promql_range_function(samples, 'rate', start, end, step, range, offset, at)`.
 //!
 //! `rate(x[5m])` is, per series and per step, a function of the samples
-//! in a window ending at the step: the same shape as the instant vector,
+//! in a window ending at the step: the same shape as the vector selector,
 //! with a window instead of a lookback and real arithmetic instead of
 //! "the last one". So it is the same kind of function: one series' slice
 //! in, that series' values on the step grid out, DataFusion parallel over
@@ -29,8 +29,8 @@ use datafusion::logical_expr::{
     Signature, Volatility,
 };
 
-use crate::instant::{int_arg, is_stale};
 use crate::math;
+use crate::selector::{int_arg, is_stale};
 use crate::series;
 
 pub const NAME: &str = "promql_range_function";
@@ -495,7 +495,7 @@ pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instant::STALE_NAN_BITS;
+    use crate::selector::STALE_NAN_BITS;
 
     const S: i64 = 1000;
     const M: i64 = 60 * S;

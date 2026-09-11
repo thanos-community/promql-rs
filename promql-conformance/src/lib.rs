@@ -16,8 +16,8 @@
 //! # Current state
 //!
 //! [`datafusion::DataFusionEngine`] fills the [`result::Engine`] seam
-//! with the `promql-engine` crate. It evaluates bare instant-vector
-//! selectors; every other expression fails with
+//! with the `promql-engine` crate. It evaluates vector selectors,
+//! aggregations and range functions; every other expression fails with
 //! [`result::EngineError::Unsupported`], and those failures are the
 //! specification for what to build next. The passing count is the
 //! progress meter.

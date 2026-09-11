@@ -11,7 +11,7 @@
 //! is particular about (see [`crate::math`]).
 //!
 //! Every input series is already on the query's step grid — it came
-//! through `promql_instant_vector` or a range function, both of which
+//! through `promql_vector_selector` or a range function, both of which
 //! emit at `start + i * step` — so a timestamp *is* an array index, and
 //! the group's state is a flat array with one slot per step rather than
 //! a map. That is what lets this work on slices: Prometheus sees one
@@ -27,7 +27,7 @@
 //!
 //! The operator is a literal argument rather than eight registered
 //! functions: one name to register, one plan to serialize, and the
-//! same reasoning as the parameters of `promql_instant_vector`.
+//! same reasoning as the parameters of `promql_vector_selector`.
 
 use std::any::Any;
 use std::sync::Arc;

@@ -16,7 +16,7 @@ use crate::error::EngineError;
 pub use crate::plan::RangeQuery;
 use crate::series::{self, DecodedSeries};
 use crate::source::SeriesSource;
-use crate::{aggregate, instant, labels, range};
+use crate::{aggregate, labels, range, selector};
 
 pub struct Engine {
     ctx: SessionContext,
@@ -27,7 +27,7 @@ impl Engine {
     /// An engine for async callers. Use the `*_async` methods.
     pub fn new() -> Self {
         let ctx = SessionContext::new_with_config(SessionConfig::new());
-        ctx.register_udf(instant::udf());
+        ctx.register_udf(selector::udf());
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
         ctx.register_udf(range::udf());

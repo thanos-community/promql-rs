@@ -1,6 +1,6 @@
-//! The instant-vector selector as a DataFusion scalar function.
+//! The vector selector as a DataFusion scalar function.
 //!
-//! `promql_instant_vector(samples, start, end, step, lookback, offset, at)`
+//! `promql_vector_selector(samples, start, end, step, lookback, offset, at)`
 //! takes one series' samples and returns that series' values on the step
 //! grid: for every step, the most recent sample no older than `lookback`,
 //! stamped with the step's timestamp. This is the operation that turns a
@@ -14,9 +14,14 @@
 //! — serializes the plan with no custom codec and never confuses two
 //! selectors with different parameters for one.
 //!
-//! The semantics are `vectorSelectorSingle` in Prometheus's
-//! `promql/engine.go`, and the tests below are the boundary cases that
-//! function's `if`s encode.
+//! The names follow Prometheus's `promql/engine.go`. There, evaluating a
+//! `VectorSelector` expands the series set and then runs `evalSeries`,
+//! which walks every series across every step and asks
+//! `vectorSelectorSingle` for the value at each one. Here the expansion
+//! is [`crate::source::SelectorTable`], [`eval_series`] is one series'
+//! walk across the grid, and [`apply`] runs it over every row of a batch.
+//! The tests below are the boundary cases `vectorSelectorSingle`'s `if`s
+//! encode.
 
 use std::sync::Arc;
 
@@ -36,7 +41,7 @@ use datafusion::logical_expr::{
 
 use crate::series;
 
-pub const NAME: &str = "promql_instant_vector";
+pub const NAME: &str = "promql_vector_selector";
 
 /// Prometheus's staleness marker: a NaN with this exact payload. It must
 /// be compared by bits, since every NaN compares unequal to everything.
@@ -102,12 +107,14 @@ fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, lookback_ms: i64) -> Option<f64
     Some(v)
 }
 
-/// Evaluate one series on the step grid.
+/// Evaluate one series on the step grid: the body of upstream's
+/// `evalSeries` loop for one series, with `vectorSelectorSingle` inlined
+/// as a single forward sweep.
 ///
 /// `ts` and `vs` are one series' samples, sorted ascending. `emit` is
 /// called with `(step_timestamp, value)` for every step that has a value,
 /// in step order.
-pub fn instant_vector(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64, f64)) {
+pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64, f64)) {
     debug_assert_eq!(ts.len(), vs.len());
     if p.step_ms <= 0 || p.end_ms < p.start_ms {
         return;
@@ -146,11 +153,11 @@ pub fn instant_vector(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i
 
 /// The DataFusion function. Stateless: every parameter is an argument.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct InstantVector {
+pub struct VectorSelector {
     signature: Signature,
 }
 
-impl Default for InstantVector {
+impl Default for VectorSelector {
     fn default() -> Self {
         Self {
             signature: Signature::any(7, Volatility::Immutable),
@@ -160,7 +167,7 @@ impl Default for InstantVector {
 
 /// The registered function, ready to `call`.
 pub fn udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(InstantVector::default())
+    ScalarUDF::new_from_impl(VectorSelector::default())
 }
 
 /// Build the call expression for a samples column and parameters.
@@ -180,7 +187,7 @@ pub fn call(samples: Expr, p: &Params) -> Expr {
     ])
 }
 
-impl ScalarUDFImpl for InstantVector {
+impl ScalarUDFImpl for VectorSelector {
     fn name(&self) -> &str {
         NAME
     }
@@ -276,7 +283,7 @@ pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
     out_offsets.push(0);
     for row in 0..samples.len() {
         let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-        instant_vector(&ts[a..b], &vs[a..b], p, |t, v| {
+        eval_series(&ts[a..b], &vs[a..b], p, |t, v| {
             out_ts.push(t);
             out_vs.push(v);
         });
@@ -307,7 +314,7 @@ mod tests {
 
     fn run(ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
         let mut out = Vec::new();
-        instant_vector(ts, vs, &p, |t, v| out.push((t, v)));
+        eval_series(ts, vs, &p, |t, v| out.push((t, v)));
         out
     }
 

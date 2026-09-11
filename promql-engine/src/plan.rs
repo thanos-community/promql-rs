@@ -31,10 +31,10 @@ use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
 
 use crate::aggregate::{self, Op};
 use crate::error::EngineError;
-use crate::instant::{self, Params};
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::range::{self, Func};
+use crate::selector::{self, Params};
 use crate::series::{LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
 
@@ -162,7 +162,7 @@ impl Planner<'_> {
         let plan = builder
             .project(vec![
                 col(LABELS),
-                instant::call(col(SAMPLES), &params).alias(SAMPLES),
+                selector::call(col(SAMPLES), &params).alias(SAMPLES),
             ])?
             .build()?;
         Ok(Planned { plan, label_names })

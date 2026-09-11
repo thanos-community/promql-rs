@@ -26,13 +26,13 @@
 pub mod aggregate;
 pub mod engine;
 pub mod error;
-pub mod instant;
 pub mod labels;
 pub mod matcher;
 pub mod math;
 pub mod memory;
 pub mod plan;
 pub mod range;
+pub mod selector;
 pub mod series;
 pub mod source;
 
