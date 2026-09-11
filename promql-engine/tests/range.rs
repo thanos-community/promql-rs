@@ -1,10 +1,9 @@
 //! End to end: range functions over the in-memory source, expectations
 //! worked by hand from the semantics.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery};
+use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery, Series};
 use promql_parser::SeriesDescription;
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
@@ -25,14 +24,7 @@ fn source() -> Arc<MemorySeriesSource> {
     ))
 }
 
-fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-fn query(q: &str, range: RangeQuery) -> Vec<promql_engine::DecodedSeries> {
+fn query(q: &str, range: RangeQuery) -> Vec<Series> {
     Engine::blocking()
         .unwrap()
         .range_query(source(), q, &range)
@@ -53,15 +45,18 @@ fn rate_drops_the_metric_name_and_gives_the_slope() {
         RangeQuery::new(300_000, 300_000, 30_000),
     );
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0].labels, labels(&[("pod", "nginx-1")]));
-    assert!(close(out[0].samples[0].1, 1.0 / 30.0), "{out:?}");
-    assert!(close(out[1].samples[0].1, 2.0 / 30.0), "{out:?}");
+    assert_eq!(
+        out[0].labels().collect::<Vec<_>>(),
+        vec![("pod", "nginx-1")]
+    );
+    assert!(close(out[0].values()[0], 1.0 / 30.0), "{out:?}");
+    assert!(close(out[1].values()[0], 2.0 / 30.0), "{out:?}");
 }
 
 #[test]
 fn increase_and_the_over_time_family_at_one_step() {
     let at = RangeQuery::new(300_000, 300_000, 30_000);
-    let one = |q: &str| query(q, at)[0].samples[0].1;
+    let one = |q: &str| query(q, at)[0].values()[0];
     assert!(close(one("increase(http_requests_total[5m])"), 10.0));
     assert_eq!(one("sum_over_time(http_requests_total[5m])"), 65.0);
     assert_eq!(one("avg_over_time(http_requests_total[5m])"), 6.5);
@@ -83,10 +78,11 @@ fn last_over_time_keeps_the_metric_name() {
         RangeQuery::new(0, 0, 30_000),
     );
     assert_eq!(
-        out[0].labels,
-        labels(&[("__name__", "http_requests_total"), ("pod", "nginx-1")])
+        out[0].labels().collect::<Vec<_>>(),
+        vec![("__name__", "http_requests_total"), ("pod", "nginx-1")]
     );
-    assert_eq!(out[0].samples, vec![(0, 1.0)]);
+    assert_eq!(out[0].timestamps(), [0]);
+    assert_eq!(out[0].values(), [1.0]);
 }
 
 #[test]
@@ -98,9 +94,10 @@ fn a_series_ends_when_its_window_empties() {
         RangeQuery::new(0, 900_000, 30_000),
     );
     let nginx1 = &out[0];
-    assert_eq!(nginx1.samples.last(), Some(&(480_000, 1.0)));
-    assert_eq!(nginx1.samples[0], (0, 1.0));
-    assert_eq!(nginx1.samples[1], (30_000, 2.0));
+    assert_eq!(nginx1.timestamps().last(), Some(&480_000));
+    assert_eq!(nginx1.values().last(), Some(&1.0));
+    assert_eq!(nginx1.timestamps()[..2], [0, 30_000]);
+    assert_eq!(nginx1.values()[..2], [1.0, 2.0]);
 }
 
 #[test]
@@ -109,23 +106,23 @@ fn offset_and_at_shift_the_window() {
         "count_over_time(http_requests_total[5m] offset 1m)",
         RangeQuery::new(360_000, 360_000, 30_000),
     );
-    assert_eq!(out[0].samples, vec![(360_000, 10.0)]);
+    assert_eq!(out[0].timestamps(), [360_000]);
+    assert_eq!(out[0].values(), [10.0]);
 
     let out = query(
         "count_over_time(http_requests_total[5m] @ 300)",
         RangeQuery::new(0, 60_000, 30_000),
     );
-    assert_eq!(
-        out[0].samples,
-        vec![(0, 10.0), (30_000, 10.0), (60_000, 10.0)]
-    );
+    assert_eq!(out[0].timestamps(), [0, 30_000, 60_000]);
+    assert_eq!(out[0].values(), [10.0, 10.0, 10.0]);
 
     let out = query(
         "count_over_time(http_requests_total[5m] @ end())",
         RangeQuery::new(0, 60_000, 30_000),
     );
     // (−4m, 60s]: samples at 0, 30s, 60s.
-    assert_eq!(out[0].samples, vec![(0, 3.0), (30_000, 3.0), (60_000, 3.0)]);
+    assert_eq!(out[0].timestamps(), [0, 30_000, 60_000]);
+    assert_eq!(out[0].values(), [3.0, 3.0, 3.0]);
 }
 
 #[test]
@@ -135,8 +132,8 @@ fn aggregations_compose_over_range_functions() {
         RangeQuery::new(300_000, 300_000, 30_000),
     );
     assert_eq!(out.len(), 1);
-    assert!(out[0].labels.is_empty());
-    assert!(close(out[0].samples[0].1, 3.0 / 30.0), "{out:?}");
+    assert_eq!(out[0].labels().count(), 0);
+    assert!(close(out[0].values()[0], 3.0 / 30.0), "{out:?}");
 
     let out = query(
         "avg by (pod) (increase(http_requests_total[5m]))",
@@ -145,9 +142,10 @@ fn aggregations_compose_over_range_functions() {
     assert_eq!(out.len(), 2);
     let nginx1 = out
         .iter()
-        .find(|s| s.labels == labels(&[("pod", "nginx-1")]))
+        .find(|s| s.label("pod") == "nginx-1")
         .expect("nginx-1 group");
-    assert!(close(nginx1.samples[0].1, 10.0), "{out:?}");
+    assert_eq!(nginx1.labels().count(), 1);
+    assert!(close(nginx1.values()[0], 10.0), "{out:?}");
 }
 
 #[test]

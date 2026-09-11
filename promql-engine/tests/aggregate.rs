@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery};
+use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery, Series};
 use promql_parser::SeriesDescription;
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
@@ -27,14 +27,7 @@ fn source() -> Arc<MemorySeriesSource> {
     ))
 }
 
-fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-fn query(q: &str, range: RangeQuery) -> Vec<promql_engine::DecodedSeries> {
+fn query(q: &str, range: RangeQuery) -> Vec<Series> {
     Engine::blocking()
         .unwrap()
         .range_query(source(), q, &range)
@@ -48,12 +41,10 @@ fn sum_over_everything_yields_one_unlabelled_series() {
         RangeQuery::new(0, 60_000, 30_000),
     );
     assert_eq!(out.len(), 1);
-    assert!(out[0].labels.is_empty());
+    assert_eq!(out[0].labels().count(), 0);
     // t=0: 1+1+100, t=30s: 2+3+100, t=60s: 3+5+100.
-    assert_eq!(
-        out[0].samples,
-        vec![(0, 102.0), (30_000, 105.0), (60_000, 108.0)]
-    );
+    assert_eq!(out[0].timestamps(), [0, 30_000, 60_000]);
+    assert_eq!(out[0].values(), [102.0, 105.0, 108.0]);
 }
 
 #[test]
@@ -63,13 +54,12 @@ fn by_keeps_only_the_listed_labels() {
         RangeQuery::new(0, 30_000, 30_000),
     );
     assert_eq!(out.len(), 2);
-    let by_route: BTreeMap<_, _> = out
-        .iter()
-        .map(|s| (s.labels["route"].clone(), s.samples.clone()))
-        .collect();
-    assert_eq!(by_route["/"], vec![(0, 2.0), (30_000, 5.0)]);
-    assert_eq!(by_route["/api"], vec![(0, 100.0), (30_000, 100.0)]);
-    assert!(out.iter().all(|s| s.labels.len() == 1), "{out:?}");
+    let by_route: BTreeMap<&str, &Series> = out.iter().map(|s| (s.label("route"), s)).collect();
+    assert_eq!(by_route["/"].timestamps(), [0, 30_000]);
+    assert_eq!(by_route["/"].values(), [2.0, 5.0]);
+    assert_eq!(by_route["/api"].timestamps(), [0, 30_000]);
+    assert_eq!(by_route["/api"].values(), [100.0, 100.0]);
+    assert!(out.iter().all(|s| s.labels().count() == 1), "{out:?}");
 }
 
 #[test]
@@ -79,9 +69,10 @@ fn without_drops_the_listed_labels_and_the_metric_name() {
         RangeQuery::new(0, 30_000, 30_000),
     );
     assert_eq!(out.len(), 2);
-    let slash = out.iter().find(|s| s.labels["route"] == "/").unwrap();
-    assert_eq!(slash.labels, labels(&[("route", "/")]));
-    assert_eq!(slash.samples, vec![(0, 1.0), (30_000, 3.0)]);
+    let slash = out.iter().find(|s| s.label("route") == "/").unwrap();
+    assert_eq!(slash.labels().collect::<Vec<_>>(), vec![("route", "/")]);
+    assert_eq!(slash.timestamps(), [0, 30_000]);
+    assert_eq!(slash.values(), [1.0, 3.0]);
 }
 
 #[test]
@@ -93,14 +84,15 @@ fn a_group_lives_exactly_as_long_as_its_series() {
         "count by (route) (http_requests_total)",
         RangeQuery::new(0, 600_000, 30_000),
     );
-    let api = out.iter().find(|s| s.labels["route"] == "/api").unwrap();
-    assert_eq!(api.samples.len(), 13);
-    assert_eq!(api.samples.last(), Some(&(360_000, 1.0)));
+    let api = out.iter().find(|s| s.label("route") == "/api").unwrap();
+    assert_eq!(api.timestamps().len(), 13);
+    assert_eq!(api.timestamps().last(), Some(&360_000));
+    assert_eq!(api.values().last(), Some(&1.0));
     // The "/" series end at 300s and expire at 600s: 20 steps, 0..=570s.
-    let slash = out.iter().find(|s| s.labels["route"] == "/").unwrap();
-    assert_eq!(slash.samples.len(), 20);
-    assert_eq!(slash.samples.last(), Some(&(570_000, 2.0)));
-    assert!(slash.samples.iter().all(|(_, v)| *v == 2.0));
+    let slash = out.iter().find(|s| s.label("route") == "/").unwrap();
+    assert_eq!(slash.timestamps().len(), 20);
+    assert_eq!(slash.timestamps().last(), Some(&570_000));
+    assert!(slash.values().iter().all(|v| *v == 2.0));
 }
 
 #[test]
@@ -109,22 +101,23 @@ fn avg_and_the_spread_statistics() {
         "avg by (route) (http_requests_total)",
         RangeQuery::new(30_000, 30_000, 30_000),
     );
-    let slash = out.iter().find(|s| s.labels["route"] == "/").unwrap();
-    assert_eq!(slash.samples, vec![(30_000, 2.5)]);
+    let slash = out.iter().find(|s| s.label("route") == "/").unwrap();
+    assert_eq!(slash.timestamps(), [30_000]);
+    assert_eq!(slash.values(), [2.5]);
 
     // Values at 30s on "/": 2 and 3. Population variance 0.25, stddev 0.5.
     let out = query(
         "stdvar by (route) (http_requests_total)",
         RangeQuery::new(30_000, 30_000, 30_000),
     );
-    let slash = out.iter().find(|s| s.labels["route"] == "/").unwrap();
-    assert_eq!(slash.samples, vec![(30_000, 0.25)]);
+    let slash = out.iter().find(|s| s.label("route") == "/").unwrap();
+    assert_eq!(slash.values(), [0.25]);
     let out = query(
         "stddev by (route) (http_requests_total)",
         RangeQuery::new(30_000, 30_000, 30_000),
     );
-    let slash = out.iter().find(|s| s.labels["route"] == "/").unwrap();
-    assert_eq!(slash.samples, vec![(30_000, 0.5)]);
+    let slash = out.iter().find(|s| s.label("route") == "/").unwrap();
+    assert_eq!(slash.values(), [0.5]);
 }
 
 #[test]
@@ -135,10 +128,11 @@ fn by_can_keep_the_metric_name() {
     );
     assert_eq!(out.len(), 1);
     assert_eq!(
-        out[0].labels,
-        labels(&[("__name__", "http_requests_total")])
+        out[0].labels().collect::<Vec<_>>(),
+        vec![("__name__", "http_requests_total")]
     );
-    assert_eq!(out[0].samples, vec![(0, 3.0)]);
+    assert_eq!(out[0].timestamps(), [0]);
+    assert_eq!(out[0].values(), [3.0]);
 }
 
 #[test]
@@ -159,7 +153,8 @@ fn aggregations_nest() {
         RangeQuery::new(0, 30_000, 30_000),
     );
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].samples, vec![(0, 100.0), (30_000, 100.0)]);
+    assert_eq!(out[0].timestamps(), [0, 30_000]);
+    assert_eq!(out[0].values(), [100.0, 100.0]);
 }
 
 #[test]

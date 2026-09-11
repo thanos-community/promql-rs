@@ -14,7 +14,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::error::EngineError;
 pub use crate::plan::RangeQuery;
-use crate::series::{self, DecodedSeries};
+use crate::series::{self, Series};
 use crate::source::SeriesSource;
 use crate::{aggregate, labels, range, selector};
 
@@ -69,7 +69,7 @@ impl Engine {
         source: &dyn SeriesSource,
         query: &str,
         range: &RangeQuery,
-    ) -> Result<Vec<DecodedSeries>, EngineError> {
+    ) -> Result<Vec<Series>, EngineError> {
         let plan = self.plan_async(source, query, range).await?;
         let df = self.ctx.execute_logical_plan(plan).await?;
         let batches = df.collect().await?;
@@ -82,7 +82,7 @@ impl Engine {
         source: Arc<dyn SeriesSource>,
         query: &str,
         range: &RangeQuery,
-    ) -> Result<Vec<DecodedSeries>, EngineError> {
+    ) -> Result<Vec<Series>, EngineError> {
         self.runtime()?
             .block_on(self.range_query_async(source.as_ref(), query, range))
     }

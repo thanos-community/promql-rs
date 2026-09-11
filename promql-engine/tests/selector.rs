@@ -4,7 +4,6 @@
 //! from a run, so this holds the engine to the specification rather than
 //! to itself. The conformance suite then holds it to Prometheus.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::logical_expr::LogicalPlan;
@@ -29,13 +28,6 @@ fn nginx() -> Arc<MemorySeriesSource> {
     ))
 }
 
-fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
 #[test]
 fn a_selector_with_offset_expires_series_at_the_lookback_boundary() {
     let engine = Engine::blocking().unwrap();
@@ -50,26 +42,24 @@ fn a_selector_with_offset_expires_series_at_the_lookback_boundary() {
     assert_eq!(out.len(), 2);
     let nginx1 = &out[0];
     assert_eq!(
-        nginx1.labels,
-        labels(&[("__name__", "http_requests_total"), ("pod", "nginx-1")])
+        nginx1.labels().collect::<Vec<_>>(),
+        vec![("__name__", "http_requests_total"), ("pod", "nginx-1")]
     );
     // nginx-1's last sample is 16 at 450s. Looking back 30s from step t,
     // it is visible while t - 30s - 450s < 5m, i.e. t < 780s: six steps
     // from 600s to 750s. At 780s the sample is exactly 5m old and gone.
     assert_eq!(
-        nginx1.samples,
-        (0..6)
-            .map(|i| (600_000 + i * 30_000, 16.0))
-            .collect::<Vec<_>>()
+        nginx1.timestamps(),
+        (0..6).map(|i| 600_000 + i * 30_000).collect::<Vec<_>>()
     );
+    assert_eq!(nginx1.values(), [16.0; 6]);
     // nginx-2 ends at 540s with 37, so it lasts until t < 870s: nine steps.
     let nginx2 = &out[1];
     assert_eq!(
-        nginx2.samples,
-        (0..9)
-            .map(|i| (600_000 + i * 30_000, 37.0))
-            .collect::<Vec<_>>()
+        nginx2.timestamps(),
+        (0..9).map(|i| 600_000 + i * 30_000).collect::<Vec<_>>()
     );
+    assert_eq!(nginx2.values(), [37.0; 9]);
 }
 
 #[test]
@@ -97,9 +87,9 @@ fn at_start_repeats_the_first_sample_on_every_step() {
         .unwrap();
     assert_eq!(out.len(), 2);
     for s in &out {
-        assert_eq!(s.samples.len(), 5);
-        assert!(s.samples.iter().all(|(_, v)| *v == 1.0), "{s:?}");
-        assert_eq!(s.samples[4].0, 120_000);
+        assert_eq!(s.timestamps().len(), 5);
+        assert!(s.values().iter().all(|v| *v == 1.0), "{s:?}");
+        assert_eq!(s.timestamps()[4], 120_000);
     }
 }
 
@@ -114,8 +104,9 @@ fn matchers_reach_the_source() {
         )
         .unwrap();
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].labels["pod"], "nginx-2");
-    assert_eq!(out[0].samples, vec![(0, 1.0), (30_000, 3.0), (60_000, 5.0)]);
+    assert_eq!(out[0].label("pod"), "nginx-2");
+    assert_eq!(out[0].timestamps(), [0, 30_000, 60_000]);
+    assert_eq!(out[0].values(), [1.0, 3.0, 5.0]);
 }
 
 #[test]

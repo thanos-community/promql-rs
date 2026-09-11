@@ -14,23 +14,23 @@
 //! structs rather than two aligned lists means one offsets buffer, so a
 //! timestamp and its value cannot drift apart by construction.
 //!
-//! Every producer builds the shape through [`SeriesBatchBuilder`] and
-//! every consumer checks it through [`validate`], so there is exactly one
-//! definition of the shape in code, here.
+//! A [`Series`] is one row of it, held as its two column values. A store
+//! puts rows together with [`encode`], the engine reads them back with
+//! [`decode`], and every consumer checks the shape through [`validate`],
+//! so there is exactly one definition of the shape in code, here.
 //!
 //! The same shape comes out of every operator: an instant vector over a
 //! range query is again one row per series with a list of samples, now at
 //! step timestamps. That is what lets operators stack.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, ListArray, RecordBatch, StringDictionaryBuilder,
-    StructArray, TimestampMillisecondArray,
+    new_empty_array, Array, ArrayRef, AsArray, Float64Array, ListArray, RecordBatch,
+    StringDictionaryBuilder, StructArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::concat;
 use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Float64Type, Schema, SchemaRef, TimeUnit,
     TimestampMillisecondType, UInt32Type,
@@ -173,134 +173,234 @@ pub fn label_names(schema: &Schema) -> Vec<String> {
     }
 }
 
-/// Builds one canonical batch, one series at a time.
+/// One series: one row of the canonical shape, held as its two column
+/// values.
 ///
-/// The label names are fixed up front because they are the schema. A
-/// series lacking one of them gets `""`; a series carrying a name not in
-/// the set is an error, since silently dropping a label would merge two
-/// series into one.
-pub struct SeriesBatchBuilder {
-    names: Vec<String>,
-    labels: Vec<StringDictionaryBuilder<UInt32Type>>,
-    timestamps: Vec<i64>,
-    values: Vec<f64>,
-    offsets: Vec<i32>,
+/// A series is its label set. A different label set is a different
+/// series, and the label set never changes, so a `Series` is immutable:
+/// deriving one from another, as [`Series::clip`] does, yields a new
+/// `Series` sharing the buffers. It is Prometheus's `promql.Series`, the
+/// pair `Metric` and `Floats`, in Arrow.
+#[derive(Debug, Clone)]
+pub struct Series {
+    /// One row: one field per label name, names sorted, values strings.
+    labels: StructArray,
+    /// The `(timestamp, value)` structs, timestamps strictly ascending.
+    samples: StructArray,
 }
 
-impl SeriesBatchBuilder {
-    pub fn new(label_names: &[String]) -> Self {
-        let mut names = label_names.to_vec();
-        names.sort();
-        names.dedup();
-        let labels = names
+impl Series {
+    /// Build one from plain values, checking everything once: the two
+    /// vectors have one length, the timestamps ascend, no label name is
+    /// given twice. Labels are sorted by name, and a `""` value is not
+    /// stored because that is how PromQL spells an absent label. The
+    /// vectors become Arrow arrays without a copy.
+    pub fn new(
+        labels: &[(&str, &str)],
+        timestamps: Vec<i64>,
+        values: Vec<f64>,
+    ) -> Result<Series, String> {
+        if timestamps.len() != values.len() {
+            return Err(format!(
+                "{} timestamps but {} values",
+                timestamps.len(),
+                values.len()
+            ));
+        }
+        if let Some(w) = timestamps.windows(2).find(|w| w[0] >= w[1]) {
+            return Err(format!(
+                "timestamps must be strictly ascending; {} is followed by {}",
+                w[0], w[1]
+            ));
+        }
+        let mut pairs: Vec<(&str, &str)> = labels
             .iter()
-            .map(|_| StringDictionaryBuilder::<UInt32Type>::new())
+            .copied()
+            .filter(|(_, v)| !v.is_empty())
             .collect();
-        Self {
-            names,
-            labels,
-            timestamps: Vec::new(),
-            values: Vec::new(),
-            offsets: vec![0],
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        if let Some(w) = pairs.windows(2).find(|w| w[0].0 == w[1].0) {
+            return Err(format!("label `{}` is given twice", w[0].0));
         }
-    }
 
-    /// Append one series. `samples` must be sorted ascending by timestamp;
-    /// that is a promise the store makes and this builder trusts.
-    pub fn push(
-        &mut self,
-        labels: &BTreeMap<String, String>,
-        samples: &[(i64, f64)],
-    ) -> Result<(), String> {
-        for name in labels.keys() {
-            if self.names.binary_search(name).is_err() {
-                return Err(format!(
-                    "label `{name}` is not among the builder's label names"
-                ));
-            }
-        }
-        for (name, b) in self.names.iter().zip(self.labels.iter_mut()) {
-            b.append_value(labels.get(name).map(String::as_str).unwrap_or(""));
-        }
-        for (t, v) in samples {
-            self.timestamps.push(*t);
-            self.values.push(*v);
-        }
-        self.offsets.push(
-            i32::try_from(self.timestamps.len())
-                .map_err(|_| "more than i32::MAX samples in one batch".to_string())?,
-        );
-        Ok(())
-    }
-
-    pub fn len(&self) -> usize {
-        self.offsets.len() - 1
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn schema(&self) -> SchemaRef {
-        schema(&self.names)
-    }
-
-    pub fn finish(mut self) -> RecordBatch {
-        let n = self.len();
-        let label_fields: Fields = self
-            .names
+        let fields: Fields = pairs
             .iter()
-            .map(|n| Field::new(n, label_type(), false))
+            .map(|(n, _)| Field::new(*n, label_type(), false))
             .collect();
-        let children: Vec<ArrayRef> = self
-            .labels
-            .iter_mut()
-            .map(|b| Arc::new(b.finish()) as ArrayRef)
+        let columns: Vec<ArrayRef> = pairs
+            .iter()
+            .map(|(_, v)| {
+                let mut b = StringDictionaryBuilder::<UInt32Type>::new();
+                b.append_value(v);
+                Arc::new(b.finish()) as ArrayRef
+            })
             .collect();
-        let labels = if label_fields.is_empty() {
-            StructArray::new_empty_fields(n, None)
+        let labels = if fields.is_empty() {
+            StructArray::new_empty_fields(1, None)
         } else {
-            StructArray::new(label_fields, children, None)
+            StructArray::new(fields, columns, None)
         };
-
-        let entries = StructArray::new(
+        let samples = StructArray::new(
             sample_fields(),
             vec![
-                Arc::new(TimestampMillisecondArray::from(std::mem::take(
-                    &mut self.timestamps,
-                ))),
-                Arc::new(Float64Array::from(std::mem::take(&mut self.values))),
+                Arc::new(TimestampMillisecondArray::from(timestamps)),
+                Arc::new(Float64Array::from(values)),
             ],
             None,
         );
-        let samples = ListArray::new(
-            sample_item(),
-            OffsetBuffer::new(std::mem::take(&mut self.offsets).into()),
-            Arc::new(entries),
-            None,
-        );
+        Ok(Series { labels, samples })
+    }
 
-        RecordBatch::try_new(self.schema(), vec![Arc::new(labels), Arc::new(samples)])
-            .expect("builder output matches its own schema")
+    /// The value of one label, `""` when the series does not have it, as
+    /// in PromQL.
+    pub fn label(&self, name: &str) -> &str {
+        self.labels
+            .column_by_name(name)
+            .map_or("", |c| dictionary_value(c, 0))
+    }
+
+    /// The label set as Prometheus prints it: sorted by name, without the
+    /// `""` placeholders a batch stores for labels a series lacks.
+    pub fn labels(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.labels
+            .fields()
+            .iter()
+            .zip(self.labels.columns())
+            .map(|(f, c)| (f.name().as_str(), dictionary_value(c, 0)))
+            .filter(|(_, v)| !v.is_empty())
+    }
+
+    /// Milliseconds, strictly ascending.
+    pub fn timestamps(&self) -> &[i64] {
+        self.samples
+            .column_by_name(TIMESTAMP)
+            .expect("canonical")
+            .as_primitive::<TimestampMillisecondType>()
+            .values()
+    }
+
+    /// One per timestamp.
+    pub fn values(&self) -> &[f64] {
+        self.samples
+            .column_by_name(VALUE)
+            .expect("canonical")
+            .as_primitive::<Float64Type>()
+            .values()
+    }
+
+    /// The same series with only the samples in `[start_ms, end_ms]`,
+    /// sharing the buffers: two binary searches and a slice.
+    pub fn clip(&self, start_ms: i64, end_ms: i64) -> Series {
+        let ts = self.timestamps();
+        let lo = ts.partition_point(|t| *t < start_ms);
+        let hi = ts.partition_point(|t| *t <= end_ms).max(lo);
+        Series {
+            labels: self.labels.clone(),
+            samples: self.samples.slice(lo, hi - lo),
+        }
     }
 }
 
-/// One series read back out of a canonical batch.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DecodedSeries {
-    /// Labels with the empty-string placeholders removed, so this is the
-    /// label set as Prometheus would print it.
-    pub labels: BTreeMap<String, String>,
-    pub samples: Vec<(i64, f64)>,
+/// The string at `row` of one label column.
+fn dictionary_value(column: &ArrayRef, row: usize) -> &str {
+    let d = column.as_dictionary::<UInt32Type>();
+    if d.keys().is_null(row) {
+        return "";
+    }
+    let values = d.values().as_string::<i32>();
+    let key = d.keys().value(row) as usize;
+    if values.is_null(key) {
+        ""
+    } else {
+        values.value(key)
+    }
 }
 
-/// Read canonical batches back into plain Rust.
+/// The sorted union of the series' label names: the schema a batch of
+/// them needs.
+pub fn label_names_of(series: &[Series]) -> Vec<String> {
+    let mut names: Vec<String> = series
+        .iter()
+        .flat_map(|s| s.labels().map(|(n, _)| n.to_string()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// One batch, one row per series, in the schema for `names`.
+///
+/// The names are a parameter rather than derived here because a store
+/// that streams several batches for one scan must give them all the same
+/// schema. A series lacking one of the names gets `""`; a series carrying
+/// a label outside them is an error, since silently dropping a label
+/// would merge two series into one.
+pub fn encode(names: &[String], series: &[Series]) -> Result<RecordBatch, String> {
+    let mut names = names.to_vec();
+    names.sort();
+    names.dedup();
+
+    let mut columns: Vec<StringDictionaryBuilder<UInt32Type>> = names
+        .iter()
+        .map(|_| StringDictionaryBuilder::new())
+        .collect();
+    let mut offsets: Vec<i32> = Vec::with_capacity(series.len() + 1);
+    offsets.push(0);
+    let mut total = 0usize;
+    for s in series {
+        for (name, _) in s.labels() {
+            if names.binary_search_by(|n| n.as_str().cmp(name)).is_err() {
+                return Err(format!(
+                    "label `{name}` is not among the batch's label names"
+                ));
+            }
+        }
+        for (name, column) in names.iter().zip(columns.iter_mut()) {
+            column.append_value(s.label(name));
+        }
+        total += s.samples.len();
+        offsets.push(
+            i32::try_from(total)
+                .map_err(|_| "more than i32::MAX samples in one batch".to_string())?,
+        );
+    }
+
+    let label_fields: Fields = names
+        .iter()
+        .map(|n| Field::new(n, label_type(), false))
+        .collect();
+    let labels = if label_fields.is_empty() {
+        StructArray::new_empty_fields(series.len(), None)
+    } else {
+        let columns: Vec<ArrayRef> = columns
+            .iter_mut()
+            .map(|b| Arc::new(b.finish()) as ArrayRef)
+            .collect();
+        StructArray::new(label_fields, columns, None)
+    };
+    let entries = if series.is_empty() {
+        new_empty_array(&DataType::Struct(sample_fields()))
+    } else {
+        let parts: Vec<&dyn Array> = series.iter().map(|s| &s.samples as &dyn Array).collect();
+        concat(&parts).map_err(|e| e.to_string())?
+    };
+    let samples = ListArray::new(
+        sample_item(),
+        OffsetBuffer::new(offsets.into()),
+        entries,
+        None,
+    );
+    RecordBatch::try_new(schema(&names), vec![Arc::new(labels), Arc::new(samples)])
+        .map_err(|e| e.to_string())
+}
+
+/// The rows of canonical batches, as zero-copy slices.
 ///
 /// Series with no samples are dropped here rather than filtered in the
 /// plan, because the plan-side filter would sit above the projection that
 /// computes the samples and the optimizer may push it below, evaluating
 /// the kernel twice. An empty series is inert for every operator anyway.
-pub fn decode(batches: &[RecordBatch]) -> Result<Vec<DecodedSeries>, String> {
+pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, String> {
     let mut out = Vec::new();
     for batch in batches {
         validate(&batch.schema())?;
@@ -309,47 +409,13 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<DecodedSeries>, String> {
             .column_by_name(SAMPLES)
             .expect("validated")
             .as_list::<i32>();
-
-        // One cast per label column per batch, not per value: dictionaries
-        // may have been re-keyed by an operator, and `cast` to Utf8 handles
-        // every encoding uniformly.
-        let mut label_columns = Vec::with_capacity(labels.num_columns());
-        for (field, column) in labels.fields().iter().zip(labels.columns()) {
-            let utf8 = cast(column, &DataType::Utf8).map_err(|e| e.to_string())?;
-            label_columns.push((field.name().clone(), utf8));
-        }
-
-        let entries = samples.values().as_struct();
-        let ts = entries
-            .column_by_name(TIMESTAMP)
-            .expect("validated")
-            .as_primitive::<TimestampMillisecondType>();
-        let vs = entries
-            .column_by_name(VALUE)
-            .expect("validated")
-            .as_primitive::<Float64Type>();
-        let offsets = samples.offsets();
-
         for row in 0..batch.num_rows() {
-            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            if a == b {
+            if samples.value_length(row) == 0 {
                 continue;
             }
-            let mut label_set = BTreeMap::new();
-            for (name, column) in &label_columns {
-                let s = column.as_string::<i32>();
-                if s.is_null(row) {
-                    continue;
-                }
-                let v = s.value(row);
-                if !v.is_empty() {
-                    label_set.insert(name.clone(), v.to_string());
-                }
-            }
-            let points = (a..b).map(|i| (ts.value(i), vs.value(i))).collect();
-            out.push(DecodedSeries {
-                labels: label_set,
-                samples: points,
+            out.push(Series {
+                labels: labels.slice(row, 1),
+                samples: samples.value(row).as_struct().clone(),
             });
         }
     }
@@ -360,62 +426,93 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<DecodedSeries>, String> {
 mod tests {
     use super::*;
 
-    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    fn series(labels: &[(&str, &str)], samples: &[(i64, f64)]) -> Series {
+        let (ts, vs) = samples.iter().copied().unzip();
+        Series::new(labels, ts, vs).unwrap()
     }
 
     #[test]
-    fn builder_output_validates_and_round_trips() {
-        let names = vec!["pod".to_string(), "__name__".to_string()];
-        let mut b = SeriesBatchBuilder::new(&names);
-        b.push(
-            &labels(&[("__name__", "up"), ("pod", "a")]),
-            &[(0, 1.0), (30_000, 2.0)],
-        )
-        .unwrap();
-        // A series lacking `pod` gets "" and decodes without it.
-        b.push(&labels(&[("__name__", "up")]), &[(0, 3.0)]).unwrap();
-        // An empty series is built but not decoded.
-        b.push(&labels(&[("__name__", "up"), ("pod", "z")]), &[])
-            .unwrap();
-        let batch = b.finish();
-
+    fn a_batch_validates_and_round_trips() {
+        let all = [
+            series(
+                &[("__name__", "up"), ("pod", "a")],
+                &[(0, 1.0), (30_000, 2.0)],
+            ),
+            // A series lacking `pod` gets "" in the batch and reads back
+            // without it.
+            series(&[("__name__", "up")], &[(0, 3.0)]),
+            // An empty series is encoded but not decoded.
+            series(&[("__name__", "up"), ("pod", "z")], &[]),
+        ];
+        let names = label_names_of(&all);
+        assert_eq!(names, vec!["__name__", "pod"]);
+        let batch = encode(&names, &all).unwrap();
+        assert_eq!(batch.num_rows(), 3);
         validate(&batch.schema()).unwrap();
         assert_eq!(label_names(&batch.schema()), vec!["__name__", "pod"]);
 
         let decoded = decode(&[batch]).unwrap();
+        assert_eq!(decoded.len(), 2);
         assert_eq!(
-            decoded,
-            vec![
-                DecodedSeries {
-                    labels: labels(&[("__name__", "up"), ("pod", "a")]),
-                    samples: vec![(0, 1.0), (30_000, 2.0)],
-                },
-                DecodedSeries {
-                    labels: labels(&[("__name__", "up")]),
-                    samples: vec![(0, 3.0)],
-                },
-            ]
+            decoded[0].labels().collect::<Vec<_>>(),
+            vec![("__name__", "up"), ("pod", "a")]
         );
+        assert_eq!(decoded[0].timestamps(), [0, 30_000]);
+        assert_eq!(decoded[0].values(), [1.0, 2.0]);
+        assert_eq!(
+            decoded[1].labels().collect::<Vec<_>>(),
+            vec![("__name__", "up")]
+        );
+        assert_eq!(decoded[1].label("pod"), "");
+        assert_eq!(decoded[1].timestamps(), [0]);
+        assert_eq!(decoded[1].values(), [3.0]);
     }
 
     #[test]
     fn a_label_outside_the_schema_is_rejected() {
-        let mut b = SeriesBatchBuilder::new(&["a".to_string()]);
-        let err = b.push(&labels(&[("b", "x")]), &[]).unwrap_err();
+        let err = encode(&["a".to_string()], &[series(&[("b", "x")], &[])]).unwrap_err();
         assert!(err.contains("`b`"), "{err}");
     }
 
     #[test]
     fn no_labels_at_all_is_a_valid_shape() {
-        let mut b = SeriesBatchBuilder::new(&[]);
-        b.push(&BTreeMap::new(), &[(1, 1.0)]).unwrap();
-        let batch = b.finish();
+        let batch = encode(&[], &[series(&[], &[(1, 1.0)])]).unwrap();
         validate(&batch.schema()).unwrap();
         assert_eq!(decode(&[batch]).unwrap().len(), 1);
+
+        let empty = encode(&[], &[]).unwrap();
+        validate(&empty.schema()).unwrap();
+        assert_eq!(empty.num_rows(), 0);
+    }
+
+    #[test]
+    fn a_series_is_checked_once_when_built() {
+        let err = Series::new(&[], vec![0, 1], vec![1.0]).unwrap_err();
+        assert!(err.contains("values"), "{err}");
+        let err = Series::new(&[], vec![1, 1], vec![1.0, 2.0]).unwrap_err();
+        assert!(err.contains("ascending"), "{err}");
+        let err = Series::new(&[("a", "1"), ("a", "2")], vec![], vec![]).unwrap_err();
+        assert!(err.contains("`a`"), "{err}");
+
+        // Sorted by name, and "" is how PromQL spells an absent label.
+        let s = series(&[("b", "2"), ("a", ""), ("c", "3")], &[]);
+        assert_eq!(s.labels().collect::<Vec<_>>(), vec![("b", "2"), ("c", "3")]);
+        assert_eq!(s.label("a"), "");
+        assert_eq!(s.label("b"), "2");
+        assert_eq!(s.label("nope"), "");
+    }
+
+    #[test]
+    fn clip_keeps_the_closed_range_and_shares_the_buffers() {
+        let s = series(&[("a", "1")], &[(0, 1.0), (10, 2.0), (20, 3.0), (30, 4.0)]);
+        let c = s.clip(10, 20);
+        assert_eq!(c.timestamps(), [10, 20]);
+        assert_eq!(c.values(), [2.0, 3.0]);
+        assert_eq!(c.label("a"), "1");
+        assert_eq!(c.values().as_ptr(), s.values()[1..].as_ptr());
+        assert!(s.clip(31, 40).timestamps().is_empty());
+        assert_eq!(s.clip(-5, 40).timestamps().len(), 4);
+        assert!(s.clip(20, 10).timestamps().is_empty());
     }
 
     #[test]

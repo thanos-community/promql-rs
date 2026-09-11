@@ -39,5 +39,5 @@ pub mod source;
 pub use engine::{Engine, RangeQuery};
 pub use error::EngineError;
 pub use memory::MemorySeriesSource;
-pub use series::DecodedSeries;
+pub use series::Series;
 pub use source::{Grouping, SelectHints, SelectorTable, SeriesSource};

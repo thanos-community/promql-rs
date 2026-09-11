@@ -43,10 +43,18 @@ impl Engine for DataFusionEngine {
         match self.inner.range_query(source, query, &range) {
             Ok(decoded) => Ok(QueryResult::Matrix(
                 decoded
-                    .into_iter()
+                    .iter()
                     .map(|s| Series {
-                        labels: s.labels,
-                        floats: s.samples.into_iter().map(|(t, v)| Point { t, v }).collect(),
+                        labels: s
+                            .labels()
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                            .collect(),
+                        floats: s
+                            .timestamps()
+                            .iter()
+                            .zip(s.values())
+                            .map(|(&t, &v)| Point { t, v })
+                            .collect(),
                         histograms: 0,
                     })
                     .collect(),

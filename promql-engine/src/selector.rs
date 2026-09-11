@@ -468,12 +468,15 @@ mod tests {
 
     #[test]
     fn apply_runs_the_kernel_row_by_row() {
-        let names: Vec<String> = vec![];
-        let mut b = series::SeriesBatchBuilder::new(&names);
-        b.push(&Default::default(), &[(0, 1.0)]).unwrap();
-        b.push(&Default::default(), &[]).unwrap();
-        b.push(&Default::default(), &[(0, 1.0), (M, 2.0)]).unwrap();
-        let batch = b.finish();
+        let batch = series::encode(
+            &[],
+            &[
+                series::Series::new(&[], vec![0], vec![1.0]).unwrap(),
+                series::Series::new(&[], vec![], vec![]).unwrap(),
+                series::Series::new(&[], vec![0, M], vec![1.0, 2.0]).unwrap(),
+            ],
+        )
+        .unwrap();
         let samples = batch
             .column_by_name(series::SAMPLES)
             .unwrap()

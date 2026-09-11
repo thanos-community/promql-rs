@@ -12,13 +12,12 @@
 //!   `^(?:…)$`; the non-capturing group keeps a top-level `|` from binding
 //!   looser than the anchors.
 
-use std::collections::BTreeMap;
-
 use promql_parser::ast::{LabelMatcher, MatchOp, VectorSelector};
 use promql_parser::posrange::PositionRange;
 use regex::Regex;
 
 use crate::error::EngineError;
+use crate::series::Series;
 
 pub const METRIC_NAME: &str = "__name__";
 
@@ -63,9 +62,10 @@ impl CompiledMatcher {
         }
     }
 
-    /// Whether a label set satisfies this matcher; an absent label is `""`.
-    pub fn matches_labels(&self, labels: &BTreeMap<String, String>) -> bool {
-        self.matches(labels.get(&self.name).map(String::as_str).unwrap_or(""))
+    /// Whether a series' label set satisfies this matcher; an absent label
+    /// is `""`.
+    pub fn matches_labels(&self, series: &Series) -> bool {
+        self.matches(series.label(&self.name))
     }
 }
 
@@ -97,9 +97,9 @@ pub fn effective_matchers(vs: &VectorSelector) -> Vec<LabelMatcher> {
     out
 }
 
-/// Whether a label set satisfies every matcher.
-pub fn matches_all(matchers: &[CompiledMatcher], labels: &BTreeMap<String, String>) -> bool {
-    matchers.iter().all(|m| m.matches_labels(labels))
+/// Whether a series' label set satisfies every matcher.
+pub fn matches_all(matchers: &[CompiledMatcher], series: &Series) -> bool {
+    matchers.iter().all(|m| m.matches_labels(series))
 }
 
 #[cfg(test)]
@@ -116,11 +116,8 @@ mod tests {
         .unwrap()
     }
 
-    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    fn labels(pairs: &[(&str, &str)]) -> Series {
+        Series::new(pairs, vec![], vec![]).unwrap()
     }
 
     #[test]
