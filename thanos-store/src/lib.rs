@@ -13,4 +13,18 @@
 //! for the fan-out.
 
 pub mod chunkenc;
+pub mod endpointset;
+pub mod error;
+pub mod labels;
+pub mod proxy;
+pub mod source;
 pub mod storepb;
+#[cfg(feature = "testutil")]
+pub mod testutil;
+
+pub use endpointset::{EndpointMetadata, EndpointRef, EndpointSet, EndpointSetConfig};
+pub use error::StoreError;
+pub use labels::LabelSet;
+pub use proxy::{LabelsResult, ProxyStore, SeriesResult};
+pub use source::{SelectOptions, ThanosSeriesSource};
+pub use storepb::thanos::PartialResponseStrategy;
