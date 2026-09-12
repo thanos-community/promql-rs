@@ -16,3 +16,10 @@ promql-parser/upstream/MANIFEST.toml linguist-generated=true
 # tool is the only thing that writes here.
 promql-parser/upstream/*.go    linguist-vendored=true
 promql-parser/upstream/*.y     linguist-vendored=true
+
+# Copies of thanos-io/thanos@<pinned sha> protos with the Go-only
+# gogoproto options removed; see thanos-store/proto/README.md.
+thanos-store/proto/**/*.proto  linguist-vendored=true
+
+# Emitted by scripts/gen-xor-fixtures from Prometheus's chunkenc.
+thanos-store/testdata/xor_chunks.json linguist-generated=true
