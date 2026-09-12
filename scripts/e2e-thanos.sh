@@ -10,14 +10,20 @@
 # instead, which is also the fallback when no thanos is on PATH), jq,
 # curl, cargo. Listens on 19000-19094.
 #
-#   scripts/e2e-thanos.sh                        # ~2 minutes, mostly warm-up
+#   scripts/e2e-thanos.sh                        # ~4 minutes, mostly warm-up
 #   THANOS_SRC=~/src/github.com/thanos-io/thanos scripts/e2e-thanos.sh
-#   WARMUP=120 scripts/e2e-thanos.sh             # more samples in the windows
+#   WARMUP=300 RANGE=180 scripts/e2e-thanos.sh   # longer range queries
+#
+# The warm-up must outlast RANGE plus the widest rate() window by a good
+# margin: a counter born inside the window extrapolates differently in
+# Prometheus 2.x (the engine inside older Thanos releases) and 3.x (what
+# promql-engine ports), so young series would show up as diffs.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
-WARMUP=${WARMUP:-75}
+WARMUP=${WARMUP:-180}
+RANGE=${RANGE:-90}
 PROM_PORT=19000
 SIDECAR_GRPC=19090
 SIDECAR_HTTP=19091
@@ -103,8 +109,8 @@ sleep "$WARMUP"
 normalize() {
   jq -S '
     def round9: if type == "string" then (try (tonumber | . * 1e9 | round / 1e9 | tostring) catch .) else . end;
-    del(.data.analysis)
-    | if (.data.result? | type) == "array" then
+    (if (.data | type) == "object" then del(.data.analysis) else . end)
+    | if (.data | type) == "object" and (.data.result | type) == "array" then
         .data.result |= (map(
           (if .values? then .values |= map([.[0], (.[1] | round9)]) else . end)
           | (if .value? then .value |= [.[0], (.[1] | round9)] else . end)
@@ -129,7 +135,7 @@ compare() { # path query-string
 enc() { jq -rn --arg q "$1" '$q | @uri'; }
 
 END=$(( $(date +%s) - 15 ))
-START=$(( END - 300 ))
+START=$(( END - RANGE ))
 
 for q in \
   'up' \
