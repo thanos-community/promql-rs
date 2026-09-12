@@ -1,0 +1,44 @@
+[package]
+name = "thanos-query-rs"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "Thanos Query look-alike: the Prometheus HTTP API over Thanos Store API endpoints, evaluated by promql-engine"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "thanos-query-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+# No `form`/`query`/`json` features: forms are parsed with form_urlencoded
+# to get Go's ParseForm semantics, and the Prometheus JSON is written by
+# hand to match Go's number formatting byte for byte.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "tracing",
+] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { workspace = true }
+form_urlencoded = "1.2"
+prometheus-client = "0.23"
+promql-engine = { path = "../promql-engine" }
+promql-parser = { path = "../promql-parser" }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+thanos-store = { path = "../thanos-store" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

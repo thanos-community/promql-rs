@@ -1,0 +1,37 @@
+[package]
+name = "thanos-store"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "Thanos Store API (gRPC) client as a promql-engine SeriesSource"
+publish = false
+
+[features]
+default = []
+# In-process fake `thanos.Store` and `thanos.info.Info` server for tests.
+testutil = ["tonic/server", "tonic/router", "dep:tokio-stream"]
+
+[dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+promql-engine = { path = "../promql-engine" }
+promql-parser = { path = "../promql-parser" }
+prost = { workspace = true }
+prost-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+protox = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Turns the fake store on for `tests/` and `cargo test`.
+thanos-store = { path = ".", features = ["testutil"] }
+tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread"] }
