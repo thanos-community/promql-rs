@@ -3740,11 +3740,12 @@ name = "thanos-query-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
+ "datafusion",
  "form_urlencoded",
- "insta",
  "prometheus-client",
  "promql-engine",
  "promql-parser",
@@ -3779,6 +3780,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]
