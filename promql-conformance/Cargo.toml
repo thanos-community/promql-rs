@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+# `cargo bench` runs only the criterion target below, not libtest's.
+bench = false
+
 [dependencies]
 promql-engine = { path = "../promql-engine" }
 promql-parser = { path = "../promql-parser" }
@@ -15,10 +19,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 libtest-mimic = "0.8"
 
 # The differential suite registers one test per corpus case at runtime,
 # so it needs its own harness rather than #[test] attributes.
 [[test]]
 name = "differential"
+harness = false
+
+[[bench]]
+name = "corpus"
 harness = false

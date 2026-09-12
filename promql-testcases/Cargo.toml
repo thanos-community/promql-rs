@@ -8,6 +8,8 @@ description = "Loader for the shared PromQL engine test cases kept in YAML by th
 
 [lib]
 path = "src/lib.rs"
+# Nothing to benchmark here; keeps `cargo bench --workspace` to criterion.
+bench = false
 
 [dependencies]
 promql-parser = { path = "../promql-parser" }
