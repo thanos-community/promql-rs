@@ -2688,6 +2688,7 @@ name = "promql-conformance"
 version = "0.1.0"
 dependencies = [
  "libtest-mimic",
+ "promql-engine",
  "promql-parser",
  "promql-testcases",
  "serde",

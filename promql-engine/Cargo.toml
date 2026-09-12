@@ -15,6 +15,4 @@ datafusion = { workspace = true }
 promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
