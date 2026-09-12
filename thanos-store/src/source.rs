@@ -74,6 +74,10 @@ impl ThanosSeriesSource {
         &self.options
     }
 
+    pub fn proxy(&self) -> &ProxyStore {
+        &self.proxy
+    }
+
     /// The warnings gathered so far, leaving none behind.
     pub fn take_warnings(&self) -> Vec<String> {
         std::mem::take(&mut *self.warnings.lock().unwrap_or_else(PoisonError::into_inner))
