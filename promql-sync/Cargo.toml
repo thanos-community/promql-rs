@@ -9,6 +9,8 @@ description = "Developer-invoked upstream sync tool for promql-parser"
 [[bin]]
 name = "promql-sync"
 path = "src/main.rs"
+# Nothing to benchmark here; keeps `cargo bench --workspace` to criterion.
+bench = false
 
 [dependencies]
 anyhow = { workspace = true }

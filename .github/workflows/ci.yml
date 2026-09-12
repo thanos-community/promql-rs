@@ -43,6 +43,10 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # Compiled but not run: benches that do not build rot silently.
+      - name: Build benchmarks
+        run: cargo build --workspace --benches
+
       - name: Test
         run: cargo test --workspace
 
