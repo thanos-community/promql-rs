@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+promql-engine = { path = "../promql-engine" }
 promql-parser = { path = "../promql-parser" }
 promql-testcases = { path = "../promql-testcases" }
 serde = { workspace = true }

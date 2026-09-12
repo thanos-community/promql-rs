@@ -147,6 +147,12 @@ pub enum EngineError {
     /// engine's specification.
     #[error("not implemented: no Rust execution engine exists yet")]
     NotImplemented,
+    /// The engine exists but the query uses a feature it lacks, named so
+    /// the suite can count cases per missing feature. Distinct from
+    /// [`Self::Other`] so that "not built yet" is never mistaken for
+    /// "built wrong".
+    #[error("{0} is not supported yet")]
+    Unsupported(String),
     #[error("{0}")]
     Other(String),
 }

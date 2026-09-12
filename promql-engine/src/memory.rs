@@ -1,13 +1,15 @@
 //! An in-memory [`SeriesSource`], and the reference implementation of a
 //! store's three obligations.
 //!
-//! It exists for tests, but it is also the executable statement of what a
-//! real store has to do: apply the matchers with [`crate::matcher`]'s
+//! It exists for tests, the conformance suite seeds it from the corpus's
+//! `load` blocks, but it is also the executable statement of what a real
+//! store has to do: apply the matchers with [`crate::matcher`]'s
 //! semantics, keep only samples inside the range, hand over one row per
 //! series with samples in timestamp order, in the canonical schema. A
 //! store implementer who wants to know "what exactly am I promising" can
 //! read `select` below.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,7 +17,7 @@ use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::ExecutionPlan;
-use promql_parser::ast::LabelMatcher;
+use promql_parser::ast::{LabelMatcher, SeriesDescription};
 
 use crate::matcher::{matches_all, CompiledMatcher};
 use crate::series::{encode, label_names_of, Series};
@@ -32,6 +34,51 @@ impl MemorySeriesSource {
     /// label set are the caller's mistake and would select as two rows.
     pub fn new(series: Vec<Series>) -> Self {
         Self { series }
+    }
+
+    /// Seed from promqltest series descriptions the way upstream's
+    /// `load` does: value `i` sits at `i * interval` from the epoch, an
+    /// omitted value (`_`) emits no sample, and `stale` is already a
+    /// StaleNaN payload courtesy of the parser.
+    ///
+    /// Two lines with the same labels are one series, the corpus repeats
+    /// lines on purpose, so they are merged, the later line winning any
+    /// timestamp both define. That is obligation 2, partition, applied at
+    /// load time, and it is what keeps [`encode`] from seeing one label
+    /// set twice.
+    pub fn from_descriptions(series: &[SeriesDescription], interval_secs: f64) -> Self {
+        let interval_ms = (interval_secs * 1000.0).round() as i64;
+        let mut merged: BTreeMap<Vec<(&str, &str)>, BTreeMap<i64, f64>> = BTreeMap::new();
+        for sd in series {
+            // The parser keeps a description's labels as written, possibly
+            // with a name repeated; sorted by name, the last value wins.
+            let mut pairs: Vec<(&str, &str)> = sd
+                .labels
+                .iter()
+                .map(|l| (l.name.as_str(), l.value.as_str()))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            let mut labels: Vec<(&str, &str)> = Vec::with_capacity(pairs.len());
+            for p in pairs {
+                match labels.last_mut() {
+                    Some(last) if last.0 == p.0 => last.1 = p.1,
+                    _ => labels.push(p),
+                }
+            }
+            let samples = merged.entry(labels).or_default();
+            for (i, v) in sd.values.iter().enumerate().filter(|(_, v)| !v.omitted) {
+                samples.insert(i as i64 * interval_ms, v.value);
+            }
+        }
+        let stored = merged
+            .into_iter()
+            .map(|(labels, samples)| {
+                let (timestamps, values) = samples.into_iter().unzip();
+                Series::new(&labels, timestamps, values)
+                    .expect("a sorted map yields ascending timestamps and unique names")
+            })
+            .collect();
+        Self::new(stored)
     }
 
     pub fn series(&self) -> &[Series] {
@@ -163,6 +210,23 @@ mod tests {
         crate::series::validate(&plan.schema()).unwrap();
         let batches = collect(plan, ctx.task_ctx()).await.unwrap();
         assert!(crate::series::decode(&batches).unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_lines_for_one_series_are_one_series() {
+        let load = [
+            r#"x{a="1"} 1 2 3"#,
+            r#"x{a="1"} 1 2 3"#,
+            r#"x{a="1"} _ _ _ 4"#,
+        ];
+        let series: Vec<SeriesDescription> = load
+            .iter()
+            .map(|l| promql_parser::parse_series_desc(l).unwrap())
+            .collect();
+        let src = MemorySeriesSource::from_descriptions(&series, 1.0);
+        assert_eq!(src.series().len(), 1);
+        assert_eq!(src.series()[0].timestamps(), [0, 1000, 2000, 3000]);
+        assert_eq!(src.series()[0].values(), [1.0, 2.0, 3.0, 4.0]);
     }
 
     #[tokio::test]
