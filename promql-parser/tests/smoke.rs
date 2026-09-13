@@ -54,6 +54,22 @@ fn arithmetic_precedence() {
     }
 }
 
+/// Upstream gives the unary rule `MUL`'s precedence, so a sign binds to
+/// the operand and not to the expression around it.
+#[test]
+fn unary_binds_tighter_than_a_binary_operator() {
+    for q in ["-foo + bar", "-foo or bar", "-foo == bar"] {
+        match must_parse(q) {
+            Expr::Binary(b) => assert!(
+                matches!(*b.lhs, Expr::Unary(_)),
+                "{q}: the sign belongs to the left operand, got {:?}",
+                b.lhs
+            ),
+            other => panic!("{q}: expected Binary, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn right_associative_pow() {
     // 2 ^ 3 ^ 4 parses as 2 ^ (3 ^ 4)

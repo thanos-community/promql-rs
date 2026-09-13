@@ -179,7 +179,7 @@ subquery_expr -> Result<Expr, ()>:
   ;
 
 unary_expr -> Result<Expr, ()>:
-    unary_op expr { actions::unary_from_token($lexer, $span, $1, $2) }
+    unary_op expr %prec 'MUL' { actions::unary_from_token($lexer, $span, $1, $2) }
   ;
 
 vector_selector -> Result<Expr, ()>:
@@ -400,7 +400,7 @@ offset_duration_expr -> Result<Expr, ()>:
   | unary_op 'RANGE' 'LPAREN' 'RPAREN' { Err(()) }
   | min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { Err(()) }
   | unary_op min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { Err(()) }
-  | unary_op 'LPAREN' duration_expr 'RPAREN' { Err(()) }
+  | unary_op 'LPAREN' duration_expr 'RPAREN' %prec 'MUL' { Err(()) }
   | duration_expr { $1 }
   ;
 
@@ -411,7 +411,7 @@ min_max -> Result<ItemType, ()>:
 
 duration_expr -> Result<Expr, ()>:
     number_duration_literal { $1 }
-  | unary_op duration_expr { Err(()) }
+  | unary_op duration_expr %prec 'MUL' { Err(()) }
   | duration_expr 'ADD' duration_expr { Err(()) }
   | duration_expr 'SUB' duration_expr { Err(()) }
   | duration_expr 'MUL' duration_expr { Err(()) }
