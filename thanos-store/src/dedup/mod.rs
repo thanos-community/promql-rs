@@ -228,6 +228,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_series_that_ended_stays_finite_under_a_counter_function() {
+        // Both replicas saw the target go away and wrote a staleness
+        // marker; the merge must hand it on with its bits intact or the
+        // engine cannot tell it from a NaN sample.
+        let stale = f64::from_bits(promql_engine::selector::STALE_NAN_BITS);
+        let source = MemorySeriesSource::new(vec![
+            series(
+                &[("__name__", "c"), ("replica", "a")],
+                &[(0, 1.0), (10_000, 2.0), (20_000, 3.0), (30_000, stale)],
+            ),
+            series(
+                &[("__name__", "c"), ("replica", "b")],
+                &[(1_000, 1.0), (11_000, 2.0), (21_000, 3.0), (31_000, stale)],
+            ),
+        ]);
+        let engine = Engine::with_extension_planners(vec![Dedup::planner()]);
+        let range = RangeQuery::new(30_000, 40_000, 10_000);
+        let dedup = Dedup::new(vec!["replica".into()], DeduplicationFunc::Penalty);
+
+        for query in ["increase(c[1m])", "rate(c[1m])", "irate(c[1m])"] {
+            let plan = engine.plan_async(&source, query, &range).await.unwrap();
+            let result = engine
+                .execute_async(dedup.inject(plan).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(result.len(), 1, "{query}: {result:?}");
+            assert!(
+                result[0].values().iter().all(|v| v.is_finite()),
+                "{query}: {:?}",
+                result[0].values()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_engine_runs_the_injected_plan() {
         let source = replicated();
         let engine = Engine::with_extension_planners(vec![Dedup::planner()]);

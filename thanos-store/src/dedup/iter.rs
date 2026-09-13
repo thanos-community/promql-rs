@@ -101,7 +101,10 @@ impl AdjustableIterator for ReplicaIterator {
 
     fn at(&self) -> (i64, f64) {
         let (t, v) = self.current();
-        if self.is_counter {
+        // A staleness marker is a NaN with one fixed payload, and PromQL
+        // knows it by its bits. Adding the adjustment, even 0, would
+        // quieten it into a NaN taken for a sample, so it passes as is.
+        if self.is_counter && !v.is_nan() {
             (t, v + self.err_adjust)
         } else {
             (t, v)
@@ -292,6 +295,8 @@ impl AdjustableIterator for DedupSeriesIterator {
 
 #[cfg(test)]
 mod tests {
+    use promql_engine::selector::STALE_NAN_BITS;
+
     use super::*;
 
     /// Samples every `step` seconds from `start` seconds, values 1, 2, 3…
@@ -357,6 +362,20 @@ mod tests {
             vec![(0, 100.0), (10_000, 110.0), (35_000, 105.0)],
             "a gauge is taken as is"
         );
+    }
+
+    #[test]
+    fn a_staleness_marker_keeps_its_bits_through_the_counter_lift() {
+        // Prometheus ends a series with a NaN of one fixed payload, a
+        // signalling NaN. Adding the counter adjustment to it, even 0,
+        // quietens it into a NaN the engine takes for a value, and every
+        // rate over the window turns NaN.
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let a = vec![(0, 10.0), (10_000, 20.0), (20_000, stale)];
+        let b = vec![(1_000, 10.0), (11_000, 20.0), (21_000, stale)];
+        let merged = dedup_samples(vec![a, b], true);
+        assert_eq!(seconds(&merged), [0, 10, 20]);
+        assert_eq!(merged[2].1.to_bits(), STALE_NAN_BITS);
     }
 
     #[test]
