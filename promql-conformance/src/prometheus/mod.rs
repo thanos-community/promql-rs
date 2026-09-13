@@ -16,10 +16,14 @@
 //! cross-checked against this very corpus.
 
 //! [`run`] walks a parsed script against an [`crate::result::Engine`]
-//! and reports one [`run::Outcome`] per eval.
+//! and reports one [`run::Outcome`] per eval; [`baseline`] records which
+//! of those are already known not to pass, so CI can be green about a
+//! corpus the engine mostly cannot answer yet.
 
+pub mod baseline;
 pub mod run;
 pub mod script;
 
+pub use baseline::Baseline;
 pub use run::{almost_equal, run_script, Outcome, Verdict};
 pub use script::{load_corpus, Command, Eval, Expect, Expected, Script, Timing};

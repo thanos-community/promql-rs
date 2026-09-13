@@ -97,11 +97,12 @@ impl Verdict {
 pub struct Outcome {
     /// The `.test` file's stem, e.g. `operators`.
     pub file: String,
-    /// Stable across an upstream re-pin: the file, the query and the
-    /// evaluation time, plus an ordinal only when a file repeats the
-    /// identical query at the identical time. Line numbers deliberately
-    /// play no part — comments reflow, and a baseline keyed on them
-    /// would invalidate wholesale on every bump.
+    /// Identifies the eval within its file, and stays stable across an
+    /// upstream re-pin: the query and the evaluation time, plus an
+    /// ordinal only when a file repeats the identical query at the
+    /// identical time. Line numbers deliberately play no part — comments
+    /// reflow, and a baseline keyed on them would invalidate wholesale
+    /// on every bump.
     pub id: String,
     /// 1-based line of the `eval`, for humans reading a failure.
     pub line: usize,
@@ -213,7 +214,7 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
                     .collect(),
             }),
             Command::Eval(eval) => {
-                let key = case_key(script, eval);
+                let key = case_key(eval);
                 let n = seen.entry(key.clone()).or_insert(0);
                 *n += 1;
                 let id = if *n > 1 { format!("{key} #{n}") } else { key };
@@ -237,14 +238,11 @@ pub fn run_script(engine: &dyn Engine, script: &Script) -> Vec<Outcome> {
     outcomes
 }
 
-fn case_key(script: &Script, eval: &Eval) -> String {
+fn case_key(eval: &Eval) -> String {
     let query = eval.query.split_whitespace().collect::<Vec<_>>().join(" ");
     match eval.timing {
-        Timing::Instant { at_ms } => format!("{}/{query} @ {at_ms}", script.name),
-        Timing::Range(r) => format!(
-            "{}/{query} @ {}..{}/{}",
-            script.name, r.start_ms, r.end_ms, r.step_ms
-        ),
+        Timing::Instant { at_ms } => format!("{query} @ {at_ms}"),
+        Timing::Range(r) => format!("{query} @ {}..{}/{}", r.start_ms, r.end_ms, r.step_ms),
     }
 }
 
