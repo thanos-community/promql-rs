@@ -251,7 +251,15 @@ fn load_directive() -> &'static Regex {
 /// histogram is a known gap, not a broken corpus. Anything else is
 /// flagged as [`Unsupported::ParseError`] so the tests can tell the two
 /// apart.
-fn parse_load_block(case: &str, raw: &str) -> Result<LoadBlock, Error> {
+///
+/// Public because this block format is not the YAML's own — it is
+/// upstream's, matched the way `promqltest`'s `patLoad` matches it, and
+/// a `load` block inside a `.test` script is the identical thing.
+/// `promql-conformance` parses those scripts and reuses this rather
+/// than keeping a second copy of the same rules in step with it.
+///
+/// `case` names the caller's unit of work and appears in errors only.
+pub fn parse_load_block(case: &str, raw: &str) -> Result<LoadBlock, Error> {
     let mut lines = raw.lines().map(str::trim).filter(|l| !l.is_empty());
 
     let directive = lines.next().unwrap_or_default();

@@ -12,11 +12,10 @@
 //!   Prometheus evolves; asking it afresh every run cannot. The cost is
 //!   a Go toolchain and a corpus checkout, so this suite skips when
 //!   either is missing.
-//! - `prometheus` — Prometheus's **own promqltest corpus**, vendored
+//! - [`prometheus`] — Prometheus's **own promqltest corpus**, vendored
 //!   under `testdata/prometheus/`, where the expected values ship with
 //!   the questions. Nothing to ask, so nothing to be unavailable: no
-//!   oracle, no Go, no network. This is the suite that will run in CI.
-//!   The corpus is vendored; the runner lands next.
+//!   oracle, no Go, no network. This is the suite that runs in CI.
 //!
 //! # Current state
 //!
@@ -35,6 +34,7 @@
 
 pub mod compare;
 pub mod datafusion;
+pub mod prometheus;
 pub mod result;
 pub mod thanos;
 

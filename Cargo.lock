@@ -2691,6 +2691,7 @@ dependencies = [
  "promql-engine",
  "promql-parser",
  "promql-testcases",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",
