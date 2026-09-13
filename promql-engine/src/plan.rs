@@ -84,31 +84,40 @@ pub async fn plan(
 }
 
 /// A planned subexpression: the plan and the label names in its schema.
-struct Planned {
-    plan: LogicalPlan,
-    label_names: Vec<String>,
+#[derive(Clone)]
+pub(crate) struct Planned {
+    pub(crate) plan: LogicalPlan,
+    pub(crate) label_names: Vec<String>,
 }
 
-struct Planner<'a> {
+pub(crate) struct Planner<'a> {
     state: &'a dyn Session,
     source: &'a dyn SeriesSource,
-    query: &'a RangeQuery,
+    pub(crate) query: &'a RangeQuery,
     /// Selectors seen so far; each becomes its own table `selector_N`.
     selectors: usize,
 }
 
-type Planning<'f> = Pin<Box<dyn Future<Output = Result<Planned, EngineError>> + Send + 'f>>;
+pub(crate) type Planning<'f> =
+    Pin<Box<dyn Future<Output = Result<Planned, EngineError>> + Send + 'f>>;
 
 impl Planner<'_> {
     /// Plan one node. `grouping` is the aggregation directly above, handed
     /// down to the selector as a hint for the store.
-    fn expr<'f>(&'f mut self, expr: &'f Expr, grouping: Option<&'f Grouping>) -> Planning<'f> {
+    pub(crate) fn expr<'f>(
+        &'f mut self,
+        expr: &'f Expr,
+        grouping: Option<&'f Grouping>,
+    ) -> Planning<'f> {
         Box::pin(async move {
             match expr {
                 Expr::VectorSelector(vs) => self.selector(vs, grouping).await,
                 Expr::Paren(p) => self.expr(&p.expr, grouping).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c, grouping).await,
+                Expr::Binary(b) => self.binary(b).await,
+                Expr::Unary(u) => self.unary(u).await,
+                Expr::NumberLiteral(n) => self.number(n.val),
                 other => Err(EngineError::Unsupported(describe(other))),
             }
         })
