@@ -166,6 +166,28 @@ schema, so the store has to know the label-name union before the first
 batch. That is why `encode` takes the names as a parameter instead of
 deriving them.
 
+## Steps above a scan
+
+`Engine::plan_async` returns the `LogicalPlan` before anything runs. Its
+leaves are `TableScan`s over `SelectorTable`, one per selector; a caller
+finds them with `source_as_provider(&scan.source)` and a downcast, and
+the table tells it the `label_names()` and the `hints()` the selection
+was asked with. The caller may wrap such a scan in a
+`LogicalPlan::Extension` node of its own and run the result with
+`Engine::execute_async`; the `ExtensionPlanner` that turns the node into
+an operator goes to `Engine::with_extension_planners`, since DataFusion
+plans extension nodes through no other route. The step has to keep the
+shape, and when it keeps the schema too, nothing the engine planned above
+the scan has to know about it: an absent label is `""`, so a step that
+merges rows may blank a label instead of dropping the field. Such a node
+should own its schema rather than report its input's: DataFusion pushes
+label accesses like `get_field(labels, 'job')` towards the scan through
+any node that appears to pass the new column through, and a step that
+merges rows cannot. Thanos's replica deduplication is one such step, in
+the Thanos crates and not in the engine: rows equal but for the replica
+labels become one row whose replica labels read `""`, and the label is
+gone from the result.
+
 ## Relation to #4
 
 #4 proposes a virtual table per metric, one sample per row and a column

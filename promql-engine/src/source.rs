@@ -148,6 +148,7 @@ pub trait SeriesSource: fmt::Debug + Send + Sync {
 pub struct SelectorTable {
     plan: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
+    hints: SelectHints,
 }
 
 impl SelectorTable {
@@ -158,15 +159,26 @@ impl SelectorTable {
         matchers: &[LabelMatcher],
         hints: SelectHints,
     ) -> std::result::Result<Self, EngineError> {
-        let plan = source.select(state, matchers, hints).await?;
+        let plan = source.select(state, matchers, hints.clone()).await?;
         let schema = plan.schema();
         series::validate(&schema).map_err(EngineError::Schema)?;
-        Ok(Self { plan, schema })
+        Ok(Self {
+            plan,
+            schema,
+            hints,
+        })
     }
 
     /// The label names this selection carries.
     pub fn label_names(&self) -> Vec<String> {
         series::label_names(&self.schema)
+    }
+
+    /// The hints the selection was asked with, for a caller that puts a
+    /// step of its own above the scan and wants to know, say, the function
+    /// above the selector.
+    pub fn hints(&self) -> &SelectHints {
+        &self.hints
     }
 }
 
