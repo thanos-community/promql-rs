@@ -80,7 +80,7 @@ pub async fn plan(
         query,
         selectors: 0,
     };
-    Ok(planner.expr(expr, None).await?.plan)
+    Ok(planner.expr(expr, None, None).await?.plan)
 }
 
 /// A planned subexpression: the plan and the label names in its schema.
@@ -100,13 +100,20 @@ struct Planner<'a> {
 type Planning<'f> = Pin<Box<dyn Future<Output = Result<Planned, EngineError>> + Send + 'f>>;
 
 impl Planner<'_> {
-    /// Plan one node. `grouping` is the aggregation directly above, handed
-    /// down to the selector as a hint for the store.
-    fn expr<'f>(&'f mut self, expr: &'f Expr, grouping: Option<&'f Grouping>) -> Planning<'f> {
+    /// Plan one node. `grouping` is the aggregation directly above and
+    /// `func` the function or aggregation directly above, by name; both
+    /// reach the selector as hints for the store, as Prometheus's
+    /// `extractFuncFromPath` finds them.
+    fn expr<'f>(
+        &'f mut self,
+        expr: &'f Expr,
+        grouping: Option<&'f Grouping>,
+        func: Option<&'f str>,
+    ) -> Planning<'f> {
         Box::pin(async move {
             match expr {
-                Expr::VectorSelector(vs) => self.selector(vs, grouping).await,
-                Expr::Paren(p) => self.expr(&p.expr, grouping).await,
+                Expr::VectorSelector(vs) => self.selector(vs, grouping, func).await,
+                Expr::Paren(p) => self.expr(&p.expr, grouping, func).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c, grouping).await,
                 other => Err(EngineError::Unsupported(describe(other))),
@@ -114,25 +121,16 @@ impl Planner<'_> {
         })
     }
 
-    /// Ask the store for `vs` over `[start_ms, end_ms]` and start a plan
-    /// on the resulting table.
+    /// Ask the store for `vs` with `hints` and start a plan on the
+    /// resulting table.
     async fn scan(
         &mut self,
         vs: &VectorSelector,
-        (start_ms, end_ms): (i64, i64),
-        grouping: Option<&Grouping>,
+        hints: SelectHints,
     ) -> Result<(LogicalPlanBuilder, Vec<String>), EngineError> {
         reject_unsupported_modifiers(vs)?;
-        let table = SelectorTable::try_new(
-            self.state,
-            self.source,
-            &effective_matchers(vs),
-            SelectHints {
-                grouping: grouping.cloned(),
-                ..SelectHints::range(start_ms, end_ms)
-            },
-        )
-        .await?;
+        let table =
+            SelectorTable::try_new(self.state, self.source, &effective_matchers(vs), hints).await?;
         let label_names = table.label_names();
         let index = self.selectors;
         self.selectors += 1;
@@ -148,6 +146,7 @@ impl Planner<'_> {
         &mut self,
         vs: &VectorSelector,
         grouping: Option<&Grouping>,
+        func: Option<&str>,
     ) -> Result<Planned, EngineError> {
         let params = Params {
             start_ms: self.query.start_ms,
@@ -157,7 +156,13 @@ impl Planner<'_> {
             offset_ms: offset_ms(vs),
             at_ms: resolve_at(vs, self.query),
         };
-        let (builder, label_names) = self.scan(vs, params.select_range(), grouping).await?;
+        let (start_ms, end_ms) = params.select_range();
+        let hints = SelectHints {
+            grouping: grouping.cloned(),
+            func: func.map(str::to_string),
+            ..SelectHints::range(start_ms, end_ms)
+        };
+        let (builder, label_names) = self.scan(vs, hints).await?;
         let plan = builder
             .project(vec![
                 col(LABELS),
@@ -214,7 +219,14 @@ impl Planner<'_> {
             offset_ms: offset_ms(vs),
             at_ms: resolve_at(vs, self.query),
         };
-        let (builder, input_names) = self.scan(vs, params.select_range(), grouping).await?;
+        let (start_ms, end_ms) = params.select_range();
+        let hints = SelectHints {
+            grouping: grouping.cloned(),
+            func: Some(name.to_string()),
+            range_ms: Some(params.range_ms),
+            ..SelectHints::range(start_ms, end_ms)
+        };
+        let (builder, input_names) = self.scan(vs, hints).await?;
         let (labels_expr, label_names) = if func.drops_metric_name() {
             labels::keep(&input_names, |n| n != METRIC_NAME)
         } else {
@@ -242,7 +254,10 @@ impl Planner<'_> {
             labels: agg.grouping.clone(),
             by: !agg.without,
         };
-        let input = self.expr(&agg.expr, Some(&grouping)).await?;
+        let op_name = agg.op.to_string();
+        let input = self
+            .expr(&agg.expr, Some(&grouping), Some(&op_name))
+            .await?;
 
         let keys = labels::group_keys(&input.label_names, &agg.grouping, agg.without);
         let plan = LogicalPlanBuilder::from(input.plan)
