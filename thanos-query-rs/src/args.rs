@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::{ArgAction, Parser, ValueEnum};
+use thanos_store::DeduplicationFunc;
 
 use crate::params::parse_duration;
 
@@ -94,6 +95,22 @@ pub struct QueryArgs {
         help = "Answer with the healthy stores' data and a warning when a store fails, instead of an error"
     )]
     pub query_partial_response: bool,
+
+    #[arg(
+        long = "query-replica-label",
+        value_name = "LABEL",
+        value_delimiter = ',',
+        help = "Label that only tells replicas apart; series equal but for it are deduplicated unless a query says dedup=false. Repeat, or separate by commas, for more than one"
+    )]
+    pub query_replica_labels: Vec<String>,
+
+    #[arg(
+        long,
+        default_value = "penalty",
+        value_parser = deduplication_func_arg,
+        help = "How the samples of replicas are merged: penalty follows one replica and penalises switching, chain unions them one to one"
+    )]
+    pub query_deduplication_func: DeduplicationFunc,
 }
 
 #[derive(Debug, clap::Args)]
@@ -137,6 +154,10 @@ fn duration_arg(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_nanos(ns as u64))
 }
 
+fn deduplication_func_arg(s: &str) -> Result<DeduplicationFunc, String> {
+    s.parse()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +176,11 @@ mod tests {
         assert_eq!(args.query.query_default_step, Duration::from_secs(1));
         assert_eq!(args.query.query_max_concurrent, 20);
         assert!(args.query.query_partial_response);
+        assert!(args.query.query_replica_labels.is_empty());
+        assert_eq!(
+            args.query.query_deduplication_func,
+            DeduplicationFunc::Penalty
+        );
         assert_eq!(args.web.web_route_prefix, "");
         assert!(!args.web.web_disable_cors);
         assert_eq!(args.log.log_level, "info");
@@ -176,11 +202,28 @@ mod tests {
             "json",
             "--http-address",
             "127.0.0.1:0",
+            "--query-replica-label",
+            "prometheus_replica",
+            "--query-replica-label=replica,ruler_replica",
+            "--query-deduplication-func",
+            "chain",
         ])
         .unwrap();
         assert_eq!(args.endpoints.endpoints, ["a:10901", "b:10901"]);
         assert_eq!(args.query.query_timeout, Duration::from_secs(30));
         assert!(!args.query.query_partial_response);
+        assert_eq!(
+            args.query.query_replica_labels,
+            ["prometheus_replica", "replica", "ruler_replica"]
+        );
+        assert_eq!(
+            args.query.query_deduplication_func,
+            DeduplicationFunc::Chain
+        );
+        assert!(
+            Args::try_parse_from(["thanos-query-rs", "--query-deduplication-func", "first"])
+                .is_err()
+        );
         assert!(args.web.web_disable_cors);
         assert_eq!(args.log.log_format, LogFormat::Json);
 

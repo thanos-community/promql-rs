@@ -11,7 +11,7 @@ use thanos_query_rs::metrics::Metrics;
 use thanos_query_rs::query::ThanosQueryableCreator;
 use thanos_query_rs::v1::{QueryApi, QueryOptions};
 use thanos_query_rs::{router, RouterOptions};
-use thanos_store::{EndpointSet, EndpointSetConfig, ProxyStore};
+use thanos_store::{Dedup, EndpointSet, EndpointSetConfig, ProxyStore};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -49,8 +49,9 @@ async fn main() -> anyhow::Result<()> {
     let _refresh = Arc::clone(&endpoints).spawn_refresh();
 
     let proxy = Arc::new(ProxyStore::new(endpoints));
+    // The engine plans replica deduplication only through this planner.
     let api = Arc::new(QueryApi::new(
-        Engine::new(),
+        Engine::with_extension_planners(vec![Dedup::planner()]),
         Arc::new(ThanosQueryableCreator::new(proxy)),
         QueryOptions {
             query_timeout: args.query.query_timeout,
@@ -58,6 +59,8 @@ async fn main() -> anyhow::Result<()> {
             default_step: args.query.query_default_step,
             max_concurrent: args.query.query_max_concurrent,
             partial_response: args.query.query_partial_response,
+            replica_labels: args.query.query_replica_labels.clone(),
+            deduplication_func: args.query.query_deduplication_func,
         },
     ));
     let app = router(

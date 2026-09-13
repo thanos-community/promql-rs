@@ -18,7 +18,7 @@ use thanos_query_rs::metrics::Metrics;
 use thanos_query_rs::query::{MemoryQueryableCreator, Queryable, QueryableCreator};
 use thanos_query_rs::v1::{QueryApi, QueryOptions};
 use thanos_query_rs::{router, RouterOptions};
-use thanos_store::{LabelsResult, SelectOptions};
+use thanos_store::{Dedup, LabelsResult, SelectOptions};
 use tower::ServiceExt;
 
 /// 2023-11-14T22:13:20Z.
@@ -55,8 +55,94 @@ fn app_with(
     opts: QueryOptions,
     router_opts: RouterOptions,
 ) -> Router {
-    let api = QueryApi::new(Engine::new(), creator, opts).with_now(|| NOW);
+    let engine = Engine::with_extension_planners(vec![Dedup::planner()]);
+    let api = QueryApi::new(engine, creator, opts).with_now(|| NOW);
     router(Arc::new(api), Arc::new(Metrics::new()), &router_opts)
+}
+
+/// `up` scraped by two replicas.
+fn replicated() -> MemorySeriesSource {
+    MemorySeriesSource::new(vec![
+        series(
+            &[("__name__", "up"), ("job", "x"), ("replica", "a")],
+            &[1.0, 1.0, 1.0, 1.0, 1.0],
+        ),
+        series(
+            &[("__name__", "up"), ("job", "x"), ("replica", "b")],
+            &[1.0, 1.0, 1.0, 1.0, 1.0],
+        ),
+    ])
+}
+
+fn replicated_app(replica_labels: &[&str]) -> Router {
+    app_with(
+        Arc::new(MemoryQueryableCreator::new(replicated())),
+        QueryOptions {
+            replica_labels: replica_labels.iter().map(|l| l.to_string()).collect(),
+            ..QueryOptions::default()
+        },
+        RouterOptions::default(),
+    )
+}
+
+/// The one value of a `count(...)` instant query.
+async fn count_up(app: Router, extra: &[(&str, &str)]) -> String {
+    let mut pairs = vec![("query", "count(up)"), ("time", "1700000060")];
+    pairs.extend_from_slice(extra);
+    let (status, _, body) = get(app, "/api/v1/query", &pairs).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["data"]["result"][0]["value"][1]
+        .as_str()
+        .unwrap_or_else(|| panic!("{body}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn dedup_merges_replicas_along_the_replica_labels() {
+    // The flag alone: dedup is on by default.
+    assert_eq!(count_up(replicated_app(&["replica"]), &[]).await, "1");
+    assert_eq!(
+        count_up(replicated_app(&["replica"]), &[("dedup", "false")]).await,
+        "2"
+    );
+    // `replicaLabels[]` replaces the flag's labels.
+    assert_eq!(
+        count_up(replicated_app(&["replica"]), &[("replicaLabels[]", "job")]).await,
+        "2"
+    );
+    assert_eq!(
+        count_up(replicated_app(&[]), &[("replicaLabels[]", "replica")]).await,
+        "1"
+    );
+    // No replica label configured: nothing to merge along.
+    assert_eq!(count_up(replicated_app(&[]), &[]).await, "2");
+
+    // The merged series has no replica label.
+    let (status, _, body) = get(
+        replicated_app(&["replica"]),
+        "/api/v1/query_range",
+        &[
+            ("query", "up"),
+            ("start", "1700000000"),
+            ("end", "1700000060"),
+            ("step", "15"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"up","job":"x"},"values":[[1700000000,"1"],[1700000015,"1"],[1700000030,"1"],[1700000045,"1"],[1700000060,"1"]]}]}}"#
+    );
+
+    // The labels endpoints never deduplicate, as in Thanos.
+    let (status, _, body) = get(replicated_app(&["replica"]), "/api/v1/labels", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        r#"{"status":"success","data":["__name__","job","replica"]}"#
+    );
 }
 
 fn app() -> Router {

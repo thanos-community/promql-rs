@@ -12,7 +12,9 @@ use promql_engine::{Engine, EngineError, RangeQuery, Series};
 use promql_parser::ast::LabelMatcher;
 use serde::Serialize;
 use serde_json::value::RawValue;
-use thanos_store::{LabelsResult, PartialResponseStrategy, SelectOptions, StoreError};
+use thanos_store::{
+    Dedup, DeduplicationFunc, LabelsResult, PartialResponseStrategy, SelectOptions, StoreError,
+};
 use tokio::sync::Semaphore;
 
 use crate::api::{respond, ApiError};
@@ -41,6 +43,11 @@ pub struct QueryOptions {
     pub max_concurrent: usize,
     /// `--query-partial-response`, unless `partial_response=` is given.
     pub partial_response: bool,
+    /// `--query-replica-label`, unless `replicaLabels[]` is given: the
+    /// labels deduplication merges along while `dedup=true`.
+    pub replica_labels: Vec<String>,
+    /// `--query-deduplication-func`.
+    pub deduplication_func: DeduplicationFunc,
 }
 
 impl Default for QueryOptions {
@@ -51,6 +58,8 @@ impl Default for QueryOptions {
             default_step: Duration::from_secs(1),
             max_concurrent: 20,
             partial_response: true,
+            replica_labels: Vec::new(),
+            deduplication_func: DeduplicationFunc::Penalty,
         }
     }
 }
@@ -118,9 +127,8 @@ impl QueryApi {
     /// Order and messages follow `query`/`queryRange`; `range_query` picks
     /// the one difference between them.
     fn query_params(&self, form: &FormValues, range_query: bool) -> Result<QueryParams, ApiError> {
-        // `dedup` and `replicaLabels[]` are validated and ignored: no
-        // deduplication yet, replica labels stay in the result.
-        parse_bool_param(form, "dedup", true)?;
+        let enable_dedup = parse_bool_param(form, "dedup", true)?;
+        let replica_labels = parse_replica_labels(form, &self.opts.replica_labels);
         let store_matchers = parse_store_matchers(form)?;
         let mut partial_response = self.opts.partial_response;
         if !range_query {
@@ -135,9 +143,13 @@ impl QueryApi {
         let query = form.get("query").to_string();
         let lookback_ms =
             parse_lookback_delta(form)?.unwrap_or(self.opts.lookback_delta.as_millis() as i64);
+        // `isDedupEnabled`: only with a label to merge along.
+        let dedup = (enable_dedup && !replica_labels.is_empty())
+            .then(|| Dedup::new(replica_labels, self.opts.deduplication_func));
         Ok(QueryParams {
             query,
             lookback_ms,
+            dedup,
             select: SelectOptions {
                 partial_response: if partial_response {
                     PartialResponseStrategy::Warn
@@ -158,14 +170,16 @@ impl QueryApi {
         })
     }
 
-    /// Evaluate under the gate and the timeout; the source's warnings come
-    /// back with the series.
+    /// Evaluate under the gate and the timeout, with replica deduplication
+    /// put into the plan when the request asks for it; the source's
+    /// warnings come back with the series.
     async fn exec(
         &self,
         query: &str,
         range: RangeQuery,
         timeout: Duration,
         select: SelectOptions,
+        dedup: Option<Dedup>,
     ) -> Result<(Vec<Series>, Vec<String>), ApiError> {
         let queryable = self.queryable_create.queryable(select);
         let run = async {
@@ -174,10 +188,17 @@ impl QueryApi {
                 .acquire()
                 .await
                 .map_err(|_| ApiError::exec("query gate is closed"))?;
-            self.engine
-                .range_query_async(queryable.source(), query, &range)
+            let mut plan = self
+                .engine
+                .plan_async(queryable.source(), query, &range)
                 .await
-                .map_err(engine_error)
+                .map_err(engine_error)?;
+            if let Some(dedup) = &dedup {
+                plan = dedup
+                    .inject(plan)
+                    .map_err(|e| engine_error(EngineError::from(e)))?;
+            }
+            self.engine.execute_async(plan).await.map_err(engine_error)
         };
         let series = tokio::time::timeout(timeout, run)
             .await
@@ -190,6 +211,18 @@ struct QueryParams {
     query: String,
     lookback_ms: i64,
     select: SelectOptions,
+    /// The deduplication to put into the plan, when enabled.
+    dedup: Option<Dedup>,
+}
+
+/// `replicaLabels[]` when given, else `--query-replica-label`.
+fn parse_replica_labels(form: &FormValues, default: &[String]) -> Vec<String> {
+    let given = form.get_all("replicaLabels[]");
+    if given.is_empty() {
+        default.to_vec()
+    } else {
+        given.into_iter().map(str::to_string).collect()
+    }
 }
 
 /// Prometheus's status codes for what the engine reports: a bad query is
@@ -298,7 +331,7 @@ pub async fn query(
         lookback_ms: params.lookback_ms,
     };
     let (series, warnings) = api
-        .exec(&params.query, range, timeout, params.select)
+        .exec(&params.query, range, timeout, params.select, params.dedup)
         .await?;
     Ok(respond(
         &vector_from_series(&series, ts).to_query_data(),
@@ -353,7 +386,7 @@ pub async fn query_range(
         lookback_ms: params.lookback_ms,
     };
     let (series, warnings) = api
-        .exec(&params.query, range, timeout, params.select)
+        .exec(&params.query, range, timeout, params.select, params.dedup)
         .await?;
     Ok(respond(
         &matrix_from_series(&series).to_query_data(),
