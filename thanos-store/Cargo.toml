@@ -15,6 +15,7 @@ testutil = ["tonic/server", "tonic/router", "dep:tokio-stream"]
 [dependencies]
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+futures = { workspace = true }
 promql-engine = { path = "../promql-engine" }
 promql-parser = { path = "../promql-parser" }
 prost = { workspace = true }

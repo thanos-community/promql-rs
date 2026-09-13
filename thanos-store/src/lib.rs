@@ -13,6 +13,7 @@
 //! for the fan-out.
 
 pub mod chunkenc;
+pub mod dedup;
 pub mod endpointset;
 pub mod error;
 pub mod labels;
@@ -22,6 +23,7 @@ pub mod storepb;
 #[cfg(feature = "testutil")]
 pub mod testutil;
 
+pub use dedup::{Dedup, DeduplicationFunc};
 pub use endpointset::{EndpointMetadata, EndpointRef, EndpointSet, EndpointSetConfig};
 pub use error::StoreError;
 pub use labels::LabelSet;

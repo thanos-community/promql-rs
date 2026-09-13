@@ -7,13 +7,14 @@
 use std::sync::Arc;
 
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series, SeriesSource};
+use thanos_store::dedup::dedup_samples;
 use thanos_store::testutil::{
     batch_frame, info, raw_chunk, series as store_series, series_frame, serve, warning_frame,
     FakeStore,
 };
 use thanos_store::{
-    EndpointSet, EndpointSetConfig, PartialResponseStrategy, ProxyStore, SelectOptions,
-    ThanosSeriesSource,
+    Dedup, DeduplicationFunc, EndpointSet, EndpointSetConfig, PartialResponseStrategy, ProxyStore,
+    SelectOptions, ThanosSeriesSource,
 };
 use tonic::Status;
 
@@ -299,6 +300,225 @@ async fn a_dead_store_is_a_warning_with_partial_data() {
         warnings[0].ends_with("Unavailable: transport is closing"),
         "{warnings:?}"
     );
+}
+
+/// One series behind two replica stores and a compacted, replica-less
+/// copy of its start, plus a series only the first replica has.
+struct Replicated {
+    fakes: Vec<FakeStore>,
+    api: Vec<Vec<(i64, f64)>>,
+    web: Vec<(i64, f64)>,
+}
+
+fn replicated() -> Replicated {
+    let api_a = counter(21, 10.0);
+    // Replica b scrapes five seconds later and sees the counter three ahead.
+    let api_b: Vec<(i64, f64)> = (0..21)
+        .map(|i| (T0 + 5_000 + i * STEP, i as f64 * 10.0 + 3.0))
+        .collect();
+    let compacted = api_a[..5].to_vec();
+    let web = counter(21, 5.0);
+    let store = |replica: &[(&str, &str)], frames: Vec<_>| {
+        FakeStore::new(info("sidecar", &[replica], T0, T0 + 20 * STEP)).with_frames(frames)
+    };
+    let a = store(
+        &[("prometheus_replica", "a")],
+        vec![
+            series_frame(store_series(
+                &[
+                    ("__name__", "http_requests_total"),
+                    ("job", "api"),
+                    ("prometheus_replica", "a"),
+                ],
+                vec![raw_chunk(&api_a)],
+            )),
+            series_frame(store_series(
+                &[
+                    ("__name__", "http_requests_total"),
+                    ("job", "web"),
+                    ("prometheus_replica", "a"),
+                ],
+                vec![raw_chunk(&web)],
+            )),
+        ],
+    );
+    let b = store(
+        &[("prometheus_replica", "b")],
+        vec![series_frame(store_series(
+            &[
+                ("__name__", "http_requests_total"),
+                ("job", "api"),
+                ("prometheus_replica", "b"),
+            ],
+            vec![raw_chunk(&api_b)],
+        ))],
+    );
+    let c = store(
+        &[],
+        vec![series_frame(store_series(
+            &[("__name__", "http_requests_total"), ("job", "api")],
+            vec![raw_chunk(&compacted)],
+        ))],
+    );
+    Replicated {
+        fakes: vec![a, b, c],
+        // In the order the step merges them: by first sample, then by the
+        // replica label, which the compacted copy lacks.
+        api: vec![compacted, api_a, api_b],
+        web,
+    }
+}
+
+/// What the step is expected to produce, as a memory source: the `api`
+/// replicas merged for `is_counter`, `web` as is, no replica label.
+fn merged_reference(replicated: &Replicated, is_counter: bool) -> MemorySeriesSource {
+    MemorySeriesSource::new(vec![
+        memory_series(
+            &[("__name__", "http_requests_total"), ("job", "api")],
+            &dedup_samples(replicated.api.clone(), is_counter),
+        ),
+        memory_series(
+            &[("__name__", "http_requests_total"), ("job", "web")],
+            &replicated.web,
+        ),
+    ])
+}
+
+async fn deduplicated(
+    engine: &Engine,
+    source: &dyn SeriesSource,
+    dedup: &Dedup,
+    query: &str,
+    range: &RangeQuery,
+) -> Vec<Series> {
+    let plan = engine
+        .plan_async(source, query, range)
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let plan = dedup.inject(plan).unwrap();
+    engine
+        .execute_async(plan)
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+}
+
+#[tokio::test]
+async fn replicas_are_merged_in_the_plan() {
+    let replicated = replicated();
+    let thanos = source_over(replicated.fakes, SelectOptions::default()).await;
+    let replicated = Replicated {
+        fakes: Vec::new(),
+        ..replicated
+    };
+    let engine = Engine::with_extension_planners(vec![Dedup::planner()]);
+    let dedup = Dedup::new(
+        vec!["prometheus_replica".into()],
+        DeduplicationFunc::Penalty,
+    );
+    let range = RangeQuery::new(T0 + 4 * STEP, T0 + 20 * STEP, 60_000);
+
+    for (query, is_counter) in [
+        ("http_requests_total", false),
+        (r#"http_requests_total{job="api"}"#, false),
+        ("sum by (job) (http_requests_total)", false),
+        ("count(http_requests_total)", false),
+        ("max_over_time(http_requests_total[1m])", false),
+        ("rate(http_requests_total[1m])", true),
+        ("sum by (job) (increase(http_requests_total[1m]))", true),
+        // Grouping by the replica label finds none.
+        ("count by (prometheus_replica) (http_requests_total)", false),
+    ] {
+        let from_thanos = deduplicated(&engine, &thanos, &dedup, query, &range).await;
+        let reference = merged_reference(&replicated, is_counter);
+        let from_memory = engine
+            .range_query_async(&reference, query, &range)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(
+            flatten(&from_thanos),
+            flatten(&from_memory),
+            "{query} differs from the merged reference"
+        );
+        assert!(
+            from_thanos
+                .iter()
+                .all(|s| s.label("prometheus_replica").is_empty()),
+            "{query} kept a replica label"
+        );
+    }
+
+    // Two series, not four.
+    let counted = deduplicated(
+        &engine,
+        &thanos,
+        &dedup,
+        "count(http_requests_total)",
+        &range,
+    )
+    .await;
+    assert_eq!(counted.len(), 1);
+    assert!(counted[0].values().iter().all(|v| *v == 2.0), "{counted:?}");
+
+    // Without the step, every replica is its own series.
+    let plain = engine
+        .range_query_async(&thanos, "count(http_requests_total)", &range)
+        .await
+        .unwrap();
+    assert!(plain[0].values().iter().all(|v| *v == 4.0), "{plain:?}");
+    let plain = engine
+        .range_query_async(&thanos, "http_requests_total", &range)
+        .await
+        .unwrap();
+    assert_eq!(plain.len(), 4);
+    assert!(thanos.take_warnings().is_empty());
+}
+
+#[tokio::test]
+async fn a_lagging_replica_is_lifted_under_a_counter_function() {
+    let a = vec![(T0, 100.0), (T0 + 10_000, 110.0)];
+    let b = vec![(T0 + 35_000, 105.0)];
+    let store = |replica: &str, samples: &[(i64, f64)]| {
+        FakeStore::new(info("sidecar", &[&[("replica", replica)]], T0, T0 + 60_000)).with_frames(
+            vec![series_frame(store_series(
+                &[("__name__", "restarts_total"), ("replica", replica)],
+                vec![raw_chunk(samples)],
+            ))],
+        )
+    };
+    let thanos = source_over(
+        vec![store("a", &a), store("b", &b)],
+        SelectOptions::default(),
+    )
+    .await;
+    let engine = Engine::with_extension_planners(vec![Dedup::planner()]);
+    let dedup = Dedup::new(vec!["replica".into()], DeduplicationFunc::Penalty);
+    let range = RangeQuery::new(T0 + 35_000, T0 + 35_000, 1_000);
+
+    // Under `rate` the replica found behind at the switch is lifted to 110,
+    // so there is no counter reset to add back in.
+    let lifted = MemorySeriesSource::new(vec![memory_series(
+        &[("__name__", "restarts_total")],
+        &[(T0, 100.0), (T0 + 10_000, 110.0), (T0 + 35_000, 110.0)],
+    )]);
+    let query = "rate(restarts_total[1m])";
+    let from_thanos = deduplicated(&engine, &thanos, &dedup, query, &range).await;
+    let expected = engine
+        .range_query_async(&lifted, query, &range)
+        .await
+        .unwrap();
+    assert_eq!(flatten(&from_thanos), flatten(&expected));
+    assert!(from_thanos[0].values()[0] < 1.0, "{from_thanos:?}");
+
+    // A function that is not a counter function takes the values as they are.
+    let raw = MemorySeriesSource::new(vec![memory_series(
+        &[("__name__", "restarts_total")],
+        &[(T0, 100.0), (T0 + 10_000, 110.0), (T0 + 35_000, 105.0)],
+    )]);
+    let query = "min_over_time(restarts_total[1m])";
+    let from_thanos = deduplicated(&engine, &thanos, &dedup, query, &range).await;
+    let expected = engine.range_query_async(&raw, query, &range).await.unwrap();
+    assert_eq!(flatten(&from_thanos), flatten(&expected));
+    assert_eq!(from_thanos[0].values(), &[100.0]);
 }
 
 #[tokio::test]
