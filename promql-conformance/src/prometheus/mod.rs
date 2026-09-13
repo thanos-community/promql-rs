@@ -15,6 +15,11 @@
 //! rows go through `promql_parser::parse_series_desc`, which is already
 //! cross-checked against this very corpus.
 
+//! [`run`] walks a parsed script against an [`crate::result::Engine`]
+//! and reports one [`run::Outcome`] per eval.
+
+pub mod run;
 pub mod script;
 
+pub use run::{almost_equal, run_script, Outcome, Verdict};
 pub use script::{load_corpus, Command, Eval, Expect, Expected, Script, Timing};

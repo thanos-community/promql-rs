@@ -18,8 +18,12 @@ thiserror = { workspace = true }
 [dev-dependencies]
 libtest-mimic = "0.8"
 
-# The differential suite registers one test per corpus case at runtime,
-# so it needs its own harness rather than #[test] attributes.
+# Both conformance suites register one test per corpus case at runtime,
+# so they need their own harness rather than #[test] attributes.
 [[test]]
 name = "differential"
+harness = false
+
+[[test]]
+name = "promqltest"
 harness = false
