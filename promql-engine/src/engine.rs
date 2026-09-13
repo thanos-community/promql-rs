@@ -16,7 +16,7 @@ use crate::error::EngineError;
 pub use crate::plan::RangeQuery;
 use crate::series::{self, Series};
 use crate::source::SeriesSource;
-use crate::{aggregate, labels, range, selector};
+use crate::{aggregate, binary, labels, range, selector};
 
 pub struct Engine {
     ctx: SessionContext,
@@ -31,6 +31,12 @@ impl Engine {
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
         ctx.register_udf(range::udf());
+        ctx.register_udf(binary::combine::match_udf());
+        ctx.register_udf(binary::combine::scalar_udf());
+        ctx.register_udf(binary::combine::filter_udf());
+        ctx.register_udf(binary::combine::literal_udf());
+        ctx.register_udf(binary::combine::unique_udf());
+        ctx.register_udaf(binary::group::udaf());
         Self { ctx, rt: None }
     }
 

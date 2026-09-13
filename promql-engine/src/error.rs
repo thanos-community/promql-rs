@@ -27,10 +27,58 @@ pub enum EngineError {
 
     /// DataFusion refused or failed the plan.
     #[error("datafusion: {0}")]
-    DataFusion(#[from] DataFusionError),
+    DataFusion(DataFusionError),
 
     /// A blocking call on an engine without a runtime, or a runtime that
     /// could not be built.
     #[error("runtime: {0}")]
     Runtime(String),
+}
+
+/// A [`EngineError::Query`] raised from inside a DataFusion kernel.
+///
+/// A kernel can only fail with a [`DataFusionError`], but some of its
+/// failures are Prometheus's own answers rather than bugs: "multiple
+/// matches for labels" is what the reference engine tells the user, and
+/// the differential suite has to count it as a match, not as a crash.
+/// [`QueryError::raise`] wraps one so it survives the trip out through
+/// DataFusion, and [`query_error`] recognises it on the way back.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct QueryError(pub String);
+
+impl QueryError {
+    /// This message, as a DataFusion error to return from a kernel.
+    pub fn raise(message: impl Into<String>) -> DataFusionError {
+        DataFusionError::External(Box::new(QueryError(message.into())))
+    }
+}
+
+/// The [`QueryError`] inside a DataFusion error, if there is one.
+///
+/// The chain is walked rather than using `DataFusionError::find_root`,
+/// which stops at the deepest *DataFusion* error and so never reaches
+/// through `External` to the payload. Execution wraps errors in `Context`
+/// and `ArrowError` on the way up, and all of those forward `source`.
+pub fn query_error(e: &DataFusionError) -> Option<&QueryError> {
+    let mut error: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(e) = error {
+        if let Some(q) = e.downcast_ref::<QueryError>() {
+            return Some(q);
+        }
+        error = e.source();
+    }
+    None
+}
+
+/// Every `?` on a DataFusion error passes through here, so a kernel's
+/// [`QueryError`] becomes [`EngineError::Query`] wherever it surfaces —
+/// planning, execution, or collection — without each call site knowing.
+impl From<DataFusionError> for EngineError {
+    fn from(e: DataFusionError) -> Self {
+        match query_error(&e) {
+            Some(q) => EngineError::Query(q.0.clone()),
+            None => EngineError::DataFusion(e),
+        }
+    }
 }

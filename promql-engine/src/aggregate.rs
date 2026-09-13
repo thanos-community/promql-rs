@@ -49,6 +49,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_expr::expressions::Literal;
 
+use crate::grid::Grid;
 use crate::math::{self, max_nan_loses, min_nan_loses, KahanSum, Mean, Welford};
 use crate::series;
 
@@ -197,61 +198,6 @@ impl State {
                 count: n,
             }),
         }
-    }
-}
-
-/// The query's step grid, which is what makes a timestamp an index.
-///
-/// Everything an aggregation can sit on top of — a selector, a range
-/// function, another aggregation — emits at `start + i * step` and
-/// nowhere else, so a step is an array position and the accumulator can
-/// be a flat array rather than a map.
-#[derive(Debug, Clone, Copy)]
-struct Grid {
-    start_ms: i64,
-    step_ms: i64,
-    len: usize,
-}
-
-impl Grid {
-    fn new(start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
-        if step_ms <= 0 {
-            return Err(DataFusionError::Execution(format!(
-                "{NAME}: step must be positive, got {step_ms}ms"
-            )));
-        }
-        let len = if end_ms < start_ms {
-            0
-        } else {
-            usize::try_from((end_ms - start_ms) / step_ms + 1).map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "{NAME}: {start_ms}..{end_ms} has too many steps"
-                ))
-            })?
-        };
-        Ok(Self {
-            start_ms,
-            step_ms,
-            len,
-        })
-    }
-
-    fn timestamp(&self, index: usize) -> i64 {
-        self.start_ms + index as i64 * self.step_ms
-    }
-
-    fn index(&self, ts: i64) -> Result<usize> {
-        let offset = ts - self.start_ms;
-        let index = offset / self.step_ms;
-        if offset < 0 || offset % self.step_ms != 0 || index as usize >= self.len {
-            return Err(DataFusionError::Execution(format!(
-                "{NAME}: sample at {ts}ms is not on the step grid {}..{} every {}ms",
-                self.start_ms,
-                self.timestamp(self.len.saturating_sub(1)),
-                self.step_ms
-            )));
-        }
-        Ok(index as usize)
     }
 }
 
@@ -438,7 +384,7 @@ pub struct Steps {
 
 impl Steps {
     pub fn new(op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
-        let grid = Grid::new(start_ms, end_ms, step_ms)?;
+        let grid = Grid::new(NAME, start_ms, end_ms, step_ms)?;
         Ok(Self {
             op,
             seen: vec![false; grid.len],
