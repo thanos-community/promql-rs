@@ -33,7 +33,8 @@ use std::sync::OnceLock;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use promql_conformance::{
-    compare, oracle, result::Engine, DataFusionEngine, EngineError, QueryResult,
+    compare, oracle, result::Engine, result::LoadedSeries, DataFusionEngine, EngineError,
+    QueryResult,
 };
 use promql_testcases::{range_queries_in, testcases_dir, Case, SeriesLine};
 
@@ -129,14 +130,8 @@ fn engine() -> &'static DataFusionEngine {
 /// its own trial.
 fn unsupported_feature(case: &Case) -> Option<String> {
     let (series, interval) = seed(case);
-    match engine().range_query(
-        &series,
-        interval,
-        &case.query,
-        case.start_ms,
-        case.end_ms,
-        case.step_ms,
-    ) {
+    let load = blocks(&series, interval);
+    match engine().range_query(&load, &case.query, case.start_ms, case.end_ms, case.step_ms) {
         Err(EngineError::Unsupported(feature)) => Some(feature),
         _ => None,
     }
@@ -150,6 +145,21 @@ fn seed(case: &Case) -> (Vec<promql_parser::SeriesDescription>, f64) {
         .unwrap_or_default();
     let interval = case.load.as_ref().map(|l| l.interval_secs).unwrap_or(0.0);
     (series, interval)
+}
+
+/// A YAML case carries exactly one `load` block, so it is the
+/// single-block case of the engine's multi-block seeding.
+fn blocks(
+    series: &[promql_parser::SeriesDescription],
+    interval_secs: f64,
+) -> Vec<LoadedSeries<'_>> {
+    if series.is_empty() {
+        return Vec::new();
+    }
+    vec![LoadedSeries {
+        series,
+        interval_secs,
+    }]
 }
 
 fn run(case: Case) -> Result<(), Failed> {
@@ -196,21 +206,16 @@ fn run(case: Case) -> Result<(), Failed> {
     }
 
     let (series, interval) = seed(&case);
-    let actual = match engine().range_query(
-        &series,
-        interval,
-        &case.query,
-        case.start_ms,
-        case.end_ms,
-        case.step_ms,
-    ) {
-        Ok(r) => r,
-        // Deliberately terse. The query and range are already in the
-        // YAML, and repeating them for every case buys nothing when the
-        // reason is identical throughout. Detail is worth printing for a
-        // real mismatch, below, where the two sides actually differ.
-        Err(e) => return Err(Failed::from(e.to_string())),
-    };
+    let load = blocks(&series, interval);
+    let actual =
+        match engine().range_query(&load, &case.query, case.start_ms, case.end_ms, case.step_ms) {
+            Ok(r) => r,
+            // Deliberately terse. The query and range are already in the
+            // YAML, and repeating them for every case buys nothing when the
+            // reason is identical throughout. Detail is worth printing for a
+            // real mismatch, below, where the two sides actually differ.
+            Err(e) => return Err(Failed::from(e.to_string())),
+        };
 
     let Err(mismatch) = compare(&expected, &actual) else {
         return Ok(());

@@ -131,13 +131,31 @@ impl QueryResult {
 pub trait Engine {
     fn range_query(
         &self,
-        series: &[SeriesDescription],
-        interval_secs: f64,
+        load: &[LoadedSeries<'_>],
         query: &str,
         start_ms: i64,
         end_ms: i64,
         step_ms: i64,
     ) -> Result<QueryResult, EngineError>;
+}
+
+/// One `load <interval>` block's worth of data.
+///
+/// A slice of these rather than a single `(series, interval)` pair
+/// because a promqltest script accumulates: `histograms.test` issues 37
+/// loads against 4 clears, and one file mixes intervals freely —
+/// `functions.test` uses 10s, 1ms, 4m and six others. Each block keeps
+/// its own interval, so sample *i* of a block lands at
+/// `i * interval_ms(block)` and blocks merge by label set. Collapsing
+/// them to one interval would silently move half that file's samples.
+///
+/// The YAML corpus passes exactly one block, which is the degenerate
+/// case rather than a separate code path.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadedSeries<'a> {
+    pub series: &'a [SeriesDescription],
+    /// The block's sample interval, in seconds.
+    pub interval_secs: f64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -167,8 +185,7 @@ pub struct Unimplemented;
 impl Engine for Unimplemented {
     fn range_query(
         &self,
-        _series: &[SeriesDescription],
-        _interval_secs: f64,
+        _load: &[LoadedSeries<'_>],
         _query: &str,
         _start_ms: i64,
         _end_ms: i64,
