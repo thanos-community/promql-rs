@@ -137,6 +137,8 @@ Flags are the Thanos ones in kebab-case (`--help` lists them all):
 | `--query-default-step` | `1s` | `--query.default-step` |
 | `--query-max-concurrent` | `20` | `--query.max-concurrent` |
 | `--query-partial-response[=false]` | `true` | `--query.partial-response` |
+| `--query-replica-label` (repeatable) | | `--query.replica-label` |
+| `--query-deduplication-func` | `penalty` | `--deduplication.func` |
 | `--web-route-prefix` | | `--web.route-prefix` |
 | `--web-disable-cors` | `false` | `--web.disable-cors` |
 | `--log-level`, `--log-format` | `info`, `text` | `--log.level`, `--log.format` |
@@ -155,15 +157,33 @@ Endpoints:
 Parameter parsing, validation order and every error message are ported
 from Thanos's `pkg/api/query/v1.go`, so a client sees the same 400s.
 `query`, `time`, `start`, `end`, `step`, `timeout`, `lookback_delta`,
-`partial_response`, `storeMatch[]`, `match[]` and `limit` are honoured.
-`dedup`, `max_source_resolution`, `engine` and `shard_info` are
-validated and ignored; `replicaLabels[]`, `stats` and `analyze` are
-ignored. Where it deliberately differs from Thanos:
+`partial_response`, `dedup`, `replicaLabels[]`, `storeMatch[]`,
+`match[]` and `limit` are honoured. `max_source_resolution`, `engine`
+and `shard_info` are validated and ignored; `stats` and `analyze` are
+ignored.
 
-- **No deduplication yet.** Replica labels stay in the results and
-  `dedup=true` does nothing.
+Replica deduplication is Thanos's, done as a step in the query plan.
+With `--query-replica-label prometheus_replica` (or `replicaLabels[]=`
+per query, off with `dedup=false`) the querier puts a `ThanosDedup` node
+above every selector of the plan `promql-engine` made, and the node's
+operator merges the rows that are equal but for the replica labels with
+the penalty algorithm from `pkg/dedup`: the replica with the next sample
+is followed and the other is held back for twice the last interval, so
+the frequency stays a scrape's. Under `rate`, `increase`, `irate` and
+`resets` a replica found behind at a switch is lifted to the last value,
+as Go does, so no false counter reset appears.
+`--query-deduplication-func chain` unions the samples one to one
+instead. The labels endpoints never deduplicate, as in Thanos. Nothing
+of this is in the engine: it only lets a caller build it with the
+node's planner and run a plan the caller has changed. Where it
+deliberately differs from Thanos:
+
 - **Floats and raw data only.** Histogram chunks are skipped and
   downsampled data is never requested.
+- **Stores keep their replica labels.** Thanos asks stores to drop them
+  and reconstructs the replicas from overlapping chunks; here the rows
+  stay apart by their labels and the plan step merges them, so nothing is
+  reconstructed.
 - **What the engine cannot evaluate yet** (binary operators, most
   functions) is a 422 `execution` error reading
   `<feature> is not supported yet`, which Prometheus clients show as a
