@@ -1,17 +1,22 @@
-//! Differential conformance testing against a Prometheus oracle.
+//! Conformance testing for the Rust PromQL engine.
 //!
-//! `promql-engine`'s conformance suite is differential:
-//! `TestQueriesAgainstOldEngine` (`engine/engine_test.go:209`) runs each
-//! case against both the Thanos engine and Prometheus's own and asserts
-//! the results match, which is why `testcases/range_queries.yaml`
-//! carries no expected values at all. Recording Go's current output as
-//! fixtures would rot silently as upstream Prometheus evolves; asking
-//! the reference implementation on every run cannot.
+//! Two suites live here, split by where their notion of "correct" comes
+//! from. The split is the point: they rot in opposite directions, so
+//! running both is worth more than running either twice.
 //!
-//! This crate does the same in Rust. A small Go binary
-//! (`scripts/promql-oracle`) answers "what does Prometheus return for
-//! this load block and query" over a line-based JSON protocol;
-//! [`compare`] then applies Go's own comparison rules.
+//! - [`thanos`] — `thanos-io/promql-engine`'s shared corpus, checked
+//!   against a **live Prometheus**. Upstream's own suite is differential
+//!   for the same reason (`engine/engine_test.go:209`), which is why
+//!   `testcases/range_queries.yaml` carries no expected values at all.
+//!   Recording Go's current output as fixtures would rot silently as
+//!   Prometheus evolves; asking it afresh every run cannot. The cost is
+//!   a Go toolchain and a corpus checkout, so this suite skips when
+//!   either is missing.
+//! - `prometheus` — Prometheus's **own promqltest corpus**, vendored
+//!   under `testdata/prometheus/`, where the expected values ship with
+//!   the questions. Nothing to ask, so nothing to be unavailable: no
+//!   oracle, no Go, no network. This is the suite that will run in CI.
+//!   The corpus is vendored; the runner lands next.
 //!
 //! # Current state
 //!
@@ -22,25 +27,18 @@
 //! specification for what to build next. The passing count is the
 //! progress meter.
 //!
-//! The suite is split in two, and the split is the point:
-//!
-//! - **Harness self-checks** (`tests/selfcheck.rs`) must pass. They
-//!   prove the oracle is reachable, the protocol round-trips, and the
-//!   comparer is correct.
-//! - **Differential cases** (`tests/differential.rs`) pass where the
-//!   engine agrees with Prometheus, fail where it disagrees, and are
-//!   collapsed into one failure where the engine has nothing to say yet.
-//!
-//! A red test is only useful when it is red for the right reason. If a
-//! self-check fails, the plumbing is broken and no differential failure
-//! means anything.
+//! A red test is only useful when it is red for the right reason, so
+//! harness breakage is always reported as such rather than as a failing
+//! engine. `tests/selfcheck.rs` proves the oracle is reachable, the
+//! protocol round-trips and the comparer is correct; if those fail,
+//! no differential failure means anything.
 
 pub mod compare;
 pub mod datafusion;
-pub mod oracle;
 pub mod result;
+pub mod thanos;
 
 pub use compare::{compare, floats_equal, Mismatch};
 pub use datafusion::DataFusionEngine;
-pub use oracle::{Oracle, OracleError};
 pub use result::{Engine, EngineError, Labels, Point, QueryResult, Sample, Series, Unimplemented};
+pub use thanos::oracle::{self, Oracle, OracleError};
