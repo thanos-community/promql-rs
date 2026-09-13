@@ -66,6 +66,12 @@ pub struct Alternative {
     /// upstream's action do" report) can surface it.
     #[allow(dead_code)]
     pub upstream_action: Option<String>,
+    /// The token named by a `%prec` override, which gives the whole
+    /// alternative that token's precedence instead of its own last
+    /// terminal's. Upstream needs exactly one: unary `-` takes `MUL`'s
+    /// precedence, so `-foo + bar` is `(-foo) + bar`. Dropping it
+    /// silently reparses a quarter of the language.
+    pub prec: Option<String>,
 }
 
 impl Alternative {
@@ -291,6 +297,7 @@ impl<'a> Parser<'a> {
     fn parse_alternative(&mut self) -> Result<Alternative> {
         let mut symbols = Vec::new();
         let mut upstream_action = None;
+        let mut prec = None;
         loop {
             self.skip_trivia();
             match self.peek_byte() {
@@ -301,12 +308,11 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 Some(b'%') => {
-                    // `%prec TOKEN` association override. Consume the
-                    // directive + the token. We don't emit these
-                    // currently, but record for future use.
+                    // `%prec TOKEN`: the alternative borrows that
+                    // token's precedence.
                     if self.eat("%prec") {
                         self.skip_trivia();
-                        let _ = self.read_ident();
+                        prec = Some(self.read_ident());
                         continue;
                     }
                     break;
@@ -329,6 +335,7 @@ impl<'a> Parser<'a> {
         Ok(Alternative {
             symbols,
             upstream_action,
+            prec,
         })
     }
 
@@ -511,6 +518,7 @@ mod tests {
 
         expr : expr PLUS expr        { $$ = yylex.(*parser).add($1, $3) }
              | expr POW expr         { $$ = yylex.(*parser).pow($1, $3) }
+             | PLUS expr %prec POW   { $$ = $2 }
              | IDENT                 { $$ = $1 }
              | NUMBER                { $$ = $1 }
              ;
@@ -532,7 +540,7 @@ mod tests {
         assert_eq!(g.rules[0].alternatives[0].symbols, vec!["expr"]);
         let expr_rule = &g.rules[1];
         assert_eq!(expr_rule.lhs, "expr");
-        assert_eq!(expr_rule.alternatives.len(), 4);
+        assert_eq!(expr_rule.alternatives.len(), 5);
         assert_eq!(
             expr_rule.alternatives[0].symbols,
             vec!["expr", "PLUS", "expr"]
@@ -542,6 +550,11 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("add"));
+        // The `%prec` override belongs to the alternative, not to the
+        // symbols: dropping it would reparse the language silently.
+        assert_eq!(expr_rule.alternatives[0].prec, None);
+        assert_eq!(expr_rule.alternatives[2].symbols, vec!["PLUS", "expr"]);
+        assert_eq!(expr_rule.alternatives[2].prec.as_deref(), Some("POW"));
     }
 
     #[test]

@@ -177,10 +177,14 @@ fn emit_rule(
             });
             sc.unmapped_placeholder.clone()
         };
+        let prec = match &alt.prec {
+            Some(token) => format!(" %prec '{}'", sc.rename_token(token)),
+            None => String::new(),
+        };
         if symbols.is_empty() {
-            out.push_str(&format!("{prefix}/* empty */ {{ {body} }}\n"));
+            out.push_str(&format!("{prefix}/* empty */{prec} {{ {body} }}\n"));
         } else {
-            out.push_str(&format!("{prefix}{symbols} {{ {body} }}\n"));
+            out.push_str(&format!("{prefix}{symbols}{prec} {{ {body} }}\n"));
         }
     }
     out.push_str("  ;\n\n");
