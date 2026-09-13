@@ -8,11 +8,20 @@ promql-parser/src/grammar.y linguist-generated=true
 # Emitted by scripts/gen-conformance from upstream's parse_test.go.
 promql-parser/tests/fixtures/parse_test_corpus.json linguist-generated=true
 
-# Maintained by promql-sync (hash manifest).
-promql-parser/upstream/MANIFEST.toml linguist-generated=true
+# Maintained by promql-sync (hash manifests).
+promql-parser/upstream/MANIFEST.toml                  linguist-generated=true
+promql-conformance/testdata/prometheus/MANIFEST.toml  linguist-generated=true
 
 # Verbatim copies from prometheus/prometheus@<pinned sha>. Not our
 # source of truth to modify — the `promql-sync pull --target <sha>`
 # tool is the only thing that writes here.
 promql-parser/upstream/*.go    linguist-vendored=true
 promql-parser/upstream/*.y     linguist-vendored=true
+
+# Prometheus's own promqltest corpus, replayed verbatim against our
+# engine. See testdata/prometheus/UPSTREAM.md.
+promql-conformance/testdata/prometheus/*.test linguist-vendored=true
+
+# Records which of those evals currently fail, regenerated with
+# PROMQL_PROMQLTEST_BLESS=1.
+promql-conformance/testdata/prometheus/BASELINE.toml linguist-generated=true
