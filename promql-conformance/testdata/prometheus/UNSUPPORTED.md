@@ -14,7 +14,7 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 
 | evals blocked | feature |
 |---:|---|
-| 199 | a binary operator |
+| 203 | a binary operator |
 | 78 | the histogram_quantile function |
 | 57 | a subquery |
 | 56 | the histogram_fraction function |
@@ -25,9 +25,9 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | 13 | the absent function |
 | 13 | the timestamp function |
 | 12 | a scalar literal |
-| 12 | a unary operator |
 | 9 | the quantile_over_time function |
 | 9 | the sort_by_label function |
+| 8 | a unary operator |
 | 8 | the predict_linear function |
 | 8 | the topk aggregation |
 | 7 | the label_join function |
