@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# End to end against a real Thanos: Prometheus scraping itself, a Thanos
-# Sidecar in front of it, the Go `thanos query` as the reference and
-# thanos-query-rs next to it. The same requests go to both queriers and
-# the JSON is diffed after normalizing what legitimately differs (result
-# order, float noise, Thanos's empty "analysis" object).
+# End to end against a real Thanos: two Prometheus replicas scraping each
+# other, a Thanos Sidecar in front of each, the Go `thanos query` as the
+# reference and thanos-query-rs next to it, both deduplicating along the
+# `replica` label. The same requests go to both queriers and the JSON is
+# diffed after normalizing what legitimately differs (result order, float
+# noise, Thanos's empty "analysis" object).
 #
 # Needs: prometheus and thanos (binaries on PATH, or PROMETHEUS_BIN /
 # THANOS_BIN; set THANOS_SRC to a Thanos checkout to `go build` it
 # instead, which is also the fallback when no thanos is on PATH), jq,
-# curl, cargo. Listens on 19000-19094.
+# curl, cargo. Listens on 19000-19001 and 19090-19096.
 #
 #   scripts/e2e-thanos.sh                        # ~4 minutes, mostly warm-up
 #   THANOS_SRC=~/src/github.com/thanos-io/thanos scripts/e2e-thanos.sh
@@ -24,12 +25,15 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
 WARMUP=${WARMUP:-180}
 RANGE=${RANGE:-90}
-PROM_PORT=19000
-SIDECAR_GRPC=19090
-SIDECAR_HTTP=19091
+PROM_A_PORT=19000
+PROM_B_PORT=19001
+SIDECAR_A_GRPC=19090
+SIDECAR_A_HTTP=19091
 GO_HTTP=19092
 GO_GRPC=19093
 RS_HTTP=19094
+SIDECAR_B_GRPC=19095
+SIDECAR_B_HTTP=19096
 
 cleanup() {
   local status=$?
@@ -64,22 +68,29 @@ RS_BIN=$(cd "$ROOT" && cargo build -p thanos-query-rs --message-format=json 2>/d
   | jq -r 'select(.reason == "compiler-artifact" and .executable != null and (.target.name == "thanos-query-rs")) | .executable' | tail -1)
 [ -x "$RS_BIN" ] || { echo "could not find the built thanos-query-rs binary" >&2; exit 2; }
 
-cat >"$WORK/prometheus.yml" <<EOF
+# Two replicas of one Prometheus, told apart by the `replica` external
+# label, both scraping both; a Sidecar in front of each.
+replica() { # name prometheus-port sidecar-grpc-port sidecar-http-port
+  local name=$1 port=$2 grpc=$3 http=$4
+  cat >"$WORK/prometheus-$name.yml" <<EOF
 global:
   scrape_interval: 5s
   external_labels:
-    replica: a
+    replica: $name
 scrape_configs:
   - job_name: prometheus
     static_configs:
-      - targets: ['localhost:$PROM_PORT']
+      - targets: ['localhost:$PROM_A_PORT', 'localhost:$PROM_B_PORT']
 EOF
-
-"$PROMETHEUS_BIN" --config.file="$WORK/prometheus.yml" --storage.tsdb.path="$WORK/tsdb" \
-  --web.listen-address="0.0.0.0:$PROM_PORT" >"$WORK/prometheus.log" 2>&1 &
-"$THANOS_BIN" sidecar --prometheus.url="http://localhost:$PROM_PORT" --tsdb.path="$WORK/tsdb" \
-  --grpc-address="0.0.0.0:$SIDECAR_GRPC" --http-address="0.0.0.0:$SIDECAR_HTTP" >"$WORK/sidecar.log" 2>&1 &
-"$THANOS_BIN" query --endpoint="localhost:$SIDECAR_GRPC" --http-address="0.0.0.0:$GO_HTTP" \
+  "$PROMETHEUS_BIN" --config.file="$WORK/prometheus-$name.yml" --storage.tsdb.path="$WORK/tsdb-$name" \
+    --web.listen-address="0.0.0.0:$port" >"$WORK/prometheus-$name.log" 2>&1 &
+  "$THANOS_BIN" sidecar --prometheus.url="http://localhost:$port" --tsdb.path="$WORK/tsdb-$name" \
+    --grpc-address="0.0.0.0:$grpc" --http-address="0.0.0.0:$http" >"$WORK/sidecar-$name.log" 2>&1 &
+}
+replica a "$PROM_A_PORT" "$SIDECAR_A_GRPC" "$SIDECAR_A_HTTP"
+replica b "$PROM_B_PORT" "$SIDECAR_B_GRPC" "$SIDECAR_B_HTTP"
+"$THANOS_BIN" query --endpoint="localhost:$SIDECAR_A_GRPC" --endpoint="localhost:$SIDECAR_B_GRPC" \
+  --query.replica-label=replica --http-address="0.0.0.0:$GO_HTTP" \
   --grpc-address="0.0.0.0:$GO_GRPC" >"$WORK/query.log" 2>&1 &
 
 wait_for() {
@@ -91,13 +102,16 @@ wait_for() {
   tail -20 "$WORK"/*.log >&2 || true
   exit 1
 }
-wait_for "http://localhost:$PROM_PORT/-/ready" prometheus
-wait_for "http://localhost:$SIDECAR_HTTP/-/ready" sidecar
+wait_for "http://localhost:$PROM_A_PORT/-/ready" "prometheus a"
+wait_for "http://localhost:$PROM_B_PORT/-/ready" "prometheus b"
+wait_for "http://localhost:$SIDECAR_A_HTTP/-/ready" "sidecar a"
+wait_for "http://localhost:$SIDECAR_B_HTTP/-/ready" "sidecar b"
 wait_for "http://localhost:$GO_HTTP/-/ready" "thanos query"
 
-# Ours learns the sidecar's Info before serving, so it starts once the
-# sidecar is up.
-"$RS_BIN" --endpoint="localhost:$SIDECAR_GRPC" --http-address="0.0.0.0:$RS_HTTP" \
+# Ours learns the sidecars' Info before serving, so it starts once they
+# are up.
+"$RS_BIN" --endpoint="localhost:$SIDECAR_A_GRPC" --endpoint="localhost:$SIDECAR_B_GRPC" \
+  --query-replica-label=replica --http-address="0.0.0.0:$RS_HTTP" \
   --endpoint-info-interval=5s >"$WORK/query-rs.log" 2>&1 &
 wait_for "http://localhost:$RS_HTTP/api/v1/status/buildinfo" thanos-query-rs
 
@@ -140,15 +154,20 @@ START=$(( END - RANGE ))
 for q in \
   'up' \
   'sum by (job) (up)' \
+  'count by (replica) (up)' \
   'rate(prometheus_http_requests_total[1m])' \
   'sum(rate(prometheus_http_requests_total[1m]))' \
   'count_over_time(up[10m])' \
   'max_over_time(process_resident_memory_bytes[5m])'; do
   compare /api/v1/query_range "query=$(enc "$q")&start=$START&end=$END&step=15"
 done
-for q in 'up' 'sum(up)' 'rate(prometheus_http_requests_total[2m])'; do
+for q in 'up' 'sum(up)' 'count(up)' 'rate(prometheus_http_requests_total[2m])'; do
   compare /api/v1/query "query=$(enc "$q")&time=$END"
 done
+# Deduplication switched off, or along another label, per request.
+compare /api/v1/query_range "query=up&start=$START&end=$END&step=15&dedup=false"
+compare /api/v1/query "query=$(enc 'count(up)')&time=$END&dedup=false"
+compare /api/v1/query "query=$(enc 'count(up)')&time=$END&replicaLabels%5B%5D=instance"
 compare /api/v1/labels "start=$START&end=$END"
 compare /api/v1/labels "start=$START&end=$END&match%5B%5D=up"
 compare /api/v1/label/job/values "start=$START&end=$END"
