@@ -7,27 +7,34 @@
 //!
 //! # What green means
 //!
-//! Not "the engine passes PromQL". It means *exactly* the evals recorded
-//! in `testdata/prometheus/BASELINE.toml` are still the ones not
-//! passing. A case that starts passing, stops passing, changes how it
-//! fails, or stops existing all turn this red — see
-//! [`promql_conformance::prometheus::baseline`] for why each direction
-//! has to fail closed.
+//! Everything named in `testdata/prometheus/SUPPORTED.toml` still
+//! passes. That file is the list of what this engine is expected to do
+//! *right now*, and nothing on it may ever stop working.
 //!
-//! Every run prints a census regardless, so the real numbers are never
-//! hidden behind a green tick.
+//! It is an allowlist, so the rest of the corpus runs without gating
+//! anything. Three things turn CI red: a listed eval stops passing, an
+//! unlisted eval starts passing (declare it), or a listed eval stops
+//! existing after an upstream re-pin.
 //!
-//! # Reading the output
+//! # Seeing where we stand
 //!
-//! Trials are registered for evals that **pass** and for **violations**
-//! of the baseline. Evals that fail exactly as recorded are counted, not
-//! registered — several hundred permanently-red trials would bury the
-//! few that mean something.
+//! Just run it. The per-file scoreboard and the missing-feature table
+//! print on every run, gated or not — a green tick never hides how much
+//! of PromQL is left.
 //!
-//! - `PROMQL_PROMQLTEST_PER_CASE=1` ignores the baseline and gives every
-//!   eval its own trial, failing as it really is. This is the view for
-//!   working on the engine.
-//! - `PROMQL_PROMQLTEST_BLESS=1` rewrites the baseline from this run.
+//! ```sh
+//! cargo test -p promql-conformance --test promqltest
+//!
+//! # every eval as its own trial, failing as it really is
+//! PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest
+//!
+//! # ...narrowed to one file, or one feature you are implementing
+//! PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest -- operators/
+//! PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest -- topk
+//! ```
+//!
+//! `PROMQL_PROMQLTEST_BLESS=1` rewrites `SUPPORTED.toml` and
+//! `UNSUPPORTED.md` from what actually passes.
 //!
 //! # What is not asserted
 //!
@@ -36,13 +43,15 @@
 //! and reported, but not checked; the count is printed so the gap stays
 //! visible rather than silently passing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use promql_conformance::prometheus::baseline::{self, Baseline, Violation};
-use promql_conformance::prometheus::{load_corpus, run_script, Outcome, Verdict};
+use promql_conformance::prometheus::supported::{self, Supported};
+use promql_conformance::prometheus::{
+    inventory_markdown, load_corpus, run_script, scoreboard, Outcome, Verdict,
+};
 use promql_conformance::DataFusionEngine;
 
 fn main() -> ExitCode {
@@ -61,81 +70,102 @@ fn main() -> ExitCode {
         .flat_map(|script| run_script(engine(), script))
         .collect();
 
-    census(corpus.len(), &outcomes);
+    // Read it even when blessing: the "all" batches in it are human
+    // choices that a bless has to preserve rather than overwrite.
+    let declared = match Supported::load(&supported::path()) {
+        Ok(s) => s,
+        // A bless can create the file, but must not paper over a
+        // corrupt one: losing the "all" batches in it would silently
+        // weaken the gate.
+        Err(supported::Error::Read { source, .. })
+            if supported::bless_requested() && source.kind() == ErrorKind::NotFound =>
+        {
+            eprintln!("no {} yet — creating it", supported::FILE_NAME);
+            Supported::default()
+        }
+        Err(e) => {
+            eprintln!("cannot read the supported list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    if baseline::bless_requested() {
-        let baseline = Baseline::from_outcomes(&outcomes);
-        return match baseline.save(&baseline::path()) {
-            Ok(()) => {
-                eprintln!(
-                    "\nwrote {} entries to {}",
-                    baseline.len(),
-                    baseline::path().display()
-                );
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("\ncannot write the baseline: {e}");
-                ExitCode::FAILURE
-            }
-        };
+    eprint!("{}", scoreboard(&outcomes, &declared));
+    annotations_note(&outcomes);
+
+    if supported::bless_requested() {
+        return bless(&outcomes, &declared);
     }
 
-    let trials = if per_case_requested() {
-        per_case_trials(&outcomes)
+    let trials = if all_requested() {
+        every_eval(&outcomes)
     } else {
-        match Baseline::load(&baseline::path()) {
-            Ok(b) => gated_trials(&b, &outcomes),
-            Err(e) => {
-                eprintln!("\ncannot read the baseline: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+        gated(&declared, &outcomes)
     };
 
     libtest_mimic::run(&args, trials).exit_code()
 }
 
-/// One trial per passing eval, plus one per baseline violation. Evals
-/// that do not pass exactly as recorded produce no trial at all.
-fn gated_trials(baseline: &Baseline, outcomes: &[Outcome]) -> Vec<Trial> {
-    let violations = baseline::check(baseline, outcomes);
+/// Rewrite both generated files from this run.
+fn bless(outcomes: &[Outcome], previous: &Supported) -> ExitCode {
+    let (next, downgrades) = Supported::from_outcomes(outcomes, previous);
 
-    // An unexpected pass is both a passing eval and a violation, and two
-    // trials cannot share a name — the violation is the one to report.
-    let flagged: BTreeSet<(&str, &str)> = violations
-        .iter()
-        .filter_map(|v| match v {
-            Violation::UnexpectedPass { file, id } => Some((file.as_str(), id.as_str())),
-            _ => None,
-        })
-        .collect();
+    for warning in &downgrades {
+        eprintln!("  warning: {warning}");
+    }
+
+    if let Err(e) = next.save(&supported::path()) {
+        eprintln!("cannot write the supported list: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let inventory = supported::path().with_file_name("UNSUPPORTED.md");
+    if let Err(e) = std::fs::write(&inventory, inventory_markdown(outcomes)) {
+        eprintln!("cannot write {}: {e}", inventory.display());
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!(
+        "\nwrote {} declared case(s) to {}\nwrote {}",
+        next.len(),
+        supported::path().display(),
+        inventory.display(),
+    );
+    ExitCode::SUCCESS
+}
+
+/// One trial per declared eval, plus one per violation.
+///
+/// Undeclared evals get no trial. Registering several hundred
+/// permanently-red ones would bury the few that mean something, and they
+/// are already accounted for in the scoreboard above.
+fn gated(declared: &Supported, outcomes: &[Outcome]) -> Vec<Trial> {
+    let violations = supported::check(declared, outcomes);
+
+    // A violation and a passing trial can collide on one eval — an
+    // unlisted case that passes is both. The violation is the one to
+    // report, and two trials cannot share a name.
+    let flagged: std::collections::BTreeSet<String> =
+        violations.iter().map(|v| v.trial_name()).collect();
 
     let mut trials: Vec<Trial> = outcomes
         .iter()
-        .filter(|o| o.verdict.is_pass() && !flagged.contains(&(o.file.as_str(), o.id.as_str())))
-        .map(|o| {
-            let name = format!("{}/{}", o.file, o.id);
-            Trial::test(name, || Ok(()))
-        })
+        .filter(|o| o.verdict.is_pass() && declared.covers(&o.file, &o.id))
+        .map(|o| format!("{}/{}", o.file, o.id))
+        .filter(|name| !flagged.contains(&format!("SUPPORTED {name}")))
+        .map(|name| Trial::test(name, || Ok(())))
         .collect();
 
     trials.extend(violations.into_iter().map(|v| {
-        let name = match &v {
-            Violation::UnexpectedPass { file, id }
-            | Violation::Unbaselined { file, id, .. }
-            | Violation::Changed { file, id, .. }
-            | Violation::Orphaned { file, id, .. } => format!("BASELINE {file}/{id}"),
-        };
+        let name = v.trial_name();
         Trial::test(name, move || Err(Failed::from(v.to_string())))
     }));
 
     trials
 }
 
-/// Every eval on its own, baseline ignored: the view for working on the
+/// Every eval on its own, allowlist ignored: the view for working on the
 /// engine rather than for guarding it.
-fn per_case_trials(outcomes: &[Outcome]) -> Vec<Trial> {
+fn every_eval(outcomes: &[Outcome]) -> Vec<Trial> {
     outcomes
         .iter()
         .filter(|o| !matches!(o.verdict, Verdict::Skipped(_)))
@@ -158,59 +188,23 @@ fn per_case_trials(outcomes: &[Outcome]) -> Vec<Trial> {
         .collect()
 }
 
-/// The real numbers, printed on every run so a green tick never stands
-/// in for "the engine passes PromQL".
-fn census(files: usize, outcomes: &[Outcome]) {
-    let mut passed = 0;
-    let mut empty_passes = 0;
-    let mut failed = 0;
-    let mut skipped = 0;
-    let mut unchecked_annotations = 0;
-    let mut unsupported: BTreeMap<&str, usize> = BTreeMap::new();
-
-    for o in outcomes {
-        if o.unchecked_annotations {
-            unchecked_annotations += 1;
-        }
-        match &o.verdict {
-            Verdict::Pass => {
-                passed += 1;
-                if o.expected_rows == 0 {
-                    empty_passes += 1;
-                }
-            }
-            Verdict::Fail(_) => failed += 1,
-            Verdict::Skipped(_) => skipped += 1,
-            Verdict::Unsupported(feature) => *unsupported.entry(feature).or_default() += 1,
-        }
+/// Say how many assertions we parse but do not check, so the gap stays
+/// visible instead of reading as coverage.
+fn annotations_note(outcomes: &[Outcome]) {
+    let unchecked = outcomes.iter().filter(|o| o.unchecked_annotations).count();
+    if unchecked > 0 {
+        eprintln!(
+            "\n{unchecked} evals carry warn/info assertions that are parsed but not \
+             checked — the engine has no annotation channel yet."
+        );
     }
-
-    let unsupported_total: usize = unsupported.values().sum();
-    eprintln!(
-        "promqltest: {files} files, {} evals — {passed} pass, {failed} fail, \
-         {unsupported_total} unsupported, {skipped} skipped\n  \
-         {} of those passes assert a non-empty result; {empty_passes} assert only that \
-         nothing came back.\n  \
-         {unchecked_annotations} evals carry warn/info assertions that are parsed but \
-         not checked.",
-        outcomes.len(),
-        passed - empty_passes,
-    );
-
-    if !unsupported.is_empty() {
-        eprintln!("\nmissing engine features, by evals blocked:");
-        for (feature, count) in &unsupported {
-            eprintln!("  {count:>4}  {feature}");
-        }
-    }
-    eprintln!();
 }
 
-/// Ignore the baseline and give every eval its own trial.
-const PER_CASE_ENV: &str = "PROMQL_PROMQLTEST_PER_CASE";
+/// Ignore the allowlist and give every eval its own trial.
+const ALL_ENV: &str = "PROMQL_PROMQLTEST_ALL";
 
-fn per_case_requested() -> bool {
-    std::env::var_os(PER_CASE_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+fn all_requested() -> bool {
+    std::env::var_os(ALL_ENV).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 fn engine() -> &'static DataFusionEngine {

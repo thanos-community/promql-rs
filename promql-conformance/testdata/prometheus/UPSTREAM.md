@@ -78,13 +78,19 @@ cargo run -p promql-sync -- pull --set promqltest --target <sha>
 
 This rewrites the `.test` files, `MANIFEST.toml` and the pinned SHA in
 `promql-conformance/sync-meta.toml`. Re-pinning moves test content, so
-the conformance baseline must be regenerated in the same change:
+`SUPPORTED.toml` and `UNSUPPORTED.md` must be regenerated in the same
+change:
 
 ```sh
 PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 ```
 
-Review the baseline diff — it is the record of what changed upstream.
+**Read the `SUPPORTED.toml` diff before committing it.** Every removed
+line is coverage that used to exist and no longer does. A re-pin that
+renames or reflows a query moves its case id, so the eval it covered
+silently stops being gated — the suite reports that as an orphan first,
+and re-blessing is what makes it permanent. That review is the entire
+reason the gate is an allowlist.
 
 If upstream adds or removes a file, update the `promqltest` entry in
 `VENDOR_SETS` (`promql-sync/src/main.rs`); the list is explicit on

@@ -346,7 +346,13 @@ fn check_integrity(root: &Path, sets: &[&VendorSet]) -> Result<ExitCode> {
 /// bookkeeping files we write ourselves — `go.mod` among them, which is
 /// a stub keeping the vendored Go out of any parent module's build.
 fn stray_files(dir: &Path, known: &[&str]) -> Result<Vec<String>> {
-    const OURS: &[&str] = &["MANIFEST.toml", "UPSTREAM.md", "BASELINE.toml", "go.mod"];
+    const OURS: &[&str] = &[
+        "MANIFEST.toml",
+        "UPSTREAM.md",
+        "SUPPORTED.toml",
+        "UNSUPPORTED.md",
+        "go.mod",
+    ];
     let mut stray = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let name = entry?.file_name().to_string_lossy().into_owned();

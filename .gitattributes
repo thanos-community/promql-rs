@@ -22,6 +22,9 @@ promql-parser/upstream/*.y     linguist-vendored=true
 # engine. See testdata/prometheus/UPSTREAM.md.
 promql-conformance/testdata/prometheus/*.test linguist-vendored=true
 
-# Records which of those evals currently fail, regenerated with
-# PROMQL_PROMQLTEST_BLESS=1.
-promql-conformance/testdata/prometheus/BASELINE.toml linguist-generated=true
+# Which of those evals we expect to pass (the CI gate) and what the
+# engine is still missing (a roadmap, not a gate). Both regenerated with
+# PROMQL_PROMQLTEST_BLESS=1 — but the "all" batches in SUPPORTED.toml are
+# deliberate human edits that blessing preserves.
+promql-conformance/testdata/prometheus/SUPPORTED.toml   linguist-generated=true
+promql-conformance/testdata/prometheus/UNSUPPORTED.md   linguist-generated=true
