@@ -135,6 +135,11 @@ pub trait SeriesSource: fmt::Debug + Send + Sync {
 ///
 /// Public so that a store which implements [`SeriesSource`] can register
 /// itself as a SQL table for debugging: `SELECT labels, samples FROM …`.
+///
+/// Nothing in this crate constructs one yet. The planner that stacks on
+/// this PR is the first caller; it lives here because it is the other half
+/// of what the trait promises — the shape a store returns, and how the
+/// engine mounts that shape into a plan.
 #[derive(Debug)]
 pub struct SelectorTable {
     plan: Arc<dyn ExecutionPlan>,

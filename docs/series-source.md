@@ -1,6 +1,6 @@
 # The `SeriesSource` trait
 
-*Status: draft for discussion. Companion to #4 (table providers).*
+*Status: draft for discussion. An alternative to #4 (table providers).*
 
 Every PromQL-on-something implementation ends up writing the thing
 Prometheus calls `storage.Querier.Select`: the series matching these
