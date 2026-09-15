@@ -14,6 +14,8 @@ with upstream as Prometheus evolves.
 | `promql-sync/` | Developer-invoked CLI that checks, pulls, and regenerates the port against upstream. |
 | `scripts/gen-conformance/` | Go tool that turns upstream's own parser test suite into a JSON fixture. |
 | `docs/parser-sync.md` | Design rationale for the parser and the sync tooling. |
+| `promql-engine/` | The PromQL engine crate. Today: the `SeriesSource` trait every store implements and the series-batch schema it returns. |
+| `docs/series-source.md` | Design note for `SeriesSource`: the trait and the Arrow shape. |
 
 ## Why hand-porting a parser needs its own tooling
 

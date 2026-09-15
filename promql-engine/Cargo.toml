@@ -1,0 +1,20 @@
+[package]
+name = "promql-engine"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "PromQL evaluation as DataFusion plans over a row-per-series Arrow seam"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+promql-parser = { path = "../promql-parser" }
+regex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
