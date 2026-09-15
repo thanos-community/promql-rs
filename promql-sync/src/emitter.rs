@@ -132,17 +132,19 @@ fn emit_rule(
         .unwrap_or_else(|| "Result<(), ()>".to_string());
 
     out.push_str(&format!("{} -> {}:\n", rule.lhs, return_type));
-    // Filter alternatives that reference skipped rules or that use
-    // upstream's `error` recovery production (grmtools has its own
-    // error-recovery mechanism that we don't lean on, so emitting
+    // Filter alternatives that reference skipped rules or tokens, or
+    // that use upstream's `error` recovery production (grmtools has its
+    // own error-recovery mechanism that we don't lean on, so emitting
     // `error` as a symbol would be an unknown-rule reference).
     let kept_alts: Vec<&Alternative> = rule
         .alternatives
         .iter()
         .filter(|a| {
-            a.symbols
-                .iter()
-                .all(|s| !sc.skip_rules.iter().any(|skip| skip == s) && s != "error")
+            a.symbols.iter().all(|s| {
+                !sc.skip_rules.iter().any(|skip| skip == s)
+                    && !sc.skip_tokens.iter().any(|skip| skip == s)
+                    && s != "error"
+            })
         })
         .collect();
 
@@ -285,7 +287,7 @@ mod tests {
             "{}",
             &result.text[..200]
         );
-        assert!(result.text.contains("\n%start expr\n"));
+        assert!(result.text.contains("\n%start start\n"));
         assert!(result.text.contains("%left"));
         assert!(result.text.contains("%%\n"));
 
@@ -297,7 +299,19 @@ mod tests {
         assert!(result.text.contains("expr 'ADD' bin_modifier expr"));
 
         // At least the rules we've mapped should have emitted.
-        for rule in &["expr", "binary_expr", "vector_selector", "label_matchers"] {
+        for rule in &[
+            "expr",
+            "binary_expr",
+            "vector_selector",
+            "label_matchers",
+            // Series descriptions share `metric` / `label_set` with the
+            // expression grammar and reach them through `start`.
+            "series_description",
+            "series_values",
+            "series_item",
+            "metric",
+            "label_set",
+        ] {
             assert!(
                 result.rules_emitted.iter().any(|r| r == rule),
                 "expected rule {rule} in emitted set"
@@ -305,12 +319,24 @@ mod tests {
         }
 
         // Skip-list rules must not appear.
-        for rule in &["series_description", "histogram_desc_map"] {
+        for rule in &["histogram_desc_map", "bucket_set"] {
             assert!(
                 !result.rules_emitted.iter().any(|r| r == rule),
                 "rule {rule} should have been skipped"
             );
         }
+
+        // `series_item`'s histogram alternatives reference skipped
+        // rules, so they must have been filtered out of the emitted
+        // rule while the float alternatives survive.
+        assert!(result
+            .text
+            .contains("series_value signed_number 'TIMES' uint"));
+        assert!(!result.text.contains("histogram_series_value"));
+
+        // Upstream's `EOF` token has no id on our side; alts using it
+        // are dropped via `skip_tokens`.
+        assert!(!result.text.contains("'EOF'"));
     }
 
     fn locate_crate_dir() -> std::path::PathBuf {
