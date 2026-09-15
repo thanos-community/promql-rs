@@ -170,3 +170,38 @@ fn expression_parsing_is_unaffected() {
     // Conversely, an expression is not a series description.
     assert!(parse_series_desc("rate(foo[5m])").is_err());
 }
+
+// -------- repetition counts --------
+
+#[test]
+fn rejects_repeat_count_at_u64_max() {
+    // `u64::MAX` is the largest value that still parses as the count, so
+    // it is what reaches the expansion: one more digit and `parse::<u64>`
+    // fails on its own. Unbounded, `series_repeat` computed
+    // `count as usize + 1` and panicked with "attempt to add with
+    // overflow" in debug, or wrapped to a zero-capacity Vec and looped
+    // 2^64 times in release. It must be an ordinary parse error.
+    assert!(parse_series_desc("metric 1x18446744073709551615").is_err());
+    assert!(parse_series_desc("metric _x18446744073709551615").is_err());
+}
+
+#[test]
+fn rejects_repeat_count_above_limit() {
+    assert!(parse_series_desc("metric 1x1000001").is_err());
+    assert!(parse_series_desc("metric _x1000001").is_err());
+}
+
+#[test]
+fn accepts_repeat_count_at_limit() {
+    // The bound is inclusive, and `1x<count>` yields `count + 1` points.
+    let sd = parse("metric 1x1000000");
+    assert_eq!(sd.values.len(), 1_000_001);
+}
+
+#[test]
+fn rejects_repeat_count_wider_than_u64() {
+    // Already an error before the bound existed — `parse::<u64>` refuses
+    // it — but worth pinning so the two rejection paths stay distinct.
+    assert!(parse_series_desc("metric 1x18446744073709551616").is_err());
+}
+

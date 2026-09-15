@@ -858,6 +858,9 @@ pub fn extend_values(
 /// Note the asymmetry with [`series_repeat`]: upstream's `BLANK TIMES
 /// uint` loop is `i < $3`, not `i <= $3`, so `_x5` yields exactly 5
 /// omitted points while `1x5` yields 6.
+///
+/// `count` is bounded by [`MAX_REPEAT_COUNT`] in [`parse_uint`], the
+/// only rule that produces it.
 pub fn repeat_omitted(count: u64) -> Vec<SequenceValue> {
     vec![SequenceValue::omitted(); count as usize]
 }
@@ -867,6 +870,10 @@ pub fn repeat_omitted(count: u64) -> Vec<SequenceValue> {
 /// Upstream loops `for i := 0; i <= count; i++`, i.e. it emits
 /// `count + 1` points: "Add an additional value for time 0, which we
 /// ignore in tests". So `46.00+13.00x40` is 41 values, not 40.
+///
+/// `count` is bounded by [`MAX_REPEAT_COUNT`] in [`parse_uint`], the
+/// only rule that produces it; that is what makes the `count + 1`
+/// below safe from overflow.
 pub fn series_repeat(start: f64, step: f64, count: u64) -> Vec<SequenceValue> {
     let mut out = Vec::with_capacity(count as usize + 1);
     let mut val = start;
@@ -887,12 +894,33 @@ pub fn stale_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Resu
     Ok(f64::from_bits(STALE_NAN))
 }
 
+/// Upper bound on an `x<count>` repetition.
+///
+/// Upstream has no explicit limit: Go would simply attempt the
+/// allocation. Here the count is a `u64` taken straight from the input
+/// text and [`series_repeat`] emits `count + 1` points, so an unbounded
+/// value overflows `usize` on a 64-bit target (`metric 1x18446744073709551615`
+/// panicked with "attempt to add with overflow" before this bound
+/// existed) or asks for an allocation no test could want. promqltest's
+/// own fixtures stay in the low thousands, so this is far above any
+/// legitimate input while keeping a bad one a parse error.
+const MAX_REPEAT_COUNT: u64 = 1_000_000;
+
 /// `uint : NUMBER` — the repetition count after `x`.
+///
+/// Rejects counts above [`MAX_REPEAT_COUNT`], which is what keeps
+/// [`series_repeat`] and [`repeat_omitted`] from being handed a value
+/// they cannot allocate for. Both reach their count through this rule,
+/// so bounding it here covers both.
 pub fn parse_uint<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Result<u64, ()> {
-    lexer
+    let count = lexer
         .span_str(lx.map_err(|_| ())?.span())
         .parse::<u64>()
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    if count > MAX_REPEAT_COUNT {
+        return Err(());
+    }
+    Ok(count)
 }
 
 // -------- shared parsers (number, duration, string) --------
