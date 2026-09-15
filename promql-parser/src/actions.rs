@@ -11,9 +11,9 @@
 //! the `__gt_lexer` / `__gt_input` lifetimes in grmtools' generated
 //! parser.
 //!
-//! Current scope: the subset invoked by the core expression grammar
-//! (see `src/grammar.y` for the matching rule coverage). Helpers for
-//! series descriptions, histogram descriptors, fill modifiers, and
+//! Current scope: the subset invoked by the core expression and series
+//! description grammars (see `src/grammar.y` for the matching rule
+//! coverage). Helpers for histogram descriptors, fill modifiers, and
 //! duration-expression arithmetic are not yet implemented.
 
 // Every action returns `Result<T, ()>`: that is grmtools' convention for

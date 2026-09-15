@@ -205,3 +205,35 @@ fn rejects_repeat_count_wider_than_u64() {
     assert!(parse_series_desc("metric 1x18446744073709551616").is_err());
 }
 
+// -------- parse_metric --------
+
+#[test]
+fn parses_bare_label_set() {
+    let matchers = promql_parser::parse_metric(r#"{foo="bar", baz="qux"}"#).expect("parses");
+    let pairs: Vec<(&str, &str)> = matchers
+        .iter()
+        .map(|m| (m.name.as_str(), m.value.as_str()))
+        .collect();
+    assert_eq!(pairs, vec![("foo", "bar"), ("baz", "qux")]);
+}
+
+#[test]
+fn parses_metric_name_with_labels() {
+    let matchers =
+        promql_parser::parse_metric(r#"http_requests_total{job="api"}"#).expect("parses");
+    let pairs: Vec<(&str, &str)> = matchers
+        .iter()
+        .map(|m| (m.name.as_str(), m.value.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![("__name__", "http_requests_total"), ("job", "api")]
+    );
+}
+
+#[test]
+fn parse_metric_rejects_a_value_sequence() {
+    // A metric is the label set alone; the trailing values belong to
+    // `parse_series_desc`.
+    assert!(promql_parser::parse_metric("metric 1 2 3").is_err());
+}
