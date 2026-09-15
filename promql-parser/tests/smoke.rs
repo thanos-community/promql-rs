@@ -187,3 +187,46 @@ fn metric_selector_api() {
         .any(|m| m.name == "__name__" && m.value == "up"));
     assert!(matchers.iter().any(|m| m.name == "job" && m.value == "api"));
 }
+
+// -------- error positions --------
+
+#[test]
+fn parse_error_points_at_the_offending_token() {
+    // Every error used to be reported as `0..0`, so a consumer could not
+    // tell where the problem was without re-parsing the message text.
+    let input = "sum(foo) by";
+    let errs = parse_expr(input).expect_err("rejects");
+    let range = errs.0.first().expect("at least one error").range;
+    assert!(
+        range.start > 0,
+        "expected a position past the start of the input, got {range:?}"
+    );
+    assert!(
+        range.end as usize <= input.len(),
+        "range {range:?} runs past the input"
+    );
+}
+
+#[test]
+fn parse_error_position_tracks_the_input() {
+    // The same malformed tail, pushed further along, has to report a
+    // correspondingly later position — otherwise the range is constant
+    // rather than meaningful.
+    let near = parse_expr("foo +").expect_err("rejects");
+    let far = parse_expr("foo + bar + baz +").expect_err("rejects");
+    let near_start = near.0.first().expect("an error").range.start;
+    let far_start = far.0.first().expect("an error").range.start;
+    assert!(
+        far_start > near_start,
+        "expected the later error to report a later offset, got {far_start} vs {near_start}"
+    );
+}
+
+#[test]
+fn empty_input_error_covers_the_input() {
+    // No lexeme to blame, so the range spans what was given rather than
+    // claiming a misleading `0..0`.
+    let errs = parse_expr("").expect_err("rejects");
+    let range = errs.0.first().expect("an error").range;
+    assert_eq!(range.start, 0);
+}
