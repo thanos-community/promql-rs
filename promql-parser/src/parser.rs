@@ -90,16 +90,50 @@ impl<'input> NonStreamingLexer<'input, LexerTypes> for InjectingLexer<'_, 'input
     }
 }
 
-/// Run the grammar over `input` in the given parse mode. `start_token`
-/// selects the `start` alternative; upstream's `parseGenerated`.
-fn parse_generated(
-    input: &str,
-    start_token: u32,
-    series_mode: bool,
-) -> Result<ParseResult, ParseErrors> {
+/// Which `start` alternative the grammar takes, and therefore which
+/// lexer feeds it.
+///
+/// Upstream keeps these as two independent values — a `START_*` token
+/// for the parser and a `seriesDesc` bool for the lexer — and relies on
+/// each entry point pairing them correctly. Pairing them in one type
+/// instead makes a disagreeing combination (say, `START_SERIES_DESCRIPTION`
+/// lexed by `lexer.l`) unrepresentable rather than merely unlikely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseMode {
+    Expression,
+    MetricSelector,
+    SeriesDescription,
+    Metric,
+}
+
+impl ParseMode {
+    /// The pseudo-token prepended to the lexeme stream to select the
+    /// `start` alternative.
+    fn start_token(self) -> u32 {
+        match self {
+            Self::Expression => start_tokens::START_EXPRESSION,
+            Self::MetricSelector => start_tokens::START_METRIC_SELECTOR,
+            Self::SeriesDescription => start_tokens::START_SERIES_DESCRIPTION,
+            Self::Metric => start_tokens::START_METRIC,
+        }
+    }
+
+    /// Whether this mode lexes with `series.l` — upstream's `seriesDesc`
+    /// lexer mode — rather than `lexer.l`.
+    fn uses_series_lexer(self) -> bool {
+        matches!(self, Self::SeriesDescription | Self::Metric)
+    }
+}
+
+/// Run the grammar over `input` in the given parse mode. Upstream's
+/// `parseGenerated`.
+fn parse_generated(input: &str, mode: ParseMode) -> Result<ParseResult, ParseErrors> {
+    // Declared out here, initialised inside the branches: the boxed
+    // lexer borrows from its `LexerDef`, so the def has to outlive it.
+    // This is a lifetime constraint, not a lazy initialisation.
     let expr_def;
     let series_def;
-    let lexer = if series_mode {
+    let lexer = if mode.uses_series_lexer() {
         series_def = crate::series_l::lexerdef();
         Box::new(series_def.lexer(input)) as Box<dyn NonStreamingLexer<'_, LexerTypes>>
     } else {
@@ -108,7 +142,7 @@ fn parse_generated(
     };
     let injecting = InjectingLexer {
         inner: lexer.as_ref(),
-        inject: start_token,
+        inject: mode.start_token(),
     };
 
     let (ast, errs) = crate::grammar::parse(&injecting);
@@ -141,7 +175,7 @@ fn unexpected_mode(what: &str, input: &str) -> ParseErrors {
 
 /// Parse a PromQL expression. Upstream: `parser.ParseExpr`.
 pub fn parse_expr(input: &str) -> Result<Expr, ParseErrors> {
-    match parse_generated(input, start_tokens::START_EXPRESSION, false)? {
+    match parse_generated(input, ParseMode::Expression)? {
         ParseResult::Expr(e) => Ok(e),
         _ => Err(unexpected_mode("an expression", input)),
     }
@@ -150,7 +184,7 @@ pub fn parse_expr(input: &str) -> Result<Expr, ParseErrors> {
 /// Parse a metric selector, returning its label matchers.
 /// Upstream: `parser.ParseMetricSelector`.
 pub fn parse_metric_selector(input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
-    let expr = match parse_generated(input, start_tokens::START_METRIC_SELECTOR, false)? {
+    let expr = match parse_generated(input, ParseMode::MetricSelector)? {
         ParseResult::Expr(e) => e,
         _ => return Err(unexpected_mode("a metric selector", input)),
     };
@@ -182,7 +216,7 @@ pub fn parse_metric_selector(input: &str) -> Result<Vec<LabelMatcher>, ParseErro
 /// still on the sidecar's skip list, so they are rejected as parse
 /// errors.
 pub fn parse_series_desc(input: &str) -> Result<SeriesDescription, ParseErrors> {
-    match parse_generated(input, start_tokens::START_SERIES_DESCRIPTION, true)? {
+    match parse_generated(input, ParseMode::SeriesDescription)? {
         ParseResult::SeriesDescription(sd) => Ok(sd),
         _ => Err(unexpected_mode("a series description", input)),
     }
@@ -191,7 +225,7 @@ pub fn parse_series_desc(input: &str) -> Result<SeriesDescription, ParseErrors> 
 /// Parse a bare label set (`{foo="bar"}`). Upstream's `START_METRIC`
 /// mode, used by promtool's unit-test loader.
 pub fn parse_metric(input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
-    match parse_generated(input, start_tokens::START_METRIC, true)? {
+    match parse_generated(input, ParseMode::Metric)? {
         ParseResult::Metric(m) => Ok(m),
         _ => Err(unexpected_mode("a metric", input)),
     }
