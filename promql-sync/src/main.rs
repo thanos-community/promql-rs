@@ -1,15 +1,30 @@
-//! Developer-invoked sync tool for `promql-parser`.
+//! Developer-invoked sync tool for the files we vendor verbatim from
+//! prometheus/prometheus.
 //!
 //! Per `docs/parser-sync.md` this tool:
 //!
-//! - `--check`: verifies that every file listed in
-//!   `promql-parser/upstream/MANIFEST.toml` matches its recorded
-//!   sha256. Runs in CI to catch accidental edits to vendored files.
-//! - `--target <sha-or-tag>`: fetches the upstream vendored files at
-//!   the target revision, diffs them against the currently-vendored
-//!   copies, and writes a Markdown + JSON report with a change
-//!   summary. Mutates only the files under `upstream/` and
-//!   `sync-meta.toml` — never commits, branches, or pushes.
+//! - `check`: verifies that every vendored file matches the sha256
+//!   recorded in its set's `MANIFEST.toml`. Runs in CI to catch
+//!   accidental edits to files that are meant to be verbatim copies.
+//! - `pull --target <sha-or-tag>`: fetches the upstream files at the
+//!   target revision, diffs them against the currently-vendored copies,
+//!   and writes a Markdown report with a change summary. Mutates only
+//!   the vendored files and `sync-meta.toml` — never commits, branches,
+//!   or pushes.
+//!
+//! # Vendored sets
+//!
+//! There are two, listed in [`VENDOR_SETS`], and they track upstream
+//! independently:
+//!
+//! - `parser` — the Go sources our parser is ported from. Translated
+//!   line by line into Rust, so a bump here means human work.
+//! - `promqltest` — Prometheus's own `.test` corpus. Data, replayed
+//!   verbatim; a bump here means regenerating the conformance baseline.
+//!
+//! `check` covers every set. `pull` takes one at a time, because
+//! adopting an upstream change is a per-set decision with different
+//! follow-up work in each case.
 //!
 //! Structural classification (Green / Yellow / Red per the design doc)
 //! is a follow-up. Today the tool gives an honest "what changed, pass
@@ -33,25 +48,114 @@ mod yacc;
 
 const UPSTREAM_OWNER: &str = "prometheus";
 const UPSTREAM_REPO: &str = "prometheus";
-const UPSTREAM_SUBDIR: &str = "promql/parser";
 
-/// Files vendored under `upstream/`. Keep in sync with `UPSTREAM.md`.
-const VENDORED_FILES: &[&str] = &[
-    "generated_parser.y",
-    "lex.go",
-    "ast.go",
-    "parse.go",
-    "functions.go",
-    "printer.go",
-];
+/// One directory of files copied verbatim from prometheus/prometheus,
+/// with its own manifest and its own pinned revision.
+struct VendorSet {
+    /// Selector for `--set`.
+    name: &'static str,
+    /// Where the copies live, relative to the repo root. Holds
+    /// `MANIFEST.toml` and `UPSTREAM.md` alongside them.
+    vendor_dir: &'static str,
+    /// Where this set's pinned revision is recorded.
+    sync_meta: &'static str,
+    /// The directory these files come from upstream.
+    upstream_subdir: &'static str,
+    /// The filenames, listed rather than globbed from the upstream
+    /// tree: adopting a newly-added upstream file should be a decision
+    /// someone makes, not something a sync quietly pulls in.
+    files: &'static [&'static str],
+}
+
+impl VendorSet {
+    fn dir(&self, root: &Path) -> PathBuf {
+        root.join(self.vendor_dir)
+    }
+
+    fn manifest_path(&self, root: &Path) -> PathBuf {
+        self.dir(root).join("MANIFEST.toml")
+    }
+
+    fn sync_meta_path(&self, root: &Path) -> PathBuf {
+        root.join(self.sync_meta)
+    }
+}
+
+/// The Go sources our parser is a port of. Keep in sync with
+/// `promql-parser/upstream/UPSTREAM.md`.
+const PARSER: VendorSet = VendorSet {
+    name: "parser",
+    vendor_dir: "promql-parser/upstream",
+    sync_meta: "promql-parser/sync-meta.toml",
+    upstream_subdir: "promql/parser",
+    files: &[
+        "generated_parser.y",
+        "lex.go",
+        "ast.go",
+        "parse.go",
+        "functions.go",
+        "printer.go",
+    ],
+};
+
+/// Prometheus's promqltest corpus. Keep in sync with
+/// `promql-conformance/testdata/prometheus/UPSTREAM.md`.
+const PROMQLTEST: VendorSet = VendorSet {
+    name: "promqltest",
+    vendor_dir: "promql-conformance/testdata/prometheus",
+    sync_meta: "promql-conformance/sync-meta.toml",
+    upstream_subdir: "promql/promqltest/testdata",
+    files: &[
+        "aggregators.test",
+        "at_modifier.test",
+        "collision.test",
+        "duration_expression.test",
+        "extended_vectors.test",
+        "fill-modifier.test",
+        "functions.test",
+        "histograms.test",
+        "info.test",
+        "limit.test",
+        "literals.test",
+        "name_label_dropping.test",
+        "native_histograms.test",
+        "operators.test",
+        "range_queries.test",
+        "selectors.test",
+        "staleness.test",
+        "subquery.test",
+        "trig_functions.test",
+        "type_and_unit.test",
+    ],
+};
+
+const VENDOR_SETS: &[&VendorSet] = &[&PARSER, &PROMQLTEST];
+
+/// Resolve `--set`. `None` means every set, which is what `check`
+/// wants and what CI runs.
+fn resolve_sets(name: Option<&str>) -> Result<Vec<&'static VendorSet>> {
+    let Some(name) = name else {
+        return Ok(VENDOR_SETS.to_vec());
+    };
+    VENDOR_SETS
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| vec![*s])
+        .with_context(|| {
+            let known: Vec<_> = VENDOR_SETS.iter().map(|s| s.name).collect();
+            format!("unknown --set {name:?}; known sets: {}", known.join(", "))
+        })
+}
 
 #[derive(Debug, Parser)]
-#[command(name = "promql-sync", about = "Upstream sync tool for promql-parser")]
+#[command(
+    name = "promql-sync",
+    about = "Upstream sync tool for files vendored from prometheus/prometheus"
+)]
 struct Cli {
-    /// Path to the crate root. Defaults to `promql-parser`
-    /// relative to the current working directory.
-    #[arg(long, value_name = "PATH", global = true)]
-    crate_dir: Option<PathBuf>,
+    /// Repository root. Defaults to the current working directory.
+    #[arg(long, value_name = "PATH", global = true, default_value = ".")]
+    root: PathBuf,
 
     #[command(subcommand)]
     command: Command,
@@ -61,13 +165,22 @@ struct Cli {
 enum Command {
     /// Verify vendored-file hashes match MANIFEST.toml. No network
     /// access, no mutations. Intended for CI.
-    Check,
+    Check {
+        /// Limit to one vendored set. Defaults to checking all of them.
+        #[arg(long, value_name = "NAME")]
+        set: Option<String>,
+    },
 
     /// Fetch upstream at the given git SHA (or tag) and compare with
     /// the currently-vendored files. When not in dry-run mode,
-    /// rewrites `upstream/<file>`, `upstream/MANIFEST.toml`, and
-    /// `sync-meta.toml`; otherwise just reports.
+    /// rewrites the vendored files, their `MANIFEST.toml`, and the
+    /// set's `sync-meta.toml`; otherwise just reports.
     Pull {
+        /// Which vendored set to pull. One at a time: adopting an
+        /// upstream change means different follow-up work per set.
+        #[arg(long, value_name = "NAME", default_value = "parser")]
+        set: String,
+
         /// Target git SHA or tag.
         #[arg(long, value_name = "SHA_OR_TAG")]
         target: String,
@@ -109,34 +222,28 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let crate_dir = cli
-        .crate_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("promql-parser"));
-    let upstream_dir = crate_dir.join("upstream");
-    let manifest_path = upstream_dir.join("MANIFEST.toml");
+    let root = cli.root.clone();
 
     match cli.command {
-        Command::Check => check_integrity(&upstream_dir, &manifest_path),
+        Command::Check { set } => check_integrity(&root, &resolve_sets(set.as_deref())?),
         Command::Pull {
+            set,
             target,
             dry_run,
             report,
         } => {
+            let sets = resolve_sets(Some(&set))?;
             let report_path =
                 report.unwrap_or_else(|| PathBuf::from("target/promql-sync-report.md"));
-            sync(
-                &upstream_dir,
-                &manifest_path,
-                &crate_dir.join("sync-meta.toml"),
-                &target,
-                &report_path,
-                dry_run,
-            )
+            sync(&root, sets[0], &target, &report_path, dry_run)
         }
+        // Deliberately bound to the parser set rather than `--set`:
+        // there is only one grammar, and pointing this at the test
+        // corpus could only ever destroy `src/grammar.y`.
         Command::GenerateGrammar { dry_run, out } => {
+            let crate_dir = root.join("promql-parser");
             let out_path = out.unwrap_or_else(|| crate_dir.join("src/grammar.y"));
-            generate_grammar(&crate_dir, &upstream_dir, &out_path, dry_run)
+            generate_grammar(&crate_dir, &PARSER.dir(&root), &out_path, dry_run)
         }
     }
 }
@@ -188,35 +295,73 @@ fn generate_grammar(
 
 // ---------------- --check mode ----------------
 
-fn check_integrity(upstream_dir: &Path, manifest_path: &Path) -> Result<ExitCode> {
-    let manifest = Manifest::load(manifest_path)
-        .with_context(|| format!("load manifest at {}", manifest_path.display()))?;
-    let mut mismatches = Vec::new();
-    for file in VENDORED_FILES {
-        let disk = sha256_file(&upstream_dir.join(file)).with_context(|| format!("hash {file}"))?;
-        match manifest.file_hashes.get(*file) {
-            Some(recorded) if recorded == &disk => {
-                println!("ok     {file}");
-            }
-            Some(recorded) => {
-                println!("drift  {file}\n       disk={disk}\n       toml={recorded}");
-                mismatches.push(*file);
-            }
-            None => {
-                println!("absent {file} (not in MANIFEST)");
-                mismatches.push(*file);
+fn check_integrity(root: &Path, sets: &[&VendorSet]) -> Result<ExitCode> {
+    let mut drifted = 0usize;
+
+    for set in sets {
+        let manifest_path = set.manifest_path(root);
+        let manifest = Manifest::load(&manifest_path)
+            .with_context(|| format!("load manifest at {}", manifest_path.display()))?;
+        let dir = set.dir(root);
+
+        println!("[{}] {}", set.name, set.vendor_dir);
+        for file in set.files {
+            let disk = sha256_file(&dir.join(file)).with_context(|| format!("hash {file}"))?;
+            match manifest.file_hashes.get(*file) {
+                Some(recorded) if recorded == &disk => {
+                    println!("  ok     {file}");
+                }
+                Some(recorded) => {
+                    println!("  drift  {file}\n         disk={disk}\n         toml={recorded}");
+                    drifted += 1;
+                }
+                None => {
+                    println!("  absent {file} (not in MANIFEST)");
+                    drifted += 1;
+                }
             }
         }
+
+        // A file present on disk but missing from the set's list is
+        // invisible to every check above, so say so: either upstream
+        // added it and `files` needs updating, or it does not belong.
+        for stray in stray_files(&dir, set.files)? {
+            println!("  stray  {stray} (on disk, not in the {} set)", set.name);
+            drifted += 1;
+        }
     }
-    if mismatches.is_empty() {
+
+    if drifted == 0 {
         Ok(ExitCode::SUCCESS)
     } else {
         eprintln!(
-            "\n{} vendored file(s) have drifted. Either revert the edit or run `promql-sync --target <sha>` to adopt the change.",
-            mismatches.len()
+            "\n{drifted} vendored file(s) have drifted. Either revert the edit or run \
+             `promql-sync pull --set <name> --target <sha>` to adopt the change."
         );
         Ok(ExitCode::from(1))
     }
+}
+
+/// Vendored-directory entries that the set does not list. Ignores the
+/// bookkeeping files we write ourselves — `go.mod` among them, which is
+/// a stub keeping the vendored Go out of any parent module's build.
+fn stray_files(dir: &Path, known: &[&str]) -> Result<Vec<String>> {
+    const OURS: &[&str] = &[
+        "MANIFEST.toml",
+        "UPSTREAM.md",
+        "SUPPORTED.toml",
+        "UNSUPPORTED.md",
+        "go.mod",
+    ];
+    let mut stray = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if !known.contains(&name.as_str()) && !OURS.contains(&name.as_str()) {
+            stray.push(name);
+        }
+    }
+    stray.sort();
+    Ok(stray)
 }
 
 // ---------------- --target mode ----------------
@@ -231,23 +376,27 @@ struct FileDelta {
 }
 
 fn sync(
-    upstream_dir: &Path,
-    manifest_path: &Path,
-    sync_meta_path: &Path,
+    root: &Path,
+    set: &VendorSet,
     target: &str,
     report_path: &Path,
     dry_run: bool,
 ) -> Result<ExitCode> {
+    let upstream_dir = set.dir(root);
+    let manifest_path = set.manifest_path(root);
+    let sync_meta_path = set.sync_meta_path(root);
+    let subdir = set.upstream_subdir;
+
     let client = reqwest::blocking::Client::builder()
         .user_agent("promql-sync/0.1")
         .build()?;
-    let prior = Manifest::load(manifest_path).unwrap_or_default();
+    let prior = Manifest::load(&manifest_path).unwrap_or_default();
 
     let mut deltas = Vec::new();
     let mut new_manifest = Manifest::default();
-    for file in VENDORED_FILES {
+    for file in set.files {
         let url = format!(
-            "https://raw.githubusercontent.com/{UPSTREAM_OWNER}/{UPSTREAM_REPO}/{target}/{UPSTREAM_SUBDIR}/{file}"
+            "https://raw.githubusercontent.com/{UPSTREAM_OWNER}/{UPSTREAM_REPO}/{target}/{subdir}/{file}"
         );
         let body = client
             .get(&url)
@@ -279,7 +428,10 @@ fn sync(
     // Report.
     fs::create_dir_all(report_path.parent().unwrap_or_else(|| Path::new(".")))?;
     let mut md = String::new();
-    md.push_str(&format!("# promql-sync report — target `{target}`\n\n"));
+    md.push_str(&format!(
+        "# promql-sync report — set `{}`, target `{target}`\n\n",
+        set.name
+    ));
     md.push_str(if dry_run {
         "Mode: `--dry-run`. No files were modified.\n\n"
     } else {
@@ -304,26 +456,40 @@ fn sync(
         ));
     }
     md.push_str("\n## Next steps\n\n");
-    if any_changed {
-        md.push_str(
-            "1. Inspect the diff: `git diff promql-parser/upstream/`.\n\
+    if !any_changed {
+        md.push_str("No vendored files changed vs the prior manifest.\n");
+    } else if set.name == PROMQLTEST.name {
+        md.push_str(&format!(
+            "1. Inspect the diff: `git diff {}`.\n\
+             2. Regenerate the conformance baseline — upstream test content moved, so the old one no longer describes reality:\n   \
+                `PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest`\n\
+             3. Review the baseline diff. It is the record of what changed upstream: cases that started passing, cases that started failing, cases that vanished.\n\
+             4. Commit the vendored bump and the regenerated baseline together.\n\n\
+             If upstream added or removed a file, update the `promqltest` entry in `VENDOR_SETS` first — this sync only fetches the files it already knows about.\n",
+            set.vendor_dir,
+        ));
+    } else {
+        md.push_str(&format!(
+            "1. Inspect the diff: `git diff {}`.\n\
              2. Re-run `cargo test -p promql-parser` to see which translation steps are needed.\n\
              3. Translate any new grammar rules / action bodies / lexer states / AST fields into the corresponding Rust modules.\n\
              4. Update `sync-meta.toml` with the translation hashes (manual for now; structural classification is a follow-up).\n\
              5. Commit the vendored-file bump alongside the Rust translations in a single reviewable change.\n\n\
              Note: structural Green/Yellow/Red classification (design doc) is not yet implemented. This produces a byte-level diff; human handles the translation call.\n",
-        );
-    } else {
-        md.push_str("No vendored files changed vs the prior manifest.\n");
+            set.vendor_dir,
+        ));
     }
     fs::write(report_path, &md)
         .with_context(|| format!("write report {}", report_path.display()))?;
     println!("wrote report to {}", report_path.display());
 
     if !dry_run && any_changed {
-        new_manifest.save(manifest_path)?;
-        update_sync_meta(sync_meta_path, target)?;
-        println!("updated MANIFEST and sync-meta.toml");
+        new_manifest.save(&manifest_path)?;
+        update_sync_meta(&sync_meta_path, target)?;
+        println!(
+            "updated MANIFEST and sync-meta.toml for the {} set",
+            set.name
+        );
     }
 
     Ok(ExitCode::SUCCESS)
@@ -345,20 +511,31 @@ impl Manifest {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        // Re-emit a hand-friendly MANIFEST.toml that matches the format
-        // humans wrote. `toml::to_string_pretty` produces the right
-        // shape for a `[file_hashes]` table.
+        // Reproduce byte-for-byte what a human would have written, so a
+        // sync that changes no hashes leaves no diff. The `=` column is
+        // padded for the same reason the committed manifests pad it:
+        // the hashes are the part worth scanning.
+        let width = self
+            .file_hashes
+            .keys()
+            .map(|k| k.len() + 2)
+            .max()
+            .unwrap_or(0);
         let mut out = String::new();
         out.push_str(
             "# SHA-256 of every vendored upstream file.\n\
              #\n\
-             # The promql-sync tool maintains this file. See\n\
-             # `docs/parser-sync.md`.\n\n\
+             # The promql-sync tool verifies these hashes on startup and after a sync,\n\
+             # catching accidental manual edits to files that are meant to be verbatim\n\
+             # copies from prometheus/prometheus. A mismatch is not fatal on its own,\n\
+             # but the sync tool refuses to proceed until the discrepancy is resolved\n\
+             # (either revert the local edit or re-vendor).\n\n\
              [file_hashes]\n",
         );
         for (k, v) in &self.file_hashes {
+            let quoted = format!("\"{k}\"");
             out.push_str(&format!(
-                "\"{k}\" = \"sha256:{}\"\n",
+                "{quoted:<width$} = \"sha256:{}\"\n",
                 v.trim_start_matches("sha256:")
             ));
         }
