@@ -3,6 +3,18 @@ use lrlex::CTLexerBuilder;
 use lrpar::CTParserBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A build script that emits no `rerun-if-changed` is rerun by Cargo
+    // on *any* change inside the package, so editing a source file or a
+    // test regenerates the grammar and the lexer too. Bound the rerun to
+    // the files that actually drive codegen; `build.rs` itself is always
+    // tracked by Cargo.
+    //
+    // These have to stay exhaustive: emitting even one `rerun-if-changed`
+    // turns off the rerun-on-any-change fallback, so a file left out here
+    // stops being watched altogether.
+    println!("cargo:rerun-if-changed=src/grammar.y");
+    println!("cargo:rerun-if-changed=src/lexer.l");
+
     // The PromQL grammar carries the same inherent shift/reduce
     // conflicts as upstream's goyacc grammar: one per binary operator
     // resolved by %left/%right precedence, plus a handful from the
