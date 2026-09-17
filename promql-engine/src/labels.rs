@@ -22,7 +22,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringViewBuilder, StructArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
-use datafusion::common::{plan_err, ScalarValue};
+use datafusion::common::{plan_err, Column, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::{
@@ -202,18 +202,48 @@ pub fn group_keys(input: &[String], grouping: &[String], without: bool) -> Vec<S
     keys
 }
 
+/// The namespace an aggregation's group-key columns live in.
+///
+/// Aliased to the bare label name, a group column collides with the
+/// planner's own `samples` and `labels` columns as soon as a series
+/// carries a label so named.
+///
+/// The prefix holds for any label name, the quoted UTF-8 ones included:
+/// `GROUP_PREFIX + label` can only equal a reserved name if the prefix
+/// is itself a prefix of that name, and it is a prefix of neither.
+const GROUP_PREFIX: &str = "__group__";
+
+/// The DataFusion column name a group key is aliased to. Shared by
+/// [`group_exprs`] and [`regroup`] so the two cannot drift apart.
+fn group_alias(key: &str) -> String {
+    format!("{GROUP_PREFIX}{key}")
+}
+
 /// The grouping expressions for `LogicalPlanBuilder::aggregate`:
-/// `get_field(labels, k) AS k`. The keys stay `Utf8View`, which
-/// DataFusion's vectorized group-by takes as it is.
+/// `get_field(labels, k) AS __group__k`. The keys stay `Utf8View`, which
+/// DataFusion's vectorized group-by takes as it is; `GROUP_PREFIX` says
+/// why the alias is prefixed.
 pub fn group_exprs(keys: &[String]) -> Vec<Expr> {
     keys.iter()
-        .map(|k| get_field(col(LABELS), k.as_str()).alias(k))
+        .map(|k| get_field(col(LABELS), k.as_str()).alias(group_alias(k)))
         .collect()
 }
 
-/// The `labels` struct of an aggregation's output, from its group columns.
+/// The `labels` struct of an aggregation's output, from the group columns
+/// [`group_exprs`] produced.
+///
+/// Built through `Column` directly because `col` parses its argument as a
+/// SQL identifier: it would read a label named `service.name` as relation
+/// `service` column `name`, and fold `Region` to `region`.
 pub fn regroup(keys: &[String]) -> Expr {
-    call(keys.iter().map(|k| (k.clone(), col(k))).collect())
+    call(
+        keys.iter()
+            .map(|k| {
+                let column = Column::new_unqualified(group_alias(k));
+                (k.clone(), Expr::Column(column))
+            })
+            .collect(),
+    )
 }
 
 /// The `labels` struct with only the names passing `keep`, read from the
@@ -233,10 +263,85 @@ pub fn keep(input: &[String], mut keep: impl FnMut(&str) -> bool) -> (Expr, Vec<
 
 #[cfg(test)]
 mod tests {
+    use datafusion::functions_aggregate::expr_fn::count;
+    use datafusion::logical_expr::{LogicalPlanBuilder, LogicalTableSource};
+
     use super::*;
+    use crate::series::SAMPLES;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Plans `sum by (keys) (…)` over a series with these label names and
+    /// reports the label names its output carries. `count` stands in for
+    /// this crate's aggregate: a mis-read or colliding label name fails
+    /// while the plan is built.
+    fn planned_group(input: &[String], keys: &[String]) -> Result<Vec<String>> {
+        let source = Arc::new(LogicalTableSource::new(series::schema(input)));
+        let plan = LogicalPlanBuilder::scan("series", source, None)?
+            .aggregate(group_exprs(keys), vec![count(col(SAMPLES)).alias(SAMPLES)])?
+            .project(vec![regroup(keys).alias(LABELS), col(SAMPLES)])?
+            .build()?;
+        match plan
+            .schema()
+            .field_with_unqualified_name(LABELS)?
+            .data_type()
+        {
+            DataType::Struct(fields) => Ok(fields.iter().map(|f| f.name().clone()).collect()),
+            other => plan_err!("`{LABELS}` is {other}, expected a struct"),
+        }
+    }
+
+    #[test]
+    fn a_dotted_label_name_is_not_read_as_a_qualified_column() {
+        let names = s(&["service.name"]);
+        assert_eq!(planned_group(&names, &names).unwrap(), names);
+    }
+
+    #[test]
+    fn a_label_name_keeps_its_capitals() {
+        let names = s(&["Region"]);
+        assert_eq!(planned_group(&names, &names).unwrap(), names);
+    }
+
+    #[test]
+    fn a_label_named_samples_survives_its_reserved_namesake() {
+        let names = s(&["samples"]);
+        assert_eq!(planned_group(&names, &names).unwrap(), names);
+    }
+
+    #[test]
+    fn a_label_named_labels_survives_its_reserved_namesake() {
+        let names = s(&["labels"]);
+        assert_eq!(planned_group(&names, &names).unwrap(), names);
+    }
+
+    #[test]
+    fn the_group_prefix_cannot_reach_a_reserved_column_name() {
+        for reserved in [LABELS, SAMPLES] {
+            assert!(!reserved.starts_with(GROUP_PREFIX));
+        }
+    }
+
+    #[test]
+    fn the_group_column_is_one_unqualified_name_at_both_ends() {
+        let keys = s(&["service.name"]);
+        let aliased = match &group_exprs(&keys)[0] {
+            Expr::Alias(a) => a.name.clone(),
+            other => panic!("expected an alias, got {other:?}"),
+        };
+        assert_eq!(aliased, "__group__service.name");
+
+        let read = match &regroup(&keys) {
+            Expr::ScalarFunction(f) => match &f.args[1] {
+                Expr::Column(c) => c.clone(),
+                other => panic!("expected a column, got {other:?}"),
+            },
+            other => panic!("expected {NAME}, got {other:?}"),
+        };
+        assert_eq!(read.relation, None);
+        assert_eq!(read.name, aliased);
     }
 
     #[test]

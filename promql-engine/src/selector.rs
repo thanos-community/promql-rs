@@ -69,14 +69,19 @@ impl Params {
     /// be answered: `getTimeRangesForSelector` in upstream. The `- 1` is
     /// the strict lower bound of the lookback window, so that a sample
     /// exactly `lookback` old is not even read.
+    ///
+    /// The saturating arithmetic is the lower half of a two-part defence
+    /// against an absurd timestamp: the planner rejects an out-of-range
+    /// `@` or offset, and this clamps whatever still reaches it.
     pub fn select_range(&self) -> (i64, i64) {
         let (lo, hi) = match self.at_ms {
             Some(at) => (at, at),
             None => (self.start_ms, self.end_ms),
         };
         (
-            lo - (self.lookback_ms - 1) - self.offset_ms,
-            hi - self.offset_ms,
+            lo.saturating_sub(self.lookback_ms.saturating_sub(1))
+                .saturating_sub(self.offset_ms),
+            hi.saturating_sub(self.offset_ms),
         )
     }
 
@@ -223,7 +228,10 @@ impl ScalarUDFImpl for VectorSelector {
             .iter()
             .map(|f| f.data_type().clone())
             .collect();
-        Ok(Arc::new(Field::new(NAME, self.return_type(&types)?, false)))
+        let data_type = self.return_type(&types)?;
+        // A null row maps to a null row, so nullability mirrors the input.
+        let nullable = args.arg_fields[0].is_nullable();
+        Ok(Arc::new(Field::new(NAME, data_type, nullable)))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -232,12 +240,12 @@ impl ScalarUDFImpl for VectorSelector {
             ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
         };
         let p = Params {
-            start_ms: int_arg(&args, 1)?.ok_or_else(|| missing("start"))?,
-            end_ms: int_arg(&args, 2)?.ok_or_else(|| missing("end"))?,
-            step_ms: int_arg(&args, 3)?.ok_or_else(|| missing("step"))?,
-            lookback_ms: int_arg(&args, 4)?.ok_or_else(|| missing("lookback"))?,
-            offset_ms: int_arg(&args, 5)?.ok_or_else(|| missing("offset"))?,
-            at_ms: int_arg(&args, 6)?,
+            start_ms: int_arg(&args, 1, NAME)?.ok_or_else(|| missing("start"))?,
+            end_ms: int_arg(&args, 2, NAME)?.ok_or_else(|| missing("end"))?,
+            step_ms: int_arg(&args, 3, NAME)?.ok_or_else(|| missing("step"))?,
+            lookback_ms: int_arg(&args, 4, NAME)?.ok_or_else(|| missing("lookback"))?,
+            offset_ms: int_arg(&args, 5, NAME)?.ok_or_else(|| missing("offset"))?,
+            at_ms: int_arg(&args, 6, NAME)?,
         };
         Ok(ColumnarValue::Array(Arc::new(apply(
             samples.as_list::<i32>(),
@@ -251,12 +259,15 @@ fn missing(what: &str) -> DataFusionError {
 }
 
 /// Read literal argument `i` as an `Int64`, `None` for SQL NULL.
-pub(crate) fn int_arg(args: &ScalarFunctionArgs, i: usize) -> Result<Option<i64>> {
+///
+/// The range kernel shares this helper, so `caller` names the function
+/// the query called rather than this module.
+pub(crate) fn int_arg(args: &ScalarFunctionArgs, i: usize, caller: &str) -> Result<Option<i64>> {
     match &args.args[i] {
         ColumnarValue::Scalar(ScalarValue::Int64(v)) => Ok(*v),
         ColumnarValue::Scalar(ScalarValue::Null) => Ok(None),
         other => Err(DataFusionError::Execution(format!(
-            "{NAME}: argument {i} must be an Int64 literal, got {:?}",
+            "{caller}: argument {i} must be an Int64 literal, got {:?}",
             other.data_type()
         ))),
     }
@@ -277,16 +288,21 @@ pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
         .values();
     let offsets = samples.offsets();
 
-    let mut out_ts: Vec<i64> = Vec::new();
-    let mut out_vs: Vec<f64> = Vec::new();
+    // A starting size, not a ceiling: one sample can serve many steps.
+    let mut out_ts: Vec<i64> = Vec::with_capacity(ts.len());
+    let mut out_vs: Vec<f64> = Vec::with_capacity(ts.len());
     let mut out_offsets: Vec<i32> = Vec::with_capacity(samples.len() + 1);
     out_offsets.push(0);
     for row in 0..samples.len() {
-        let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-        eval_series(&ts[a..b], &vs[a..b], p, |t, v| {
-            out_ts.push(t);
-            out_vs.push(v);
-        });
+        // A null row is an absent series, not an empty one, and its
+        // offsets may still span samples.
+        if !samples.is_null(row) {
+            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
+            eval_series(&ts[a..b], &vs[a..b], p, |t, v| {
+                out_ts.push(t);
+                out_vs.push(v);
+            });
+        }
         out_offsets.push(out_ts.len() as i32);
     }
 
@@ -302,13 +318,16 @@ pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
         series::sample_item(),
         OffsetBuffer::new(out_offsets.into()),
         Arc::new(entries),
-        None,
+        // One output row per input row, in order, so the input's
+        // validity is the output's.
+        samples.nulls().cloned(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::buffer::NullBuffer;
 
     const M: i64 = 60_000;
 
@@ -466,6 +485,32 @@ mod tests {
         assert_eq!(p.select_range(), (M - 5 * M + 1, M));
     }
 
+    /// `up @ -1e30` is where an extreme timestamp comes from.
+    #[test]
+    fn an_extreme_at_timestamp_clamps_the_select_range() {
+        let p = Params {
+            at_ms: Some(i64::MIN),
+            offset_ms: i64::MAX,
+            ..params()
+        };
+        assert_eq!(p.select_range(), (i64::MIN, i64::MIN));
+        let p = Params {
+            at_ms: Some(i64::MAX),
+            offset_ms: i64::MIN,
+            ..params()
+        };
+        assert_eq!(p.select_range(), (i64::MAX, i64::MAX));
+        let p = Params {
+            start_ms: i64::MIN,
+            end_ms: i64::MAX,
+            lookback_ms: i64::MAX,
+            ..params()
+        };
+        let (lo, hi) = p.select_range();
+        assert_eq!((lo, hi), (i64::MIN, i64::MAX));
+        assert!(lo <= hi);
+    }
+
     #[test]
     fn apply_runs_the_kernel_row_by_row() {
         // Three series, so three distinct label sets.
@@ -491,5 +536,45 @@ mod tests {
         );
         assert_eq!(out.len(), 3);
         assert_eq!(out.offsets().to_vec(), vec![0, 2, 2, 4]);
+    }
+
+    /// Three one-sample rows; the middle is null but still spans a sample.
+    fn with_a_null_row() -> ListArray {
+        let entries = StructArray::new(
+            series::sample_fields(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![0, 0, 0])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+            ],
+            None,
+        );
+        ListArray::new(
+            series::sample_item(),
+            OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+            Arc::new(entries),
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+    }
+
+    #[test]
+    fn a_null_row_yields_a_null_row() {
+        let out = apply(
+            &with_a_null_row(),
+            &Params {
+                end_ms: 0,
+                ..params()
+            },
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.null_count(), 1);
+        assert!(!out.is_null(0) && out.is_null(1) && !out.is_null(2));
+        // The sample the null row spans stays out of the output.
+        assert_eq!(out.offsets().to_vec(), vec![0, 1, 1, 2]);
+        let vs = out
+            .values()
+            .as_struct()
+            .column(1)
+            .as_primitive::<Float64Type>();
+        assert_eq!(vs.values(), &[1.0, 3.0]);
     }
 }

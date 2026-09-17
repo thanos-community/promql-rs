@@ -27,7 +27,7 @@ fn source() -> Arc<MemorySeriesSource> {
 fn query(q: &str, range: RangeQuery) -> Vec<Series> {
     Engine::blocking()
         .unwrap()
-        .range_query(source(), q, &range)
+        .range_query(source().as_ref(), q, &range)
         .unwrap()
 }
 
@@ -163,7 +163,7 @@ fn what_is_still_unsupported_is_named() {
             "the quantile_over_time function",
         ),
     ] {
-        match engine.range_query(source(), q, &RangeQuery::new(0, 0, 30_000)) {
+        match engine.range_query(source().as_ref(), q, &RangeQuery::new(0, 0, 30_000)) {
             Err(EngineError::Unsupported(f)) => assert_eq!(f, what, "{q}"),
             other => panic!("{q}: {other:?}"),
         }

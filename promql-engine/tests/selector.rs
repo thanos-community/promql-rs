@@ -33,7 +33,7 @@ fn a_selector_with_offset_expires_series_at_the_lookback_boundary() {
     let engine = Engine::blocking().unwrap();
     let out = engine
         .range_query(
-            nginx(),
+            nginx().as_ref(),
             "http_requests_total offset 30s",
             &RangeQuery::new(600_000, 1_200_000, 30_000),
         )
@@ -67,7 +67,7 @@ fn at_end_beyond_all_data_yields_nothing() {
     let engine = Engine::blocking().unwrap();
     let out = engine
         .range_query(
-            nginx(),
+            nginx().as_ref(),
             "http_requests_total @ end()",
             &RangeQuery::new(0, 1_800_000, 30_000),
         )
@@ -80,7 +80,7 @@ fn at_start_repeats_the_first_sample_on_every_step() {
     let engine = Engine::blocking().unwrap();
     let out = engine
         .range_query(
-            nginx(),
+            nginx().as_ref(),
             "http_requests_total @ start()",
             &RangeQuery::new(0, 120_000, 30_000),
         )
@@ -98,7 +98,7 @@ fn matchers_reach_the_source() {
     let engine = Engine::blocking().unwrap();
     let out = engine
         .range_query(
-            nginx(),
+            nginx().as_ref(),
             r#"http_requests_total{pod=~"nginx-2|nginx-3"}"#,
             &RangeQuery::new(0, 60_000, 30_000),
         )
@@ -122,7 +122,7 @@ fn anything_but_a_selector_is_unsupported_by_name() {
         ("http_requests_total[5m]", "a range selector"),
     ] {
         let err = engine
-            .range_query(nginx(), query, &RangeQuery::new(0, 60_000, 30_000))
+            .range_query(nginx().as_ref(), query, &RangeQuery::new(0, 60_000, 30_000))
             .unwrap_err();
         match err {
             EngineError::Unsupported(f) => assert_eq!(f, what, "{query}"),
@@ -136,7 +136,7 @@ fn a_parse_error_is_a_query_error() {
     let engine = Engine::blocking().unwrap();
     let err = engine
         .range_query(
-            nginx(),
+            nginx().as_ref(),
             "http_requests_total{",
             &RangeQuery::new(0, 0, 30_000),
         )

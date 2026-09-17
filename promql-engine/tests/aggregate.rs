@@ -30,7 +30,7 @@ fn source() -> Arc<MemorySeriesSource> {
 fn query(q: &str, range: RangeQuery) -> Vec<Series> {
     Engine::blocking()
         .unwrap()
-        .range_query(source(), q, &range)
+        .range_query(source().as_ref(), q, &range)
         .unwrap()
 }
 
@@ -171,7 +171,7 @@ fn parameterized_aggregations_are_named_as_unsupported() {
             "the count_values aggregation",
         ),
     ] {
-        match engine.range_query(source(), q, &RangeQuery::new(0, 0, 30_000)) {
+        match engine.range_query(source().as_ref(), q, &RangeQuery::new(0, 0, 30_000)) {
             Err(EngineError::Unsupported(f)) => assert_eq!(f, what, "{q}"),
             other => panic!("{q}: {other:?}"),
         }
@@ -193,7 +193,7 @@ async fn the_plan_is_an_aggregate_over_the_label_fields() {
     let rendered = plan.display_indent().to_string();
     assert!(
         rendered.starts_with(
-            "Projection: promql_labels(Utf8(\"route\"), route) AS labels, samples\n  Aggregate: groupBy=[[get_field(selector_0.labels, Utf8(\"route\")) AS route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\"), Int64(0), Int64(60000), Int64(30000)) AS samples]]"
+            "Projection: promql_labels(Utf8(\"route\"), __group__route) AS labels, samples\n  Aggregate: groupBy=[[get_field(selector_0.labels, Utf8(\"route\")) AS __group__route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\"), Int64(0), Int64(60000), Int64(30000)) AS samples]]"
         ),
         "{rendered}"
     );

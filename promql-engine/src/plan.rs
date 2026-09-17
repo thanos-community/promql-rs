@@ -12,13 +12,17 @@
 //! ```text
 //! sum by (pod) (rate(http_requests_total[5m]))
 //!
-//! Projection: promql_labels('pod', pod) AS labels, samples
-//!   Aggregate: groupBy=[CAST(get_field(labels, 'pod') AS Utf8) AS pod],
+//! Projection: promql_labels('pod', __group__pod) AS labels, samples
+//!   Aggregate: groupBy=[get_field(labels, 'pod') AS __group__pod],
 //!              aggr=[promql_aggregate(samples, 'sum') AS samples]
 //!     Projection: promql_labels(…without __name__) AS labels,
 //!                 promql_range_function(samples, 'rate', …) AS samples
 //!       TableScan: selector_0          ← SelectorTable over SeriesSource::select
 //! ```
+//!
+//! The `__group__` prefix on a group key keeps a label named `labels`
+//! or `samples` from colliding with the engine's own columns; see
+//! [`labels::group_exprs`]. [`labels::regroup`] restores the bare name.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -72,6 +76,18 @@ pub async fn plan(
         return Err(EngineError::Query(format!(
             "step must be positive, got {}ms",
             query.step_ms
+        )));
+    }
+    // `aggregate::Grid` checks the same constant; this half exists so
+    // the user gets a query error naming the limit.
+    let steps = aggregate::step_count(query.start_ms, query.end_ms, query.step_ms);
+    if steps > aggregate::MAX_STEPS as i128 {
+        return Err(EngineError::Query(format!(
+            "{}..{} every {}ms is {steps} steps, more than the {} this engine allows",
+            query.start_ms,
+            query.end_ms,
+            query.step_ms,
+            aggregate::MAX_STEPS
         )));
     }
     let mut planner = Planner {
@@ -157,6 +173,7 @@ impl Planner<'_> {
             offset_ms: offset_ms(vs),
             at_ms: resolve_at(vs, self.query),
         };
+        check_selector_bounds(params.at_ms, params.offset_ms)?;
         let (builder, label_names) = self.scan(vs, params.select_range(), grouping).await?;
         let plan = builder
             .project(vec![
@@ -214,6 +231,8 @@ impl Planner<'_> {
             offset_ms: offset_ms(vs),
             at_ms: resolve_at(vs, self.query),
         };
+        check_selector_bounds(params.at_ms, params.offset_ms)?;
+        check_time_bound("the range", params.range_ms)?;
         let (builder, input_names) = self.scan(vs, params.select_range(), grouping).await?;
         let (labels_expr, label_names) = if func.drops_metric_name() {
             labels::keep(&input_names, |n| n != METRIC_NAME)
@@ -230,7 +249,7 @@ impl Planner<'_> {
     }
 
     async fn aggregate(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
-        let op = Op::parse(&agg.op.to_string())
+        let op = Op::from_token(agg.op)
             .ok_or_else(|| EngineError::Unsupported(format!("the {} aggregation", agg.op)))?;
         if agg.param.is_some() {
             return Err(EngineError::Unsupported(format!(
@@ -268,6 +287,34 @@ impl Planner<'_> {
 
 fn offset_ms(vs: &VectorSelector) -> i64 {
     (vs.original_offset_secs * 1000.0).round() as i64
+}
+
+/// The widest `@` timestamp, offset or range this engine will plan.
+///
+/// Three of these terms meet in one `i64` where `select_range` subtracts
+/// the window and the offset, so the bound is a quarter of the range.
+/// Prometheus catches an out-of-bounds `@` while parsing (`setTimestamp`
+/// in `parser.go`); ours saturates the float instead.
+const MAX_TIME_MS: i64 = i64::MAX / 4;
+
+/// One term of the scan-range arithmetic, named for the message.
+fn check_time_bound(what: &str, ms: i64) -> Result<(), EngineError> {
+    if (-MAX_TIME_MS..=MAX_TIME_MS).contains(&ms) {
+        return Ok(());
+    }
+    Err(EngineError::Query(format!(
+        "{what} {ms}ms is out of range, the limit is {MAX_TIME_MS}ms"
+    )))
+}
+
+/// The `@` and the offset of one selector, rejected here rather than in
+/// the kernel: `select_range` and the kernels below it saturate rather
+/// than panic, which would answer an absurd query with an empty result.
+fn check_selector_bounds(at_ms: Option<i64>, offset_ms: i64) -> Result<(), EngineError> {
+    if let Some(at) = at_ms {
+        check_time_bound("the @ modifier timestamp", at)?;
+    }
+    check_time_bound("the offset", offset_ms)
 }
 
 /// The `@` modifier's timestamp, with `start()`/`end()` resolved against
@@ -318,5 +365,113 @@ pub fn describe(expr: &Expr) -> String {
         Expr::Unary(_) => "a unary operator".into(),
         Expr::StepInvariant(_) => "a step-invariant expression".into(),
         Expr::VectorSelector(_) => "a vector selector".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::prelude::SessionContext;
+    use promql_parser::ast::Expr;
+
+    use super::*;
+    use crate::memory::MemorySeriesSource;
+
+    /// Plan `query` against an empty store: every guard here runs before
+    /// the store is asked for anything, and each node carries its own
+    /// functions, so none need registering.
+    async fn plan_of(query: &str, range: RangeQuery) -> Result<LogicalPlan, EngineError> {
+        let ctx = SessionContext::new();
+        let source = MemorySeriesSource::default();
+        let expr: Expr = promql_parser::parse_expr(query).expect("query parses");
+        plan(&ctx.state(), &source, &expr, &range).await
+    }
+
+    #[tokio::test]
+    async fn a_query_with_more_steps_than_the_cap_is_a_query_error() {
+        let range = RangeQuery::new(0, 1000 * 24 * 60 * 60 * 1000, 1);
+        let err = plan_of("up", range).await.unwrap_err();
+        assert!(matches!(err, EngineError::Query(_)), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains(&aggregate::MAX_STEPS.to_string()),
+            "the message names the limit: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_at_the_step_cap_is_planned() {
+        let end = aggregate::MAX_STEPS as i64 - 1;
+        assert!(plan_of("up", RangeQuery::new(0, end, 1)).await.is_ok());
+        assert!(plan_of("up", RangeQuery::new(0, end + 1, 1)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_at_modifier_out_of_range_is_a_query_error() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        let err = plan_of("up @ -1e30", range).await.unwrap_err();
+        assert!(matches!(err, EngineError::Query(_)), "{err}");
+        assert!(err.to_string().contains("@ modifier"), "{err}");
+
+        let err = plan_of("rate(up[5m] @ 1e30)", range).await.unwrap_err();
+        assert!(matches!(err, EngineError::Query(_)), "{err}");
+        assert!(err.to_string().contains("@ modifier"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_at_modifier_at_a_real_timestamp_is_planned() {
+        let range = RangeQuery::new(1_600_000_000_000, 1_600_000_060_000, 30_000);
+        assert!(plan_of("up @ 1600000000", range).await.is_ok());
+        assert!(plan_of("up @ start()", range).await.is_ok());
+        assert!(plan_of("up offset 5m", range).await.is_ok());
+    }
+
+    #[test]
+    fn a_term_the_scan_range_cannot_hold_is_rejected() {
+        assert!(check_selector_bounds(None, 0).is_ok());
+        assert!(check_selector_bounds(Some(0), 0).is_ok());
+        assert!(check_selector_bounds(Some(MAX_TIME_MS), -MAX_TIME_MS).is_ok());
+
+        assert!(check_selector_bounds(Some(i64::MIN), 0).is_err());
+        assert!(check_selector_bounds(Some(i64::MAX), 0).is_err());
+        assert!(check_selector_bounds(None, i64::MAX).is_err());
+        assert!(check_time_bound("the range", i64::MAX).is_err());
+
+        let message = check_selector_bounds(Some(i64::MIN), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("@ modifier timestamp"), "{message}");
+        assert!(message.contains(&MAX_TIME_MS.to_string()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn every_supported_aggregation_plans() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for op in [
+            "sum", "avg", "count", "min", "max", "group", "stddev", "stdvar",
+        ] {
+            let query = format!("{op} by (pod) (up)");
+            assert!(plan_of(&query, range).await.is_ok(), "{query}");
+        }
+        for op in [
+            "topk",
+            "bottomk",
+            "quantile",
+            "count_values",
+            "limitk",
+            "limit_ratio",
+        ] {
+            let query = format!("{op}(1, up)");
+            let err = plan_of(&query, range).await.unwrap_err();
+            assert!(matches!(err, EngineError::Unsupported(_)), "{query}: {err}");
+            assert!(err.to_string().contains(op), "{query}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_that_is_not_positive_is_a_query_error() {
+        let err = plan_of("up", RangeQuery::new(0, 60_000, 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Query(_)), "{err}");
     }
 }

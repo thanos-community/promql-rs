@@ -48,6 +48,7 @@ use datafusion::logical_expr::{
     lit, Accumulator, AggregateUDF, AggregateUDFImpl, Expr, Signature, Volatility,
 };
 use datafusion::physical_expr::expressions::Literal;
+use promql_parser::token::ItemType;
 
 use crate::math::{self, max_nan_loses, min_nan_loses, KahanSum, Mean, Welford};
 use crate::series;
@@ -70,6 +71,29 @@ pub enum Op {
 }
 
 impl Op {
+    /// The operator a parsed `sum`/`avg`/… token selects: the planner's
+    /// side of [`Op::parse`].
+    ///
+    /// Dispatch is on the variant, not the text, because `ItemType`'s
+    /// `Display` is not injective: `SumDesc` also prints `sum`, which
+    /// would let a series-description token pick a kernel.
+    pub fn from_token(op: ItemType) -> Option<Op> {
+        Some(match op {
+            ItemType::Sum => Op::Sum,
+            ItemType::Avg => Op::Avg,
+            ItemType::Count => Op::Count,
+            ItemType::Min => Op::Min,
+            ItemType::Max => Op::Max,
+            ItemType::Group => Op::Group,
+            ItemType::Stddev => Op::Stddev,
+            ItemType::Stdvar => Op::Stdvar,
+            _ => return None,
+        })
+    }
+
+    /// The operator named by the string literal in a planned
+    /// `promql_aggregate` call, the inverse of [`Op::as_str`]: the
+    /// execution side, where the planner has [`Op::from_token`].
     pub fn parse(s: &str) -> Option<Op> {
         Some(match s {
             "sum" => Op::Sum,
@@ -200,6 +224,28 @@ impl State {
     }
 }
 
+/// The most steps one query may evaluate.
+///
+/// Sized by memory rather than copied from Prometheus's 11,000-point cap
+/// (`web/api/v1/api.go`), which bounds an HTTP response to a graph, not
+/// an engine a rule evaluator calls. The grid costs roughly 25 bytes a
+/// step per group, so this is about 25MB of lanes for one group, where
+/// an unbounded query is an abort in the allocator.
+pub const MAX_STEPS: usize = 1_000_000;
+
+/// How many steps `start_ms..=end_ms` every `step_ms` has.
+///
+/// In `i128` so that a range as wide as `i64` is a number to compare
+/// against [`MAX_STEPS`] rather than an overflow. The planner and `Grid`
+/// both measure with this, so their guards agree by construction; both
+/// reject a non-positive step first, with a message of their own.
+pub fn step_count(start_ms: i64, end_ms: i64, step_ms: i64) -> i128 {
+    if step_ms <= 0 || end_ms < start_ms {
+        return 0;
+    }
+    (i128::from(end_ms) - i128::from(start_ms)) / i128::from(step_ms) + 1
+}
+
 /// The query's step grid, which is what makes a timestamp an index.
 ///
 /// Everything an aggregation can sit on top of — a selector, a range
@@ -220,19 +266,18 @@ impl Grid {
                 "{NAME}: step must be positive, got {step_ms}ms"
             )));
         }
-        let len = if end_ms < start_ms {
-            0
-        } else {
-            usize::try_from((end_ms - start_ms) / step_ms + 1).map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "{NAME}: {start_ms}..{end_ms} has too many steps"
-                ))
-            })?
-        };
+        // The planner rejects an oversized grid too; again here because
+        // this function is registered and reachable from SQL.
+        let count = step_count(start_ms, end_ms, step_ms);
+        if count > MAX_STEPS as i128 {
+            return Err(DataFusionError::Execution(format!(
+                "{NAME}: {start_ms}..{end_ms} every {step_ms}ms is {count} steps, more than the {MAX_STEPS} this engine allows"
+            )));
+        }
         Ok(Self {
             start_ms,
             step_ms,
-            len,
+            len: count as usize,
         })
     }
 
@@ -458,9 +503,19 @@ impl Steps {
         let grid = self.grid;
         let first = grid.index(timestamps[0])?;
         let last = grid.index(timestamps[timestamps.len() - 1])?;
+        // Ascending timestamps are the store's obligation, but this is
+        // reachable from SQL over any list column, so a breach has to be
+        // an error rather than an underflowed `usize`.
+        let span = last.checked_sub(first).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "{NAME}: samples must be in ascending timestamp order, got {}ms after {}ms",
+                timestamps[timestamps.len() - 1],
+                timestamps[0]
+            ))
+        })?;
 
         // The common case: no gaps, so the whole series is one run.
-        if last - first + 1 == timestamps.len() {
+        if span + 1 == timestamps.len() {
             self.add_run(first, values);
             return Ok(());
         }
@@ -512,15 +567,45 @@ impl Steps {
     }
 }
 
+/// The four numbers of [`State::to_row`], as field names: `state`
+/// writes them and `merge_batch` reads them back, and the two must not
+/// drift apart.
+const STATE_A: &str = "a";
+const STATE_B: &str = "b";
+const STATE_N: &str = "n";
+const STATE_M: &str = "m";
+
 /// Fields of the partial state's list element.
 fn state_fields() -> Fields {
     Fields::from(vec![
         Field::new(series::TIMESTAMP, series::timestamp_type(), false),
-        Field::new("a", DataType::Float64, false),
-        Field::new("b", DataType::Float64, false),
-        Field::new("n", DataType::Float64, false),
-        Field::new("m", DataType::Boolean, false),
+        Field::new(STATE_A, DataType::Float64, false),
+        Field::new(STATE_B, DataType::Float64, false),
+        Field::new(STATE_N, DataType::Float64, false),
+        Field::new(STATE_M, DataType::Boolean, false),
     ])
+}
+
+/// One named child of the partial state's struct.
+///
+/// By name and type-checked rather than downcast blind: the state
+/// crosses a serialization boundary in a distributed plan, where a peer
+/// encoding another version has to be a query error, not a worker panic.
+fn state_child<'a>(entries: &'a StructArray, name: &str) -> Result<&'a ArrayRef> {
+    entries.column_by_name(name).ok_or_else(|| {
+        DataFusionError::Internal(format!("{NAME}: partial state has no {name} column"))
+    })
+}
+
+/// One of the partial state's `f64` lanes, by name.
+fn state_floats<'a>(entries: &'a StructArray, name: &str) -> Result<&'a Float64Array> {
+    state_child(entries, name)?
+        .as_primitive_opt::<Float64Type>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "{NAME}: partial state column {name} is not Float64"
+            ))
+        })
 }
 
 fn state_type() -> DataType {
@@ -641,14 +726,25 @@ impl Accumulator for Steps {
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         let list = states[0].as_list::<i32>();
         let entries = list.values().as_struct();
-        let ts = entries
-            .column(0)
-            .as_primitive::<TimestampMillisecondType>()
+        let ts = state_child(entries, series::TIMESTAMP)?
+            .as_primitive_opt::<TimestampMillisecondType>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "{NAME}: partial state column {} is not a millisecond timestamp",
+                    series::TIMESTAMP
+                ))
+            })?
             .values();
-        let a = entries.column(1).as_primitive::<Float64Type>().values();
-        let b = entries.column(2).as_primitive::<Float64Type>().values();
-        let n = entries.column(3).as_primitive::<Float64Type>().values();
-        let m = entries.column(4).as_boolean();
+        let a = state_floats(entries, STATE_A)?.values();
+        let b = state_floats(entries, STATE_B)?.values();
+        let n = state_floats(entries, STATE_N)?.values();
+        let m = state_child(entries, STATE_M)?
+            .as_boolean_opt()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "{NAME}: partial state column {STATE_M} is not boolean"
+                ))
+            })?;
         let offsets = list.offsets();
         for row in 0..list.len() {
             if list.is_null(row) {
@@ -973,5 +1069,137 @@ mod tests {
             empty_samples().to_array().unwrap().data_type(),
             &series::samples_type()
         );
+    }
+
+    #[test]
+    fn every_supported_aggregation_dispatches_on_its_token() {
+        for (token, op) in [
+            (ItemType::Sum, Op::Sum),
+            (ItemType::Avg, Op::Avg),
+            (ItemType::Count, Op::Count),
+            (ItemType::Min, Op::Min),
+            (ItemType::Max, Op::Max),
+            (ItemType::Group, Op::Group),
+            (ItemType::Stddev, Op::Stddev),
+            (ItemType::Stdvar, Op::Stdvar),
+        ] {
+            assert_eq!(Op::from_token(token), Some(op), "{token}");
+            // The token and the plan's string literal name one kernel.
+            assert_eq!(op.as_str(), token.to_string(), "{token}");
+            assert_eq!(Op::parse(op.as_str()), Some(op), "{token}");
+        }
+    }
+
+    #[test]
+    fn a_token_that_merely_prints_like_an_aggregation_is_not_one() {
+        assert_eq!(ItemType::SumDesc.to_string(), ItemType::Sum.to_string());
+        assert_eq!(ItemType::CountDesc.to_string(), ItemType::Count.to_string());
+        assert_eq!(Op::from_token(ItemType::SumDesc), None);
+        assert_eq!(Op::from_token(ItemType::CountDesc), None);
+    }
+
+    #[test]
+    fn an_aggregation_this_engine_does_not_implement_has_no_operator() {
+        for token in [
+            ItemType::Topk,
+            ItemType::Bottomk,
+            ItemType::Quantile,
+            ItemType::CountValues,
+            ItemType::Limitk,
+            ItemType::LimitRatio,
+        ] {
+            assert_eq!(Op::from_token(token), None, "{token}");
+        }
+    }
+
+    #[test]
+    fn a_grid_wider_than_the_cap_is_an_error() {
+        let err = Steps::new(Op::Sum, 0, 1000 * 24 * 60 * 60 * 1000, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&MAX_STEPS.to_string()), "{err}");
+        assert!(Steps::new(Op::Group, 0, MAX_STEPS as i64 - 1, 1).is_ok());
+        assert!(Steps::new(Op::Group, 0, MAX_STEPS as i64, 1).is_err());
+    }
+
+    #[test]
+    fn the_step_count_of_the_widest_possible_range_is_a_number() {
+        assert_eq!(step_count(0, 9, 1), 10);
+        assert_eq!(step_count(0, 9, 10), 1);
+        assert_eq!(step_count(10, 0, 1), 0);
+        assert_eq!(step_count(0, 10, 0), 0);
+        assert_eq!(
+            step_count(i64::MIN, i64::MAX, 1),
+            i128::from(u64::MAX) + 1,
+            "the full i64 span, counted rather than wrapped"
+        );
+    }
+
+    #[test]
+    fn a_series_whose_timestamps_are_not_ascending_is_an_error() {
+        let mut acc = Steps::new(Op::Sum, 0, 60_000, 30_000).unwrap();
+        let err = acc
+            .add_series(&[60_000, 30_000, 0], &[1.0, 2.0, 3.0])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ascending"), "{err}");
+        assert!(acc
+            .add_series(&[0, 30_000, 60_000], &[3.0, 2.0, 1.0])
+            .is_ok());
+    }
+
+    /// A partial state whose struct is not the one [`state_fields`]
+    /// describes, as a one-row list ready for `merge_batch`.
+    fn partial_state(fields: Fields, columns: Vec<ArrayRef>) -> ArrayRef {
+        let entries = StructArray::new(fields.clone(), columns, None);
+        let item = Arc::new(Field::new(
+            series::LIST_ITEM,
+            DataType::Struct(fields),
+            false,
+        ));
+        single_row_list(item, entries).to_array().unwrap()
+    }
+
+    #[test]
+    fn a_partial_state_missing_a_field_is_an_error() {
+        let state = partial_state(
+            Fields::from(vec![
+                Field::new(series::TIMESTAMP, series::timestamp_type(), false),
+                Field::new(STATE_A, DataType::Float64, false),
+            ]),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![0i64])),
+                Arc::new(Float64Array::from(vec![1.0])),
+            ],
+        );
+        let mut acc = Steps::new(Op::Sum, 0, 0, 1).unwrap();
+        let err = acc.merge_batch(&[state]).unwrap_err().to_string();
+        assert!(err.contains(&format!("no {STATE_B} column")), "{err}");
+    }
+
+    #[test]
+    fn a_partial_state_with_the_wrong_types_is_an_error() {
+        use datafusion::arrow::array::Int64Array;
+
+        let state = partial_state(
+            Fields::from(vec![
+                Field::new(series::TIMESTAMP, series::timestamp_type(), false),
+                Field::new(STATE_A, DataType::Float64, false),
+                Field::new(STATE_B, DataType::Float64, false),
+                // A peer that widened this lane, say.
+                Field::new(STATE_N, DataType::Int64, false),
+                Field::new(STATE_M, DataType::Boolean, false),
+            ]),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![0i64])),
+                Arc::new(Float64Array::from(vec![1.0])),
+                Arc::new(Float64Array::from(vec![1.0])),
+                Arc::new(Int64Array::from(vec![1i64])),
+                Arc::new(BooleanArray::from(vec![false])),
+            ],
+        );
+        let mut acc = Steps::new(Op::Sum, 0, 0, 1).unwrap();
+        let err = acc.merge_batch(&[state]).unwrap_err().to_string();
+        assert!(err.contains(&format!("{STATE_N} is not Float64")), "{err}");
     }
 }

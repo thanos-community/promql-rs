@@ -7,8 +7,6 @@
 //! on. An engine built with [`Engine::new`] has none and is safe to hold
 //! and drop inside someone else's runtime.
 
-use std::sync::Arc;
-
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
@@ -79,12 +77,12 @@ impl Engine {
     /// [`Self::range_query_async`], blocking on the engine's own runtime.
     pub fn range_query(
         &self,
-        source: Arc<dyn SeriesSource>,
+        source: &dyn SeriesSource,
         query: &str,
         range: &RangeQuery,
     ) -> Result<Vec<Series>, EngineError> {
         self.runtime()?
-            .block_on(self.range_query_async(source.as_ref(), query, range))
+            .block_on(self.range_query_async(source, query, range))
     }
 
     /// [`Self::plan_async`], blocking on the engine's own runtime.
