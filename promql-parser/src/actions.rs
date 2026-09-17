@@ -76,10 +76,15 @@ pub fn number_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, 
     }))
 }
 
+/// `number_duration_literal : DURATION`.
+///
+/// An unparseable duration is an error, never a zero window: nothing
+/// downstream validates it. grmtools fixes actions at `Result<T, ()>`,
+/// so the span and message are lost until a side channel exists.
 pub fn duration_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, ()> {
     let span = lx.span();
     let raw = lexer.span_str(span);
-    let val = parse_duration_seconds(raw).unwrap_or(0.0);
+    let val = parse_duration_seconds(raw)?;
     Ok(Expr::NumberLiteral(NumberLiteral {
         val,
         duration: true,
@@ -444,6 +449,9 @@ pub fn label_matcher_quoted_name<'l, 'i: 'l>(
 
 // -------- matrix / subquery / offset / @ --------
 
+/// `matrix_selector : expr LBRACKET DURATION RBRACKET` in the
+/// raw-token grammar shape. An unparseable window errors, see
+/// [`duration_literal`].
 pub fn matrix_selector<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
     span: Span,
@@ -451,7 +459,7 @@ pub fn matrix_selector<'l, 'i: 'l>(
     duration_lx: Lx,
 ) -> Result<Expr, ()> {
     let raw = lexer.span_str(duration_lx.span());
-    let range_secs = parse_duration_seconds(raw).unwrap_or(0.0);
+    let range_secs = parse_duration_seconds(raw)?;
     Ok(Expr::MatrixSelector(MatrixSelector {
         vector_selector: Box::new(selector?),
         range_secs,
@@ -460,6 +468,10 @@ pub fn matrix_selector<'l, 'i: 'l>(
     }))
 }
 
+/// `subquery_expr : expr LBRACKET DURATION COLON [DURATION] RBRACKET`
+/// in the raw-token grammar shape. Range and step error rather than
+/// defaulting, see [`duration_literal`]. An *absent* step is still
+/// zero: the production's own default, not a parse failure.
 pub fn subquery<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
     span: Span,
@@ -467,10 +479,11 @@ pub fn subquery<'l, 'i: 'l>(
     range_lx: Lx,
     step_lx: Option<Lx>,
 ) -> Result<Expr, ()> {
-    let range_secs = parse_duration_seconds(lexer.span_str(range_lx.span())).unwrap_or(0.0);
-    let step_secs = step_lx
-        .map(|l| parse_duration_seconds(lexer.span_str(l.span())).unwrap_or(0.0))
-        .unwrap_or(0.0);
+    let range_secs = parse_duration_seconds(lexer.span_str(range_lx.span()))?;
+    let step_secs = match step_lx {
+        Some(l) => parse_duration_seconds(lexer.span_str(l.span()))?,
+        None => 0.0,
+    };
     Ok(Expr::Subquery(SubqueryExpr {
         expr: Box::new(inner?),
         range_secs,
@@ -561,13 +574,15 @@ fn duration_from_expr(e: &Expr) -> Result<f64, ()> {
     }
 }
 
+/// `offset_expr : expr OFFSET [SUB] DURATION` in the raw-token grammar
+/// shape. An unparseable offset errors, see [`duration_literal`].
 pub fn offset<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
     inner: Result<Expr, ()>,
     negate: bool,
     duration_lx: Lx,
 ) -> Result<Expr, ()> {
-    let secs = parse_duration_seconds(lexer.span_str(duration_lx.span())).unwrap_or(0.0);
+    let secs = parse_duration_seconds(lexer.span_str(duration_lx.span()))?;
     let offset_secs = if negate { -secs } else { secs };
     Ok(apply_offset(inner?, offset_secs))
 }
@@ -845,10 +860,27 @@ pub fn series_description(
     Ok(SeriesDescription { labels, values })
 }
 
+/// Upper bound on the points one series description may expand to.
+///
+/// [`MAX_REPEAT_COUNT`] bounds a *single* run, but `series_values` is
+/// left-recursive and runs chain into one accumulator. This is exactly
+/// what one maximal run expands to, so a single run is the whole budget,
+/// still ~100x the largest line in upstream's promqltest corpus.
+const MAX_DESCRIPTION_VALUES: usize = MAX_REPEAT_COUNT as usize + 1;
+
+/// `series_values : series_values SPACE series_item`.
+///
+/// Left-recursive, so this is the one place that sees the whole
+/// description and the accumulator's length *is* the running total, with
+/// no extra state threaded through the grammar. Bounding here rather
+/// than in [`series_description`] refuses before the allocation.
 pub fn extend_values(
     mut acc: Vec<SequenceValue>,
     item: Vec<SequenceValue>,
 ) -> Result<Vec<SequenceValue>, ()> {
+    if acc.len() + item.len() > MAX_DESCRIPTION_VALUES {
+        return Err(());
+    }
     acc.extend(item);
     Ok(acc)
 }
@@ -904,6 +936,8 @@ pub fn stale_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Resu
 /// existed) or asks for an allocation no test could want. promqltest's
 /// own fixtures stay in the low thousands, so this is far above any
 /// legitimate input while keeping a bad one a parse error.
+///
+/// One run only; chained runs are bounded by [`MAX_DESCRIPTION_VALUES`].
 const MAX_REPEAT_COUNT: u64 = 1_000_000;
 
 /// `uint : NUMBER` — the repetition count after `x`.

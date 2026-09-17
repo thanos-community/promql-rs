@@ -199,6 +199,21 @@ fn accepts_repeat_count_at_limit() {
 }
 
 #[test]
+fn accepts_chained_runs_summing_to_the_description_limit() {
+    // Neither run is near MAX_REPEAT_COUNT, so this exercises the
+    // accumulated bound. `1x<count>` emits `count + 1` points, so the
+    // pair lands exactly on the inclusive per-description limit.
+    let sd = parse("metric 1x500000 1x499999");
+    assert_eq!(sd.values.len(), 1_000_001);
+}
+
+#[test]
+fn rejects_chained_runs_above_the_description_limit() {
+    // One point more than the test above.
+    assert!(parse_series_desc("metric 1x500000 1x500000").is_err());
+}
+
+#[test]
 fn rejects_repeat_count_wider_than_u64() {
     // Already an error before the bound existed — `parse::<u64>` refuses
     // it — but worth pinning so the two rejection paths stay distinct.
