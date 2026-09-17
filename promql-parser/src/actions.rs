@@ -11,9 +11,9 @@
 //! the `__gt_lexer` / `__gt_input` lifetimes in grmtools' generated
 //! parser.
 //!
-//! Current scope: the subset invoked by the core expression grammar
-//! (see `src/grammar.y` for the matching rule coverage). Helpers for
-//! series descriptions, histogram descriptors, fill modifiers, and
+//! Current scope: the subset invoked by the core expression and series
+//! description grammars (see `src/grammar.y` for the matching rule
+//! coverage). Helpers for histogram descriptors, fill modifiers, and
 //! duration-expression arithmetic are not yet implemented.
 
 // Every action returns `Result<T, ()>`: that is grmtools' convention for
@@ -28,8 +28,8 @@ use lrpar::{Lexeme, NonStreamingLexer};
 
 use crate::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, FunctionRef, LabelMatcher, MatchOp,
-    MatrixSelector, NumberLiteral, ParenExpr, StringLiteral, SubqueryExpr, UnaryExpr, ValueType,
-    VectorMatchCardinality, VectorMatching, VectorSelector,
+    MatrixSelector, NumberLiteral, ParenExpr, SequenceValue, SeriesDescription, StringLiteral,
+    SubqueryExpr, UnaryExpr, ValueType, VectorMatchCardinality, VectorMatching, VectorSelector,
 };
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
@@ -76,10 +76,15 @@ pub fn number_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, 
     }))
 }
 
+/// `number_duration_literal : DURATION`.
+///
+/// An unparseable duration is an error, never a zero window: nothing
+/// downstream validates it. grmtools fixes actions at `Result<T, ()>`,
+/// so the span and message are lost until a side channel exists.
 pub fn duration_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, ()> {
     let span = lx.span();
     let raw = lexer.span_str(span);
-    let val = parse_duration_seconds(raw).unwrap_or(0.0);
+    let val = parse_duration_seconds(raw)?;
     Ok(Expr::NumberLiteral(NumberLiteral {
         val,
         duration: true,
@@ -444,6 +449,9 @@ pub fn label_matcher_quoted_name<'l, 'i: 'l>(
 
 // -------- matrix / subquery / offset / @ --------
 
+/// `matrix_selector : expr LBRACKET DURATION RBRACKET` in the
+/// raw-token grammar shape. An unparseable window errors, see
+/// [`duration_literal`].
 pub fn matrix_selector<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
     span: Span,
@@ -451,7 +459,7 @@ pub fn matrix_selector<'l, 'i: 'l>(
     duration_lx: Lx,
 ) -> Result<Expr, ()> {
     let raw = lexer.span_str(duration_lx.span());
-    let range_secs = parse_duration_seconds(raw).unwrap_or(0.0);
+    let range_secs = parse_duration_seconds(raw)?;
     Ok(Expr::MatrixSelector(MatrixSelector {
         vector_selector: Box::new(selector?),
         range_secs,
@@ -460,6 +468,10 @@ pub fn matrix_selector<'l, 'i: 'l>(
     }))
 }
 
+/// `subquery_expr : expr LBRACKET DURATION COLON [DURATION] RBRACKET`
+/// in the raw-token grammar shape. Range and step error rather than
+/// defaulting, see [`duration_literal`]. An *absent* step is still
+/// zero: the production's own default, not a parse failure.
 pub fn subquery<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
     span: Span,
@@ -467,10 +479,11 @@ pub fn subquery<'l, 'i: 'l>(
     range_lx: Lx,
     step_lx: Option<Lx>,
 ) -> Result<Expr, ()> {
-    let range_secs = parse_duration_seconds(lexer.span_str(range_lx.span())).unwrap_or(0.0);
-    let step_secs = step_lx
-        .map(|l| parse_duration_seconds(lexer.span_str(l.span())).unwrap_or(0.0))
-        .unwrap_or(0.0);
+    let range_secs = parse_duration_seconds(lexer.span_str(range_lx.span()))?;
+    let step_secs = match step_lx {
+        Some(l) => parse_duration_seconds(lexer.span_str(l.span()))?,
+        None => 0.0,
+    };
     Ok(Expr::Subquery(SubqueryExpr {
         expr: Box::new(inner?),
         range_secs,
@@ -561,13 +574,15 @@ fn duration_from_expr(e: &Expr) -> Result<f64, ()> {
     }
 }
 
+/// `offset_expr : expr OFFSET [SUB] DURATION` in the raw-token grammar
+/// shape. An unparseable offset errors, see [`duration_literal`].
 pub fn offset<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
     inner: Result<Expr, ()>,
     negate: bool,
     duration_lx: Lx,
 ) -> Result<Expr, ()> {
-    let secs = parse_duration_seconds(lexer.span_str(duration_lx.span())).unwrap_or(0.0);
+    let secs = parse_duration_seconds(lexer.span_str(duration_lx.span()))?;
     let offset_secs = if negate { -secs } else { secs };
     Ok(apply_offset(inner?, offset_secs))
 }
@@ -735,6 +750,211 @@ fn aggregator_takes_param(op: ItemType) -> bool {
             | ItemType::Limitk
             | ItemType::LimitRatio
     )
+}
+
+// -------- start-symbol dispatch --------
+
+/// Result of the `start` rule, one variant per parse mode. Upstream
+/// stores this in `parser.generatedParserResult` as an `any` and type-
+/// asserts per entry point (`parse.go`); grmtools needs a single
+/// concrete return type, so the modes become an enum.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseResult {
+    /// `START_EXPRESSION` / `START_METRIC_SELECTOR`.
+    Expr(Expr),
+    /// `START_METRIC` — a bare label set.
+    Metric(Vec<LabelMatcher>),
+    /// `START_SERIES_DESCRIPTION`.
+    SeriesDescription(SeriesDescription),
+}
+
+// -------- label sets (series descriptions & START_METRIC) --------
+
+/// `metric : metric_identifier label_set`. Upstream sets `__name__` on
+/// a `labels.Builder`; we prepend the equivalent `Equal` matcher.
+///
+/// Going through a Builder has an observable side effect that the bare
+/// `metric : label_set` alternative does not share: `Builder.Reset`
+/// treats an empty value as a deletion, so `foo{bar=""} 1` yields just
+/// `__name__="foo"`. Dropping empties here — and only here — keeps us
+/// byte-identical with upstream on the promqltest corpus.
+pub fn metric_with_name(
+    span: Span,
+    name: String,
+    mut labels: Vec<LabelMatcher>,
+) -> Result<Vec<LabelMatcher>, ()> {
+    labels.retain(|l| !l.value.is_empty());
+    labels.insert(
+        0,
+        LabelMatcher {
+            name: "__name__".to_string(),
+            op: MatchOp::Equal,
+            value: name,
+            pos_range: to_pos_range(span),
+        },
+    );
+    Ok(labels)
+}
+
+pub fn push_label(mut acc: Vec<LabelMatcher>, item: LabelMatcher) -> Result<Vec<LabelMatcher>, ()> {
+    acc.push(item);
+    Ok(acc)
+}
+
+/// `label_set_item : IDENTIFIER EQL STRING`. Unlike `label_matcher`,
+/// a label set only ever has `=`.
+pub fn label_from_ident<'l, 'i: 'l>(
+    lexer: &'l L<'l, 'i>,
+    span: Span,
+    name: Result<Lx, Lx>,
+    value: Result<Lx, Lx>,
+) -> Result<LabelMatcher, ()> {
+    let name = lexer.span_str(name.map_err(|_| ())?.span()).to_string();
+    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    Ok(LabelMatcher {
+        name,
+        op: MatchOp::Equal,
+        value: unquote_string(raw)?,
+        pos_range: to_pos_range(span),
+    })
+}
+
+/// `label_set_item : string_identifier EQL STRING` — quoted UTF-8
+/// label name.
+pub fn label_from_string_ident<'l, 'i: 'l>(
+    lexer: &'l L<'l, 'i>,
+    span: Span,
+    name: String,
+    value: Result<Lx, Lx>,
+) -> Result<LabelMatcher, ()> {
+    let raw = lexer.span_str(value.map_err(|_| ())?.span());
+    Ok(LabelMatcher {
+        name,
+        op: MatchOp::Equal,
+        value: unquote_string(raw)?,
+        pos_range: to_pos_range(span),
+    })
+}
+
+/// `label_set_item : string_identifier` — a bare quoted string in a
+/// label set is the metric name.
+pub fn label_metric_name(span: Span, value: String) -> Result<LabelMatcher, ()> {
+    Ok(LabelMatcher {
+        name: "__name__".to_string(),
+        op: MatchOp::Equal,
+        value,
+        pos_range: to_pos_range(span),
+    })
+}
+
+// -------- series descriptions --------
+
+/// Upstream's stale marker: `math.Float64frombits(value.StaleNaN)`,
+/// a quiet NaN with a distinguishing low bit.
+const STALE_NAN: u64 = 0x7ff0_0000_0000_0002;
+
+pub fn series_description(
+    labels: Vec<LabelMatcher>,
+    values: Vec<SequenceValue>,
+) -> Result<SeriesDescription, ()> {
+    Ok(SeriesDescription { labels, values })
+}
+
+/// Upper bound on the points one series description may expand to.
+///
+/// [`MAX_REPEAT_COUNT`] bounds a *single* run, but `series_values` is
+/// left-recursive and runs chain into one accumulator. This is exactly
+/// what one maximal run expands to, so a single run is the whole budget,
+/// still ~100x the largest line in upstream's promqltest corpus.
+const MAX_DESCRIPTION_VALUES: usize = MAX_REPEAT_COUNT as usize + 1;
+
+/// `series_values : series_values SPACE series_item`.
+///
+/// Left-recursive, so this is the one place that sees the whole
+/// description and the accumulator's length *is* the running total, with
+/// no extra state threaded through the grammar. Bounding here rather
+/// than in [`series_description`] refuses before the allocation.
+pub fn extend_values(
+    mut acc: Vec<SequenceValue>,
+    item: Vec<SequenceValue>,
+) -> Result<Vec<SequenceValue>, ()> {
+    if acc.len() + item.len() > MAX_DESCRIPTION_VALUES {
+        return Err(());
+    }
+    acc.extend(item);
+    Ok(acc)
+}
+
+/// `_ x<count>` — a run of gaps.
+///
+/// Note the asymmetry with [`series_repeat`]: upstream's `BLANK TIMES
+/// uint` loop is `i < $3`, not `i <= $3`, so `_x5` yields exactly 5
+/// omitted points while `1x5` yields 6.
+///
+/// `count` is bounded by [`MAX_REPEAT_COUNT`] in [`parse_uint`], the
+/// only rule that produces it.
+pub fn repeat_omitted(count: u64) -> Vec<SequenceValue> {
+    vec![SequenceValue::omitted(); count as usize]
+}
+
+/// `<value>[<step>]x<count>` — an arithmetic run.
+///
+/// Upstream loops `for i := 0; i <= count; i++`, i.e. it emits
+/// `count + 1` points: "Add an additional value for time 0, which we
+/// ignore in tests". So `46.00+13.00x40` is 41 values, not 40.
+///
+/// `count` is bounded by [`MAX_REPEAT_COUNT`] in [`parse_uint`], the
+/// only rule that produces it; that is what makes the `count + 1`
+/// below safe from overflow.
+pub fn series_repeat(start: f64, step: f64, count: u64) -> Vec<SequenceValue> {
+    let mut out = Vec::with_capacity(count as usize + 1);
+    let mut val = start;
+    for _ in 0..=count {
+        out.push(SequenceValue::value(val));
+        val += step;
+    }
+    out
+}
+
+/// `series_value : IDENTIFIER` — the only identifier a value sequence
+/// accepts is `stale`.
+pub fn stale_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Result<f64, ()> {
+    let raw = lexer.span_str(lx.map_err(|_| ())?.span());
+    if raw != "stale" {
+        return Err(());
+    }
+    Ok(f64::from_bits(STALE_NAN))
+}
+
+/// Upper bound on an `x<count>` repetition.
+///
+/// Upstream has no explicit limit: Go would simply attempt the
+/// allocation. Here the count is a `u64` taken straight from the input
+/// text and [`series_repeat`] emits `count + 1` points, so an unbounded
+/// value overflows `usize` on a 64-bit target (`metric 1x18446744073709551615`
+/// panicked with "attempt to add with overflow" before this bound
+/// existed) or asks for an allocation no test could want. promqltest's
+/// own fixtures stay in the low thousands, so this is far above any
+/// legitimate input while keeping a bad one a parse error.
+///
+/// One run only; chained runs are bounded by [`MAX_DESCRIPTION_VALUES`].
+const MAX_REPEAT_COUNT: u64 = 1_000_000;
+
+/// `uint : NUMBER` — the repetition count after `x`.
+///
+/// Rejects counts above [`MAX_REPEAT_COUNT`], which is what keeps
+/// [`series_repeat`] and [`repeat_omitted`] from being handed a value
+/// they cannot allocate for. Both reach their count through this rule,
+/// so bounding it here covers both.
+pub fn parse_uint<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Result<Lx, Lx>) -> Result<u64, ()> {
+    let count = lexer
+        .span_str(lx.map_err(|_| ())?.span())
+        .parse::<u64>()
+        .map_err(|_| ())?;
+    if count > MAX_REPEAT_COUNT {
+        return Err(());
+    }
+    Ok(count)
 }
 
 // -------- shared parsers (number, duration, string) --------

@@ -386,8 +386,69 @@ safe without adding ceremony to the intentional-override case.
   writes a report, the developer reviews `git diff` and
   `target/promql-sync-report.md`, runs tests, and commits.
 
+## Parse modes
+
+Upstream serves several entry points from one grammar. goyacc allows a
+single `%start`, so `parse.go` selects among them by *injecting* a
+`START_*` pseudo-token at the head of the token stream (`InjectItem` /
+`parseGenerated`), and the `start` rule dispatches on it. We mirror
+that: `%start start`, the same four alternatives, and an
+`InjectingLexer` in `src/parser.rs` that prepends the lexeme. The
+pseudo-tokens have no lexer rule, so `build.rs` sets
+`allow_missing_terms_in_lexer`.
+
+Keeping upstream's shape here is what makes `metric` and `label_set`
+shared between expressions and series descriptions rather than
+duplicated into a second grammar.
+
+Upstream's `EOF` token has no counterpart on our side — grmtools
+handles end-of-input implicitly — so the sidecar's `skip_tokens` list
+drops the alternatives that reference it.
+
+### Series descriptions
+
+The `series_*` rules are generated from upstream like every other rule.
+The native-histogram alternatives of `series_item` fall out on their
+own, because they reference `histogram_series_value`, which is still on
+`skip_rules`.
+
+The lexer side is a known divergence. Upstream lexes series
+descriptions with the *same* lexer under a `seriesDesc bool`
+(`upstream/lex.go`), which makes SPACE significant, turns `x`/`_` into
+TIMES/BLANK, and disables hex literals. lrlex always begins in start
+state 0 and offers the caller no way to change it, so the mode cannot
+be a flag and currently lives in a second lexer file, `src/series.l`,
+whose start conditions mirror upstream's state functions:
+
+| `series.l` | `upstream/lex.go`  |
+|------------|--------------------|
+| `INITIAL`  | `lexStatements`    |
+| `BRACES`   | `lexInsideBraces`  |
+| `SERIES`   | `lexValueSequence` |
+
+Because lrlex requires rule names to be unique per file, tokens
+produced from more than one start condition are spelled differently in
+`series.l` and aliased back onto the real token ids in `build.rs`.
+
+See the follow-up below: finishing `src/lexer.rs` as a custom
+`lrpar::Lexer` collapses the two files, the aliases and the start-state
+limitation back into upstream's single-lexer-with-a-flag shape.
+
 ## Open follow-ups
 
+- Wire `src/lexer.rs` — the hand-written state machine that already
+  mirrors `lex.go` — into grmtools as a custom `lrpar::Lexer`, replacing
+  `src/lexer.l` and `src/series.l`. This is the layout this document
+  already describes, and series descriptions are the first feature that
+  forces the question: modal lexing is exactly what a regex/DFA lexer
+  cannot express, and the workarounds it needs (a second file, token-id
+  aliases) get more expensive every time upstream touches `lex.go`.
+- Port native-histogram descriptors (`{{schema:1 …}}`): the
+  `histogram_*` and `bucket_set*` rules, upstream's second lexer mode
+  (`histogramState` / `lexHistogram` / `lexBuckets`), and a native
+  histogram type in `ast.rs`. They are 228 of the 1015 distinct series
+  lines in upstream's `promqltest/testdata`, so this is a substantial
+  share of that corpus rather than an edge case.
 - Extend structural recognizers with per-release "known-quirks" entries
   (e.g. upstream-v3.5 reshuffled duration expression rules; recognizer
   knows to treat that transition specially). Only needed if we see the

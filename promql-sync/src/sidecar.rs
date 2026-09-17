@@ -37,6 +37,11 @@ pub struct Sidecar {
     /// histogram descriptors) but which sneak in through alts of an
     /// otherwise-reachable rule.
     pub skip_rules: Vec<String>,
+    /// Upstream *terminals* that no alt may reference. An alt using one
+    /// is dropped, exactly like an alt referencing a skipped rule. Used
+    /// for `EOF`, which upstream lexes explicitly but grmtools handles
+    /// implicitly, so it has no token id on our side.
+    pub skip_tokens: Vec<String>,
     /// Placeholder body emitted for any unmapped alt. Must produce the
     /// rule's declared return type. Default is `Err(())`.
     pub unmapped_placeholder: String,
@@ -77,6 +82,7 @@ impl Sidecar {
             default_actions: actions.default_actions.unwrap_or_default(),
             token_renames: tokens.renames.unwrap_or_default(),
             skip_rules: actions.skip_rules.unwrap_or_default(),
+            skip_tokens: actions.skip_tokens.unwrap_or_default(),
             unmapped_placeholder: actions
                 .unmapped_placeholder
                 .unwrap_or_else(|| "Err(())".to_string()),
@@ -123,6 +129,7 @@ struct ActionsFile {
     actions: Option<Vec<RawAction>>,
     default_actions: Option<BTreeMap<String, String>>,
     skip_rules: Option<Vec<String>>,
+    skip_tokens: Option<Vec<String>>,
     unmapped_placeholder: Option<String>,
 }
 
