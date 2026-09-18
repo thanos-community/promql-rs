@@ -30,13 +30,13 @@ fn floats(sd: &SeriesDescription) -> Vec<f64> {
 
 #[test]
 fn arithmetic_run() {
-    let sd = parse(r#"http_requests_total{pod="nginx-1", route="/"} 46.00+13.00x40"#);
+    let sd = parse(r#"http_requests_total{pod="envoy-1", route="/"} 46.00+13.00x40"#);
 
     assert_eq!(
         labels(&sd),
         vec![
             ("__name__", "http_requests_total"),
-            ("pod", "nginx-1"),
+            ("pod", "envoy-1"),
             ("route", "/"),
         ]
     );
@@ -53,7 +53,7 @@ fn arithmetic_run() {
 #[test]
 fn fractional_step() {
     let vals = floats(&parse(
-        r#"http_requests_total{pod="nginx-2", route="/"}  2+5.25x40"#,
+        r#"http_requests_total{pod="envoy-2", route="/"}  2+5.25x40"#,
     ));
     assert_eq!(vals.len(), 41);
     assert_eq!(vals[0], 2.0);
