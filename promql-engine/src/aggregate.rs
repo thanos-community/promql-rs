@@ -1013,9 +1013,10 @@ impl Accumulator for OneGroup {
     }
 }
 
-/// The four numbers of the test oracle's `State::to_row`, as field names: the partial
-/// state writes them and `merge_batch` reads them back by name, so they
-/// are named once here.
+/// Field names of the partial-state struct, shared by `state_fields()` on the
+/// writing side and `merge_batch` on the reading side. Named once so a rename
+/// fails to compile at both ends instead of mismatching at runtime across a
+/// partial/final plan boundary. The test module borrows them for fixtures.
 const STATE_A: &str = "a";
 const STATE_B: &str = "b";
 const STATE_N: &str = "n";
