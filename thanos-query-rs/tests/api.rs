@@ -33,8 +33,8 @@ fn series(labels: &[(&str, &str)], values: &[f64]) -> Series {
 }
 
 /// Two `up` series, stored out of order, and a counter.
-fn memory() -> MemorySeriesSource {
-    MemorySeriesSource::new(vec![
+fn memory() -> Vec<Series> {
+    vec![
         series(
             &[("__name__", "up"), ("instance", "b"), ("job", "web")],
             &[0.0, 1.0, 0.0, 1.0, 0.0],
@@ -47,7 +47,7 @@ fn memory() -> MemorySeriesSource {
             &[("__name__", "http_requests_total"), ("job", "api")],
             &[0.0, 10.0, 20.0, 30.0, 40.0],
         ),
-    ])
+    ]
 }
 
 fn app_with(
@@ -61,8 +61,8 @@ fn app_with(
 }
 
 /// `up` scraped by two replicas.
-fn replicated() -> MemorySeriesSource {
-    MemorySeriesSource::new(vec![
+fn replicated() -> Vec<Series> {
+    vec![
         series(
             &[("__name__", "up"), ("job", "x"), ("replica", "a")],
             &[1.0, 1.0, 1.0, 1.0, 1.0],
@@ -71,7 +71,7 @@ fn replicated() -> MemorySeriesSource {
             &[("__name__", "up"), ("job", "x"), ("replica", "b")],
             &[1.0, 1.0, 1.0, 1.0, 1.0],
         ),
-    ])
+    ]
 }
 
 fn replicated_app(replica_labels: &[&str]) -> Router {
@@ -645,7 +645,7 @@ impl QueryableCreator for Wrapped {
         Box::new(WrappedQueryable {
             inner: self.inner.queryable(options),
             source: SlowSource {
-                inner: Arc::new(memory()),
+                inner: Arc::new(MemorySeriesSource::try_new(memory()).unwrap()),
                 delay: self.delay,
             },
             warnings: self.warnings.clone(),

@@ -200,9 +200,13 @@ impl QueryApi {
             }
             self.engine.execute_async(plan).await.map_err(engine_error)
         };
-        let series = tokio::time::timeout(timeout, run)
+        let batches = tokio::time::timeout(timeout, run)
             .await
             .map_err(|_| ApiError::timeout("query timed out in query execution"))??;
+        // The engine's boundary is Arrow; the Prometheus API response is
+        // series, so this is where the batches are materialized.
+        let series = promql_engine::series::decode(&batches)
+            .map_err(|e| engine_error(EngineError::Schema(e)))?;
         Ok((series, queryable.warnings()))
     }
 }

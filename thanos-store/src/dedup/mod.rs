@@ -145,6 +145,7 @@ impl Dedup {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::array::RecordBatch;
     use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series};
 
     use super::*;
@@ -154,9 +155,15 @@ mod tests {
         Series::new(labels, ts, vs).unwrap()
     }
 
+    /// The engine hands back Arrow batches; these assertions are written
+    /// against series.
+    fn decode(batches: &[RecordBatch]) -> Vec<Series> {
+        promql_engine::series::decode(batches).expect("canonical schema")
+    }
+
     /// `up` from two replicas, `other` from none.
     fn replicated() -> MemorySeriesSource {
-        MemorySeriesSource::new(vec![
+        MemorySeriesSource::try_new(vec![
             series(
                 &[("__name__", "up"), ("job", "x"), ("replica", "a")],
                 &[(0, 1.0), (10_000, 1.0), (20_000, 1.0)],
@@ -170,6 +177,7 @@ mod tests {
                 &[(0, 5.0), (10_000, 5.0), (20_000, 5.0)],
             ),
         ])
+        .unwrap()
     }
 
     #[test]
@@ -233,7 +241,7 @@ mod tests {
         // marker; the merge must hand it on with its bits intact or the
         // engine cannot tell it from a NaN sample.
         let stale = f64::from_bits(promql_engine::selector::STALE_NAN_BITS);
-        let source = MemorySeriesSource::new(vec![
+        let source = MemorySeriesSource::try_new(vec![
             series(
                 &[("__name__", "c"), ("replica", "a")],
                 &[(0, 1.0), (10_000, 2.0), (20_000, 3.0), (30_000, stale)],
@@ -242,7 +250,8 @@ mod tests {
                 &[("__name__", "c"), ("replica", "b")],
                 &[(1_000, 1.0), (11_000, 2.0), (21_000, 3.0), (31_000, stale)],
             ),
-        ]);
+        ])
+        .unwrap();
         let engine = Engine::with_extension_planners(vec![Dedup::planner()]);
         let range = RangeQuery::new(30_000, 40_000, 10_000);
         let dedup = Dedup::new(vec!["replica".into()], DeduplicationFunc::Penalty);
@@ -253,6 +262,7 @@ mod tests {
                 .execute_async(dedup.inject(plan).unwrap())
                 .await
                 .unwrap();
+            let result = decode(&result);
             assert_eq!(result.len(), 1, "{query}: {result:?}");
             assert!(
                 result[0].values().iter().all(|v| v.is_finite()),
@@ -274,6 +284,7 @@ mod tests {
             .execute_async(dedup.inject(plan).unwrap())
             .await
             .unwrap();
+        let result = decode(&result);
         assert_eq!(result.len(), 1, "{result:?}");
         assert_eq!(result[0].label("replica"), "");
         assert_eq!(result[0].label("job"), "x");
@@ -288,7 +299,7 @@ mod tests {
             .execute_async(dedup.inject(plan).unwrap())
             .await
             .unwrap();
-        assert_eq!(result[0].values(), &[1.0, 1.0, 1.0]);
+        assert_eq!(decode(&result)[0].values(), &[1.0, 1.0, 1.0]);
 
         // Label accesses above the node, which DataFusion likes to push
         // down to the scan, stay above it: the group and the kept labels
@@ -303,6 +314,7 @@ mod tests {
                 .execute_async(dedup.inject(plan).unwrap())
                 .await
                 .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let result = decode(&result);
             assert_eq!(result.len(), 1, "{query}: {result:?}");
             assert_eq!(result[0].label("replica"), "", "{query}");
         }
@@ -313,7 +325,7 @@ mod tests {
             .await
             .unwrap();
         let result = engine.execute_async(plan).await.unwrap();
-        assert_eq!(result[0].values(), &[1.0, 2.0, 2.0]);
+        assert_eq!(decode(&result)[0].values(), &[1.0, 2.0, 2.0]);
 
         // An engine without the planner cannot run the node.
         let plan = Engine::new()

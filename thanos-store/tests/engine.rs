@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::RecordBatch;
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series, SeriesSource};
 use thanos_store::dedup::dedup_samples;
 use thanos_store::testutil::{
@@ -35,6 +36,12 @@ async fn source_over(fakes: Vec<FakeStore>, options: SelectOptions) -> ThanosSer
     let set = EndpointSet::new(&addrs, &EndpointSetConfig::default()).unwrap();
     set.update().await;
     ThanosSeriesSource::new(Arc::new(ProxyStore::new(Arc::new(set))), options)
+}
+
+/// The engine hands back Arrow batches; these assertions are written
+/// against series, so every result goes through here.
+fn decode(batches: &[RecordBatch]) -> Vec<Series> {
+    promql_engine::series::decode(batches).expect("canonical schema")
 }
 
 fn memory_series(labels: &[(&str, &str)], samples: &[(i64, f64)]) -> Series {
@@ -121,7 +128,7 @@ fn two_clusters() -> (Vec<FakeStore>, MemorySeriesSource) {
             vec![raw_chunk(&west_api[10..])],
         )]),
     ]);
-    let memory = MemorySeriesSource::new(vec![
+    let memory = MemorySeriesSource::try_new(vec![
         memory_series(
             &[
                 ("__name__", "http_requests_total"),
@@ -146,7 +153,8 @@ fn two_clusters() -> (Vec<FakeStore>, MemorySeriesSource) {
             ],
             &west_api,
         ),
-    ]);
+    ])
+    .unwrap();
     (vec![east, west], memory)
 }
 
@@ -171,10 +179,12 @@ async fn the_engine_cannot_tell_the_stores_from_memory() {
             .range_query_async(&thanos, query, &range)
             .await
             .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let from_thanos = decode(&from_thanos);
         let from_memory = engine
             .range_query_async(&memory, query, &range)
             .await
             .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let from_memory = decode(&from_memory);
         assert_eq!(
             flatten(&from_thanos),
             flatten(&from_memory),
@@ -199,6 +209,7 @@ async fn rate_has_the_expected_value() {
         )
         .await
         .unwrap();
+    let result = decode(&result);
     assert_eq!(result.len(), 2, "{result:?}");
     // A counter growing by 10 every 15s rates at 2/3 per second; the
     // west one grows by 30 per 15s.
@@ -226,6 +237,7 @@ async fn only_the_stores_that_can_answer_are_asked() {
         )
         .await
         .unwrap();
+    let result = decode(&result);
     assert_eq!(result.len(), 1);
     // Both east series, at 60s resolution over four minutes: 5 points.
     assert_eq!(result[0].timestamps().len(), 5);
@@ -252,7 +264,7 @@ async fn warnings_reach_the_caller_and_abort_fails_the_query() {
         .range_query_async(&warning, "up", &range)
         .await
         .unwrap();
-    assert_eq!(result.len(), 1);
+    assert_eq!(decode(&result).len(), 1);
     assert_eq!(warning.take_warnings(), vec!["block 01X is corrupted"]);
     assert!(warning.take_warnings().is_empty(), "taken means gone");
 
@@ -288,6 +300,7 @@ async fn a_dead_store_is_a_warning_with_partial_data() {
         .range_query_async(&thanos, "up", &RangeQuery::new(T0, T0 + 4 * STEP, STEP))
         .await
         .unwrap();
+    let result = decode(&result);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].label("replica"), "a");
     let warnings = thanos.take_warnings();
@@ -372,7 +385,7 @@ fn replicated() -> Replicated {
 /// What the step is expected to produce, as a memory source: the `api`
 /// replicas merged for `is_counter`, `web` as is, no replica label.
 fn merged_reference(replicated: &Replicated, is_counter: bool) -> MemorySeriesSource {
-    MemorySeriesSource::new(vec![
+    MemorySeriesSource::try_new(vec![
         memory_series(
             &[("__name__", "http_requests_total"), ("job", "api")],
             &dedup_samples(replicated.api.clone(), is_counter),
@@ -382,6 +395,7 @@ fn merged_reference(replicated: &Replicated, is_counter: bool) -> MemorySeriesSo
             &replicated.web,
         ),
     ])
+    .unwrap()
 }
 
 async fn deduplicated(
@@ -396,10 +410,11 @@ async fn deduplicated(
         .await
         .unwrap_or_else(|e| panic!("{query}: {e}"));
     let plan = dedup.inject(plan).unwrap();
-    engine
+    let batches = engine
         .execute_async(plan)
         .await
-        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    decode(&batches)
 }
 
 #[tokio::test]
@@ -434,6 +449,7 @@ async fn replicas_are_merged_in_the_plan() {
             .range_query_async(&reference, query, &range)
             .await
             .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let from_memory = decode(&from_memory);
         assert_eq!(
             flatten(&from_thanos),
             flatten(&from_memory),
@@ -464,12 +480,13 @@ async fn replicas_are_merged_in_the_plan() {
         .range_query_async(&thanos, "count(http_requests_total)", &range)
         .await
         .unwrap();
+    let plain = decode(&plain);
     assert!(plain[0].values().iter().all(|v| *v == 4.0), "{plain:?}");
     let plain = engine
         .range_query_async(&thanos, "http_requests_total", &range)
         .await
         .unwrap();
-    assert_eq!(plain.len(), 4);
+    assert_eq!(decode(&plain).len(), 4);
     assert!(thanos.take_warnings().is_empty());
 }
 
@@ -496,28 +513,30 @@ async fn a_lagging_replica_is_lifted_under_a_counter_function() {
 
     // Under `rate` the replica found behind at the switch is lifted to 110,
     // so there is no counter reset to add back in.
-    let lifted = MemorySeriesSource::new(vec![memory_series(
+    let lifted = MemorySeriesSource::try_new(vec![memory_series(
         &[("__name__", "restarts_total")],
         &[(T0, 100.0), (T0 + 10_000, 110.0), (T0 + 35_000, 110.0)],
-    )]);
+    )])
+    .unwrap();
     let query = "rate(restarts_total[1m])";
     let from_thanos = deduplicated(&engine, &thanos, &dedup, query, &range).await;
     let expected = engine
         .range_query_async(&lifted, query, &range)
         .await
         .unwrap();
-    assert_eq!(flatten(&from_thanos), flatten(&expected));
+    assert_eq!(flatten(&from_thanos), flatten(&decode(&expected)));
     assert!(from_thanos[0].values()[0] < 1.0, "{from_thanos:?}");
 
     // A function that is not a counter function takes the values as they are.
-    let raw = MemorySeriesSource::new(vec![memory_series(
+    let raw = MemorySeriesSource::try_new(vec![memory_series(
         &[("__name__", "restarts_total")],
         &[(T0, 100.0), (T0 + 10_000, 110.0), (T0 + 35_000, 105.0)],
-    )]);
+    )])
+    .unwrap();
     let query = "min_over_time(restarts_total[1m])";
     let from_thanos = deduplicated(&engine, &thanos, &dedup, query, &range).await;
     let expected = engine.range_query_async(&raw, query, &range).await.unwrap();
-    assert_eq!(flatten(&from_thanos), flatten(&expected));
+    assert_eq!(flatten(&from_thanos), flatten(&decode(&expected)));
     assert_eq!(from_thanos[0].values(), &[100.0]);
 }
 
@@ -535,6 +554,7 @@ async fn the_source_can_be_shared_as_a_trait_object() {
         )
         .await
         .unwrap();
+    let result = decode(&result);
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0].values(),

@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use promql_engine::matcher::{matches_all, CompiledMatcher};
+use promql_engine::matcher::CompiledMatcher;
 use promql_engine::{MemorySeriesSource, SeriesSource};
 use promql_parser::ast::LabelMatcher;
 use thanos_store::{LabelsResult, ProxyStore, SelectOptions, StoreError, ThanosSeriesSource};
@@ -123,12 +123,19 @@ impl Queryable for ThanosQueryable {
 #[derive(Debug)]
 pub struct MemoryQueryableCreator {
     source: Arc<MemorySeriesSource>,
+    /// The same series the source was built from. The source keeps them
+    /// as Arrow and hands back no rows, but the metadata endpoints below
+    /// answer over label sets, so they are kept here rather than decoded
+    /// again on every request.
+    series: Arc<Vec<promql_engine::Series>>,
 }
 
 impl MemoryQueryableCreator {
-    pub fn new(source: MemorySeriesSource) -> Self {
+    pub fn new(series: Vec<promql_engine::Series>) -> Self {
+        let source = MemorySeriesSource::try_new(series.clone()).expect("distinct label sets");
         Self {
             source: Arc::new(source),
+            series: Arc::new(series),
         }
     }
 }
@@ -137,12 +144,14 @@ impl QueryableCreator for MemoryQueryableCreator {
     fn queryable(&self, _options: SelectOptions) -> Box<dyn Queryable> {
         Box::new(MemoryQueryable {
             source: Arc::clone(&self.source),
+            series: Arc::clone(&self.series),
         })
     }
 }
 
 struct MemoryQueryable {
     source: Arc<MemorySeriesSource>,
+    series: Arc<Vec<promql_engine::Series>>,
 }
 
 impl MemoryQueryable {
@@ -159,10 +168,9 @@ impl MemoryQueryable {
             .collect::<Result<_, _>>()
             .map_err(|e| ApiError::bad_data(e.to_string()))?;
         Ok(self
-            .source
-            .series()
+            .series
             .iter()
-            .filter(|s| matches_all(&compiled, s))
+            .filter(|s| compiled.iter().all(|m| m.matches(s.label(&m.name))))
             .filter(|s| s.timestamps().iter().any(|&t| t >= start_ms && t <= end_ms))
             .collect())
     }

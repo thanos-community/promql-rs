@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use promql_engine::matcher::{matches_all, CompiledMatcher};
+use promql_engine::matcher::CompiledMatcher;
 use promql_engine::{SelectHints, Series};
 use promql_parser::ast::LabelMatcher;
 use tokio::task::JoinSet;
@@ -357,7 +357,11 @@ fn merge_series(
                 message,
             }
         })?;
-        if options.verify_matchers && !matches_all(compiled, &built) {
+        // A label a store never sent reads as "", which is what the
+        // matchers are defined against, so an absent label needs no case
+        // of its own here.
+        let matches_all = compiled.iter().all(|m| m.matches(built.label(&m.name)));
+        if options.verify_matchers && !matches_all {
             warnings.push(format!(
                 "dropped series {labels} that does not match the selector"
             ));
