@@ -359,9 +359,9 @@ fn merge_series(
         })?;
         // A label a store never sent reads as "", which is what the
         // matchers are defined against, so an absent label needs no case
-        // of its own here.
-        let matches_all = compiled.iter().all(|m| m.matches(built.label(&m.name)));
-        if options.verify_matchers && !matches_all {
+        // of its own here. The scan stays behind the flag: it walks every
+        // matcher of every merged series.
+        if options.verify_matchers && !compiled.iter().all(|m| m.matches(built.label(&m.name))) {
             warnings.push(format!(
                 "dropped series {labels} that does not match the selector"
             ));

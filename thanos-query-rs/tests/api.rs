@@ -76,7 +76,7 @@ fn replicated() -> Vec<Series> {
 
 fn replicated_app(replica_labels: &[&str]) -> Router {
     app_with(
-        Arc::new(MemoryQueryableCreator::new(replicated())),
+        Arc::new(MemoryQueryableCreator::try_new(replicated()).unwrap()),
         QueryOptions {
             replica_labels: replica_labels.iter().map(|l| l.to_string()).collect(),
             ..QueryOptions::default()
@@ -147,7 +147,7 @@ async fn dedup_merges_replicas_along_the_replica_labels() {
 
 fn app() -> Router {
     app_with(
-        Arc::new(MemoryQueryableCreator::new(memory())),
+        Arc::new(MemoryQueryableCreator::try_new(memory()).unwrap()),
         QueryOptions::default(),
         RouterOptions::default(),
     )
@@ -488,7 +488,7 @@ async fn preflight_and_cors_headers() {
     assert_eq!(headers["access-control-allow-origin"], "*");
 
     let quiet = app_with(
-        Arc::new(MemoryQueryableCreator::new(memory())),
+        Arc::new(MemoryQueryableCreator::try_new(memory()).unwrap()),
         QueryOptions::default(),
         RouterOptions {
             disable_cors: true,
@@ -616,7 +616,7 @@ async fn buildinfo_and_metrics() {
 #[tokio::test]
 async fn route_prefix_moves_everything() {
     let prefixed = app_with(
-        Arc::new(MemoryQueryableCreator::new(memory())),
+        Arc::new(MemoryQueryableCreator::try_new(memory()).unwrap()),
         QueryOptions::default(),
         RouterOptions {
             route_prefix: "/thanos/".into(),
@@ -716,7 +716,7 @@ impl SeriesSource for SlowSource {
 async fn a_slow_source_hits_the_timeout() {
     let slow = app_with(
         Arc::new(Wrapped {
-            inner: MemoryQueryableCreator::new(memory()),
+            inner: MemoryQueryableCreator::try_new(memory()).unwrap(),
             delay: Duration::from_millis(300),
             warnings: vec![],
         }),
@@ -737,7 +737,7 @@ async fn a_slow_source_hits_the_timeout() {
     // The flag caps the request's own timeout.
     let capped = app_with(
         Arc::new(Wrapped {
-            inner: MemoryQueryableCreator::new(memory()),
+            inner: MemoryQueryableCreator::try_new(memory()).unwrap(),
             delay: Duration::from_millis(300),
             warnings: vec![],
         }),
@@ -760,7 +760,7 @@ async fn a_slow_source_hits_the_timeout() {
 async fn source_warnings_reach_the_envelope() {
     let chatty = app_with(
         Arc::new(Wrapped {
-            inner: MemoryQueryableCreator::new(memory()),
+            inner: MemoryQueryableCreator::try_new(memory()).unwrap(),
             delay: Duration::ZERO,
             warnings: vec!["receive series from store-1:10901: Unavailable: down".into()],
         }),

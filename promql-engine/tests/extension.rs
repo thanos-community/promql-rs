@@ -203,9 +203,9 @@ async fn a_scan_keeps_the_hints_it_was_asked_with() {
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].func.as_deref(), Some("rate"));
     assert_eq!(recorded[0].range_ms, Some(60_000));
-    // `rate` stands between the aggregation and the selector, so the
-    // grouping no longer describes the selector's parent and the planner
-    // drops it.
+    // A range function between the aggregation and the selector makes
+    // the grouping describe something other than the selector's parent,
+    // so the planner drops it and a store must not rely on it there.
     assert!(recorded[0].grouping.is_none());
 
     let mut kept = None;

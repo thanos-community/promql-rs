@@ -131,12 +131,14 @@ pub struct MemoryQueryableCreator {
 }
 
 impl MemoryQueryableCreator {
-    pub fn new(series: Vec<promql_engine::Series>) -> Self {
-        let source = MemorySeriesSource::try_new(series.clone()).expect("distinct label sets");
-        Self {
+    /// Fails the way [`MemorySeriesSource::try_new`] does, on two series
+    /// sharing a label set.
+    pub fn try_new(series: Vec<promql_engine::Series>) -> Result<Self, String> {
+        let source = MemorySeriesSource::try_new(series.clone())?;
+        Ok(Self {
             source: Arc::new(source),
             series: Arc::new(series),
-        }
+        })
     }
 }
 
