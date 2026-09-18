@@ -1,41 +1,134 @@
 //! An in-memory [`SeriesSource`], and the reference implementation of a
 //! store's three obligations.
 //!
-//! It exists for tests, but it is also the executable statement of what a
-//! real store has to do: apply the matchers with [`crate::matcher`]'s
+//! It exists for tests, the conformance suite seeds it from the corpus's
+//! `load` blocks, but it is also the executable statement of what a real
+//! store has to do: apply the matchers with [`crate::matcher`]'s
 //! semantics, keep only samples inside the range, hand over one row per
 //! series with samples in timestamp order, in the canonical schema. A
 //! store implementer who wants to know "what exactly am I promising" can
 //! read `select` below.
+//!
+//! The shape of that `select` is the part worth copying, not the fact
+//! that the data happens to sit in memory: a mask per matcher over a
+//! whole label column, one `filter`, one pass that copies the samples
+//! inside the range, and nothing that walks a row. A store reading
+//! Parquet or answering over gRPC has the same three steps with its own
+//! scan underneath.
+//!
+//! Only the first of those steps is this module's: the last two are
+//! [`crate::series::drop_unused_labels`] and [`crate::series::clip`],
+//! which live with the shape they operate on so every store gets them
+//! rather than writing them again.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::array::{AsArray, RecordBatch};
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::ExecutionPlan;
-use promql_parser::ast::LabelMatcher;
+use promql_parser::ast::{LabelMatcher, SeriesDescription};
 
-use crate::matcher::{matches_all, CompiledMatcher};
-use crate::series::{encode, label_names_of, Series};
+use crate::matcher::{mask_all, CompiledMatcher};
+#[cfg(test)]
+use crate::series::decode;
+use crate::series::{clip, drop_unused_labels, encode, label_names_of, Series, LABELS};
 use crate::source::{SelectHints, SeriesSource};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemorySeriesSource {
-    series: Vec<Series>,
+    batch: RecordBatch,
+}
+
+impl Default for MemorySeriesSource {
+    fn default() -> Self {
+        Self::unique(Vec::new())
+    }
 }
 
 impl MemorySeriesSource {
-    /// Hold these series. Each [`Series`] was checked when it was built,
-    /// so there is nothing to validate here; two series with the same
-    /// label set are the caller's mistake and would select as two rows.
-    pub fn new(series: Vec<Series>) -> Self {
-        Self { series }
+    /// Encode these series into the one batch every query is answered
+    /// from. Each [`Series`] was checked when it was built, so the only
+    /// thing left to reject is two of them sharing a label set: that is
+    /// one series split in two, and it is caught here rather than on
+    /// every query.
+    pub fn try_new(series: Vec<Series>) -> std::result::Result<Self, String> {
+        Ok(Self {
+            batch: encode(&label_names_of(&series), &series)?,
+        })
     }
 
-    pub fn series(&self) -> &[Series] {
-        &self.series
+    /// The same, for callers that already merged by label set. They key
+    /// that merge the way `Series::new` normalizes a label set, dropping
+    /// `""` values before comparing, so no two entries can collapse into
+    /// one set here. What remains is `i32` offset overflow, which no merge
+    /// could have caused, so the panic surfaces a broken caller rather
+    /// than a reachable condition.
+    fn unique(series: Vec<Series>) -> Self {
+        Self::try_new(series).expect("callers merge by Series::new's normalized label set")
+    }
+
+    /// Seed from promqltest series descriptions the way upstream's
+    /// `load` does: value `i` sits at `i * interval` from the epoch, an
+    /// omitted value (`_`) emits no sample, and `stale` is already a
+    /// StaleNaN payload courtesy of the parser.
+    ///
+    /// The corpus repeats lines on purpose, so lines with equal labels
+    /// merge, the later one winning any timestamp both define. That is
+    /// obligation 2, partition, applied at load time, and it is what
+    /// keeps [`encode`] from seeing one label set twice.
+    pub fn from_descriptions(series: &[SeriesDescription], interval_secs: f64) -> Self {
+        let interval_ms = (interval_secs * 1000.0).round() as i64;
+        let mut merged: BTreeMap<Vec<(&str, &str)>, BTreeMap<i64, f64>> = BTreeMap::new();
+        for sd in series {
+            // The parser keeps a description's labels as written, a name
+            // possibly repeated; sorted by name, the last value wins. The
+            // key also drops `""` values because `Series::new` does:
+            // otherwise `x{env=""}` and `x` key differently here and then
+            // collide once built, which `unique` promises cannot happen.
+            let mut pairs: Vec<(&str, &str)> = sd
+                .labels
+                .iter()
+                .map(|l| (l.name.as_str(), l.value.as_str()))
+                .filter(|(_, v)| !v.is_empty())
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            let mut labels: Vec<(&str, &str)> = Vec::with_capacity(pairs.len());
+            for p in pairs {
+                match labels.last_mut() {
+                    Some(last) if last.0 == p.0 => last.1 = p.1,
+                    _ => labels.push(p),
+                }
+            }
+            let samples = merged.entry(labels).or_default();
+            for (i, v) in sd.values.iter().enumerate().filter(|(_, v)| !v.omitted) {
+                samples.insert(i as i64 * interval_ms, v.value);
+            }
+        }
+        let stored = merged
+            .into_iter()
+            .map(|(labels, samples)| {
+                let (timestamps, values) = samples.into_iter().unzip();
+                Series::new(&labels, timestamps, values)
+                    .expect("a sorted map yields ascending timestamps and unique names")
+            })
+            .collect();
+        // The merge above keyed on the label set, so no two survive equal.
+        Self::unique(stored)
+    }
+
+    /// The stored series, read back out of the batch.
+    ///
+    /// Test-only: [`decode`] drops zero-sample rows, which is right for a
+    /// query result but would hide a held series here, so this must never
+    /// grow a non-test caller without a row iterator that keeps them.
+    #[cfg(test)]
+    fn series(&self) -> Vec<Series> {
+        decode(std::slice::from_ref(&self.batch)).expect("encoded here")
     }
 }
 
@@ -53,24 +146,20 @@ impl SeriesSource for MemorySeriesSource {
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Obligation 1, filter: every matcher on every series, then the
-        // range on every sample. Clipping yields a new series that shares
-        // the stored buffers.
-        let selected: Vec<Series> = self
-            .series
-            .iter()
-            .filter(|s| matches_all(&compiled, s))
-            .map(|s| s.clip(hints.start_ms, hints.end_ms))
-            .collect();
+        // Obligation 1, filter.
+        let labels = self.batch.column_by_name(LABELS).expect("canonical");
+        let mask = mask_all(&compiled, labels.as_struct())?;
+        let selected = filter_record_batch(&self.batch, &mask)?;
+        let selected = drop_unused_labels(&selected).map_err(DataFusionError::Execution)?;
+        let selected =
+            clip(&selected, hints.start_ms, hints.end_ms).map_err(DataFusionError::Execution)?;
 
-        // Obligations 2 and 3, partition and order: one row per series,
-        // samples ascending as they were stored. The schema is the union
-        // of the selected series' label names.
-        let batch =
-            encode(&label_names_of(&selected), &selected).map_err(DataFusionError::Internal)?;
-        let schema = batch.schema();
+        // Obligations 2 and 3, partition and order, come for free: the
+        // stored batch already holds one row per series with its samples
+        // ascending, and neither step here reorders anything.
+        let schema = selected.schema();
         Ok(MemorySourceConfig::try_new_exec(
-            &[vec![batch]],
+            &[vec![selected]],
             schema,
             None,
         )?)
@@ -102,9 +191,9 @@ mod tests {
     }
 
     fn source() -> MemorySeriesSource {
-        MemorySeriesSource::new(vec![
+        MemorySeriesSource::try_new(vec![
             counter(
-                &[("__name__", "http_requests_total"), ("pod", "nginx-1")],
+                &[("__name__", "http_requests_total"), ("pod", "envoy-1")],
                 1.0,
                 1.0,
                 4,
@@ -112,7 +201,7 @@ mod tests {
             counter(
                 &[
                     ("__name__", "http_requests_total"),
-                    ("pod", "nginx-2"),
+                    ("pod", "envoy-2"),
                     ("route", "/"),
                 ],
                 1.0,
@@ -121,6 +210,17 @@ mod tests {
             ),
             counter(&[("__name__", "other")], 5.0, 0.0, 1),
         ])
+        .unwrap()
+    }
+
+    #[test]
+    fn one_label_set_twice_is_refused_at_construction() {
+        let err = MemorySeriesSource::try_new(vec![
+            counter(&[("__name__", "up")], 1.0, 0.0, 1),
+            counter(&[("__name__", "up")], 2.0, 0.0, 1),
+        ])
+        .unwrap_err();
+        assert!(err.contains(r#"__name__="up""#), "{err}");
     }
 
     #[tokio::test]
@@ -142,11 +242,40 @@ mod tests {
         assert_eq!(decoded[0].values(), [2.0, 3.0]);
         assert_eq!(decoded[1].timestamps(), [30_000, 60_000]);
         assert_eq!(decoded[1].values(), [3.0, 5.0]);
-        // `route` is in the schema because nginx-2 has it, and absent from
-        // nginx-1's label set because its row holds "".
+        // `route` is in the schema because envoy-2 has it, and absent from
+        // envoy-1's label set because its row holds "".
         assert!(decoded[0].labels().all(|(n, _)| n != "route"));
         assert_eq!(decoded[0].label("route"), "");
         assert_eq!(decoded[1].label("route"), "/");
+    }
+
+    /// The clip filters the shared child array, so a row keeps its own
+    /// samples only as long as the kept ranges stay in row order. The
+    /// series selected here is not the first one stored, which is what
+    /// makes the two disagree if they ever do.
+    #[tokio::test]
+    async fn a_clip_after_dropping_earlier_rows_keeps_each_row_its_samples() {
+        let ctx = SessionContext::new();
+        let plan = source()
+            .select(
+                &ctx.state(),
+                &[matcher("pod", MatchOp::Equal, "envoy-2")],
+                SelectHints::range(60_000, 90_000),
+            )
+            .await
+            .unwrap();
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let decoded = crate::series::decode(&batches).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].label("pod"), "envoy-2");
+        assert_eq!(decoded[0].timestamps(), [60_000, 90_000]);
+        assert_eq!(decoded[0].values(), [5.0, 7.0]);
+        // `other` is out of the selection, so its label set is out of the
+        // schema too.
+        assert_eq!(
+            crate::series::label_names(&batches[0].schema()),
+            ["__name__", "pod", "route"]
+        );
     }
 
     #[tokio::test]
@@ -155,7 +284,7 @@ mod tests {
         let plan = source()
             .select(
                 &ctx.state(),
-                &[matcher("pod", MatchOp::Equal, "nginx-3")],
+                &[matcher("pod", MatchOp::Equal, "envoy-3")],
                 SelectHints::range(0, 1_000_000),
             )
             .await
@@ -163,6 +292,45 @@ mod tests {
         crate::series::validate(&plan.schema()).unwrap();
         let batches = collect(plan, ctx.task_ctx()).await.unwrap();
         assert!(crate::series::decode(&batches).unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_lines_for_one_series_are_one_series() {
+        let load = [
+            r#"x{a="1"} 1 2 3"#,
+            r#"x{a="1"} 1 2 3"#,
+            r#"x{a="1"} _ _ _ 4"#,
+        ];
+        let series: Vec<SeriesDescription> = load
+            .iter()
+            .map(|l| promql_parser::parse_series_desc(l).unwrap())
+            .collect();
+        let src = MemorySeriesSource::from_descriptions(&series, 1.0);
+        assert_eq!(src.series().len(), 1);
+        assert_eq!(src.series()[0].timestamps(), [0, 1000, 2000, 3000]);
+        assert_eq!(src.series()[0].values(), [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// `parse_series_desc` already retains only non-empty-valued matchers
+    /// (`actions::series_description`'s `labels.retain`), so this never
+    /// sees `env=""` through the parser. The merge key still drops an
+    /// empty value itself, defensively, so a `SeriesDescription` built
+    /// any other way can't produce two entries that later collapse to one
+    /// label set inside `Series::new`.
+    #[test]
+    fn an_empty_valued_label_merges_with_the_label_omitted() {
+        let with_empty = promql_parser::parse_series_desc(r#"foo{env=""} 1"#).unwrap();
+        assert_eq!(with_empty.labels.len(), 1, "{:?}", with_empty.labels);
+
+        let load = [r#"foo{env=""} 1"#, r#"foo 2"#];
+        let series: Vec<SeriesDescription> = load
+            .iter()
+            .map(|l| promql_parser::parse_series_desc(l).unwrap())
+            .collect();
+        let src = MemorySeriesSource::from_descriptions(&series, 1.0);
+        assert_eq!(src.series().len(), 1);
+        assert_eq!(src.series()[0].values(), [2.0]);
+        assert_eq!(src.series()[0].label("env"), "");
     }
 
     #[tokio::test]
