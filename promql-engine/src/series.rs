@@ -39,15 +39,18 @@
 //! range query is again one row per series with a list of samples, now at
 //! step timestamps. That is what lets operators stack.
 
-use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    new_empty_array, Array, ArrayRef, AsArray, Float64Array, ListArray, RecordBatch,
-    StringViewArray, StringViewBuilder, StructArray, TimestampMillisecondArray,
+    new_empty_array, Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, Float64Array,
+    ListArray, RecordBatch, StringViewArray, StringViewBuilder, StructArray,
+    TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::concat;
+use datafusion::arrow::compute::{concat, filter, filter_record_batch};
 use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Float64Type, Schema, SchemaRef, TimeUnit,
     TimestampMillisecondType,
@@ -194,11 +197,10 @@ pub fn label_names(schema: &Schema) -> Vec<String> {
 /// One series: one row of the canonical shape, held as its two column
 /// values.
 ///
-/// A series is its label set. A different label set is a different
-/// series, and the label set never changes, so a `Series` is immutable:
-/// deriving one from another, as [`Series::clip`] does, yields a new
-/// `Series` sharing the buffers. It is Prometheus's `promql.Series`, the
-/// pair `Metric` and `Floats`, in Arrow.
+/// Prometheus's `promql.Series`, the pair `Metric` and `Floats`, in
+/// Arrow. Immutable, because a different label set is a different series.
+/// This is the row-at-a-time view that tests and [`decode`] hand back; a
+/// store holds a whole batch and works on it with kernels instead.
 #[derive(Debug, Clone)]
 pub struct Series {
     /// One row: one field per label name, names sorted, values strings.
@@ -303,18 +305,6 @@ impl Series {
             .as_primitive::<Float64Type>()
             .values()
     }
-
-    /// The same series with only the samples in `[start_ms, end_ms]`,
-    /// sharing the buffers: two binary searches and a slice.
-    pub fn clip(&self, start_ms: i64, end_ms: i64) -> Series {
-        let ts = self.timestamps();
-        let lo = ts.partition_point(|t| *t < start_ms);
-        let hi = ts.partition_point(|t| *t <= end_ms).max(lo);
-        Series {
-            labels: self.labels.clone(),
-            samples: self.samples.slice(lo, hi - lo),
-        }
-    }
 }
 
 /// The string at `row` of one label column. The schema forbids nulls; a
@@ -359,29 +349,52 @@ pub fn encode(names: &[String], series: &[Series]) -> Result<RecordBatch, String
         .iter()
         .map(|_| StringViewBuilder::new().with_deduplicate_strings())
         .collect();
-    let mut seen: HashSet<Vec<&str>> = HashSet::with_capacity(series.len());
+    // A row is hashed as it is written rather than collected into a key,
+    // so encoding allocates nothing per series; a collision costs only the
+    // label-by-label comparison against the rows already in that bucket.
+    let mut seen: HashMap<u64, Vec<usize>> = HashMap::with_capacity(series.len());
     let mut offsets: Vec<i32> = Vec::with_capacity(series.len() + 1);
     offsets.push(0);
     let mut total = 0usize;
-    for s in series {
-        for (name, _) in s.labels() {
-            if names.binary_search_by(|n| n.as_str().cmp(name)).is_err() {
-                return Err(format!(
-                    "label `{name}` is not among the batch's label names"
-                ));
+    for (row, s) in series.iter().enumerate() {
+        // Both `s.labels()` and `names` are sorted by name, so a merge
+        // walk finds each column's value, or reports a label the schema
+        // doesn't carry, in one linear pass instead of a `column_by_name`
+        // scan per label per series.
+        let mut labels = s.labels().peekable();
+        let mut hasher = DefaultHasher::new();
+        for (column, name) in columns.iter_mut().zip(&names) {
+            if let Some((n, _)) = labels.peek() {
+                if *n < name.as_str() {
+                    return Err(format!("label `{n}` is not among the batch's label names"));
+                }
             }
-        }
-        let values: Vec<&str> = names.iter().map(|n| s.label(n)).collect();
-        for (column, value) in columns.iter_mut().zip(&values) {
+            let value = match labels.peek() {
+                Some((n, v)) if *n == name.as_str() => {
+                    let v = *v;
+                    labels.next();
+                    v
+                }
+                _ => "",
+            };
             column.append_value(value);
+            value.hash(&mut hasher);
         }
-        if !seen.insert(values) {
+        if let Some((n, _)) = labels.next() {
+            return Err(format!("label `{n}` is not among the batch's label names"));
+        }
+        let bucket = seen.entry(hasher.finish()).or_default();
+        if bucket
+            .iter()
+            .any(|&other| names.iter().all(|n| series[other].label(n) == s.label(n)))
+        {
             let set: Vec<String> = s.labels().map(|(n, v)| format!("{n}={v:?}")).collect();
             return Err(format!(
                 "two series in one batch share the label set {{{}}}",
                 set.join(", ")
             ));
         }
+        bucket.push(row);
         total += s.samples.len();
         offsets.push(
             i32::try_from(total)
@@ -444,6 +457,143 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, String> {
         }
     }
     Ok(out)
+}
+
+/// A canonical batch with every empty-samples row removed.
+///
+/// Pulled out of [`decode`] so the engine's public API can hand back
+/// Arrow batches with this one piece of decode's semantics already
+/// applied: the module doc on [`decode`] explains why dropping empty
+/// series can't be a plan-side filter instead.
+pub fn drop_empty(batch: &RecordBatch) -> RecordBatch {
+    let samples = batch
+        .column_by_name(SAMPLES)
+        .expect("validated")
+        .as_list::<i32>();
+    if (0..batch.num_rows()).all(|row| samples.value_length(row) > 0) {
+        return batch.clone();
+    }
+    let mask = BooleanArray::from_iter(
+        (0..batch.num_rows()).map(|row| Some(samples.value_length(row) > 0)),
+    );
+    filter_record_batch(batch, &mask).expect("mask has one entry per row")
+}
+
+/// Drop the label columns no row in `batch` carries.
+///
+/// The store's schema is the union over everything it holds, and a
+/// selection is usually much narrower. Keeping an all-`""` column would
+/// be correct — that is how the shape spells an absent label — but it
+/// would make the schema depend on what else is in the store, so two
+/// stores holding the same series would answer one query with different
+/// schemas.
+pub fn drop_unused_labels(batch: &RecordBatch) -> Result<RecordBatch, String> {
+    let labels = batch.column_by_name(LABELS).expect("canonical").as_struct();
+    let used: Vec<usize> = (0..labels.num_columns())
+        .filter(|&i| {
+            // A `Utf8View`'s low 32 bits are its length, so a non-empty
+            // value is visible in the view word without materializing
+            // the `&str` behind it.
+            let values = labels.column(i).as_string_view();
+            values.views().iter().any(|v| *v as u32 != 0)
+        })
+        .collect();
+    if used.len() == labels.num_columns() {
+        return Ok(batch.clone());
+    }
+
+    let names: Vec<String> = used
+        .iter()
+        .map(|&i| labels.fields()[i].name().clone())
+        .collect();
+    let kept: ArrayRef = if used.is_empty() {
+        Arc::new(StructArray::new_empty_fields(batch.num_rows(), None))
+    } else {
+        Arc::new(StructArray::new(
+            used.iter().map(|&i| labels.fields()[i].clone()).collect(),
+            used.iter().map(|&i| Arc::clone(labels.column(i))).collect(),
+            None,
+        ))
+    };
+    RecordBatch::try_new(
+        schema(&names),
+        vec![
+            kept,
+            Arc::clone(batch.column_by_name(SAMPLES).expect("canonical")),
+        ],
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Keep only the samples in `[start_ms, end_ms]`.
+///
+/// Timestamps ascend within a row, so two binary searches per row give the
+/// kept range without looking at a sample. Those ranges then drive one
+/// `filter` over the shared child array, so the samples are copied once
+/// and the ones outside the range are never touched. A batch whose rows
+/// all lie inside the range — the common case for a store that already
+/// pruned by time — is handed back untouched.
+pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBatch, String> {
+    let samples = batch
+        .column_by_name(SAMPLES)
+        .expect("canonical")
+        .as_list::<i32>();
+    let entries = samples.values().as_struct();
+    let timestamps = entries
+        .column_by_name(TIMESTAMP)
+        .expect("canonical")
+        .as_primitive::<TimestampMillisecondType>()
+        .values();
+
+    // A first pass finds each row's kept range and whether any row needs
+    // clipping at all; a second, only entered when one does, builds the
+    // mask run-wise (the gap before the range, then the range itself) in
+    // one pass over each row rather than a `set_bit` per kept sample.
+    let offsets = samples.offsets();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(batch.num_rows());
+    let mut untouched = true;
+    for row in 0..batch.num_rows() {
+        let (from, to) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let window = &timestamps[from..to];
+        let lo = from + window.partition_point(|t| *t < start_ms);
+        let hi = (from + window.partition_point(|t| *t <= end_ms)).max(lo);
+        untouched &= lo == from && hi == to;
+        ranges.push((lo, hi));
+    }
+    if untouched {
+        return Ok(batch.clone());
+    }
+
+    let mut mask = BooleanBufferBuilder::new(entries.len());
+    let mut clipped: Vec<i32> = Vec::with_capacity(ranges.len() + 1);
+    clipped.push(0);
+    let mut total = 0i32;
+    let mut cursor = 0usize;
+    for (lo, hi) in ranges {
+        mask.append_n(lo - cursor, false);
+        mask.append_n(hi - lo, true);
+        cursor = hi;
+        total += (hi - lo) as i32;
+        clipped.push(total);
+    }
+    mask.append_n(entries.len() - cursor, false);
+
+    let entries =
+        filter(entries, &BooleanArray::new(mask.finish(), None)).map_err(|e| e.to_string())?;
+    let samples = ListArray::new(
+        sample_item(),
+        OffsetBuffer::new(clipped.into()),
+        entries,
+        None,
+    );
+    RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::clone(batch.column_by_name(LABELS).expect("canonical")),
+            Arc::new(samples),
+        ],
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -584,17 +734,33 @@ mod tests {
         assert_eq!(s.label("nope"), "");
     }
 
+    /// Both helpers keep the canonical shape, which is why they live
+    /// here: the batch that comes back still validates and still decodes
+    /// to the series the store meant to hand over.
     #[test]
-    fn clip_keeps_the_closed_range_and_shares_the_buffers() {
-        let s = series(&[("a", "1")], &[(0, 1.0), (10, 2.0), (20, 3.0), (30, 4.0)]);
-        let c = s.clip(10, 20);
-        assert_eq!(c.timestamps(), [10, 20]);
-        assert_eq!(c.values(), [2.0, 3.0]);
-        assert_eq!(c.label("a"), "1");
-        assert_eq!(c.values().as_ptr(), s.values()[1..].as_ptr());
-        assert!(s.clip(31, 40).timestamps().is_empty());
-        assert_eq!(s.clip(-5, 40).timestamps().len(), 4);
-        assert!(s.clip(20, 10).timestamps().is_empty());
+    fn the_store_helpers_narrow_a_batch_without_leaving_the_shape() {
+        let all = [
+            series(
+                &[("__name__", "up"), ("pod", "a")],
+                &[(0, 1.0), (1000, 2.0)],
+            ),
+            series(&[("__name__", "up")], &[(1000, 3.0), (2000, 4.0)]),
+        ];
+        // `pod` is in the schema, but no row below carries it.
+        let batch = encode(&["__name__".to_string(), "pod".to_string()], &all[1..]).unwrap();
+
+        let narrowed = drop_unused_labels(&batch).unwrap();
+        validate(&narrowed.schema()).unwrap();
+        assert_eq!(label_names(&narrowed.schema()), ["__name__"]);
+
+        let clipped = clip(&narrowed, 2000, 9000).unwrap();
+        validate(&clipped.schema()).unwrap();
+        let decoded = decode(&[clipped]).unwrap();
+        assert_eq!(decoded[0].timestamps(), [2000]);
+        assert_eq!(decoded[0].values(), [4.0]);
+
+        // Nothing to narrow and nothing to clip hands the batch back.
+        assert_eq!(clip(&narrowed, 0, 9000).unwrap().num_rows(), 1);
     }
 
     #[test]
