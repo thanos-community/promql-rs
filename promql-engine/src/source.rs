@@ -65,10 +65,12 @@ pub struct SelectHints {
     /// PromQL name (`rate`, `sum`); `None` when there is none.
     /// `count_over_time` needs no values; `rate` needs whole windows.
     pub func: Option<String>,
-    /// `by`/`without` of the aggregation directly above the selector. With
+    /// `by` of the aggregation directly above the selector. With
     /// `sum by (route)` only `route` decides the output, so a store may
     /// drop the other labels, and if it partitions its plan by the
-    /// grouping labels the engine aggregates without a shuffle.
+    /// grouping labels the engine aggregates without a shuffle. Absent as
+    /// soon as anything sits in between, as in `sum by (route)
+    /// (rate(x[5m]))`, where the selector's own parent is `rate`.
     pub grouping: Option<Grouping>,
     /// Return only shard `index` of `count` of the matching series, for
     /// scanning the series space in parallel; `None` for all of them.
@@ -94,7 +96,9 @@ impl SelectHints {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grouping {
     pub labels: Vec<String>,
-    /// `true` for `by`, `false` for `without`.
+    /// `true` for `by`, `false` for `without`. Carried for parity with
+    /// upstream's `SelectHints.By`, which is likewise only ever set for
+    /// `by`: `without` tells a store nothing it can act on.
     pub by: bool,
 }
 
