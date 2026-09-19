@@ -91,7 +91,11 @@ fn synthetic(shape: &Shape) -> Arc<dyn SeriesSource> {
 }
 
 /// The queries, from a bare selector to the SLO recording-rule shape.
-const QUERIES: [(&str, &str); 5] = [
+///
+/// The two `sort` shapes only do work in the `instant` half of the
+/// matrix below: a range result is never reordered, so their `range_1h`
+/// numbers are the plain selector's plus the planner's.
+const QUERIES: [(&str, &str); 7] = [
     ("selector", "http_requests_total"),
     ("sum", "sum(http_requests_total)"),
     ("sum_by_route", "sum by (route) (http_requests_total)"),
@@ -99,6 +103,11 @@ const QUERIES: [(&str, &str); 5] = [
     (
         "sum_by_route_increase_5m",
         "sum by (route) (increase(http_requests_total[5m]))",
+    ),
+    ("sort", "sort(http_requests_total)"),
+    (
+        "sort_by_label_pod",
+        r#"sort_by_label(http_requests_total, "pod")"#,
     ),
 ];
 

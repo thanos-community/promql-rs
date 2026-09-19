@@ -40,6 +40,7 @@ pub mod plan;
 pub mod range;
 pub mod selector;
 pub mod series;
+pub mod sort;
 pub mod source;
 
 pub use engine::{Engine, RangeQuery};

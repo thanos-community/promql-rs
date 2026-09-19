@@ -35,7 +35,8 @@
 //!
 //! # Conventions borrowed
 //!
-//! The file layout — `defaults` holding the query range, `tests` holding
+//! The file layout — `defaults` holding the query range, which a case
+//! may override with a `range` of its own, `tests` holding
 //! `name`/`description`/`load`/`query` — is the shared engine test-case
 //! format that `promql-testcases` binds (thanos-io/promql-engine's
 //! `testcases/range_queries.yaml`), read with the same `serde_norway`,
@@ -57,12 +58,12 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct Suite {
-    defaults: Defaults,
+    defaults: Bounds,
     tests: Vec<Case>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Defaults {
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct Bounds {
     start_ms: i64,
     end_ms: i64,
     step_ms: i64,
@@ -76,13 +77,19 @@ struct Case {
     load: Vec<String>,
     query: String,
     plan: String,
+    /// The default bounds, unless the shape only exists at other ones:
+    /// the ordering functions plan a `Sort` over an instant query and
+    /// nothing at all over a range.
+    range: Option<Bounds>,
 }
 
 fn plans_file() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/plans.yaml")
 }
 
-fn plan_of(case: &Case, range: &RangeQuery) -> String {
+fn plan_of(case: &Case, defaults: Bounds) -> String {
+    let b = case.range.unwrap_or(defaults);
+    let range = &RangeQuery::new(b.start_ms, b.end_ms, b.step_ms);
     let series: Vec<_> = case
         .load
         .iter()
@@ -126,19 +133,13 @@ fn every_case_plans_to_its_expected_shape() {
     let suite: Suite = serde_norway::from_str(&body).expect("the plans file parses");
     assert!(!suite.tests.is_empty(), "{} has no cases", path.display());
 
-    let range = RangeQuery::new(
-        suite.defaults.start_ms,
-        suite.defaults.end_ms,
-        suite.defaults.step_ms,
-    );
-
     // Every case is reported, not just the first: one planner change
     // usually moves several shapes, and seeing all of them is what makes
     // the update a single reviewable edit.
     let mut failures = Vec::new();
     for case in &suite.tests {
         let expected = case.plan.trim_end();
-        let actual = plan_of(case, &range);
+        let actual = plan_of(case, suite.defaults);
         if actual != expected {
             failures.push(format!(
                 "case {:?}\n  query:    {}\n  expected: {}\n  actual:   {}",

@@ -42,6 +42,7 @@ use crate::params::{step_count, Params};
 use crate::range::{self, Func};
 use crate::selector;
 use crate::series::{LABELS, SAMPLES};
+use crate::sort;
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
 
 /// The range a query is evaluated over.
@@ -217,12 +218,65 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
+    /// One of the four ordering functions over an instant vector.
+    ///
+    /// The result of a range query is a matrix, which Prometheus sorts by
+    /// label set regardless, so these are inert there — `funcSort` only
+    /// ever sees the one-step vector. Equal bounds is how the one entry
+    /// point this engine has spells an instant query.
+    async fn sort(&mut self, call: &Call, func: sort::Func) -> Result<Planned, EngineError> {
+        let name = func.as_str();
+        let (vector, args) = call.args.split_first().ok_or_else(|| {
+            EngineError::Query(format!("{name} expects a vector argument, got none"))
+        })?;
+        if !func.by_label() && !args.is_empty() {
+            return Err(EngineError::Query(format!(
+                "{name} expects exactly one argument, got {}",
+                call.args.len()
+            )));
+        }
+        let mut labels = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                Expr::StringLiteral(s) => labels.push(s.val.clone()),
+                other => {
+                    return Err(EngineError::Query(format!(
+                        "{name} expects label names as string literals, got {}",
+                        describe(other)
+                    )))
+                }
+            }
+        }
+
+        let input = self
+            .expr(
+                vector,
+                Above {
+                    func: Some(name),
+                    grouping: None,
+                },
+            )
+            .await?;
+        if self.query.start_ms != self.query.end_ms {
+            return Ok(input);
+        }
+        let keys = sort::exprs(func, &labels, &input.label_names);
+        let plan = LogicalPlanBuilder::from(input.plan).sort(keys)?.build()?;
+        Ok(Planned {
+            plan,
+            label_names: input.label_names,
+        })
+    }
+
     /// A function of one range selector: `rate(x[5m])` and its family.
     ///
     /// Takes no `Above`: this call is itself what stands directly over the
     /// selector, so nothing higher reaches the store.
     async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
         let name = call.func.name.as_str();
+        if let Some(func) = sort::Func::parse(name) {
+            return self.sort(call, func).await;
+        }
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
         let (ms, vs) = match call.args.as_slice() {

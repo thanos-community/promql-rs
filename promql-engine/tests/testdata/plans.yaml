@@ -1,8 +1,9 @@
 # Expected LogicalPlan per query. See tests/plan.rs for what this is for
 # and how to add a case.
 #
-# `defaults` is the one query range every case is planned with, so the
-# literals in a plan never differ between cases. Field names follow the
+# `defaults` is the query range every case is planned with unless it
+# carries a `range` of its own, so the literals in a plan rarely differ
+# between cases. Field names follow the
 # shared engine test-case format (thanos-io/promql-engine
 # testcases/range_queries.yaml), with `plan` added.
 #
@@ -43,6 +44,26 @@ tests:
     plan: |
       Projection: promql_labels(Utf8("cpu"), get_field(selector_0.labels, Utf8("cpu")), Utf8("instance"), get_field(selector_0.labels, Utf8("instance")), Utf8("mode"), get_field(selector_0.labels, Utf8("mode"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
         TableScan: selector_0
+
+  - name: sort over an instant selector
+    description: >
+      sort is a Sort node over the series rows and nothing else: the
+      projection below it is the bare selector's. Two keys, because
+      Prometheus puts NaN last whichever way the values go. Equal bounds
+      because sort only orders an instant result.
+    range:
+      start_ms: 1200000
+      end_ms: 1200000
+      step_ms: 30000
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="api", pod="api-2"} 0
+    query: |
+      sort(http_requests_total)
+    plan: |
+      Sort: isnan(promql_sort_value(samples)) ASC NULLS LAST, promql_sort_value(samples) ASC NULLS LAST
+        Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(1200000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+          TableScan: selector_0
 
   - name: grouped aggregation over a range function
     description: >
