@@ -31,7 +31,7 @@
 //! `start` rule dispatches on a leading `START_*` pseudo-token that
 //! `parser` injects into the token stream. That is what lets series
 //! descriptions (promqltest load lines such as
-//! `http_requests_total{pod="nginx-1"} 46.00+13.00x40`) reuse the same
+//! `http_requests_total{pod="envoy-1"} 46.00+13.00x40`) reuse the same
 //! `metric` and `label_set` rules as expressions instead of getting a
 //! parallel grammar. See [`parser`] for the lexer-mode side of it.
 
