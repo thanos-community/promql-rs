@@ -16,6 +16,7 @@ with upstream as Prometheus evolves.
 | `docs/parser-sync.md` | Design rationale for the parser and the sync tooling. |
 | `promql-engine/` | The PromQL engine crate: the `SeriesSource` trait every store implements, the series batch it returns, and the selector, aggregation and range-function operators over it. |
 | `docs/series-source.md` | Design note for `SeriesSource`: the trait and the Arrow shape. |
+| `docs/engine-trace.md` | Walkthrough of `sum(rate(http_requests_total[1m]))` from selection to aggregation, with intermediate numbers. Interactive: https://thanos-community.github.io/promql-rs/engine-trace.html |
 
 ## Why hand-porting a parser needs its own tooling
 
