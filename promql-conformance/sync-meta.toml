@@ -1,0 +1,15 @@
+# Machine-readable state for the promql-sync tool.
+#
+# pinned_upstream_sha identifies the upstream revision the vendored
+# `.test` files under testdata/prometheus/ are known to match.
+# last_sync_date is advisory.
+#
+# Per-file hashes live in testdata/prometheus/MANIFEST.toml so that
+# accidental edits to vendored files are caught by CI.
+#
+# This set carries no translation tables. The parser set has them
+# because its vendored Go is ported line by line into Rust; these files
+# are data, replayed verbatim, with nothing to translate.
+
+pinned_upstream_sha = "83962c35a4ab0c9988bc469aa8165014fc065d34"
+last_sync_date = "2026-09-13"

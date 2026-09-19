@@ -16,6 +16,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # scripts/progress reconstructs the pass count from every commit that
+          # touched UNSUPPORTED.md, which a shallow clone cannot see.
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -48,3 +52,23 @@ jobs:
 
       - name: Check vendored upstream files
         run: cargo run -p promql-sync -- check
+
+      # The allowlist ratchet already fails when the pass set changes, but it
+      # cannot see a SUPPORTED.toml committed without its matching
+      # UNSUPPORTED.md. Blessing is byte-idempotent, so a clean tree here is
+      # what makes each commit's pass count trustworthy after the fact.
+      - name: Check the promqltest allowlist is current
+        run: |
+          PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
+          git diff --exit-code -- promql-conformance/testdata/prometheus/
+
+      - name: Report promqltest progress
+        run: |
+          {
+            echo '### promqltest progress'
+            echo
+            echo '| date | commit | passed | total | % | change |'
+            echo '|---|---|---|---|---|---|'
+            ./scripts/progress | tail -n +2 |
+              awk -F'\t' '{ printf "| %s | `%s` | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }'
+          } >> "$GITHUB_STEP_SUMMARY"
