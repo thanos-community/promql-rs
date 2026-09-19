@@ -10,10 +10,12 @@
 
 use std::collections::BTreeMap;
 
-use promql_engine::series::decode;
-use promql_engine::{MemorySeriesSource, RangeQuery};
+use promql_engine::series::{decode, decode_vector};
+use promql_engine::{InstantResult, MemorySeriesSource, RangeQuery};
 
-use crate::result::{Engine, EngineError, LoadedSeries, Point, QueryResult, Series};
+use crate::result::{
+    Engine, EngineError, Labels, LoadedSeries, Point, QueryResult, Sample, Series,
+};
 
 pub struct DataFusionEngine {
     inner: promql_engine::Engine,
@@ -86,6 +88,52 @@ fn merge(load: &[LoadedSeries<'_>]) -> Vec<promql_engine::Series> {
         .collect()
 }
 
+/// A store seeded from the case's `load` blocks. One that cannot be
+/// built is a broken fixture, not a verdict on the query, so it is an
+/// `Other` rather than an answer.
+fn store(load: &[LoadedSeries<'_>]) -> Result<MemorySeriesSource, EngineError> {
+    MemorySeriesSource::try_new(merge(load))
+        .map_err(|e| EngineError::Other(format!("seeding the store: {e}")))
+}
+
+/// Decoded canonical series as the harness's matrix.
+fn matrix(decoded: &[promql_engine::Series]) -> QueryResult {
+    QueryResult::Matrix(
+        decoded
+            .iter()
+            .map(|s| Series {
+                labels: labels_of(s.labels()),
+                floats: s
+                    .timestamps()
+                    .iter()
+                    .zip(s.values())
+                    .map(|(&t, &v)| Point { t, v })
+                    .collect(),
+                histograms: 0,
+            })
+            .collect(),
+    )
+}
+
+/// A batch this harness cannot read is the engine's bug, not an answer.
+fn decoding(e: String) -> EngineError {
+    EngineError::Other(format!("decoding: {e}"))
+}
+
+fn labels_of<'a>(labels: impl Iterator<Item = (&'a str, &'a str)>) -> Labels {
+    labels.map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+}
+
+/// The one mapping both entry points share: which engine errors are an
+/// answer, which are a missing feature, and which are a bug.
+fn map_error(e: promql_engine::EngineError) -> Result<QueryResult, EngineError> {
+    match e {
+        promql_engine::EngineError::Unsupported(feature) => Err(EngineError::Unsupported(feature)),
+        promql_engine::EngineError::Query(msg) => Ok(QueryResult::Error(msg)),
+        other => Err(EngineError::Other(other.to_string())),
+    }
+}
+
 impl Engine for DataFusionEngine {
     fn range_query(
         &self,
@@ -95,39 +143,38 @@ impl Engine for DataFusionEngine {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<QueryResult, EngineError> {
-        // A store that cannot be built is a broken fixture, not a verdict
-        // on the query, so it stays an Other rather than an answer.
-        let source = MemorySeriesSource::try_new(merge(load))
-            .map_err(|e| EngineError::Other(format!("seeding the store: {e}")))?;
+        let source = store(load)?;
         let range = RangeQuery::new(start_ms, end_ms, step_ms);
         match self.inner.range_query(&source, query, &range) {
-            Ok(batches) => {
-                let decoded =
-                    decode(&batches).map_err(|e| EngineError::Other(format!("decoding: {e}")))?;
-                Ok(QueryResult::Matrix(
-                    decoded
-                        .iter()
-                        .map(|s| Series {
-                            labels: s
-                                .labels()
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect(),
-                            floats: s
-                                .timestamps()
-                                .iter()
-                                .zip(s.values())
-                                .map(|(&t, &v)| Point { t, v })
-                                .collect(),
-                            histograms: 0,
-                        })
-                        .collect(),
-                ))
-            }
-            Err(promql_engine::EngineError::Unsupported(feature)) => {
-                Err(EngineError::Unsupported(feature))
-            }
-            Err(promql_engine::EngineError::Query(msg)) => Ok(QueryResult::Error(msg)),
-            Err(other) => Err(EngineError::Other(other.to_string())),
+            Ok(batches) => Ok(matrix(&decode(&batches).map_err(decoding)?)),
+            Err(e) => map_error(e),
+        }
+    }
+
+    fn instant_query(
+        &self,
+        load: &[LoadedSeries<'_>],
+        query: &str,
+        at_ms: i64,
+    ) -> Result<QueryResult, EngineError> {
+        let source = store(load)?;
+        match self.inner.instant_query(&source, query, at_ms) {
+            Ok(InstantResult::Vector(batch)) => Ok(QueryResult::Vector(
+                decode_vector(&batch)
+                    .map_err(decoding)?
+                    .iter()
+                    .map(|s| Sample {
+                        labels: labels_of(s.labels()),
+                        t: s.timestamp(),
+                        v: s.value(),
+                        histogram: false,
+                    })
+                    .collect(),
+            )),
+            Ok(InstantResult::Matrix(batches)) => Ok(matrix(&decode(&batches).map_err(decoding)?)),
+            Ok(InstantResult::Scalar(v)) => Ok(QueryResult::Scalar { v, t: at_ms }),
+            Ok(InstantResult::String(v)) => Ok(QueryResult::Str { v, t: at_ms }),
+            Err(e) => map_error(e),
         }
     }
 }

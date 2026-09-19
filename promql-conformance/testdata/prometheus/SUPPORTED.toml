@@ -257,6 +257,8 @@ name_label_dropping = [
 range_queries = [
     "metric @ 0..120000/60000",
     "metric @ 0..120000/60000 #2",
+    "some_metric[1m] @ 60000",
+    "some_nonexistent_metric[1m] @ 60000",
     "sum_over_time(bar[30s]) @ 0..120000/60000",
     "sum_over_time(bar[30s]) @ 0..240000/60000",
     "sum_over_time(bar[30s]) @ 0..60000/30000",

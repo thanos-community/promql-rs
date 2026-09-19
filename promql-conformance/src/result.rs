@@ -136,6 +136,19 @@ pub trait Engine {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<QueryResult, EngineError>;
+
+    /// A query at one instant, whose [`QueryResult`] variant is the
+    /// answer's *type* and is part of what the script asserts. Separate
+    /// from [`Self::range_query`] because that one cannot say: a range
+    /// query is always a matrix, so an instant eval run through it can
+    /// only be compared after guessing which type the matrix stands
+    /// for.
+    fn instant_query(
+        &self,
+        load: &[LoadedSeries<'_>],
+        query: &str,
+        at_ms: i64,
+    ) -> Result<QueryResult, EngineError>;
 }
 
 /// One `load <interval>` block's worth of data.
@@ -189,6 +202,15 @@ impl Engine for Unimplemented {
         _start_ms: i64,
         _end_ms: i64,
         _step_ms: i64,
+    ) -> Result<QueryResult, EngineError> {
+        Err(EngineError::NotImplemented)
+    }
+
+    fn instant_query(
+        &self,
+        _load: &[LoadedSeries<'_>],
+        _query: &str,
+        _at_ms: i64,
     ) -> Result<QueryResult, EngineError> {
         Err(EngineError::NotImplemented)
     }

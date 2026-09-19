@@ -11,10 +11,18 @@
 # what is being pinned. One sample per series is enough because nothing
 # but the label set reaches the planner, and a second adds nothing; the
 # loader rejects a series carrying more.
+#
+# `instant: true` on a case plans it as an instant query at
+# `defaults.at_ms` instead, which is a different entry point in the
+# planner. Its cases are here to pin that the two produce one shape:
+# apart from the grid literals — start and end are both `at_ms`, and the
+# step is the 1ms an instant evaluation runs on — an instant plan is its
+# range plan.
 defaults:
   start_ms: 600000
   end_ms: 1200000
   step_ms: 30000
+  at_ms: 1200000
 
 tests:
   - name: instant selector
@@ -59,3 +67,33 @@ tests:
         Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
           Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
             TableScan: selector_0
+
+  - name: the same aggregation as an instant query
+    description: >
+      Node for node the case above, so an instant query is shown to add
+      no plan of its own: it is the same evaluation over a range whose
+      start, end and step are the instant and 1ms.
+    instant: true
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      sum by (job) (rate(http_requests_total[5m]))
+    plan: |
+      Projection: promql_labels(Utf8("job"), __group__job) AS labels, samples
+        Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(1200000), Int64(1200000), Int64(1)) AS samples]]
+          Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(1200000), Int64(1200000), Int64(1), Int64(300000), Int64(0), Int64(NULL)) AS samples
+            TableScan: selector_0
+
+  - name: a range selector as the whole instant query
+    description: >
+      The one shape only an instant query has. Nothing stands over the
+      scan: the window is the range the store was asked for, so the
+      store's own samples are the answer and no kernel touches them.
+    instant: true
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+    query: |
+      http_requests_total[5m]
+    plan: |
+      TableScan: selector_0

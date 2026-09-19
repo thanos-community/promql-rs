@@ -19,14 +19,13 @@
 //!
 //! # Instant queries
 //!
-//! 1,801 of the 2,098 evals are instant, and the engine only offers a
-//! range query. Issuing one with `start == end` yields exactly one point
-//! per series, which is then reshaped into the vector or scalar the
-//! script expects. The *script* says which — our own output cannot,
-//! since a scalar comes back as a matrix with one empty-label series,
-//! indistinguishable from what `sum(x)` returns. Anything other than
-//! exactly one point means the emulation itself is wrong, and is
-//! reported as a harness failure rather than passed to the comparer.
+//! 1,801 of the 2,098 evals are instant, and they go to
+//! `Engine::instant_query`, which answers with the type the query has.
+//! So the script's shape and the answer's type are compared directly: a
+//! vector eval answered with a matrix is a failure naming both, not
+//! something to reshape. The range path still emulates, because a range
+//! query is always a matrix and a script can still expect a scalar from
+//! one.
 
 use std::collections::BTreeMap;
 
@@ -269,14 +268,11 @@ fn run_eval(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
         })
         .collect();
 
-    // An instant query is a range of one step. `Grid::new` rejects a
-    // non-positive step, so the step is nominal rather than zero.
-    let (start_ms, end_ms, step_ms) = match eval.timing {
-        Timing::Instant { at_ms } => (at_ms, at_ms, 1),
-        Timing::Range(r) => (r.start_ms, r.end_ms, r.step_ms),
+    let answer = match eval.timing {
+        Timing::Instant { at_ms } => engine.instant_query(&load, &eval.query, at_ms),
+        Timing::Range(r) => engine.range_query(&load, &eval.query, r.start_ms, r.end_ms, r.step_ms),
     };
-
-    let actual = match engine.range_query(&load, &eval.query, start_ms, end_ms, step_ms) {
+    let actual = match answer {
         Ok(r) => r,
         Err(EngineError::Unsupported(feature)) => return Verdict::Unsupported(feature),
         Err(e) => return Verdict::Fail(e.to_string()),
@@ -335,32 +331,44 @@ fn verify(eval: &Eval, actual: QueryResult) -> Result<(), String> {
             };
             match actual {
                 QueryResult::Str { v, .. } if &v == want => Ok(()),
-                other => Err(format!(
-                    "expected string {want:?}, got {}",
-                    describe(&other)
-                )),
+                QueryResult::Str { v, .. } => Err(format!("expected string {want:?}, got {v:?}")),
+                other => Err(wrong_type("a string", &other)),
             }
         }
         Shape::Scalar => {
             let Expected::Scalar(want) = eval.expected else {
                 unreachable!("shape() returns Scalar only for Expected::Scalar")
             };
-            match normalise_scalar(actual) {
-                Ok(got) if almost_equal(want, got, EPSILON) => Ok(()),
-                Ok(got) => Err(format!("expected scalar {want}, got {got}")),
-                Err(e) => Err(e),
+            let got = match actual {
+                QueryResult::Scalar { v, .. } => v,
+                // A range eval is still emulated, and a range query is
+                // always a matrix, so there the scalar has to be dug
+                // back out of one.
+                other if matches!(eval.timing, Timing::Range(_)) => normalise_scalar(other)?,
+                other => return Err(wrong_type("a scalar", &other)),
+            };
+            if almost_equal(want, got, EPSILON) {
+                Ok(())
+            } else {
+                Err(format!("expected scalar {want}, got {got}"))
             }
         }
         Shape::Vector => {
+            // Only an instant eval has this shape, and an instant query
+            // answers with the type its expression has, so anything but
+            // a vector is the engine getting the type wrong rather than
+            // something to reshape.
+            let QueryResult::Vector(got) = actual else {
+                return Err(wrong_type("a vector", &actual));
+            };
             let want = expected_rows(eval, at_ms, 0);
-            let got = normalise_vector(actual)?;
             compare_vector(&want, &got, eval.expect.ordered)
         }
         Shape::Matrix(r) => {
             let want = expected_rows(eval, r.start_ms, r.step_ms);
             match actual {
                 QueryResult::Matrix(series) => compare_matrix(&want, &series),
-                other => Err(format!("expected a matrix, got {}", describe(&other))),
+                other => Err(wrong_type("a matrix", &other)),
             }
         }
     }
@@ -403,40 +411,10 @@ fn labels_of(desc: &SeriesDescription) -> Labels {
         .collect()
 }
 
-/// A range query always answers with a matrix. Reshape it into the
-/// vector an instant eval expects, refusing to guess when the shape is
-/// not what a single-step query should have produced.
-fn normalise_vector(actual: QueryResult) -> Result<Vec<Sample>, String> {
-    let series = match actual {
-        QueryResult::Matrix(series) => series,
-        other => {
-            return Err(format!(
-                "expected a matrix to reshape, got {}",
-                describe(&other)
-            ))
-        }
-    };
-    let mut out = Vec::with_capacity(series.len());
-    for s in series {
-        match s.floats.len() {
-            // A series with no point at the eval time simply is not in
-            // the instant result.
-            0 => continue,
-            1 => out.push(Sample {
-                labels: s.labels,
-                t: s.floats[0].t,
-                v: s.floats[0].v,
-                histogram: false,
-            }),
-            n => {
-                return Err(format!(
-                    "HARNESS FAILURE (not an engine failure): a single-step query \
-                     returned {n} points for one series"
-                ))
-            }
-        }
-    }
-    Ok(out)
+/// The result is of a different type than the script asserts, which is
+/// a failure in itself: an instant query's type is part of its answer.
+fn wrong_type(want: &str, got: &QueryResult) -> String {
+    format!("expected {want}, got {} ({})", got.kind(), describe(got))
 }
 
 fn normalise_scalar(actual: QueryResult) -> Result<f64, String> {
@@ -699,6 +677,32 @@ mod tests {
         ) -> Result<QueryResult, EngineError> {
             (self.0)(query)
         }
+
+        fn instant_query(
+            &self,
+            _load: &[LoadedSeries<'_>],
+            query: &str,
+            _at_ms: i64,
+        ) -> Result<QueryResult, EngineError> {
+            (self.0)(query)
+        }
+    }
+
+    /// One vector element, as a test writes it inline.
+    fn vector(rows: &[Row<'_>]) -> QueryResult {
+        QueryResult::Vector(
+            rows.iter()
+                .map(|(labels, points)| Sample {
+                    labels: labels
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    t: points[0].0,
+                    v: points[0].1,
+                    histogram: false,
+                })
+                .collect(),
+        )
     }
 
     /// A label set and its points, as a test writes them inline.
@@ -761,11 +765,23 @@ mod tests {
                 .push(load.iter().map(|b| b.series.len()).sum());
             Ok(matrix(&[]))
         }
+
+        fn instant_query(
+            &self,
+            load: &[LoadedSeries<'_>],
+            _query: &str,
+            _at_ms: i64,
+        ) -> Result<QueryResult, EngineError> {
+            self.0
+                .borrow_mut()
+                .push(load.iter().map(|b| b.series.len()).sum());
+            Ok(vector(&[]))
+        }
     }
 
     #[test]
-    fn an_instant_eval_compares_the_single_point_as_a_vector() {
-        let engine = Stub(|_: &str| Ok(matrix(&[(&[("job", "a")], &[(0, 7.0)])])));
+    fn an_instant_eval_compares_the_vector_the_engine_returned() {
+        let engine = Stub(|_: &str| Ok(vector(&[(&[("job", "a")], &[(0, 7.0)])])));
         assert_eq!(
             verdicts("eval instant at 0 q\n  {job=\"a\"} 7\n", &engine),
             [Verdict::Pass]
@@ -773,22 +789,32 @@ mod tests {
         assert!(!verdicts("eval instant at 0 q\n  {job=\"a\"} 8\n", &engine)[0].is_pass());
     }
 
-    /// Without this the instant emulation could silently compare against
-    /// whichever point happened to come first.
+    /// The type is part of the answer, so an engine that returns the
+    /// wrong one fails rather than being reshaped into the right one.
     #[test]
-    fn more_than_one_point_for_an_instant_eval_is_a_harness_failure() {
-        let engine = Stub(|_: &str| Ok(matrix(&[(&[("job", "a")], &[(0, 7.0), (60_000, 8.0)])])));
+    fn an_instant_eval_answered_with_the_wrong_type_fails_naming_both() {
+        let engine = Stub(|_: &str| Ok(matrix(&[(&[("job", "a")], &[(0, 7.0)])])));
         let Verdict::Fail(detail) = &verdicts("eval instant at 0 q\n  {job=\"a\"} 7\n", &engine)[0]
         else {
             panic!("expected a failure")
         };
-        assert!(detail.contains("HARNESS FAILURE"), "{detail}");
+        assert!(detail.contains("expected a vector"), "{detail}");
+        assert!(detail.contains("matrix"), "{detail}");
+
+        // And the same the other way round, for a range-vector eval.
+        let engine = Stub(|_: &str| Ok(vector(&[(&[("job", "a")], &[(0, 7.0)])])));
+        let script = "eval instant at 0 q\n  expect range vector from 0 to 0 step 1m\n  \
+                      {job=\"a\"} 7\n";
+        let Verdict::Fail(detail) = &verdicts(script, &engine)[0] else {
+            panic!("expected a failure")
+        };
+        assert!(detail.contains("expected a matrix"), "{detail}");
     }
 
     #[test]
     fn an_unordered_eval_ignores_the_order_the_engine_returned() {
         let engine = Stub(|_: &str| {
-            Ok(matrix(&[
+            Ok(vector(&[
                 (&[("job", "b")], &[(0, 2.0)]),
                 (&[("job", "a")], &[(0, 1.0)]),
             ]))
@@ -802,7 +828,7 @@ mod tests {
     #[test]
     fn an_ordered_eval_holds_the_engine_to_the_order() {
         let engine = Stub(|_: &str| {
-            Ok(matrix(&[
+            Ok(vector(&[
                 (&[("job", "b")], &[(0, 2.0)]),
                 (&[("job", "a")], &[(0, 1.0)]),
             ]))
@@ -830,7 +856,7 @@ mod tests {
     #[test]
     fn expect_fail_wants_an_error_and_nothing_else() {
         let erroring = Stub(|_: &str| Ok(QueryResult::Error("bad".into())));
-        let answering = Stub(|_: &str| Ok(matrix(&[(&[], &[(0, 1.0)])])));
+        let answering = Stub(|_: &str| Ok(vector(&[(&[], &[(0, 1.0)])])));
         let script = "eval instant at 0 q\n  expect fail\n";
         assert_eq!(verdicts(script, &erroring), [Verdict::Pass]);
         assert!(!verdicts(script, &answering)[0].is_pass());
@@ -838,12 +864,18 @@ mod tests {
 
     #[test]
     fn a_bare_number_is_compared_as_a_scalar() {
-        let engine = Stub(|_: &str| Ok(matrix(&[(&[], &[(0, 42.0)])])));
+        let engine = Stub(|_: &str| Ok(QueryResult::Scalar { v: 42.0, t: 0 }));
         assert_eq!(
             verdicts("eval instant at 0 q\n  42\n", &engine),
             [Verdict::Pass]
         );
         assert!(!verdicts("eval instant at 0 q\n  43\n", &engine)[0].is_pass());
+
+        // A range eval expecting a scalar still digs it out of the
+        // matrix a range query always answers with.
+        let engine = Stub(|_: &str| Ok(matrix(&[(&[], &[(0, 42.0)])])));
+        let script = "eval range from 0 to 0 step 1m q\n  42\n";
+        assert_eq!(verdicts(script, &engine), [Verdict::Pass]);
     }
 
     #[test]

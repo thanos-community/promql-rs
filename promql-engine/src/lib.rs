@@ -43,7 +43,7 @@ pub mod series;
 pub mod source;
 pub mod value_type;
 
-pub use engine::{Engine, RangeQuery};
+pub use engine::{Engine, InstantResult, RangeQuery};
 pub use error::EngineError;
 pub use memory::MemorySeriesSource;
 pub use series::Series;

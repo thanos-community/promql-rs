@@ -3,7 +3,8 @@
 //!
 //! One engine, with its Tokio runtime and UDF registrations, and one
 //! source per shape are built outside the timed closure, so an iteration
-//! is what a caller of `Engine::range_query` pays. `engine/plan` isolates
+//! is what a caller of `Engine::range_query` pays. `engine/instant` is
+//! the same through `Engine::instant_query`, and `engine/plan` isolates
 //! parsing and planning, which includes the store's `select`, from
 //! execution. Ids are `engine/query/<query>/<range>/<series>x<samples>`
 //! and are chosen once: renaming a benchmark resets its history.
@@ -133,6 +134,34 @@ fn query(c: &mut Criterion) {
     g.finish();
 }
 
+/// The instant API at the last sample, which is the shape a rule
+/// evaluation and an alert both ask for.
+///
+/// The `engine/query/*/instant` cases above are the same evaluation
+/// reached through `range_query`, so the gap between the two is what the
+/// type inference and the reshape into the vector shape cost. Ids are
+/// `engine/instant/<query>/<series>x<samples>`. One shape only: this
+/// measures the per-result work, and the widest source is where it
+/// shows.
+fn instant(c: &mut Criterion) {
+    let engine = Engine::blocking().unwrap();
+    let shape = &SHAPES[2];
+    let source = synthetic(shape);
+    let end = shape.end_ms();
+    let mut g = c.benchmark_group("engine/instant");
+    g.throughput(Throughput::Elements(shape.elements()));
+    for (qname, q) in [QUERIES[3], QUERIES[4]] {
+        g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
+            b.iter(|| {
+                engine
+                    .instant_query(source.as_ref(), black_box(q), end)
+                    .unwrap()
+            })
+        });
+    }
+    g.finish();
+}
+
 /// Parsing and planning alone. The store's `select` runs here, so the gap
 /// to `engine/query` is execution proper.
 fn plan(c: &mut Criterion) {
@@ -168,6 +197,6 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(20);
-    targets = query, plan
+    targets = query, instant, plan
 }
 criterion_main!(benches);
