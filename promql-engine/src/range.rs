@@ -833,6 +833,29 @@ mod tests {
     }
 
     #[test]
+    fn an_infinite_window_averages_to_an_infinity() {
+        let ts = [30 * S, 60 * S, 90 * S];
+        let p = Params {
+            start_ms: 90 * S,
+            end_ms: 90 * S,
+            window_ms: 2 * M,
+            ..at_5m()
+        };
+        let avg = |vs: &[f64]| run(Func::AvgOverTime, &ts[3 - vs.len()..], vs, p)[0].1;
+        assert_eq!(avg(&[f64::INFINITY, 0.0, f64::INFINITY]), f64::INFINITY);
+        assert_eq!(
+            avg(&[f64::NEG_INFINITY, 0.0, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+        // A window of one sample is that sample, infinite or not.
+        assert_eq!(avg(&[f64::INFINITY]), f64::INFINITY);
+        assert_eq!(avg(&[7.0]), 7.0);
+        // Opposite infinities and NaNs still poison the window.
+        assert!(avg(&[f64::INFINITY, 1.0, f64::NEG_INFINITY]).is_nan());
+        assert!(avg(&[f64::NAN, 1.0, 2.0]).is_nan());
+    }
+
+    #[test]
     fn irate_on_a_reset_keeps_the_new_value() {
         let ts = [0, 30 * S];
         let vs = [10.0, 2.0];

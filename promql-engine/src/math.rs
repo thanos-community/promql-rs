@@ -144,6 +144,17 @@ impl Mean {
     #[inline]
     pub fn add(&mut self, f: f64) {
         self.count += 1.0;
+        if self.count == 1.0 {
+            // Seeded, not added. Upstream pre-sets the first sample
+            // (the group initialiser in `aggregation`, the `sum,
+            // count = s.Floats[0].F, 1.` in `funcAvgOverTime`) and only
+            // then starts testing for overflow. Running the test on it
+            // instead would read a lone ±Inf as a sum that overflowed
+            // and divide the still-empty accumulator by a zero count,
+            // turning the mean of an infinity into NaN.
+            self.value = f;
+            return;
+        }
         if !self.incremental {
             let (v, c) = kahan_inc(f, self.value, self.c);
             if !v.is_infinite() {
@@ -598,6 +609,23 @@ mod tests {
         assert_eq!(m.result(), f64::MAX);
         m.add(0.0);
         assert!((m.result() - f64::MAX / 1.5).abs() <= f64::MAX * 1e-15);
+    }
+
+    /// An infinity is a legitimate mean, not evidence that the running
+    /// sum overflowed, and telling the two apart is what seeding the
+    /// first sample buys.
+    #[test]
+    fn a_mean_over_infinities_keeps_the_sign_it_should() {
+        assert_eq!(mean_of(&[f64::INFINITY]), f64::INFINITY);
+        assert_eq!(mean_of(&[f64::INFINITY, 0.0, f64::INFINITY]), f64::INFINITY);
+        assert_eq!(
+            mean_of(&[f64::NEG_INFINITY, 0.0, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(mean_of(&[1.0, 2.0, 3.0, 4.0, f64::INFINITY]), f64::INFINITY);
+        // Opposite infinities still cancel, at any position.
+        assert!(mean_of(&[f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY]).is_nan());
+        assert!(mean_of(&[1.0, 2.0, f64::NEG_INFINITY, f64::INFINITY]).is_nan());
     }
 
     #[test]
