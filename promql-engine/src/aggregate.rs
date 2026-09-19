@@ -14,9 +14,9 @@
 //! value, because a step no series reached is absent from the output, as
 //! in Prometheus, and that is not the same as a step that summed to zero.
 //!
-//! The operator is a literal argument rather than eight registered
-//! functions: one name to register, one plan to serialize, and the
-//! same reasoning as the parameters of `promql_vector_selector`.
+//! The operator is a literal argument rather than one registered
+//! function per operator: one name to register, one plan to serialize,
+//! and the same reasoning as the parameters of `promql_vector_selector`.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -46,9 +46,10 @@ use crate::series;
 
 pub const NAME: &str = "promql_aggregate";
 
-/// The aggregation operators this function implements. PromQL's others
-/// (`topk`, `quantile`, `count_values`, …) produce per-series or
-/// per-value output and get their own treatment later.
+/// The aggregation operators this function implements: the ones that
+/// fold a group into one output series. PromQL's `topk` family keeps the
+/// input series instead and is [`OpK`]; `count_values` invents a label
+/// and gets its own treatment later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Sum,
@@ -59,6 +60,7 @@ pub enum Op {
     Group,
     Stddev,
     Stdvar,
+    Quantile,
 }
 
 impl Op {
@@ -75,8 +77,15 @@ impl Op {
             ItemType::Group => Op::Group,
             ItemType::Stddev => Op::Stddev,
             ItemType::Stdvar => Op::Stdvar,
+            ItemType::Quantile => Op::Quantile,
             _ => return None,
         })
+    }
+
+    /// Whether the operator reads PromQL's aggregation parameter, the
+    /// `φ` of `quantile(φ, v)`.
+    pub fn takes_parameter(&self) -> bool {
+        matches!(self, Op::Quantile)
     }
 
     /// The inverse of [`Op::as_str`], for reading the operator back off
@@ -91,6 +100,7 @@ impl Op {
             "group" => Op::Group,
             "stddev" => Op::Stddev,
             "stdvar" => Op::Stdvar,
+            "quantile" => Op::Quantile,
             _ => return None,
         })
     }
@@ -105,8 +115,38 @@ impl Op {
             Op::Group => "group",
             Op::Stddev => "stddev",
             Op::Stdvar => "stdvar",
+            Op::Quantile => "quantile",
         }
     }
+}
+
+/// PromQL's `quantile()`, restated from upstream's `promql/quantile.go`.
+///
+/// `values` is sorted in place with NaN first, matching upstream's
+/// `vectorByValueHeap`: the interpolation then reads the same two
+/// neighbours as Go does, NaNs and all.
+fn quantile(q: f64, values: &mut [f64]) -> f64 {
+    if values.is_empty() || q.is_nan() {
+        return f64::NAN;
+    }
+    if q < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if q > 1.0 {
+        return f64::INFINITY;
+    }
+    values.sort_by(|a, b| match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.partial_cmp(b).expect("neither side is NaN"),
+    });
+    let n = values.len() as f64;
+    let rank = q * (n - 1.0);
+    let lower = rank.floor().max(0.0);
+    let upper = (lower + 1.0).min(n - 1.0);
+    let weight = rank - rank.floor();
+    values[lower as usize] * (1.0 - weight) + values[upper as usize] * weight
 }
 
 /// The most steps one query may evaluate.
@@ -232,6 +272,12 @@ struct Lanes {
     /// `avg`'s "already gone incremental" flag, bit-packed: one flag
     /// where its neighbours are eight bytes.
     incremental: Option<BooleanBufferBuilder>,
+    /// `quantile`'s values, one bag per position. It is the one operator
+    /// with no bounded running state: interpolating between two ranks
+    /// needs every value of the group at that step, so the lanes give way
+    /// to a growable bag and the partial state carries the values
+    /// themselves rather than a summary of them.
+    bags: Option<Vec<Vec<f64>>>,
     /// What a position holds before anything reaches it, the test oracle's
     /// `State::new` lane-wise. Only `min` and `max` want anything but zero: they have
     /// no identity element, so a fresh position is the NaN that the
@@ -255,12 +301,13 @@ impl Lanes {
             Op::Avg | Op::Stddev | Op::Stdvar => (3, 0.0),
             Op::Count => (1, 0.0),
             Op::Min | Op::Max => (1, f64::NAN),
-            Op::Group => (0, 0.0),
+            Op::Group | Op::Quantile => (0, 0.0),
         };
         Self {
             op,
             floats: (0..count).map(|_| Vec::new()).collect(),
             incremental: (op == Op::Avg).then(|| BooleanBufferBuilder::new(0)),
+            bags: (op == Op::Quantile).then(Vec::new),
             fill,
         }
     }
@@ -281,6 +328,9 @@ impl Lanes {
         if let Some(incremental) = &mut self.incremental {
             incremental.resize(len);
         }
+        if let Some(bags) = &mut self.bags {
+            bags.resize_with(len, Vec::new);
+        }
     }
 
     /// Drop the first `cut` positions and shift the rest down to meet the
@@ -291,6 +341,9 @@ impl Lanes {
         }
         if let Some(incremental) = &mut self.incremental {
             drop_bits_front(incremental, cut);
+        }
+        if let Some(bags) = &mut self.bags {
+            bags.drain(..cut);
         }
     }
 
@@ -333,6 +386,12 @@ impl Lanes {
             Op::Stddev | Op::Stdvar => {
                 let [mean, m2, count] = runs(&mut self.floats, r);
                 math::welford_add_each(mean, m2, count, values)
+            }
+            Op::Quantile => {
+                let bags = self.bags.as_mut().expect("quantile has the bags");
+                for (bag, value) in bags[r].iter_mut().zip(values) {
+                    bag.push(*value);
+                }
             }
         }
     }
@@ -390,6 +449,7 @@ impl Lanes {
                     &rows.n[s],
                 )
             }
+            Op::Quantile => unreachable!("{}", QUANTILE_MERGES_BY_ROW),
         }
     }
 
@@ -430,6 +490,7 @@ impl Lanes {
                 m2.copy_from_slice(&rows.b[s.clone()]);
                 count.copy_from_slice(&rows.n[s]);
             }
+            Op::Quantile => unreachable!("{}", QUANTILE_MERGES_BY_ROW),
         }
     }
 
@@ -443,8 +504,21 @@ impl Lanes {
                 .incremental
                 .as_ref()
                 .map_or(0, |bits| bits.capacity() / 8)
+            + self.bags.as_ref().map_or(0, |bags| {
+                bags.capacity() * std::mem::size_of::<Vec<f64>>()
+                    + bags
+                        .iter()
+                        .map(|b| b.capacity() * std::mem::size_of::<f64>())
+                        .sum::<usize>()
+            })
     }
 }
+
+/// Why the run-at-a-time merge never sees `quantile`: its partial state
+/// is one row per value, so several rows share a timestamp and the
+/// consecutive-run walk that every other operator merges through cannot
+/// describe it. [`Grouped::merge_batch`] takes those rows one by one.
+const QUANTILE_MERGES_BY_ROW: &str = "quantile merges row by row, not by run";
 
 /// The partial states of one `merge_batch` on the way in: every row of
 /// every list, flattened into four lanes, borrowed where Arrow put them.
@@ -502,6 +576,10 @@ fn drop_bits_front(bits: &mut BooleanBufferBuilder, cut: usize) {
 #[derive(Debug)]
 pub struct Grouped {
     op: Op,
+    /// PromQL's aggregation parameter, the `φ` of `quantile(φ, v)`.
+    /// Meaningless to every other operator, which is why it is not part
+    /// of [`Op`].
+    param: f64,
     grid: Grid,
     /// What DataFusion last said `total_num_groups` was, and so the
     /// number of grids the lanes and the bitmap span.
@@ -518,11 +596,18 @@ impl Grouped {
     pub fn new(op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
         Ok(Self {
             op,
+            param: f64::NAN,
             grid: Grid::new(start_ms, end_ms, step_ms)?,
             groups: 0,
             seen: BooleanBufferBuilder::new(0),
             lanes: Lanes::new(op),
         })
+    }
+
+    /// PromQL's aggregation parameter. Only `quantile` reads it.
+    pub fn with_param(mut self, param: f64) -> Self {
+        self.param = param;
+        self
     }
 
     /// Room for `groups` grids. DataFusion only ever grows this number,
@@ -657,6 +742,16 @@ impl Grouped {
                     vs.push(m2[i] / count[i]);
                 })
             }
+            Op::Quantile => {
+                let bags = self.lanes.bags.as_ref().expect("quantile has the bags");
+                let (q, mut scratch) = (self.param, Vec::new());
+                self.walk(seen, groups, |i, t| {
+                    ts.push(t);
+                    scratch.clear();
+                    scratch.extend_from_slice(&bags[i]);
+                    vs.push(quantile(q, &mut scratch));
+                })
+            }
         };
         let entries = StructArray::new(
             series::sample_fields(),
@@ -677,6 +772,9 @@ impl Grouped {
     /// before the first: how long a zero lane has to be is only known
     /// once the walk has counted the rows.
     fn partial(&self, seen: &BooleanBuffer, groups: usize) -> ListArray {
+        if self.op == Op::Quantile {
+            return self.partial_values(seen, groups);
+        }
         let kept = seen.count_set_bits();
         let mut ts = Vec::with_capacity(kept);
         let (mut a, mut b, mut n) = (Vec::new(), Vec::new(), Vec::new());
@@ -726,6 +824,7 @@ impl Grouped {
                 })
             }
             Op::Group => self.walk(seen, groups, |_, t| ts.push(t)),
+            Op::Quantile => unreachable!("handled by partial_values"),
             Op::Stddev | Op::Stdvar => {
                 let [mean, m2, count] = self.lanes.read();
                 (a, b, n) = (lane(), lane(), lane());
@@ -765,6 +864,7 @@ impl Grouped {
                 Float64Array::from(n),
                 no_flags(),
             ),
+            Op::Quantile => unreachable!("handled by partial_values"),
         };
         let entries = StructArray::new(
             state_fields(),
@@ -774,6 +874,46 @@ impl Grouped {
                 Arc::new(b),
                 Arc::new(n),
                 Arc::new(m),
+            ],
+            None,
+        );
+        list_per_group(state_item(), offsets, entries)
+    }
+
+    /// `quantile`'s partial state: every value the group holds, each as
+    /// its own row under the timestamp of the step it belongs to.
+    ///
+    /// The other operators summarize a step into one row; this one cannot
+    /// without deciding the quantile early, which a later merge would
+    /// then be unable to correct. Rows therefore repeat a timestamp, and
+    /// [`Grouped::merge_batch`] reads them one at a time rather than
+    /// through the consecutive-run walk.
+    fn partial_values(&self, seen: &BooleanBuffer, groups: usize) -> ListArray {
+        let bags = self.lanes.bags.as_ref().expect("quantile has the bags");
+        let (mut ts, mut a) = (Vec::new(), Vec::new());
+        let mut offsets = Vec::with_capacity(groups + 1);
+        offsets.push(0i32);
+        for group in 0..groups {
+            let base = self.base(group);
+            for step in seen.slice(base, self.grid.len).set_indices() {
+                let t = self.grid.timestamp(step);
+                for value in &bags[base + step] {
+                    ts.push(t);
+                    a.push(*value);
+                }
+            }
+            offsets.push(ts.len() as i32);
+        }
+        let rows = ts.len();
+        let zeros = || Float64Array::new(ScalarBuffer::from(vec![0.0; rows]), None);
+        let entries = StructArray::new(
+            state_fields(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(ts)),
+                Arc::new(Float64Array::from(a)),
+                Arc::new(zeros()),
+                Arc::new(zeros()),
+                Arc::new(BooleanArray::new(BooleanBuffer::new_unset(rows), None)),
             ],
             None,
         );
@@ -938,6 +1078,14 @@ impl GroupsAccumulator for Grouped {
                 continue;
             }
             let base = self.base(group);
+            if self.op == Op::Quantile {
+                for k in lo..hi {
+                    let at = base + self.grid.index(ts[k])?;
+                    self.seen.set_bit(at, true);
+                    self.lanes.bags.as_mut().expect("quantile has the bags")[at].push(rows.a[k]);
+                }
+                continue;
+            }
             let grid = self.grid;
             grid.runs(&ts[lo..hi], |index, from, len| {
                 self.merge_run(base + index, &rows, lo + from, len);
@@ -1104,6 +1252,7 @@ impl Default for Aggregate {
                     DataType::Int64,
                     DataType::Int64,
                     DataType::Int64,
+                    DataType::Float64,
                 ],
                 Volatility::Immutable,
             ),
@@ -1115,16 +1264,18 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(Aggregate::default())
 }
 
-/// `promql_aggregate(samples, '<op>', start, end, step)`. The step grid
-/// is an argument because it is what turns a timestamp into an array
-/// index; see `Grid`.
-pub fn call(samples: Expr, op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Expr {
+/// `promql_aggregate(samples, '<op>', start, end, step, param)`. The step
+/// grid is an argument because it is what turns a timestamp into an array
+/// index; see `Grid`. `param` is PromQL's aggregation parameter, NaN for
+/// the operators that take none.
+pub fn call(samples: Expr, op: Op, start_ms: i64, end_ms: i64, step_ms: i64, param: f64) -> Expr {
     udaf().call(vec![
         samples,
         lit(op.as_str()),
         lit(start_ms),
         lit(end_ms),
         lit(step_ms),
+        lit(param),
     ])
 }
 
@@ -1143,7 +1294,7 @@ fn from_args(args: &AccumulatorArgs) -> Result<Grouped> {
         })
         .ok_or_else(|| {
             DataFusionError::Plan(format!(
-                "{NAME}: second argument must be one of sum, avg, count, min, max, group, stddev, stdvar as a string literal"
+                "{NAME}: second argument must be one of sum, avg, count, min, max, group, stddev, stdvar, quantile as a string literal"
             ))
         })?;
     let grid = |i: usize, what: &str| {
@@ -1156,7 +1307,15 @@ fn from_args(args: &AccumulatorArgs) -> Result<Grouped> {
                 DataFusionError::Plan(format!("{NAME}: {what} must be an Int64 literal"))
             })
     };
-    Grouped::new(op, grid(2, "start")?, grid(3, "end")?, grid(4, "step")?)
+    let param = literal(5)
+        .and_then(|v| match v {
+            ScalarValue::Float64(Some(f)) => Some(*f),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("{NAME}: the parameter must be a Float64 literal"))
+        })?;
+    Ok(Grouped::new(op, grid(2, "start")?, grid(3, "end")?, grid(4, "step")?)?.with_param(param))
 }
 
 /// `DISTINCT` would have to deduplicate whole series before folding them,
@@ -1268,6 +1427,7 @@ mod tests {
                 Op::Max => State::Max(f64::NAN),
                 Op::Group => State::Group,
                 Op::Stddev | Op::Stdvar => State::Var(Welford::default()),
+                Op::Quantile => unreachable!("{}", QUANTILE_HAS_NO_RUNNING_STATE),
             }
         }
 
@@ -1343,9 +1503,16 @@ mod tests {
                     m2: b,
                     count: n,
                 }),
+                Op::Quantile => unreachable!("{}", QUANTILE_HAS_NO_RUNNING_STATE),
             }
         }
     }
+
+    /// Why [`OPS`] and the oracle stop short of `quantile`: the oracle is
+    /// a bounded running state per step, and `quantile` has none — it
+    /// keeps every value. Its own tests below compare it against
+    /// upstream's interpolation directly instead.
+    const QUANTILE_HAS_NO_RUNNING_STATE: &str = "quantile keeps values, not a running state";
 
     /// The state one lane position holds, read back out of [`Lanes`] as a
     /// [`State`] value for comparison against the oracle.
@@ -1381,6 +1548,7 @@ mod tests {
                 State::Max(cur[at])
             }
             Op::Group => State::Group,
+            Op::Quantile => unreachable!("{}", QUANTILE_HAS_NO_RUNNING_STATE),
             Op::Stddev | Op::Stdvar => {
                 let [mean, m2, count] = lanes.read();
                 State::Var(Welford {
@@ -1830,6 +1998,7 @@ mod tests {
             (ItemType::Group, Op::Group),
             (ItemType::Stddev, Op::Stddev),
             (ItemType::Stdvar, Op::Stdvar),
+            (ItemType::Quantile, Op::Quantile),
         ] {
             assert_eq!(Op::from_token(token), Some(op), "{token}");
             // The token and the plan's string literal name one kernel.
@@ -1851,13 +2020,77 @@ mod tests {
         for token in [
             ItemType::Topk,
             ItemType::Bottomk,
-            ItemType::Quantile,
             ItemType::CountValues,
             ItemType::Limitk,
             ItemType::LimitRatio,
         ] {
             assert_eq!(Op::from_token(token), None, "{token}");
         }
+    }
+
+    /// Upstream's `quantile()` interpolates between the two ranks around
+    /// `φ(n-1)`, answers ±Inf outside [0, 1], and sorts NaN below every
+    /// number rather than dropping it.
+    #[test]
+    fn quantile_interpolates_the_way_upstream_does() {
+        let q = |phi: f64, mut vs: Vec<f64>| quantile(phi, &mut vs);
+        assert_eq!(q(0.5, vec![1.0, 2.0, 3.0]), 2.0);
+        assert_eq!(q(0.5, vec![1.0, 2.0, 3.0, 4.0]), 2.5);
+        assert_eq!(q(0.0, vec![3.0, 1.0, 2.0]), 1.0);
+        assert_eq!(q(1.0, vec![3.0, 1.0, 2.0]), 3.0);
+        assert_eq!(q(0.25, vec![1.0, 2.0, 3.0, 4.0]), 1.75);
+        assert_eq!(q(-0.5, vec![1.0]), f64::NEG_INFINITY);
+        assert_eq!(q(1.5, vec![1.0]), f64::INFINITY);
+        assert!(q(f64::NAN, vec![1.0]).is_nan());
+        assert!(q(0.5, vec![]).is_nan());
+        // NaN sorts first, so it is the lower rank the interpolation
+        // reads, and the answer is NaN rather than the numbers' median.
+        assert!(q(0.0, vec![1.0, f64::NAN, 2.0]).is_nan());
+        assert_eq!(q(1.0, vec![1.0, f64::NAN, 2.0]), 2.0);
+    }
+
+    #[test]
+    fn quantile_aggregates_each_step_over_the_series_present_at_it() {
+        let series: Vec<&[(i64, f64)]> = vec![&[(0, 1.0), (1, 4.0)], &[(0, 3.0)], &[(0, 2.0)]];
+        let acc = Grouped::new(Op::Quantile, 0, 1, 1).unwrap().with_param(0.5);
+        let mut acc = acc;
+        acc.grow(1).unwrap();
+        for s in &series {
+            let (ts, vs): (Vec<i64>, Vec<f64>) = s.iter().copied().unzip();
+            acc.add_series(0, &ts, &vs).unwrap();
+        }
+        assert_eq!(samples(&acc, 0), vec![(0, 2.0), (1, 4.0)]);
+    }
+
+    /// `quantile`'s partial state is one row per value, several sharing a
+    /// timestamp, which the run-at-a-time merge every other operator uses
+    /// cannot express. Splitting the same values across two accumulators
+    /// and merging must still give the whole group's quantile.
+    #[test]
+    fn quantile_partial_states_carry_the_values_themselves() {
+        let whole: Vec<&[(i64, f64)]> = vec![&[(0, 1.0)], &[(0, 2.0)], &[(0, 3.0)], &[(0, 4.0)]];
+        let mut left = Grouped::new(Op::Quantile, 0, 0, 1)
+            .unwrap()
+            .with_param(0.75);
+        let mut right = Grouped::new(Op::Quantile, 0, 0, 1)
+            .unwrap()
+            .with_param(0.75);
+        let mut merged = Grouped::new(Op::Quantile, 0, 0, 1)
+            .unwrap()
+            .with_param(0.75);
+        for acc in [&mut left, &mut right, &mut merged] {
+            acc.grow(1).unwrap();
+        }
+        for (i, s) in whole.iter().enumerate() {
+            let (ts, vs): (Vec<i64>, Vec<f64>) = s.iter().copied().unzip();
+            let half = if i < 2 { &mut left } else { &mut right };
+            half.add_series(0, &ts, &vs).unwrap();
+        }
+        for acc in [&mut left, &mut right] {
+            let state = acc.state(EmitTo::All).unwrap().remove(0);
+            merge(&mut merged, &state).unwrap();
+        }
+        assert_eq!(samples(&merged, 0), vec![(0, 3.25)]);
     }
 
     #[test]
@@ -2081,7 +2314,7 @@ mod tests {
         )
         .unwrap();
         let sql = format!(
-            "SELECT job, {NAME}(samples, '{}', 0, 4, 1) AS out FROM t GROUP BY job ORDER BY job",
+            "SELECT job, {NAME}(samples, '{}', 0, 4, 1, 0.5) AS out FROM t GROUP BY job ORDER BY job",
             op.as_str()
         );
         let frame = ctx.sql(&sql).await.unwrap();
@@ -2123,7 +2356,7 @@ mod tests {
     /// arithmetic as one accumulator seeing every row.
     #[tokio::test]
     async fn many_partitions_aggregate_to_the_same_bits_as_one() {
-        for op in OPS {
+        for op in OPS.into_iter().chain([Op::Quantile]) {
             let one = grouped_sql(op, 1).await;
             let many = grouped_sql(op, 4).await;
             assert_eq!(one.len(), 8, "{op:?}");
@@ -2149,7 +2382,7 @@ mod tests {
         .unwrap();
         let frame = ctx
             .sql(&format!(
-                "SELECT {NAME}(samples, 'sum', 0, 4, 1) AS out FROM t"
+                "SELECT {NAME}(samples, 'sum', 0, 4, 1, 0.5) AS out FROM t"
             ))
             .await
             .unwrap();

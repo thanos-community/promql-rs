@@ -295,12 +295,19 @@ impl Planner<'_> {
     async fn aggregate(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
         let op = Op::from_token(agg.op)
             .ok_or_else(|| EngineError::Unsupported(format!("the {} aggregation", agg.op)))?;
-        if agg.param.is_some() {
-            return Err(EngineError::Unsupported(format!(
-                "the {} aggregation with a parameter",
-                agg.op
-            )));
-        }
+        let param = match (&agg.param, op.takes_parameter()) {
+            (Some(p), true) => number_literal(p, agg.op)?,
+            (None, true) => {
+                return Err(EngineError::Query(format!(
+                    "{} expects a parameter",
+                    agg.op
+                )))
+            }
+            (Some(_), false) => {
+                return Err(EngineError::Query(format!("{} takes no parameter", agg.op)))
+            }
+            (None, false) => f64::NAN,
+        };
         // `without` names what to drop, so it says nothing about which
         // labels a store may stop reading; only `by` does, and upstream's
         // `extractGroupsFromPath` hints on that alone.
@@ -328,6 +335,7 @@ impl Planner<'_> {
                     self.query.start_ms,
                     self.query.end_ms,
                     self.query.step_ms,
+                    param,
                 )
                 .alias(SAMPLES)],
             )?
@@ -337,6 +345,20 @@ impl Planner<'_> {
             plan,
             label_names: keys,
         })
+    }
+}
+
+/// PromQL's aggregation parameter, which this engine reads only as a
+/// number literal. A scalar expression there would have to be evaluated
+/// per step, which is a piece of engine this crate does not have yet.
+fn number_literal(param: &Expr, op: promql_parser::token::ItemType) -> Result<f64, EngineError> {
+    match param {
+        Expr::NumberLiteral(n) => Ok(n.val),
+        Expr::Paren(p) => number_literal(&p.expr, op),
+        other => Err(EngineError::Unsupported(format!(
+            "the {op} aggregation with {} as its parameter",
+            describe(other)
+        ))),
     }
 }
 
@@ -588,19 +610,39 @@ mod tests {
             let query = format!("{op} by (pod) (up)");
             assert!(plan_of(&query, range).await.is_ok(), "{query}");
         }
-        for op in [
-            "topk",
-            "bottomk",
-            "quantile",
-            "count_values",
-            "limitk",
-            "limit_ratio",
-        ] {
+        for query in ["quantile(0.5, up)", "quantile by (pod) (0.5, up)"] {
+            assert!(plan_of(query, range).await.is_ok(), "{query}");
+        }
+        for op in ["topk", "bottomk", "count_values", "limitk", "limit_ratio"] {
             let query = format!("{op}(1, up)");
             let err = plan_of(&query, range).await.unwrap_err();
             assert!(matches!(err, EngineError::Unsupported(_)), "{query}: {err}");
             assert!(err.to_string().contains(op), "{query}: {err}");
         }
+    }
+
+    /// The parameter is read as a number literal only. A scalar
+    /// expression there needs per-step evaluation, so it is named as its
+    /// own missing feature rather than silently answering something else.
+    #[tokio::test]
+    async fn an_aggregation_parameter_that_is_not_a_literal_is_unsupported() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        let err = plan_of("quantile(scalar(foo), up)", range)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("quantile"), "{err}");
+
+        // A parenthesized literal is still a literal, as
+        // `quantile((0.5), (x))` in the corpus relies on.
+        assert!(plan_of("quantile((0.5), (up))", range).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_aggregation_missing_its_parameter_is_a_query_error() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        let err = plan_of("quantile(up)", range).await.unwrap_err();
+        assert!(matches!(err, EngineError::Query(_)), "{err}");
     }
 
     #[tokio::test]

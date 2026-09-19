@@ -56,6 +56,6 @@ tests:
       sum by (job) (rate(http_requests_total[5m]))
     plan: |
       Projection: promql_labels(Utf8("job"), __group__job) AS labels, samples
-        Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+        Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000), Float64(NaN)) AS samples]]
           Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
             TableScan: selector_0

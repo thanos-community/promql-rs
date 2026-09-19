@@ -159,17 +159,17 @@ fn aggregations_nest() {
 }
 
 #[test]
-fn parameterized_aggregations_are_named_as_unsupported() {
+fn the_aggregations_still_without_a_parameter_are_named_as_unsupported() {
     let engine = Engine::blocking().unwrap();
     for (q, what) in [
         ("topk(2, http_requests_total)", "the topk aggregation"),
         (
-            "quantile(0.5, http_requests_total)",
-            "the quantile aggregation",
-        ),
-        (
             "count_values(\"v\", http_requests_total)",
             "the count_values aggregation",
+        ),
+        (
+            "quantile(scalar(http_requests_total), http_requests_total)",
+            "the quantile aggregation with the scalar function as its parameter",
         ),
     ] {
         match engine.range_query(source().as_ref(), q, &RangeQuery::new(0, 0, 30_000)) {
@@ -177,6 +177,27 @@ fn parameterized_aggregations_are_named_as_unsupported() {
             other => panic!("{q}: {other:?}"),
         }
     }
+}
+
+/// `quantile` folds a group the way the other aggregations do, so its
+/// output carries the group's labels and nothing else.
+#[test]
+fn quantile_interpolates_over_the_group() {
+    // Values at 30s on "/": 2 and 3.
+    let out = query(
+        "quantile by (route) (0.5, http_requests_total)",
+        RangeQuery::new(30_000, 30_000, 30_000),
+    );
+    let slash = out.iter().find(|s| s.label("route") == "/").unwrap();
+    assert_eq!(slash.labels().collect::<Vec<_>>(), vec![("route", "/")]);
+    assert_eq!(slash.values(), [2.5]);
+
+    let out = query(
+        "quantile by (route) (0, http_requests_total)",
+        RangeQuery::new(30_000, 30_000, 30_000),
+    );
+    let slash = out.iter().find(|s| s.label("route") == "/").unwrap();
+    assert_eq!(slash.values(), [2.0]);
 }
 
 #[tokio::test]
@@ -194,7 +215,7 @@ async fn the_plan_is_an_aggregate_over_the_label_fields() {
     let rendered = plan.display_indent().to_string();
     assert!(
         rendered.starts_with(
-            "Projection: promql_labels(Utf8(\"route\"), __group__route) AS labels, samples\n  Aggregate: groupBy=[[get_field(selector_0.labels, Utf8(\"route\")) AS __group__route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\"), Int64(0), Int64(60000), Int64(30000)) AS samples]]"
+            "Projection: promql_labels(Utf8(\"route\"), __group__route) AS labels, samples\n  Aggregate: groupBy=[[get_field(selector_0.labels, Utf8(\"route\")) AS __group__route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\"), Int64(0), Int64(60000), Int64(30000), Float64(NaN)) AS samples]]"
         ),
         "{rendered}"
     );
