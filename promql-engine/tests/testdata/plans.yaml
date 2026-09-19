@@ -59,3 +59,24 @@ tests:
         Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000), Float64(NaN)) AS samples]]
           Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
             TableScan: selector_0
+
+  - name: topk over a group
+    description: >
+      topk keeps its input series, so it is a Window over the group
+      rather than an Aggregate of it: the rows and their full label
+      structs pass through, and only the samples column is rewritten.
+      The ORDER BY is every label value in name order, which is the
+      series' own identity: it is what makes limitk's first k, and every
+      tie the other two hit, a function of the data rather than of how
+      the plan happened to be partitioned.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      topk by (job) (2, http_requests_total)
+    plan: |
+      Projection: selector_0.labels, __promql_k__ AS samples
+        WindowAggr: windowExpr=[[promql_aggregation_k(samples, Utf8("topk"), Int64(2), Int64(600000), Int64(1200000), Int64(30000)) PARTITION BY [__group__job] ORDER BY [get_field(selector_0.labels, Utf8("__name__")) ASC NULLS LAST, get_field(selector_0.labels, Utf8("job")) ASC NULLS LAST, get_field(selector_0.labels, Utf8("pod")) ASC NULLS LAST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS __promql_k__]]
+          Projection: selector_0.labels, samples, get_field(selector_0.labels, Utf8("job")) AS __group__job
+            Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+              TableScan: selector_0

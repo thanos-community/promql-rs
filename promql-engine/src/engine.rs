@@ -39,6 +39,7 @@ impl Engine {
         ctx.register_udf(selector::udf());
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
+        ctx.register_udwf(aggregate::udwf());
         ctx.register_udf(range::udf());
         Self { ctx, rt: None }
     }

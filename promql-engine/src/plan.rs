@@ -34,7 +34,7 @@ use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
 
-use crate::aggregate::{self, Op};
+use crate::aggregate::{self, Op, OpK, Over};
 use crate::error::EngineError;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
@@ -293,6 +293,9 @@ impl Planner<'_> {
     }
 
     async fn aggregate(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
+        if let Some(op) = OpK::from_token(agg.op) {
+            return self.aggregate_k(agg, op).await;
+        }
         let op = Op::from_token(agg.op)
             .ok_or_else(|| EngineError::Unsupported(format!("the {} aggregation", agg.op)))?;
         let param = match (&agg.param, op.takes_parameter()) {
@@ -346,7 +349,93 @@ impl Planner<'_> {
             label_names: keys,
         })
     }
+
+    /// `topk(k, v)` and its family: a window over the group rather than
+    /// an aggregation of it.
+    ///
+    /// The surviving series keep the labels they came in with, so the
+    /// plan keeps the input rows and only rewrites their samples. Rows
+    /// left with nothing are series the result does not contain;
+    /// [`series::drop_empty`](crate::series::drop_empty) removes them on
+    /// the way out, as it does for every other operator.
+    async fn aggregate_k(&mut self, agg: &AggregateExpr, op: OpK) -> Result<Planned, EngineError> {
+        let param = agg
+            .param
+            .as_ref()
+            .ok_or_else(|| EngineError::Query(format!("{} expects a parameter", agg.op)))?;
+        let k = number_literal(param, agg.op)?;
+        // Upstream's own order, in `aggregationK` (`promql/engine.go`):
+        // anything below one empties the group before NaN is looked at,
+        // and NaN is below nothing, so it reaches the check below it.
+        //
+        // Upstream's underflow check has no counterpart here: it fires on
+        // the parameter's minimum, and a literal's minimum is its maximum,
+        // which the emptiness test above has already put at or above one.
+        let k = if k < 1.0 {
+            0
+        } else if k.is_nan() {
+            return Err(EngineError::Query("Parameter value is NaN".into()));
+        } else if k >= MAX_INT64 {
+            // The numeral is spelled Rust's way rather than Go's `%v`;
+            // the sentence is what upstream's tests match on.
+            return Err(EngineError::Query(format!(
+                "Scalar value {k} overflows int64"
+            )));
+        } else {
+            // Truncation toward zero, then a clamp to the group's own
+            // size, which costs nothing: a group can have no more
+            // survivors than it has series.
+            k as usize
+        };
+
+        let grouping = (!agg.without).then(|| Grouping {
+            labels: agg.grouping.clone(),
+            by: true,
+        });
+        let input = self
+            .expr(
+                &agg.expr,
+                Above {
+                    func: Some(op.as_str()),
+                    grouping: grouping.as_ref(),
+                },
+            )
+            .await?;
+        let label_names = input.label_names;
+        let keys = labels::group_keys(&label_names, &agg.grouping, agg.without);
+
+        let mut projected = vec![col(LABELS), col(SAMPLES)];
+        projected.extend(labels::group_exprs(&keys));
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .project(projected)?
+            .window(vec![aggregate::call_k(
+                col(SAMPLES),
+                op,
+                k,
+                self.query.start_ms,
+                self.query.end_ms,
+                self.query.step_ms,
+                Over {
+                    partition_by: labels::group_columns(&keys),
+                    order_by: labels::label_values(&label_names),
+                },
+            )
+            .alias(K_OUTPUT)])?
+            .project(vec![col(LABELS), col(K_OUTPUT).alias(SAMPLES)])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
 }
+
+/// The window function's output column, which cannot be `samples`: that
+/// name is still taken by the column it reads.
+const K_OUTPUT: &str = "__promql_k__";
+
+/// The largest float that converts to an `i64` without overflowing, and
+/// so the point where `topk`'s parameter stops naming a rank. Upstream's
+/// `maxInt64` in `promql/engine.go`, which is `i64::MAX` rounded down to
+/// a representable double, not `i64::MAX` itself.
+const MAX_INT64: f64 = 9_223_372_036_854_774_784.0;
 
 /// PromQL's aggregation parameter, which this engine reads only as a
 /// number literal. A scalar expression there would have to be evaluated
@@ -610,10 +699,12 @@ mod tests {
             let query = format!("{op} by (pod) (up)");
             assert!(plan_of(&query, range).await.is_ok(), "{query}");
         }
-        for query in ["quantile(0.5, up)", "quantile by (pod) (0.5, up)"] {
-            assert!(plan_of(query, range).await.is_ok(), "{query}");
+        for op in ["topk", "bottomk", "limitk", "quantile"] {
+            for query in [format!("{op}(1, up)"), format!("{op} by (pod) (1, up)")] {
+                assert!(plan_of(&query, range).await.is_ok(), "{query}");
+            }
         }
-        for op in ["topk", "bottomk", "count_values", "limitk", "limit_ratio"] {
+        for op in ["count_values", "limit_ratio"] {
             let query = format!("{op}(1, up)");
             let err = plan_of(&query, range).await.unwrap_err();
             assert!(matches!(err, EngineError::Unsupported(_)), "{query}: {err}");
@@ -627,22 +718,48 @@ mod tests {
     #[tokio::test]
     async fn an_aggregation_parameter_that_is_not_a_literal_is_unsupported() {
         let range = RangeQuery::new(0, 60_000, 30_000);
-        let err = plan_of("quantile(scalar(foo), up)", range)
-            .await
-            .unwrap_err();
+        let err = plan_of("topk(scalar(foo), up)", range).await.unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
-        assert!(err.to_string().contains("quantile"), "{err}");
+        assert!(err.to_string().contains("topk"), "{err}");
 
-        // A parenthesized literal is still a literal, as
-        // `quantile((0.5), (x))` in the corpus relies on.
-        assert!(plan_of("quantile((0.5), (up))", range).await.is_ok());
+        // A parenthesized literal is still a literal, as `topk((3), (x))`
+        // in the corpus relies on.
+        assert!(plan_of("topk((3), (up))", range).await.is_ok());
     }
 
     #[tokio::test]
-    async fn an_aggregation_missing_its_parameter_is_a_query_error() {
+    async fn a_parameter_that_is_not_a_number_is_a_query_error() {
         let range = RangeQuery::new(0, 60_000, 30_000);
-        let err = plan_of("quantile(up)", range).await.unwrap_err();
-        assert!(matches!(err, EngineError::Query(_)), "{err}");
+        for query in ["topk(NaN, up)", "quantile(up)"] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
+        }
+    }
+
+    /// A `k` past what an `i64` can hold no longer names a rank, and
+    /// upstream says so rather than answering with the whole group.
+    /// Below one it is an empty result, not an error, which is why
+    /// `-inf` is not caught here.
+    #[tokio::test]
+    async fn a_k_past_int64_is_a_query_error() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for query in ["topk(1e19, up)", "topk(Inf, up)", "bottomk(1e19, up)"] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
+            assert!(
+                err.to_string().contains("overflows int64"),
+                "{query}: {err}"
+            );
+        }
+        assert!(plan_of("topk(-Inf, up)", range).await.is_ok());
+        // The bound is the last `f64` below it, not the last integer:
+        // `MAX_INT64 - 1` is not representable and rounds back onto it.
+        assert!(plan_of("topk(9223372036854773760, up)", range)
+            .await
+            .is_ok());
+        assert!(plan_of("topk(9223372036854774784, up)", range)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

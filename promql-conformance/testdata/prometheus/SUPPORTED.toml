@@ -31,8 +31,10 @@ aggregators = [
     'avg(data{test="nan"}) @ 60000',
     'avg(data{test="ten"}) @ 60000',
     'avg(data{test="ten"}) @ 60000 #2',
+    "bottomk by (group) (2, http_requests) @ 3000000",
     'count by (group) (http_requests{job="api-server"}) @ 3000000',
     "group(foo) @ 60000",
+    "limitk(NaN, non_existent) @ 3000000",
     "max by (group) (http_requests) @ 0",
     "max(http_requests) @ 0",
     "min by (group) (http_requests) @ 0",
@@ -78,6 +80,8 @@ aggregators = [
     'sum(http_requests{job="api-server"}) @ 3000000',
     "sum(label_grouping_test) by (a, b) @ 3000000",
     'sum(sum by (group) (http_requests{job="api-server"})) by (job) @ 3000000',
+    "topk by (group) (1, http_requests) @ 3000000",
+    "topk(NaN, non_existent) @ 3000000",
 ]
 at_modifier = [
     "metric @ 0 offset -50 @ 10000",
@@ -256,6 +260,8 @@ name_label_dropping = [
     'sum by (__name__) (rate(metric_total{env="2"}[5m])) @ 600000',
     'sum by (__name__, env) (metric_total{env="1"}) @ 600000',
     'sum(rate({env="1"}[10m])) by (env) @ 600000',
+    'topk(10, sum by (__name__, env) (metric_total{env="1"})) @ 600000',
+    'topk(10, sum by (__name__, env) (rate(metric_total{env="1"}[10m]))) @ 600000',
 ]
 range_queries = [
     "metric @ 0..120000/60000",
