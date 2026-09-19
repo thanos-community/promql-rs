@@ -221,3 +221,51 @@ fn a_label_name_may_not_contain_a_colon() {
     // identifier as alphanumerics alone.
     assert!(parse_expr(r#"up{a:b="c"}"#).is_err());
 }
+
+#[test]
+fn keywords_lex_case_insensitively() {
+    match must_parse(r#"SUM BY (group) (http_requests) AND up"#) {
+        Expr::Binary(b) => {
+            assert_eq!(b.op, promql_parser::token::ItemType::Land);
+            match *b.lhs {
+                Expr::Aggregate(a) => {
+                    assert_eq!(a.op, promql_parser::token::ItemType::Sum);
+                    assert_eq!(a.grouping, vec!["group".to_string()]);
+                }
+                other => panic!("expected Aggregate on LHS, got {other:?}"),
+            }
+        }
+        other => panic!("expected Binary, got {other:?}"),
+    }
+    match must_parse("up OFFSET 5m") {
+        Expr::VectorSelector(vs) => assert_eq!(vs.original_offset_secs, 300.0),
+        other => panic!("expected VectorSelector with offset, got {other:?}"),
+    }
+}
+
+#[test]
+fn case_folding_does_not_invent_keywords() {
+    assert!(parse_expr("SUM BY").is_err());
+}
+
+#[test]
+fn float_literals_may_end_in_a_dot() {
+    match must_parse("1./6.") {
+        Expr::Binary(b) => {
+            assert_eq!(b.op, promql_parser::token::ItemType::Div);
+            match (*b.lhs, *b.rhs) {
+                (Expr::NumberLiteral(l), Expr::NumberLiteral(r)) => {
+                    assert_eq!(l.val, 1.0);
+                    assert_eq!(r.val, 6.0);
+                }
+                other => panic!("expected two NumberLiterals, got {other:?}"),
+            }
+        }
+        other => panic!("expected Binary, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_second_dot_is_still_an_error() {
+    assert!(parse_expr("1..6").is_err());
+}
