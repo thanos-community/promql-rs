@@ -187,3 +187,37 @@ fn metric_selector_api() {
         .any(|m| m.name == "__name__" && m.value == "up"));
     assert!(matchers.iter().any(|m| m.name == "job" && m.value == "api"));
 }
+
+#[test]
+fn keywords_are_label_names_inside_braces() {
+    let matchers = parse_metric_selector(r#"x{by="a", on="b", group="c", offset="d"}"#)
+        .expect("keywords inside braces parse as label names");
+    for (name, value) in [("by", "a"), ("on", "b"), ("group", "c"), ("offset", "d")] {
+        assert!(
+            matchers.iter().any(|m| m.name == name && m.value == value),
+            "missing matcher {name}={value:?} in {matchers:?}"
+        );
+    }
+}
+
+#[test]
+fn keywords_stay_keywords_after_the_closing_brace() {
+    // The start condition has to end at `}`, or this `offset` would lex
+    // as a label name and the modifier would silently vanish.
+    match must_parse(r#"up{group="canary"} offset 5m"#) {
+        Expr::VectorSelector(vs) => assert_eq!(vs.original_offset_secs, 300.0),
+        other => panic!("expected VectorSelector with offset, got {other:?}"),
+    }
+}
+
+#[test]
+fn keyword_as_label_name_still_needs_a_matcher() {
+    assert!(parse_expr(r#"up{by}"#).is_err());
+}
+
+#[test]
+fn a_label_name_may_not_contain_a_colon() {
+    // Only a metric name may; upstream's lexInsideBraces reads an
+    // identifier as alphanumerics alone.
+    assert!(parse_expr(r#"up{a:b="c"}"#).is_err());
+}
