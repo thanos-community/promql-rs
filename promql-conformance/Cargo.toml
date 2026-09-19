@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+# This crate has no criterion target, but `cargo bench --workspace` would
+# still hand libtest's the criterion flags and fail.
+bench = false
+
 [dependencies]
 promql-engine = { path = "../promql-engine" }
 promql-parser = { path = "../promql-parser" }

@@ -8,6 +8,8 @@ description = "PromQL evaluation as DataFusion plans over a row-per-series Arrow
 
 [lib]
 path = "src/lib.rs"
+# `cargo bench` runs only the criterion targets below, not libtest's.
+bench = false
 
 [dependencies]
 async-trait = { workspace = true }
@@ -18,5 +20,14 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 serde = { workspace = true }
 serde_norway = { workspace = true }
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[[bench]]
+name = "engine"
+harness = false
