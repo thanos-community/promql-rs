@@ -1,0 +1,61 @@
+# Expected LogicalPlan per query. See tests/plan.rs for what this is for
+# and how to add a case.
+#
+# `defaults` is the one query range every case is planned with, so the
+# literals in a plan never differ between cases. Field names follow the
+# shared engine test-case format (thanos-io/promql-engine
+# testcases/range_queries.yaml), with `plan` added.
+#
+# `load` is per case because the projection's schema is derived from the
+# source's label names, sorted and deduplicated: the label set is part of
+# what is being pinned. One sample per series is enough because nothing
+# but the label set reaches the planner, and a second adds nothing; the
+# loader rejects a series carrying more.
+defaults:
+  start_ms: 600000
+  end_ms: 1200000
+  step_ms: 30000
+
+tests:
+  - name: instant selector
+    description: >
+      The labels pass through untouched as one struct: an instant
+      selector keeps every label it was given, __name__ included.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="api", pod="api-2"} 0
+    query: |
+      http_requests_total{job="api"}
+    plan: |
+      Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+        TableScan: selector_0
+
+  - name: range function over a different label set
+    description: >
+      rate drops __name__, so the labels are rebuilt field by field. The
+      fields named here are this case's own, which is what shows that the
+      projection follows the data rather than a fixed schema.
+    load:
+      - node_cpu_seconds_total{cpu="0", instance="a", mode="idle"} 0
+      - node_cpu_seconds_total{cpu="1", instance="a", mode="user"} 0
+    query: |
+      rate(node_cpu_seconds_total[5m])
+    plan: |
+      Projection: promql_labels(Utf8("cpu"), get_field(selector_0.labels, Utf8("cpu")), Utf8("instance"), get_field(selector_0.labels, Utf8("instance")), Utf8("mode"), get_field(selector_0.labels, Utf8("mode"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+        TableScan: selector_0
+
+  - name: grouped aggregation over a range function
+    description: >
+      by (job) becomes an ordinary DataFusion Aggregate, so grouping and
+      the two-phase split are the engine's rather than hand-rolled. Only
+      the grouped label survives into the top projection.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      sum by (job) (rate(http_requests_total[5m]))
+    plan: |
+      Projection: promql_labels(Utf8("job"), __group__job) AS labels, samples
+        Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+            TableScan: selector_0
