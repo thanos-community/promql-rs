@@ -8,13 +8,13 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **304 of 2098 evals pass** (14.5%), and **820** are blocked on the features below.
+Against the vendored corpus: **304 of 2098 evals pass** (14.5%), and **821** are blocked on the features below.
 
 ## Missing features
 
 | evals blocked | feature |
 |---:|---|
-| 291 | a binary operator |
+| 292 | a binary operator |
 | 86 | the histogram_quantile function |
 | 58 | a subquery |
 | 56 | the histogram_fraction function |

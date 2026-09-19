@@ -285,3 +285,40 @@ fn float_literals_may_end_in_a_dot() {
 fn a_second_dot_is_still_an_error() {
     assert!(parse_expr("1..6").is_err());
 }
+
+#[test]
+fn hex_literals_lex_as_one_number() {
+    for (q, want) in [
+        ("0x1F", 31.0),
+        ("0X1f", 31.0),
+        ("0x_1F", 31.0),
+        ("0x1_F", 31.0),
+    ] {
+        match must_parse(q) {
+            Expr::NumberLiteral(n) => assert_eq!(n.val, want, "{q}"),
+            other => panic!("expected NumberLiteral for {q}, got {other:?}"),
+        }
+    }
+    // `scanNumber` rejects an underscore with nothing after it.
+    assert!(parse_expr("0x1F_").is_err());
+}
+
+/// Upstream only makes `fill` a keyword when the next non-space rune is
+/// `(`, so queries that already used it as a metric name keep working.
+#[test]
+fn fill_is_a_metric_name_unless_it_opens_a_call() {
+    match must_parse("fill + fill") {
+        Expr::Binary(b) => match (*b.lhs, *b.rhs) {
+            (Expr::VectorSelector(l), Expr::VectorSelector(r)) => {
+                assert_eq!(l.name, "fill");
+                assert_eq!(r.name, "fill");
+            }
+            other => panic!("expected two VectorSelectors, got {other:?}"),
+        },
+        other => panic!("expected Binary, got {other:?}"),
+    }
+    match must_parse("fill_left") {
+        Expr::VectorSelector(vs) => assert_eq!(vs.name, "fill_left"),
+        other => panic!("expected VectorSelector, got {other:?}"),
+    }
+}
