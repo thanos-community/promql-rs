@@ -139,24 +139,25 @@ fn a_range_selector_is_a_matrix_of_the_raw_samples() {
     assert_eq!(series[0].timestamps(), [210_000, 240_000]);
 }
 
-/// The types nothing plans yet are named as such, so the conformance
-/// suite counts them as a missing feature rather than a wrong answer.
+/// A scalar-typed query answers with a scalar, not with the one
+/// unlabelled series it is evaluated as.
 #[test]
-fn a_scalar_or_string_typed_query_is_unsupported_by_type() {
+fn a_scalar_typed_query_answers_with_a_scalar() {
     for (query, want) in [
-        ("42", "a scalar-typed instant query"),
-        ("1 + 1", "a scalar-typed instant query"),
-        ("time()", "a scalar-typed instant query"),
-        (
-            "scalar(http_requests_total)",
-            "a scalar-typed instant query",
-        ),
-        (r#""hello""#, "a string-typed instant query"),
+        ("42", 42.0),
+        ("1 + 1", 2.0),
+        ("-0.2e-6", -0.0000002),
+        ("1 % 0", f64::NAN),
+        ("time()", 300.0),
+        ("time() - 100", 200.0),
+        ("pi()", std::f64::consts::PI),
     ] {
-        let err = at(query, 0).unwrap_err();
+        let InstantResult::Scalar(got) = at(query, 300_000).expect(query) else {
+            panic!("{query} is scalar-typed")
+        };
         assert!(
-            matches!(&err, EngineError::Unsupported(f) if f == want),
-            "{query}: {err}"
+            got == want || (got.is_nan() && want.is_nan()),
+            "{query}: expected {want}, got {got}"
         );
     }
 }
@@ -180,6 +181,50 @@ fn reshaping_a_multi_step_result_into_a_vector_is_refused() {
     let err = to_vector(&batches, 330_000).unwrap_err();
     assert!(err.contains("has 2"), "{err}");
     assert!(err.contains("one point per series"), "{err}");
+}
+
+#[test]
+fn a_string_typed_query_answers_with_the_literal() {
+    for (query, want) in [
+        (r#""Foo""#, "Foo"),
+        (r#"(" Foo ")"#, " Foo "),
+        (r#""""#, ""),
+    ] {
+        let InstantResult::String(got) = at(query, 0).expect(query) else {
+            panic!("{query} is string-typed")
+        };
+        assert_eq!(got, want, "{query}");
+    }
+}
+
+/// `scalar(v)` reads a vector, so it is not one of the scalars that
+/// folds without data; it stays named as the missing feature it is.
+#[test]
+fn the_scalar_function_is_still_unsupported() {
+    let err = at("scalar(http_requests_total)", 0).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
+        "{err}"
+    );
+}
+
+/// The range path answers the same expression with the one unlabelled
+/// series a scalar is evaluated as, one point per step — upstream's
+/// `NumberLiteral` case over the grid.
+#[test]
+fn a_scalar_over_a_range_is_one_unlabelled_series() {
+    let engine = Engine::blocking().unwrap();
+    let range = promql_engine::RangeQuery::new(0, 120_000, 60_000);
+    let out = decode(
+        &engine
+            .range_query(source().as_ref(), "time() * 2", &range)
+            .expect("runs"),
+    )
+    .expect("canonical");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].labels().count(), 0);
+    assert_eq!(out[0].timestamps(), [0, 60_000, 120_000]);
+    assert_eq!(out[0].values(), [0.0, 120.0, 240.0]);
 }
 
 /// Same expression, same store, both entry points: the instant query is

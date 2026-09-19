@@ -38,6 +38,7 @@ pub mod memory;
 pub mod params;
 pub mod plan;
 pub mod range;
+pub mod scalar;
 pub mod selector;
 pub mod series;
 pub mod source;

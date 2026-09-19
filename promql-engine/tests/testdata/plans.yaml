@@ -85,6 +85,19 @@ tests:
           Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(1200000), Int64(1200000), Int64(1), Int64(300000), Int64(0), Int64(NULL)) AS samples
             TableScan: selector_0
 
+  - name: a scalar expression
+    description: >
+      No store is asked and no kernel runs: a scalar is a function of
+      the step alone, so the planner folds it to a value per step and
+      the plan is the one table holding them. `load` is ignored here,
+      which is the shape being pinned.
+    load:
+      - http_requests_total{job="api"} 0
+    query: |
+      time() * 2 + 1
+    plan: |
+      TableScan: scalar
+
   - name: a range selector as the whole instant query
     description: >
       The one shape only an instant query has. Nothing stands over the

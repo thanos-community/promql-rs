@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::catalog::Session;
-use datafusion::datasource::provider_as_source;
+use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, MatrixSelector, VectorSelector};
 
@@ -41,8 +41,10 @@ use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::params::{step_count, Params};
 use crate::range::{self, Func};
 use crate::selector;
-use crate::series::{LABELS, SAMPLES};
+use crate::series::{Series, LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
+use crate::value_type::{value_type, ValueType};
+use crate::{scalar, series};
 
 /// The range a query is evaluated over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,8 +82,75 @@ pub async fn plan(
     query: &RangeQuery,
 ) -> Result<LogicalPlan, EngineError> {
     check_range(query)?;
+    check_expr(expr)?;
+    if let Some(plan) = scalar_plan(expr, query)? {
+        return Ok(plan);
+    }
     let mut planner = Planner::new(state, source, query);
     Ok(planner.expr(expr, Above::default()).await?.plan)
+}
+
+/// The parse-time rules upstream holds an expression to before any of
+/// it runs, for the ones our parser does not.
+///
+/// A whole-tree walk, as upstream's `checkAST` is, and for the same
+/// reason: `1 > 1` is rejected wherever it sits, not only at the top.
+/// These are `Query` errors — Prometheus refuses the query too, so the
+/// engine is answering rather than admitting a gap — and they must come
+/// before planning, or the scalar fold would quietly answer one of them.
+fn check_expr(expr: &Expr) -> Result<(), EngineError> {
+    match expr {
+        Expr::Binary(b) => {
+            check_binary(b)?;
+            check_expr(&b.lhs)?;
+            check_expr(&b.rhs)
+        }
+        Expr::Aggregate(a) => {
+            if let Some(param) = &a.param {
+                check_expr(param)?;
+            }
+            check_expr(&a.expr)
+        }
+        Expr::Call(c) => c.args.iter().try_for_each(check_expr),
+        Expr::MatrixSelector(ms) => check_expr(&ms.vector_selector),
+        Expr::Subquery(s) => check_expr(&s.expr),
+        Expr::Paren(p) => check_expr(&p.expr),
+        Expr::Unary(u) => check_expr(&u.expr),
+        Expr::StepInvariant(e) => check_expr(e),
+        Expr::VectorSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Duration(_) => Ok(()),
+    }
+}
+
+/// Upstream's `checkAST` arm for a binary expression
+/// (`promql/parser/parse.go:779-802` at 83962c35), in its order and its
+/// words.
+fn check_binary(b: &promql_parser::ast::BinaryExpr) -> Result<(), EngineError> {
+    let (lhs, rhs) = (value_type(&b.lhs), value_type(&b.rhs));
+    // `1 > 1` is not a filter — there is nothing to filter — so upstream
+    // makes the author write `bool` and say which of the two they meant.
+    if is_comparison(b.op) && !b.return_bool && lhs == ValueType::Scalar && rhs == ValueType::Scalar
+    {
+        return Err(EngineError::Query(
+            "comparisons between scalars must use BOOL modifier".into(),
+        ));
+    }
+    for side in [lhs, rhs] {
+        if !matches!(side, ValueType::Scalar | ValueType::Vector) {
+            return Err(EngineError::Query(
+                "binary expression must contain only scalar and instant vector types".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The operators upstream's `IsComparisonOperator` answers for.
+fn is_comparison(op: promql_parser::token::ItemType) -> bool {
+    use promql_parser::token::ItemType::*;
+    matches!(op, EqlC | Neq | Gtr | Lss | Gte | Lte)
 }
 
 /// [`plan`], for a query whose range is a single instant.
@@ -99,12 +168,56 @@ pub async fn plan_instant(
     query: &RangeQuery,
 ) -> Result<LogicalPlan, EngineError> {
     check_range(query)?;
+    check_expr(expr)?;
+    if let Some(plan) = scalar_plan(expr, query)? {
+        return Ok(plan);
+    }
     let mut planner = Planner::new(state, source, query);
     match top_level_matrix(expr) {
         Some(ms) => Ok(planner.matrix_selector(ms).await?.plan),
         None => Ok(planner.expr(expr, Above::default()).await?.plan),
     }
 }
+
+/// A scalar-typed expression as a plan, or `None` when `expr` is not
+/// one.
+///
+/// A scalar is one value per step with no label set — upstream returns
+/// exactly that, `Sample{F: …, Metric: labels.EmptyLabels()}` over the
+/// grid (`promql/engine.go:2344-2348` at 83962c35), which is one row of
+/// the canonical shape. Nothing here reads a series, so the values are
+/// folded while planning ([`crate::scalar`]) and the plan is the table
+/// holding them: no store is asked, and no kernel runs.
+fn scalar_plan(expr: &Expr, query: &RangeQuery) -> Result<Option<LogicalPlan>, EngineError> {
+    if value_type(expr) != ValueType::Scalar {
+        return Ok(None);
+    }
+    let grid = Params {
+        start_ms: query.start_ms,
+        end_ms: query.end_ms,
+        step_ms: query.step_ms,
+        window_ms: 0,
+        offset_ms: 0,
+        at_ms: None,
+    };
+    let mut timestamps = Vec::new();
+    let mut values = Vec::new();
+    for ts in grid.steps() {
+        values.push(scalar::fold(expr, ts)?);
+        timestamps.push(ts);
+    }
+
+    let series = Series::new(&[], timestamps, values).map_err(EngineError::Schema)?;
+    let batch = series::encode(&[], &[series]).map_err(EngineError::Schema)?;
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+    let plan = LogicalPlanBuilder::scan(SCALAR_TABLE, provider_as_source(Arc::new(table)), None)?
+        .build()?;
+    Ok(Some(plan))
+}
+
+/// The one table a scalar plan scans. Not `selector_0`: nothing was
+/// selected, and a plan text that said so would be misleading.
+const SCALAR_TABLE: &str = "scalar";
 
 /// The range selector a query *is*, looking through the wrappers that
 /// only pass a value along. Everything else that holds one — `rate`'s
@@ -688,6 +801,46 @@ mod tests {
             let err = plan_of(&query, range).await.unwrap_err();
             assert!(matches!(err, EngineError::Unsupported(_)), "{query}: {err}");
             assert!(err.to_string().contains(op), "{query}: {err}");
+        }
+    }
+
+    /// Upstream's parser refuses `1 > 1` because it cannot mean the
+    /// filter a comparison usually is. Ours accepts it, so the rule is
+    /// held here, in upstream's words.
+    #[tokio::test]
+    async fn a_comparison_between_scalars_needs_the_bool_modifier() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for query in ["1 > 1", "(1 > 1)", "time() <= 100", "2 * (1 == 1)"] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "comparisons between scalars must use BOOL modifier",
+                "{query}"
+            );
+            assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
+        }
+
+        // With the modifier, and with a vector on either side, the
+        // comparison is allowed — the second is still unsupported, but
+        // as a missing feature rather than a bad query.
+        assert!(plan_of("1 > bool 1", range).await.is_ok());
+        let err = plan_of("up > 1", range).await.unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+    }
+
+    /// A string or a range vector as an operand is a query error, not a
+    /// gap: no operator upstream has ever taken one.
+    #[tokio::test]
+    async fn a_binary_operand_must_be_a_scalar_or_an_instant_vector() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for query in [r#""foo" + 1"#, r#"1 + "foo""#, "foo[5m] + 1", "1 + foo[5m]"] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "binary expression must contain only scalar and instant vector types",
+                "{query}"
+            );
+            assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
         }
     }
 
