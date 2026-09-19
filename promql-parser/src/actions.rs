@@ -192,10 +192,12 @@ fn op_item_type_from_lex<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Ite
         "<=" => ItemType::Lte,
         ">" => ItemType::Gtr,
         ">=" => ItemType::Gte,
-        "and" => ItemType::Land,
-        "or" => ItemType::Lor,
-        "unless" => ItemType::Lunless,
-        "atan2" => ItemType::Atan2,
+        // Word operators are recovered from the source text, so they
+        // have to fold case the way the lexer does.
+        w if w.eq_ignore_ascii_case("and") => ItemType::Land,
+        w if w.eq_ignore_ascii_case("or") => ItemType::Lor,
+        w if w.eq_ignore_ascii_case("unless") => ItemType::Lunless,
+        w if w.eq_ignore_ascii_case("atan2") => ItemType::Atan2,
         _ => return Err(()),
     };
     Ok(ty)
