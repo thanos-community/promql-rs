@@ -41,9 +41,11 @@ pub mod range;
 pub mod selector;
 pub mod series;
 pub mod source;
+pub mod value_type;
 
 pub use engine::{Engine, RangeQuery};
 pub use error::EngineError;
 pub use memory::MemorySeriesSource;
 pub use series::Series;
 pub use source::{Grouping, SelectHints, SelectorTable, SeriesSource, Shard};
+pub use value_type::{value_type, ValueType};
