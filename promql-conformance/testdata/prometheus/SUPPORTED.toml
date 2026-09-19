@@ -69,6 +69,7 @@ aggregators = [
     'sum by (group) (data{test="pos_inf"}) @ 60000',
     'sum by (group) (http_requests{job="api-server"}) @ 3000000',
     'sum by (group) (http_requests{job="api-server"}) @ 3000000 #2',
+    'sum without () (http_requests{job="api-server",group="production"}) @ 3000000',
     'sum without (instance) (http_requests{job="api-server"}) @ 3000000',
     'sum(data{test="inf_inf"}) @ 60000',
     'sum(data{test="ten"}) @ 60000',
@@ -211,6 +212,7 @@ functions = [
     'present_over_time({job="ingress"}[4m]) @ 600000',
     "rate(calculate_rate_offset_total[10m] offset 5m) @ 3000000",
     "rate(calculate_rate_window_total[50m]) @ 3000000",
+    'rate(http_requests_total{group="canary", instance="1", job="app-server"}[50m]) @ 3000000',
     "rate(testcounter_reset_end_total[5m]) @ 3000000",
     "rate(testcounter_reset_end_total[6m]) @ 3000000",
     "rate(testcounter_reset_middle_total[50m]) @ 3000000",
@@ -254,6 +256,7 @@ name_label_dropping = [
     'sum by (__name__, env) (metric_total{env="1"}) @ 600000',
     'sum(rate({env="1"}[10m])) by (env) @ 600000',
 ]
+operators = ['http_requests_total{job="api-server", group="canary"} @ 3000000']
 range_queries = [
     "metric @ 0..120000/60000",
     "metric @ 0..120000/60000 #2",
@@ -265,9 +268,27 @@ range_queries = [
 selectors = [
     'http_requests_total{foo!="bar", job="api-server"} @ 0',
     'http_requests_total{foo!="bar"} @ 0',
+    'http_requests_total{foo!~"bar", job="api-server", instance="1", x!="y", z="", group!=""} @ 0',
     'http_requests_total{foo!~"bar", job="api-server"} @ 0',
+    'http_requests_total{group!="canary"} @ 3000000',
+    'http_requests_total{group="production",job="api-server"} offset 5m @ 3000000',
+    'http_requests_total{group="production",job=~"api-.+"} @ 3000000',
+    'http_requests_total{job!~"api-.+",group!="canary"} @ 3000000',
+    'http_requests_total{job=~".+-server",group!="canary"} @ 3000000',
     "rate(http_requests_total[1m]) @ 18000000",
     "rate(http_requests_total[1m]) @ 8000000",
+    'rate(http_requests_total{group=~"((?i)PRO).*"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~"(?i:PRO).*"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~"(?i:PRODUCTION)"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*((?i)DUC).*"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*((?i)TION)"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*(?i:C).*"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*(?i:DUC).*"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*(?i:TION)"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*(?i:TION).*?"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*?(?i:PRO).*"}[1m]) @ 8000000',
+    'rate(http_requests_total{group=~".*ry", instance="1"}[1m]) @ 18000000',
+    'rate(http_requests_total{group=~"pro.*"}[1m]) @ 8000000',
     'rate(http_requests_total{instance!="3"}[1m] offset -4000s) @ 4000000',
     'rate(http_requests_total{instance!="3"}[1m] offset 10000s) @ 18000000',
     "testmetric @ 0",
@@ -279,4 +300,9 @@ staleness = "all"
 subquery = [
     "min_over_time(metric_total[10s]) @ 20000",
     "rate(metric_total[1m]) @ 80000",
+]
+type_and_unit = [
+    'http_requests_total{__type__="counter", job="api-server", group="canary"} @ 3000000',
+    'http_requests_total{job="api-server", group="canary"} @ 3000000',
+    'http_requests_total{job="api-server", group="canary"} @ 3000000 #2',
 ]

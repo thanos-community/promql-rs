@@ -1,3 +1,5 @@
+%x BRACES
+
 %%
 [ \t\n\r]+ ;
 #[^\n]* ;
@@ -61,10 +63,20 @@ smoothed "SMOOTHED"
 @ "AT"
 \( "LPAREN"
 \) "RPAREN"
-\{ "LBRACE"
-\} "RBRACE"
+\{ <BRACES>"LBRACE"
 \[ "LBRACKET"
 \] "RBRACKET"
 , "COMMA"
 : "COLON"
 ; "SEMICOLON"
+
+<BRACES>[ \t\n\r]+ ;
+<BRACES>#[^\n]* ;
+<BRACES>("([^"\\\n]|\\.)*"|'([^'\\\n]|\\.)*'|`[^`]*`) "BRACE_STRING"
+<BRACES>[a-zA-Z_][a-zA-Z_0-9]* "BRACE_IDENT"
+<BRACES>!= "BRACE_NEQ"
+<BRACES>!~ "BRACE_NEQ_REGEX"
+<BRACES>=~ "BRACE_EQL_REGEX"
+<BRACES>= "BRACE_EQ"
+<BRACES>, "BRACE_COMMA"
+<BRACES>\} <INITIAL>"RBRACE"

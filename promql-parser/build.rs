@@ -44,9 +44,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // covers the whole token set on its own, and neither has a rule
     // for the START_* pseudo-tokens (those are injected in
     // `parser.rs`, never lexed), so both directions of "missing" are
-    // expected.
+    // expected. `lexer.l`'s BRACES start condition mirrors Prometheus's
+    // `braceOpen` flag: a keyword is only a keyword outside `{...}`.
+    // Fixing that in the grammar instead would not survive, since
+    // `grammar.y` is regenerated from the vendored upstream file.
+    let mut expr_tokens = ctp.token_map().clone();
+    for (alias, token) in [
+        ("BRACE_STRING", "STRING"),
+        ("BRACE_IDENT", "IDENT"),
+        ("BRACE_NEQ", "NEQ"),
+        ("BRACE_NEQ_REGEX", "NEQ_REGEX"),
+        ("BRACE_EQL_REGEX", "EQL_REGEX"),
+        ("BRACE_EQ", "EQ"),
+        ("BRACE_COMMA", "COMMA"),
+    ] {
+        let id = *expr_tokens
+            .get(token)
+            .ok_or_else(|| format!("grammar.y has no token {token} to alias {alias} onto"))?;
+        expr_tokens.insert(alias.to_string(), id);
+    }
+    // `allow_missing_tokens_in_parser` below has to stay on for the
+    // generated grammar's sake, and it also swallows a BRACE_* rule
+    // whose alias was forgotten: lrlex drops the rule and the first
+    // sign is a lex error inside `{...}` at runtime. This is the only
+    // place that knows both the rule names and the alias table, so the
+    // check belongs here.
+    let lexer_l = std::fs::read_to_string(std::path::Path::new("src").join("lexer.l"))?;
+    let def = <lrlex::LRNonStreamingLexerDef<lrlex::DefaultLexerTypes<u32>> as lrlex::LexerDef<
+        lrlex::DefaultLexerTypes<u32>,
+    >>::from_str(&lexer_l)
+    .map_err(|e| format!("lexer.l does not parse: {e:?}"))?;
+    for rule in lrlex::LexerDef::iter_rules(&def) {
+        if let Some(name) = rule.name() {
+            if name.starts_with("BRACE_") && !expr_tokens.contains_key(name) {
+                return Err(format!("lexer.l rule {name} has no alias in build.rs").into());
+            }
+        }
+    }
     CTLexerBuilder::<lrlex::DefaultLexerTypes<u32>>::new()
-        .rule_ids_map(ctp.token_map().clone())
+        .rule_ids_map(expr_tokens)
         .allow_missing_terms_in_lexer(true)
         .allow_missing_tokens_in_parser(true)
         .lexer_in_src_dir("lexer.l")?
