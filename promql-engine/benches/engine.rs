@@ -91,7 +91,11 @@ fn synthetic(shape: &Shape) -> Arc<dyn SeriesSource> {
 }
 
 /// The queries, from a bare selector to the SLO recording-rule shape.
-const QUERIES: [(&str, &str); 5] = [
+///
+/// The subquery is the shape that pays twice: the inner range query
+/// walks its own grid over every series before the outer window reads
+/// it, so it is where a regression in either half shows up.
+const QUERIES: [(&str, &str); 6] = [
     ("selector", "http_requests_total"),
     ("sum", "sum(http_requests_total)"),
     ("sum_by_route", "sum by (route) (http_requests_total)"),
@@ -99,6 +103,10 @@ const QUERIES: [(&str, &str); 5] = [
     (
         "sum_by_route_increase_5m",
         "sum by (route) (increase(http_requests_total[5m]))",
+    ),
+    (
+        "max_over_time_rate_5m_subquery_30m",
+        "max_over_time(rate(http_requests_total[5m])[30m:1m])",
     ),
 ];
 
@@ -135,6 +143,9 @@ fn query(c: &mut Criterion) {
 
 /// Parsing and planning alone. The store's `select` runs here, so the gap
 /// to `engine/query` is execution proper.
+///
+/// Every query, not one: a subquery plans a whole second range query
+/// beneath the first, and that cost belongs on this side of the gap.
 fn plan(c: &mut Criterion) {
     let engine = Engine::new();
     // Planning is only exposed as `plan_async`, and the runtime an
@@ -142,22 +153,23 @@ fn plan(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let (qname, q) = QUERIES[4];
     let mut g = c.benchmark_group("engine/plan");
     for shape in &SHAPES {
         let source = synthetic(shape);
         let end = shape.end_ms();
         let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
         g.throughput(Throughput::Elements(shape.series as u64));
-        g.bench_function(
-            BenchmarkId::new(format!("{qname}/range_1h"), shape.id()),
-            |b| {
-                b.iter(|| {
-                    rt.block_on(engine.plan_async(source.as_ref(), black_box(q), &range))
-                        .unwrap()
-                })
-            },
-        );
+        for (qname, q) in QUERIES {
+            g.bench_function(
+                BenchmarkId::new(format!("{qname}/range_1h"), shape.id()),
+                |b| {
+                    b.iter(|| {
+                        rt.block_on(engine.plan_async(source.as_ref(), black_box(q), &range))
+                            .unwrap()
+                    })
+                },
+            );
+        }
     }
     g.finish();
 }

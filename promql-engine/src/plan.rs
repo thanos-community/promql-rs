@@ -32,7 +32,7 @@ use std::time::Duration;
 use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
-use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
+use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, SubqueryExpr, VectorSelector};
 
 use crate::aggregate::{self, Op};
 use crate::error::EngineError;
@@ -52,10 +52,15 @@ pub struct RangeQuery {
     pub step_ms: i64,
     /// Prometheus's `--query.lookback-delta`, 5m by default.
     pub lookback_ms: i64,
+    /// The step a subquery written without one evaluates on:
+    /// `noStepSubqueryIntervalFn` in upstream, which a server wires to
+    /// its global evaluation interval and `promqltest` pins to 1m.
+    pub no_step_subquery_interval_ms: i64,
 }
 
 impl RangeQuery {
     pub const DEFAULT_LOOKBACK: Duration = Duration::from_secs(5 * 60);
+    pub const DEFAULT_SUBQUERY_INTERVAL: Duration = Duration::from_secs(60);
 
     pub fn new(start_ms: i64, end_ms: i64, step_ms: i64) -> Self {
         Self {
@@ -63,6 +68,7 @@ impl RangeQuery {
             end_ms,
             step_ms,
             lookback_ms: millis(Self::DEFAULT_LOOKBACK),
+            no_step_subquery_interval_ms: millis(Self::DEFAULT_SUBQUERY_INTERVAL),
         }
     }
 }
@@ -79,14 +85,31 @@ pub async fn plan(
     expr: &Expr,
     query: &RangeQuery,
 ) -> Result<LogicalPlan, EngineError> {
+    check_grid(query)?;
+    let mut planner = Planner {
+        state,
+        source,
+        statement: *query,
+        query: *query,
+        selectors: 0,
+    };
+    Ok(planner.expr(expr, Above::default()).await?.plan)
+}
+
+/// A grid this engine will walk: positive step, no more steps than
+/// [`aggregate::MAX_STEPS`].
+///
+/// `aggregate::Grid` checks the same constant; this half exists so the
+/// user gets a query error naming the limit. A subquery's inner grid is
+/// checked here too, since its step is the query's to choose only when
+/// the expression left it out.
+fn check_grid(query: &RangeQuery) -> Result<(), EngineError> {
     if query.step_ms <= 0 {
         return Err(EngineError::Query(format!(
             "step must be positive, got {}ms",
             query.step_ms
         )));
     }
-    // `aggregate::Grid` checks the same constant; this half exists so
-    // the user gets a query error naming the limit.
     let steps = step_count(query.start_ms, query.end_ms, query.step_ms);
     if steps > aggregate::MAX_STEPS as i128 {
         return Err(EngineError::Query(format!(
@@ -97,14 +120,13 @@ pub async fn plan(
             aggregate::MAX_STEPS
         )));
     }
-    let mut planner = Planner {
-        state,
-        source,
-        query,
-        selectors: 0,
-    };
-    Ok(planner.expr(expr, Above::default()).await?.plan)
+    Ok(())
 }
+
+/// Upstream's `validateQueryType` rejection, word for word: a query
+/// whose result would be a matrix is the user's mistake, not a gap.
+const RANGE_VECTOR_AS_RESULT: &str =
+    "invalid expression type \"range vector\" for range query, must be Scalar or instant Vector";
 
 /// A planned subexpression: the plan and the label names in its schema.
 struct Planned {
@@ -112,10 +134,42 @@ struct Planned {
     label_names: Vec<String>,
 }
 
+/// The raw samples a range function reads, and the window it reads of
+/// them. Either a selector's stored samples or a subquery's step grid.
+struct Windowed {
+    inner: Planned,
+    params: Params,
+    /// Stored samples still carry `__name__`; a subquery's may not.
+    stored: bool,
+}
+
+/// The first multiple of `step_ms` strictly greater than `t`.
+///
+/// The subquery grid's phase, from the `SubqueryExpr` case in upstream's
+/// `eval`. Truncating division makes the first line land on either side
+/// of `t` depending on its sign, which is why the adjustment tests the
+/// result rather than the quotient; Go and Rust truncate alike, so the
+/// two lines transcribe directly.
+fn first_step_after(t: i64, step_ms: i64) -> i64 {
+    let aligned = (t / step_ms) * step_ms;
+    if aligned <= t {
+        aligned.saturating_add(step_ms)
+    } else {
+        aligned
+    }
+}
+
 struct Planner<'a> {
     state: &'a dyn Session,
     source: &'a dyn SeriesSource,
-    query: &'a RangeQuery,
+    /// The range the whole statement was asked for. Only `start()` and
+    /// `end()` read it: upstream resolves those once in `preprocessExpr`,
+    /// before any subquery narrows the grid, so they mean the statement's
+    /// bounds however deeply nested the selector is.
+    statement: RangeQuery,
+    /// The range the expression being planned right now evaluates over —
+    /// the statement's, or a subquery's inner grid.
+    query: RangeQuery,
     /// Selectors seen so far; each becomes its own table `selector_N`.
     selectors: usize,
 }
@@ -141,6 +195,18 @@ impl Planner<'_> {
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c).await,
+                // A bare subquery is a range vector, and its matrix is
+                // its inner grid — which is a whole answer only when the
+                // query has the single step that makes one window. The
+                // allowance stands because the conformance harness still
+                // spells an instant eval as a one-step range query; it
+                // collapses onto the `value_type()` check in
+                // `validateQueryType` once the instant-query entry point
+                // lands.
+                Expr::Subquery(sq) if self.query.start_ms == self.query.end_ms => {
+                    self.subquery(sq).await.map(|s| s.inner)
+                }
+                Expr::Subquery(_) => Err(EngineError::Query(RANGE_VECTOR_AS_RESULT.into())),
                 other => Err(EngineError::Unsupported(describe(other))),
             }
         })
@@ -203,7 +269,7 @@ impl Planner<'_> {
             step_ms: self.query.step_ms,
             window_ms: self.query.lookback_ms,
             offset_ms: offset_ms(vs),
-            at_ms: resolve_at(vs, self.query),
+            at_ms: resolve_at(vs.timestamp, vs.start_or_end, &self.statement),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         let hints = self.hints(params.select_range(), None, above);
@@ -217,7 +283,8 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
-    /// A function of one range selector: `rate(x[5m])` and its family.
+    /// A function of one range vector: `rate(x[5m])` and its family, over
+    /// a range selector or a subquery.
     ///
     /// Takes no `Above`: this call is itself what stands directly over the
     /// selector, so nothing higher reaches the store.
@@ -225,17 +292,61 @@ impl Planner<'_> {
         let name = call.func.name.as_str();
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
-        let (ms, vs) = match call.args.as_slice() {
-            [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
-                Expr::VectorSelector(vs) => (ms, vs),
-                other => {
+        // Both arms produce the same thing: rows of raw samples per
+        // series, and the window to read of each. `promql_range_function`
+        // cares only about the timestamps in those rows, so a subquery's
+        // step grid feeds it exactly as a scan's stored samples do.
+        let Windowed {
+            inner,
+            params,
+            stored,
+        } = match call.args.as_slice() {
+            [Expr::MatrixSelector(ms)] => {
+                let Expr::VectorSelector(vs) = ms.vector_selector.as_ref() else {
                     return Err(EngineError::Unsupported(format!(
                         "a range selector over {}",
-                        describe(other)
-                    )))
+                        describe(ms.vector_selector.as_ref())
+                    )));
+                };
+                if ms.range_expr.is_some() {
+                    return Err(EngineError::Unsupported(
+                        "a range given as a duration expression".into(),
+                    ));
                 }
-            },
-            [Expr::Subquery(_)] => return Err(EngineError::Unsupported("a subquery".into())),
+                let params = Params {
+                    start_ms: self.query.start_ms,
+                    end_ms: self.query.end_ms,
+                    step_ms: self.query.step_ms,
+                    window_ms: (ms.range_secs * 1000.0).round() as i64,
+                    offset_ms: offset_ms(vs),
+                    at_ms: resolve_at(vs.timestamp, vs.start_or_end, &self.statement),
+                };
+                check_selector_bounds(params.at_ms, params.offset_ms)?;
+                check_time_bound("the range", params.window_ms)?;
+                // The store hears about this function, not the
+                // aggregation over it: `rate` is what decides which
+                // samples it may skip, and the grouping above it no
+                // longer describes the selector's parent, so it is
+                // dropped rather than threaded through.
+                let hints = self.hints(
+                    params.select_range(),
+                    Some(params.window_ms),
+                    Above {
+                        func: Some(func.as_str()),
+                        grouping: None,
+                    },
+                );
+                let (builder, label_names) = self.scan(vs, hints).await?;
+                Windowed {
+                    inner: Planned {
+                        plan: builder.build()?,
+                        label_names,
+                    },
+                    params,
+                    stored: true,
+                }
+            }
+            [Expr::Subquery(sq)] => self.subquery(sq).await?,
             [other] => {
                 return Err(EngineError::Unsupported(format!(
                     "the {name} function over {}",
@@ -249,47 +360,92 @@ impl Planner<'_> {
                 )))
             }
         };
-        if ms.range_expr.is_some() {
-            return Err(EngineError::Unsupported(
-                "a range given as a duration expression".into(),
-            ));
-        }
 
-        let params = Params {
-            start_ms: self.query.start_ms,
-            end_ms: self.query.end_ms,
-            step_ms: self.query.step_ms,
-            window_ms: (ms.range_secs * 1000.0).round() as i64,
-            offset_ms: offset_ms(vs),
-            at_ms: resolve_at(vs, self.query),
-        };
-        check_selector_bounds(params.at_ms, params.offset_ms)?;
-        check_time_bound("the range", params.window_ms)?;
-        // The store hears about this function, not the aggregation over
-        // it: `rate` is what decides which samples it may skip, and the
-        // grouping above it no longer describes the selector's parent, so
-        // it is dropped rather than threaded through.
-        let hints = self.hints(
-            params.select_range(),
-            Some(params.window_ms),
-            Above {
-                func: Some(func.as_str()),
-                grouping: None,
-            },
-        );
-        let (builder, input_names) = self.scan(vs, hints).await?;
-        let (labels_expr, label_names) = if func.drops_metric_name() {
-            labels::keep(&input_names, |n| n != METRIC_NAME)
+        // Over stored samples the input always carries `__name__`, so the
+        // projection is rebuilt unconditionally and its text is pinned in
+        // `plans.yaml`. Over a subquery the inner expression may have
+        // dropped it already, and rebuilding an identical struct would
+        // only add a node.
+        let drop_name = func.drops_metric_name()
+            && (stored || inner.label_names.iter().any(|n| n == METRIC_NAME));
+        let (labels_expr, label_names) = if drop_name {
+            labels::keep(&inner.label_names, |n| n != METRIC_NAME)
         } else {
-            (col(LABELS), input_names)
+            (col(LABELS), inner.label_names)
         };
-        let plan = builder
+        let plan = LogicalPlanBuilder::from(inner.plan)
             .project(vec![
                 labels_expr.alias(LABELS),
                 range::call(col(SAMPLES), func, &params).alias(SAMPLES),
             ])?
             .build()?;
         Ok(Planned { plan, label_names })
+    }
+
+    /// `inner[range:step]`, planned as the range query it is.
+    ///
+    /// Upstream's `SubqueryExpr` case in `eval` builds a fresh evaluator
+    /// for the inner expression: its interval is the written step or
+    /// `noStepSubqueryIntervalFn`, its end the outer end less the offset,
+    /// and its start the first multiple of the interval *strictly after*
+    /// `outer_start - offset - range` — the same strict lower bound the
+    /// window functions use, so a point exactly one range old is not in
+    /// the window. Evaluating every outer step at once means one inner
+    /// grid wide enough for all of them, which the caller's window
+    /// function then slices per step.
+    async fn subquery(&mut self, sq: &SubqueryExpr) -> Result<Windowed, EngineError> {
+        if sq.range_expr.is_some() || sq.step_expr.is_some() || sq.original_offset_expr.is_some() {
+            return Err(EngineError::Unsupported(
+                "a subquery with a duration expression".into(),
+            ));
+        }
+        let params = Params {
+            start_ms: self.query.start_ms,
+            end_ms: self.query.end_ms,
+            step_ms: self.query.step_ms,
+            window_ms: (sq.range_secs * 1000.0).round() as i64,
+            offset_ms: (sq.original_offset_secs * 1000.0).round() as i64,
+            at_ms: resolve_at(sq.timestamp, sq.start_or_end, &self.statement),
+        };
+        check_selector_bounds(params.at_ms, params.offset_ms)?;
+        check_time_bound("the subquery range", params.window_ms)?;
+
+        let step_ms = match (sq.step_secs * 1000.0).round() as i64 {
+            0 => self.query.no_step_subquery_interval_ms,
+            written => written,
+        };
+        check_time_bound("the subquery step", step_ms)?;
+        if step_ms <= 0 {
+            return Err(EngineError::Query(format!(
+                "subquery step must be positive, got {step_ms}ms"
+            )));
+        }
+        // `@` pins the outer window, so the inner grid is the one window
+        // it pins rather than one per outer step.
+        let (lo, hi) = match params.at_ms {
+            Some(at) => (at, at),
+            None => (params.start_ms, params.end_ms),
+        };
+        let inner = RangeQuery {
+            start_ms: first_step_after(
+                lo.saturating_sub(params.offset_ms)
+                    .saturating_sub(params.window_ms),
+                step_ms,
+            ),
+            end_ms: hi.saturating_sub(params.offset_ms),
+            step_ms,
+            ..self.query
+        };
+        check_grid(&inner)?;
+
+        let outer = std::mem::replace(&mut self.query, inner);
+        let planned = self.expr(&sq.expr, Above::default()).await;
+        self.query = outer;
+        Ok(Windowed {
+            inner: planned?,
+            params,
+            stored: false,
+        })
     }
 
     async fn aggregate(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
@@ -373,13 +529,17 @@ fn check_selector_bounds(at_ms: Option<i64>, offset_ms: i64) -> Result<(), Engin
 }
 
 /// The `@` modifier's timestamp, with `start()`/`end()` resolved against
-/// the query. Upstream does this in `preprocessExpr`; our parser leaves it
-/// to the engine.
-fn resolve_at(vs: &VectorSelector, query: &RangeQuery) -> Option<i64> {
-    match (vs.timestamp, vs.start_or_end) {
+/// the statement. Upstream does this in `preprocessExpr`; our parser
+/// leaves it to the engine.
+fn resolve_at(
+    timestamp: Option<i64>,
+    start_or_end: Option<AtModifier>,
+    statement: &RangeQuery,
+) -> Option<i64> {
+    match (timestamp, start_or_end) {
         (Some(ts), _) => Some(ts),
-        (None, Some(AtModifier::Start)) => Some(query.start_ms),
-        (None, Some(AtModifier::End)) => Some(query.end_ms),
+        (None, Some(AtModifier::Start)) => Some(statement.start_ms),
+        (None, Some(AtModifier::End)) => Some(statement.end_ms),
         (None, None) => None,
     }
 }

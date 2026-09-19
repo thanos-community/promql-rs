@@ -157,7 +157,6 @@ fn what_is_still_unsupported_is_named() {
             "absent_over_time(http_requests_total[5m])",
             "the absent_over_time function",
         ),
-        ("rate(http_requests_total[5m:1m])", "a subquery"),
         ("abs(http_requests_total)", "the abs function"),
         (
             "quantile_over_time(0.5, http_requests_total[5m])",
