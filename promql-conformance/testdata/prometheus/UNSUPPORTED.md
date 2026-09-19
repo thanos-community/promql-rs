@@ -8,24 +8,24 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are blocked on the features below.
+Against the vendored corpus: **280 of 2098 evals pass** (13.3%), and **740** are blocked on the features below.
 
 ## Missing features
 
 | evals blocked | feature |
 |---:|---|
-| 199 | a binary operator |
-| 78 | the histogram_quantile function |
+| 234 | a binary operator |
+| 86 | the histogram_quantile function |
 | 57 | a subquery |
 | 56 | the histogram_fraction function |
 | 41 | the info function |
 | 18 | the label_replace function |
+| 16 | a unary operator |
 | 16 | the absent_over_time function |
 | 16 | the histogram_quantiles function |
+| 13 | a scalar literal |
 | 13 | the absent function |
 | 13 | the timestamp function |
-| 12 | a scalar literal |
-| 12 | a unary operator |
 | 9 | the quantile_over_time function |
 | 9 | the sort_by_label function |
 | 8 | the predict_linear function |
@@ -63,7 +63,6 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | 2 | the sort function |
 | 2 | the time function |
 | 2 | the ts_of_last_over_time function |
-| 1 | the SUM function |
 | 1 | the abs function |
 | 1 | the acos function |
 | 1 | the acosh function |
@@ -97,19 +96,19 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | file | evals | passing | |
 |---|---:|---:|---|
 | staleness | 17 | 17 (100%) | fully green |
-| aggregators | 160 | 57 (36%) |  |
+| aggregators | 160 | 68 (42%) |  |
 | selectors | 31 | 11 (35%) |  |
 | range_queries | 18 | 6 (33%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
 | name_label_dropping | 30 | 8 (27%) |  |
 | at_modifier | 71 | 18 (25%) |  |
 | functions | 413 | 95 (23%) |  |
+| type_and_unit | 58 | 10 (17%) |  |
 | subquery | 34 | 2 (6%) |  |
 | duration_expression | 59 | 3 (5%) |  |
 | histograms | 185 | 4 (2%) |  |
 | native_histograms | 521 | 0 (0%) |  |
 | operators | 213 | 0 (0%) |  |
-| type_and_unit | 58 | 0 (0%) |  |
 | fill-modifier | 45 | 0 (0%) |  |
 | info | 42 | 0 (0%) |  |
 | limit | 37 | 0 (0%) | all skipped — native histograms |

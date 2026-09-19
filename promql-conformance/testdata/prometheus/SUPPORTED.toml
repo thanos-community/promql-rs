@@ -18,6 +18,17 @@
 # UNSUPPORTED.md for what is missing, or run with PROMQL_PROMQLTEST_ALL=1.
 
 aggregators = [
+    "AVG(http_requests) BY (job) @ 3000000",
+    "COUNT(http_requests) BY (job) @ 3000000",
+    "MAX(http_requests) BY (job) @ 3000000",
+    "MIN(http_requests) BY (job) @ 3000000",
+    'SUM BY (group) (((http_requests{job="api-server"}))) @ 3000000',
+    'SUM BY (group) (http_requests{job="api-server"}) @ 3000000',
+    "SUM(http_requests) @ 3000000",
+    "SUM(http_requests) BY (job) @ 3000000",
+    "SUM(http_requests) BY (job, group) @ 3000000",
+    "SUM(http_requests) BY (job, nonexistent) @ 3000000",
+    'SUM(http_requests{instance="0"}) BY(job) @ 3000000',
     'avg by (group) (data{test="nan"}) @ 60000',
     'avg by (group) (http_requests{job="api-server"}) @ 3000000',
     "avg(data) @ 60000",
@@ -279,4 +290,16 @@ staleness = "all"
 subquery = [
     "min_over_time(metric_total[10s]) @ 20000",
     "rate(metric_total[1m]) @ 80000",
+]
+type_and_unit = [
+    "SUM(http_requests_total) BY (job) @ 3000000",
+    "SUM(http_requests_total) BY (job) @ 3000000 #2",
+    'SUM(http_requests_total{__type__="counter", __unit__="request"}) BY (job) @ 3000000',
+    'SUM(http_requests_total{__type__="counter", __unit__="request"}) BY (job) @ 3000000 #2',
+    'SUM({__type__="counter", __unit__="request"}) BY (job) @ 3000000',
+    'SUM({__type__="counter", __unit__="request"}) BY (job) @ 3000000 #2',
+    'SUM({__type__="counter"}) BY (job) @ 3000000',
+    'SUM({__type__="counter"}) BY (job) @ 3000000 #2',
+    'SUM({__unit__="request"}) BY (job) @ 3000000',
+    'SUM({__unit__="request"}) BY (job) @ 3000000 #2',
 ]
