@@ -16,3 +16,7 @@ promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_norway = { workspace = true }
