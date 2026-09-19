@@ -35,6 +35,7 @@ use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
 
 use crate::aggregate::{self, Op};
+use crate::durations;
 use crate::error::EngineError;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
@@ -202,7 +203,7 @@ impl Planner<'_> {
             end_ms: self.query.end_ms,
             step_ms: self.query.step_ms,
             window_ms: self.query.lookback_ms,
-            offset_ms: offset_ms(vs),
+            offset_ms: offset_ms(vs, self.query)?,
             at_ms: resolve_at(vs, self.query),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
@@ -249,18 +250,16 @@ impl Planner<'_> {
                 )))
             }
         };
-        if ms.range_expr.is_some() {
-            return Err(EngineError::Unsupported(
-                "a range given as a duration expression".into(),
-            ));
-        }
-
+        let window_ms = match &ms.range_expr {
+            Some(e) => durations::duration_ms(e, self.query, false)?,
+            None => (ms.range_secs * 1000.0).round() as i64,
+        };
         let params = Params {
             start_ms: self.query.start_ms,
             end_ms: self.query.end_ms,
             step_ms: self.query.step_ms,
-            window_ms: (ms.range_secs * 1000.0).round() as i64,
-            offset_ms: offset_ms(vs),
+            window_ms,
+            offset_ms: offset_ms(vs, self.query)?,
             at_ms: resolve_at(vs, self.query),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
@@ -340,8 +339,14 @@ impl Planner<'_> {
     }
 }
 
-fn offset_ms(vs: &VectorSelector) -> i64 {
-    (vs.original_offset_secs * 1000.0).round() as i64
+/// The selector's offset. `original_offset_expr` and
+/// `original_offset_secs` are the two halves of upstream's offset: the
+/// parser fills whichever it can, and an offset may be negative.
+fn offset_ms(vs: &VectorSelector, query: &RangeQuery) -> Result<i64, EngineError> {
+    match &vs.original_offset_expr {
+        Some(e) => durations::duration_ms(e, query, true),
+        None => Ok((vs.original_offset_secs * 1000.0).round() as i64),
+    }
 }
 
 /// The widest `@` timestamp, offset or range this engine will plan.
@@ -385,11 +390,6 @@ fn resolve_at(vs: &VectorSelector, query: &RangeQuery) -> Option<i64> {
 }
 
 fn reject_unsupported_modifiers(vs: &VectorSelector) -> Result<(), EngineError> {
-    if vs.original_offset_expr.is_some() {
-        return Err(EngineError::Unsupported(
-            "an offset given as a duration expression".into(),
-        ));
-    }
     if vs.anchored || vs.smoothed {
         return Err(EngineError::Unsupported(
             "the anchored and smoothed modifiers".into(),
