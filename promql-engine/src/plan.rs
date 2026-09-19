@@ -83,6 +83,7 @@ pub async fn plan(
 ) -> Result<LogicalPlan, EngineError> {
     check_range(query)?;
     check_expr(expr)?;
+    check_range_query_type(expr)?;
     if let Some(plan) = scalar_plan(expr, query)? {
         return Ok(plan);
     }
@@ -151,6 +152,26 @@ fn check_binary(b: &promql_parser::ast::BinaryExpr) -> Result<(), EngineError> {
 fn is_comparison(op: promql_parser::token::ItemType) -> bool {
     use promql_parser::token::ItemType::*;
     matches!(op, EqlC | Neq | Gtr | Lss | Gte | Lte)
+}
+
+/// A range query may only ask for a vector or a scalar.
+///
+/// Upstream's `NewRangeQuery` (`promql/engine.go:566-567` at 83962c35),
+/// message included: a matrix per step would be a result with one
+/// dimension too many, and a string does not vary over a range at all.
+/// [`plan_instant`] deliberately does not check — a matrix is exactly
+/// what `x[5m]` answers at one instant.
+///
+/// A `Query` error rather than `Unsupported`: Prometheus rejects these
+/// too, so this is an answer and not a gap in the engine.
+fn check_range_query_type(expr: &Expr) -> Result<(), EngineError> {
+    match value_type(expr) {
+        ValueType::Vector | ValueType::Scalar => Ok(()),
+        other => Err(EngineError::Query(format!(
+            "invalid expression type {:?} for range query, must be Scalar or instant Vector",
+            other.as_str()
+        ))),
+    }
 }
 
 /// [`plan`], for a query whose range is a single instant.
@@ -850,5 +871,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::Query(_)), "{err}");
+    }
+
+    /// Upstream's message, verbatim: a harness comparing error text
+    /// would otherwise diverge on wording alone.
+    #[tokio::test]
+    async fn a_range_query_of_the_wrong_type_is_rejected_in_upstreams_words() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for (query, spelling) in [
+            ("up[5m]", "range vector"),
+            ("up[5m:1m]", "range vector"),
+            ("(up[5m])", "range vector"),
+            (r#""hello""#, "string"),
+        ] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "invalid expression type \"{spelling}\" for range query, \
+                     must be Scalar or instant Vector"
+                ),
+                "{query}"
+            );
+            assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
+        }
+    }
+
+    /// The same expressions the range path rejects: a matrix is what an
+    /// instant query is *for*, and only a string stays out of reach.
+    #[tokio::test]
+    async fn the_instant_path_takes_the_types_a_range_query_cannot() {
+        let ctx = SessionContext::new();
+        let source = MemorySeriesSource::default();
+        let at = RangeQuery::new(60_000, 60_000, 1);
+        for query in ["up[5m]", "(up[5m])", "up", "42"] {
+            let expr = promql_parser::parse_expr(query).expect("parses");
+            assert!(
+                plan_instant(&ctx.state(), &source, &expr, &at)
+                    .await
+                    .is_ok(),
+                "{query}"
+            );
+        }
     }
 }
