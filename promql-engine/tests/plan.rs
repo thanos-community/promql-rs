@@ -18,7 +18,9 @@
 //! `description` saying what shape it pins, the `load` series the query
 //! runs over, the `query: |`, and an empty `plan: |` block. Both of those
 //! are block scalars even for a one-line query, so every entry has one
-//! shape and a long query can be wrapped. Run the test:
+//! shape and a long query can be wrapped. Add `instant: true` for a
+//! case that should go through the instant entry point instead, planned
+//! at `defaults.at_ms`. Run the test:
 //! the failure prints the rendered plan, and pasting it in is the whole
 //! edit. Read it before pasting — the point is to notice a shape you did
 //! not expect, not to record one.
@@ -66,6 +68,8 @@ struct Defaults {
     start_ms: i64,
     end_ms: i64,
     step_ms: i64,
+    /// The instant `instant: true` cases are planned at.
+    at_ms: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,13 +80,16 @@ struct Case {
     load: Vec<String>,
     query: String,
     plan: String,
+    /// Plan through the instant entry point rather than the range one.
+    #[serde(default)]
+    instant: bool,
 }
 
 fn plans_file() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/plans.yaml")
 }
 
-fn plan_of(case: &Case, range: &RangeQuery) -> String {
+fn plan_of(case: &Case, defaults: &Defaults) -> String {
     let series: Vec<_> = case
         .load
         .iter()
@@ -111,9 +118,14 @@ fn plan_of(case: &Case, range: &RangeQuery) -> String {
     // Both `query` and `plan` are `|` block scalars, so both shed the
     // newline it appends; a query wrapped over several lines keeps its
     // own newlines, which PromQL treats as whitespace.
-    let plan = rt
-        .block_on(engine.plan_async(&source, case.query.trim_end(), range))
-        .expect("the query plans");
+    let query = case.query.trim_end();
+    let plan = if case.instant {
+        rt.block_on(engine.plan_instant_async(&source, query, defaults.at_ms))
+    } else {
+        let range = RangeQuery::new(defaults.start_ms, defaults.end_ms, defaults.step_ms);
+        rt.block_on(engine.plan_async(&source, query, &range))
+    }
+    .expect("the query plans");
     // The renderer borrows the plan, so it cannot be the tail expression.
     let rendered = plan.display_indent().to_string();
     rendered
@@ -126,19 +138,13 @@ fn every_case_plans_to_its_expected_shape() {
     let suite: Suite = serde_norway::from_str(&body).expect("the plans file parses");
     assert!(!suite.tests.is_empty(), "{} has no cases", path.display());
 
-    let range = RangeQuery::new(
-        suite.defaults.start_ms,
-        suite.defaults.end_ms,
-        suite.defaults.step_ms,
-    );
-
     // Every case is reported, not just the first: one planner change
     // usually moves several shapes, and seeing all of them is what makes
     // the update a single reviewable edit.
     let mut failures = Vec::new();
     for case in &suite.tests {
         let expected = case.plan.trim_end();
-        let actual = plan_of(case, &range);
+        let actual = plan_of(case, &suite.defaults);
         if actual != expected {
             failures.push(format!(
                 "case {:?}\n  query:    {}\n  expected: {}\n  actual:   {}",

@@ -38,7 +38,14 @@
 //! The same shape comes out of every operator: an instant vector over a
 //! range query is again one row per series with a list of samples, now at
 //! step timestamps. That is what lets operators stack.
+//!
+//! One shape sits beside it rather than inside it: [`vector_schema`], the
+//! result of an instant query, where the list collapses to the single
+//! sample every series has at the evaluation timestamp. It is defined
+//! here so that its labels are the same struct and its timestamp the same
+//! Arrow type, and nowhere else.
 
+use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -47,10 +54,10 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     new_empty_array, Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, Float64Array,
     ListArray, RecordBatch, StringViewArray, StringViewBuilder, StructArray,
-    TimestampMillisecondArray,
+    TimestampMillisecondArray, UInt32Array,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::{concat, filter, filter_record_batch};
+use datafusion::arrow::compute::{concat, concat_batches, filter, filter_record_batch, take};
 use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Float64Type, Schema, SchemaRef, TimeUnit,
     TimestampMillisecondType,
@@ -596,6 +603,222 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     .map_err(|e| e.to_string())
 }
 
+/// One query's batches as a single batch.
+///
+/// Anything that looks at the result as a whole — its order, its shape
+/// — has to, because a batch boundary is DataFusion's partitioning and
+/// not the engine's. One `collect()` gives every batch one schema, so
+/// this never has to reconcile two.
+pub fn one_batch(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
+    match batches {
+        [one] => Ok(one.clone()),
+        many => {
+            let names = many.first().map(|b| label_names(&b.schema()));
+            concat_batches(&schema(&names.unwrap_or_default()), many).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// The instant-vector shape: one row per series, one sample.
+///
+/// ```text
+/// labels     Struct<{name}: Utf8View, …>   the same struct as above
+/// timestamp  Timestamp(ms)                 the evaluation time, on every row
+/// value      Float64
+/// ```
+///
+/// Prometheus's `promql.Vector`, a list of `Sample`. The timestamp is a
+/// column rather than a constant because a `RecordBatch` is the unit
+/// this engine hands over and a caller reading one column at a time
+/// should not have to be told the time separately. It is the same Arrow
+/// type as a sample's timestamp on purpose: one Prometheus concept,
+/// one spelling in this crate.
+pub fn vector_schema(label_names: &[String]) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(LABELS, labels_type(label_names), false),
+        Field::new(TIMESTAMP, timestamp_type(), false),
+        Field::new(VALUE, DataType::Float64, false),
+    ]))
+}
+
+/// Collapse single-point canonical batches into one vector batch.
+///
+/// Every row must carry exactly one sample; anything else means the
+/// query was not evaluated on a one-step grid, which is the caller's
+/// bug, so it is an error naming the row rather than a guess at which
+/// point was meant. The timestamp column is `at_ms` throughout, not the
+/// sample's own: upstream forces it to the evaluation time because that
+/// is when the evaluation ran (`promql/engine.go:838-841` at 83962c35).
+pub fn to_vector(batches: &[RecordBatch], at_ms: i64) -> Result<RecordBatch, String> {
+    let batch = one_batch(batches)?;
+    let names = label_names(&batch.schema());
+
+    let samples = batch
+        .column_by_name(SAMPLES)
+        .expect("canonical")
+        .as_list::<i32>();
+    for row in 0..batch.num_rows() {
+        let n = samples.value_length(row);
+        if n != 1 {
+            return Err(format!(
+                "an instant vector has one point per series; series {row} has {n}"
+            ));
+        }
+    }
+
+    // Every row holds exactly one sample, so the rows' samples are the
+    // child array's entries one for one, in order: the values column is
+    // already the column this shape wants, and slicing it copies nothing.
+    let offset = samples.offsets()[0] as usize;
+    let values = Arc::clone(
+        samples
+            .values()
+            .as_struct()
+            .column_by_name(VALUE)
+            .expect("canonical"),
+    )
+    .slice(offset, batch.num_rows());
+
+    RecordBatch::try_new(
+        vector_schema(&names),
+        vec![
+            Arc::clone(batch.column_by_name(LABELS).expect("canonical")),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                at_ms;
+                batch.num_rows()
+            ])),
+            values,
+        ],
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// One vector element: Prometheus's `promql.Sample`.
+///
+/// The row-at-a-time view of [`vector_schema`], as [`Series`] is of the
+/// canonical shape.
+#[derive(Debug, Clone)]
+pub struct Sample {
+    labels: StructArray,
+    timestamp: i64,
+    value: f64,
+}
+
+impl Sample {
+    /// The label set as Prometheus prints it: sorted by name, without
+    /// the `""` placeholders a batch stores for labels a series lacks.
+    pub fn labels(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.labels
+            .fields()
+            .iter()
+            .zip(self.labels.columns())
+            .map(|(f, c)| (f.name().as_str(), view_value(c, 0)))
+            .filter(|(_, v)| !v.is_empty())
+    }
+
+    /// The value of one label, `""` when the sample does not have it.
+    pub fn label(&self, name: &str) -> &str {
+        self.labels
+            .column_by_name(name)
+            .map_or("", |c| view_value(c, 0))
+    }
+
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+}
+
+/// The rows of a vector batch, with their labels as zero-copy slices.
+pub fn decode_vector(batch: &RecordBatch) -> Result<Vec<Sample>, String> {
+    let names = label_names(&batch.schema());
+    if batch.schema() != vector_schema(&names) {
+        return Err(format!(
+            "expected the instant-vector schema, got {}",
+            batch.schema()
+        ));
+    }
+    let labels = batch.column_by_name(LABELS).expect("checked").as_struct();
+    let timestamps = batch
+        .column_by_name(TIMESTAMP)
+        .expect("checked")
+        .as_primitive::<TimestampMillisecondType>();
+    let values = batch
+        .column_by_name(VALUE)
+        .expect("checked")
+        .as_primitive::<Float64Type>();
+    Ok((0..batch.num_rows())
+        .map(|row| Sample {
+            labels: labels.slice(row, 1),
+            timestamp: timestamps.value(row),
+            value: values.value(row),
+        })
+        .collect())
+}
+
+/// The whole result ordered by label set, as Prometheus sorts a
+/// `Matrix` (`sort.Sort(mat)`, `promql/engine.go:846` at 83962c35).
+///
+/// Takes every batch and returns one, because the order is over the
+/// result and not over a batch: sorting each batch of a partitioned
+/// result would leave the rows ordered only within each, which is no
+/// order at all to a caller that reads them in sequence.
+///
+/// Upstream's `labels.Compare` walks two label sets pair by pair and
+/// compares the first that differs, name before value. This shape pads
+/// an absent label with `""` instead of omitting it, so the walk has to
+/// skip those: a padded field is not a pair, and treating it as one
+/// would order `{b="2"}` before `{a="1"}`.
+pub fn sort_by_labels(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
+    let batch = one_batch(batches)?;
+    let labels = batch.column_by_name(LABELS).expect("canonical").as_struct();
+    let mut order: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    if order.is_sorted_by(|&a, &b| compare_label_sets(labels, a as usize, b as usize).is_le()) {
+        return Ok(batch.clone());
+    }
+    order.sort_by(|&a, &b| compare_label_sets(labels, a as usize, b as usize));
+
+    let indices = UInt32Array::from(order);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| take(c, &indices, None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let schema = batch.schema();
+    RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
+}
+
+/// `labels.Compare` over two rows of one labels struct. Fields are
+/// sorted by name, so a field index orders the same way its name does
+/// and the names never have to be compared.
+fn compare_label_sets(labels: &StructArray, a: usize, b: usize) -> Ordering {
+    let present = |row: usize, from: usize| {
+        (from..labels.num_columns()).find(|&k| !view_value(labels.column(k), row).is_empty())
+    };
+    let (mut ka, mut kb) = (present(a, 0), present(b, 0));
+    loop {
+        match (ka, kb) {
+            (None, None) => return Ordering::Equal,
+            // One set is a prefix of the other; the shorter is less.
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ia), Some(ib)) if ia != ib => return ia.cmp(&ib),
+            (Some(ia), Some(ib)) => {
+                let ord = view_value(labels.column(ia), a).cmp(view_value(labels.column(ib), b));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                ka = present(a, ia + 1);
+                kb = present(b, ib + 1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +984,95 @@ mod tests {
 
         // Nothing to narrow and nothing to clip hands the batch back.
         assert_eq!(clip(&narrowed, 0, 9000).unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn a_vector_keeps_the_labels_and_takes_the_evaluation_time() {
+        let all = [
+            series(&[("__name__", "up"), ("pod", "a")], &[(30_000, 1.0)]),
+            series(&[("__name__", "up")], &[(25_000, 2.0)]),
+        ];
+        let batch = encode(&label_names_of(&all), &all).unwrap();
+
+        let vector = to_vector(std::slice::from_ref(&batch), 60_000).unwrap();
+        assert_eq!(vector.num_rows(), 2);
+        let decoded = decode_vector(&vector).unwrap();
+        assert_eq!(
+            decoded[0].labels().collect::<Vec<_>>(),
+            vec![("__name__", "up"), ("pod", "a")]
+        );
+        assert_eq!(decoded[0].value(), 1.0);
+        assert_eq!(decoded[1].label("pod"), "");
+        assert_eq!(decoded[1].value(), 2.0);
+        // Both points sat elsewhere; both report the evaluation time.
+        assert!(decoded.iter().all(|s| s.timestamp() == 60_000));
+
+        // Several batches of one query are one vector.
+        let split = to_vector(&[batch.slice(0, 1), batch.slice(1, 1)], 60_000).unwrap();
+        assert_eq!(split.num_rows(), 2);
+        assert_eq!(decode_vector(&split).unwrap()[1].value(), 2.0);
+
+        assert_eq!(to_vector(&[], 0).unwrap().num_rows(), 0);
+    }
+
+    /// The reshape is only correct on a one-step grid, so a row that
+    /// did not come from one is an error rather than a first point.
+    #[test]
+    fn a_series_with_other_than_one_point_is_not_a_vector_element() {
+        let two = [series(&[("a", "1")], &[(0, 1.0), (1000, 2.0)])];
+        let batch = encode(&label_names_of(&two), &two).unwrap();
+        let err = to_vector(&[batch], 0).unwrap_err();
+        assert!(err.contains("has 2"), "{err}");
+
+        let none = [series(&[("a", "1")], &[])];
+        let batch = encode(&label_names_of(&none), &none).unwrap();
+        assert!(to_vector(&[batch], 0).unwrap_err().contains("has 0"));
+    }
+
+    /// The ordering upstream's `labels.Compare` defines, including the
+    /// two cases the `""` padding could get wrong: a missing label
+    /// early, and one set being a prefix of the other.
+    #[test]
+    fn rows_sort_by_label_set_as_prometheus_does() {
+        let all = [
+            series(&[("a", "1"), ("b", "2")], &[(0, 1.0)]),
+            series(&[("a", "1")], &[(0, 2.0)]),
+            series(&[("b", "2")], &[(0, 3.0)]),
+            series(&[("a", "0")], &[(0, 4.0)]),
+        ];
+        let batch = encode(&label_names_of(&all), &all).unwrap();
+        let want = [
+            vec![("a", "0")],
+            vec![("a", "1")],
+            vec![("a", "1"), ("b", "2")],
+            vec![("b", "2")],
+        ];
+        let label_sets = |batch: RecordBatch| -> Vec<Vec<(String, String)>> {
+            decode(&[batch])
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    s.labels()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .collect()
+        };
+        let check = |batches: &[RecordBatch]| {
+            let got = label_sets(sort_by_labels(batches).unwrap());
+            let got: Vec<Vec<(&str, &str)>> = got
+                .iter()
+                .map(|s| s.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
+                .collect();
+            assert_eq!(got, want);
+        };
+
+        check(std::slice::from_ref(&batch));
+        // Split across batches the order is still over the whole
+        // result, not within each batch: the two halves interleave.
+        check(&[batch.slice(0, 2), batch.slice(2, 2)]);
+        // Already ordered, so the batch comes back untouched.
+        check(&[sort_by_labels(std::slice::from_ref(&batch)).unwrap()]);
     }
 
     #[test]

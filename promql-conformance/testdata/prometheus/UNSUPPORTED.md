@@ -8,31 +8,31 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are blocked on the features below.
+Against the vendored corpus: **261 of 2098 evals pass** (12.4%), and **691** are blocked on the features below.
 
 ## Missing features
 
 | evals blocked | feature |
 |---:|---|
-| 199 | a binary operator |
+| 187 | a binary operator |
 | 78 | the histogram_quantile function |
 | 57 | a subquery |
 | 56 | the histogram_fraction function |
 | 41 | the info function |
+| 29 | a scalar-typed instant query |
 | 18 | the label_replace function |
 | 16 | the absent_over_time function |
 | 16 | the histogram_quantiles function |
 | 13 | the absent function |
 | 13 | the timestamp function |
-| 12 | a scalar literal |
-| 12 | a unary operator |
+| 10 | a unary operator |
 | 9 | the quantile_over_time function |
 | 9 | the sort_by_label function |
 | 8 | the predict_linear function |
 | 8 | the topk aggregation |
 | 7 | the label_join function |
 | 6 | the quantile aggregation |
-| 5 | a string literal |
+| 5 | a string-typed instant query |
 | 4 | the day_of_year function |
 | 4 | the exp function |
 | 4 | the sort_by_label_desc function |
@@ -49,7 +49,6 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | 3 | the rad function |
 | 3 | the stdvar_over_time function |
 | 3 | the ts_of_first_over_time function |
-| 2 | a range selector |
 | 2 | the day_of_month function |
 | 2 | the day_of_week function |
 | 2 | the days_in_month function |
@@ -61,7 +60,6 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | 2 | the mad_over_time function |
 | 2 | the month function |
 | 2 | the sort function |
-| 2 | the time function |
 | 2 | the ts_of_last_over_time function |
 | 1 | the SUM function |
 | 1 | the abs function |
@@ -81,7 +79,6 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | 1 | the histogram_stdvar function |
 | 1 | the limit_ratio aggregation |
 | 1 | the limitk aggregation |
-| 1 | the pi function |
 | 1 | the round function |
 | 1 | the sin function |
 | 1 | the sinh function |
@@ -97,9 +94,9 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | file | evals | passing | |
 |---|---:|---:|---|
 | staleness | 17 | 17 (100%) | fully green |
+| range_queries | 18 | 8 (44%) |  |
 | aggregators | 160 | 57 (36%) |  |
 | selectors | 31 | 11 (35%) |  |
-| range_queries | 18 | 6 (33%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
 | name_label_dropping | 30 | 8 (27%) |  |
 | at_modifier | 71 | 18 (25%) |  |

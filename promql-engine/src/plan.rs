@@ -32,7 +32,7 @@ use std::time::Duration;
 use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
-use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
+use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, MatrixSelector, VectorSelector};
 
 use crate::aggregate::{self, Op};
 use crate::error::EngineError;
@@ -79,6 +79,46 @@ pub async fn plan(
     expr: &Expr,
     query: &RangeQuery,
 ) -> Result<LogicalPlan, EngineError> {
+    check_range(query)?;
+    let mut planner = Planner::new(state, source, query);
+    Ok(planner.expr(expr, Above::default()).await?.plan)
+}
+
+/// [`plan`], for a query whose range is a single instant.
+///
+/// The one thing it plans that [`plan`] cannot is a range selector as
+/// the whole query, `x[5m]`, which is a matrix result. Upstream draws
+/// the same line in the evaluator rather than the planner: a matrix
+/// selector panics unless `startTimestamp == endTimestamp`
+/// (`promql/engine.go:2366-2370` at 83962c35), and a range query is
+/// rejected before that for having a type other than vector or scalar.
+pub async fn plan_instant(
+    state: &dyn Session,
+    source: &dyn SeriesSource,
+    expr: &Expr,
+    query: &RangeQuery,
+) -> Result<LogicalPlan, EngineError> {
+    check_range(query)?;
+    let mut planner = Planner::new(state, source, query);
+    match top_level_matrix(expr) {
+        Some(ms) => Ok(planner.matrix_selector(ms).await?.plan),
+        None => Ok(planner.expr(expr, Above::default()).await?.plan),
+    }
+}
+
+/// The range selector a query *is*, looking through the wrappers that
+/// only pass a value along. Everything else that holds one — `rate`'s
+/// argument — consumes it itself and never reaches here.
+fn top_level_matrix(expr: &Expr) -> Option<&MatrixSelector> {
+    match expr {
+        Expr::MatrixSelector(ms) => Some(ms),
+        Expr::Paren(p) => top_level_matrix(&p.expr),
+        Expr::StepInvariant(e) => top_level_matrix(e),
+        _ => None,
+    }
+}
+
+fn check_range(query: &RangeQuery) -> Result<(), EngineError> {
     if query.step_ms <= 0 {
         return Err(EngineError::Query(format!(
             "step must be positive, got {}ms",
@@ -97,13 +137,7 @@ pub async fn plan(
             aggregate::MAX_STEPS
         )));
     }
-    let mut planner = Planner {
-        state,
-        source,
-        query,
-        selectors: 0,
-    };
-    Ok(planner.expr(expr, Above::default()).await?.plan)
+    Ok(())
 }
 
 /// A planned subexpression: the plan and the label names in its schema.
@@ -131,7 +165,16 @@ struct Above<'a> {
     grouping: Option<&'a Grouping>,
 }
 
-impl Planner<'_> {
+impl<'a> Planner<'a> {
+    fn new(state: &'a dyn Session, source: &'a dyn SeriesSource, query: &'a RangeQuery) -> Self {
+        Self {
+            state,
+            source,
+            query,
+            selectors: 0,
+        }
+    }
+
     /// Plan one node. `above` is what the store will be told sits over
     /// the selector this subtree bottoms out in.
     fn expr<'f>(&'f mut self, expr: &'f Expr, above: Above<'f>) -> Planning<'f> {
@@ -215,6 +258,51 @@ impl Planner<'_> {
             ])?
             .build()?;
         Ok(Planned { plan, label_names })
+    }
+
+    /// A range selector as the whole query: the samples themselves, as
+    /// upstream's `matrixSelector` hands them back.
+    ///
+    /// No kernel sits over the samples, and that is the point: the
+    /// window *is* the scan range the store was asked for, strict lower
+    /// bound and all (`Params::select_range`, mirroring
+    /// `matrixIterSlice`'s `mint < t <= maxt`), and a store owes the
+    /// engine only the samples inside the range it was given. The
+    /// timestamps stay the samples' own — upstream does not move them
+    /// for an `offset` either.
+    async fn matrix_selector(&mut self, ms: &MatrixSelector) -> Result<Planned, EngineError> {
+        let Expr::VectorSelector(vs) = ms.vector_selector.as_ref() else {
+            return Err(EngineError::Unsupported(format!(
+                "a range selector over {}",
+                describe(&ms.vector_selector)
+            )));
+        };
+        if ms.range_expr.is_some() {
+            return Err(EngineError::Unsupported(
+                "a range given as a duration expression".into(),
+            ));
+        }
+
+        let params = Params {
+            start_ms: self.query.start_ms,
+            end_ms: self.query.end_ms,
+            step_ms: self.query.step_ms,
+            window_ms: (ms.range_secs * 1000.0).round() as i64,
+            offset_ms: offset_ms(vs),
+            at_ms: resolve_at(vs, self.query),
+        };
+        check_selector_bounds(params.at_ms, params.offset_ms)?;
+        check_time_bound("the range", params.window_ms)?;
+        let hints = self.hints(
+            params.select_range(),
+            Some(params.window_ms),
+            Above::default(),
+        );
+        let (builder, label_names) = self.scan(vs, hints).await?;
+        Ok(Planned {
+            plan: builder.build()?,
+            label_names,
+        })
     }
 
     /// A function of one range selector: `rate(x[5m])` and its family.
