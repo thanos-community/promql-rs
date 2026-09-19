@@ -226,6 +226,29 @@ pub fn group_exprs(keys: &[String]) -> Vec<Expr> {
         .collect()
 }
 
+/// The same columns [`group_exprs`] produced, read back by name — what a
+/// window function partitions by.
+pub fn group_columns(keys: &[String]) -> Vec<Expr> {
+    keys.iter()
+        .map(|k| Expr::Column(Column::new_unqualified(group_alias(k))))
+        .collect()
+}
+
+/// Every label value, in label-name order: the series' identity spelled
+/// as a sort key.
+///
+/// The names are already sorted and an absent label is `""`
+/// ([`series::labels_type`]), so comparing the values in this order is
+/// comparing the label sets themselves — the order a store hands series
+/// back in, and the one `limitk` has to reproduce to pick the same `k`
+/// whatever the plan's partitioning.
+pub fn label_values(names: &[String]) -> Vec<Expr> {
+    names
+        .iter()
+        .map(|n| get_field(col(LABELS), n.as_str()))
+        .collect()
+}
+
 /// The `labels` struct of an aggregation's output, from the group columns
 /// [`group_exprs`] produced.
 ///

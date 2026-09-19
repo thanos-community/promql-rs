@@ -162,7 +162,6 @@ fn aggregations_nest() {
 fn parameterized_aggregations_are_named_as_unsupported() {
     let engine = Engine::blocking().unwrap();
     for (q, what) in [
-        ("topk(2, http_requests_total)", "the topk aggregation"),
         (
             "quantile(0.5, http_requests_total)",
             "the quantile aggregation",
@@ -171,12 +170,92 @@ fn parameterized_aggregations_are_named_as_unsupported() {
             "count_values(\"v\", http_requests_total)",
             "the count_values aggregation",
         ),
+        (
+            "limit_ratio(0.5, http_requests_total)",
+            "the limit_ratio aggregation",
+        ),
+        (
+            "topk(scalar(http_requests_total), http_requests_total)",
+            "the topk aggregation with the scalar function as its parameter",
+        ),
     ] {
         match engine.range_query(source().as_ref(), q, &RangeQuery::new(0, 0, 30_000)) {
             Err(EngineError::Unsupported(f)) => assert_eq!(f, what, "{q}"),
             other => panic!("{q}: {other:?}"),
         }
     }
+}
+
+/// `topk` and its family keep the input series, full label sets and all,
+/// and drop only the steps that did not make the cut.
+#[test]
+fn topk_keeps_the_series_it_picks_whole() {
+    let out = query(
+        "topk(1, http_requests_total)",
+        RangeQuery::new(0, 30_000, 30_000),
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].label("pod"), "envoy-3");
+    assert_eq!(out[0].label("__name__"), "http_requests_total");
+    assert_eq!(out[0].values(), [100.0, 100.0]);
+
+    // Per group, the winner is decided inside the group.
+    let out = query(
+        "topk by (route) (1, http_requests_total)",
+        RangeQuery::new(30_000, 30_000, 30_000),
+    );
+    let mut pods: Vec<&str> = out.iter().map(|s| s.label("pod")).collect();
+    pods.sort();
+    assert_eq!(pods, ["envoy-2", "envoy-3"]);
+
+    let out = query(
+        "bottomk by (route) (1, http_requests_total)",
+        RangeQuery::new(30_000, 30_000, 30_000),
+    );
+    let mut pods: Vec<&str> = out.iter().map(|s| s.label("pod")).collect();
+    pods.sort();
+    assert_eq!(pods, ["envoy-1", "envoy-3"]);
+}
+
+/// A group is only as large as the series in it, and a `k` past that is
+/// the whole group rather than an error; below one it is nothing.
+#[test]
+fn a_k_outside_the_group_size_clamps_to_it() {
+    let out = query(
+        "topk(9999999999, http_requests_total)",
+        RangeQuery::new(0, 0, 30_000),
+    );
+    assert_eq!(out.len(), 3);
+    let out = query(
+        "topk(0, http_requests_total)",
+        RangeQuery::new(0, 0, 30_000),
+    );
+    assert!(out.is_empty(), "{out:?}");
+}
+
+/// `limitk` has no value to rank by, so which series it keeps is decided
+/// by the order the group is read in: the series' own label sets. It is
+/// the two alphabetically first pods, not the two with the largest
+/// values, and not whichever two a partitioning happened to put first.
+#[test]
+fn limitk_keeps_the_first_series_by_label_set() {
+    let out = query(
+        "limitk(2, http_requests_total)",
+        RangeQuery::new(0, 0, 30_000),
+    );
+    let mut pods: Vec<&str> = out.iter().map(|s| s.label("pod")).collect();
+    pods.sort();
+    assert_eq!(pods, ["envoy-1", "envoy-2"]);
+
+    // Per group, the same rule inside each group: "/api" has only
+    // envoy-3, so it keeps it however small k is.
+    let out = query(
+        "limitk by (route) (1, http_requests_total)",
+        RangeQuery::new(0, 0, 30_000),
+    );
+    let mut pods: Vec<&str> = out.iter().map(|s| s.label("pod")).collect();
+    pods.sort();
+    assert_eq!(pods, ["envoy-1", "envoy-3"]);
 }
 
 #[tokio::test]

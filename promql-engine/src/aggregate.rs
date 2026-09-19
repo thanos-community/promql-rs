@@ -17,6 +17,11 @@
 //! The operator is a literal argument rather than eight registered
 //! functions: one name to register, one plan to serialize, and the
 //! same reasoning as the parameters of `promql_vector_selector`.
+//!
+//! PromQL's `topk` family lives here too, as `promql_aggregation_k`, but
+//! as a **window** function: its output series are its input series, full
+//! label sets included, and an aggregate that yields one row per group
+//! has no way to hand a surviving series its own labels back.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -31,13 +36,18 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion::logical_expr::expr::WindowFunction;
+use datafusion::logical_expr::function::{
+    AccumulatorArgs, ExpressionArgs, PartitionEvaluatorArgs, StateFieldsArgs, WindowUDFFieldArgs,
+};
 use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    lit, Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, GroupsAccumulator, Signature,
-    Volatility,
+    lit, Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, GroupsAccumulator,
+    PartitionEvaluator, Signature, Volatility, WindowFrame, WindowFunctionDefinition, WindowUDF,
+    WindowUDFImpl,
 };
 use datafusion::physical_expr::expressions::Literal;
+use datafusion::physical_expr::PhysicalExpr;
 use promql_parser::token::ItemType;
 
 use crate::math::{self, Mean};
@@ -1225,6 +1235,289 @@ impl AggregateUDFImpl for Aggregate {
     }
 }
 
+pub const K_NAME: &str = "promql_aggregation_k";
+
+/// The aggregations that pick which input series survive rather than
+/// folding a group into one, upstream's `aggregationK` in `engine.go`.
+///
+/// They are a window function and not an aggregate because their output
+/// series are their input series, full label sets included: an aggregate
+/// yields one row per group and so has no way to give a surviving series
+/// its own labels back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpK {
+    Topk,
+    Bottomk,
+    Limitk,
+}
+
+impl OpK {
+    pub fn from_token(op: ItemType) -> Option<OpK> {
+        Some(match op {
+            ItemType::Topk => OpK::Topk,
+            ItemType::Bottomk => OpK::Bottomk,
+            ItemType::Limitk => OpK::Limitk,
+            _ => return None,
+        })
+    }
+
+    pub fn parse(s: &str) -> Option<OpK> {
+        Some(match s {
+            "topk" => OpK::Topk,
+            "bottomk" => OpK::Bottomk,
+            "limitk" => OpK::Limitk,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OpK::Topk => "topk",
+            OpK::Bottomk => "bottomk",
+            OpK::Limitk => "limitk",
+        }
+    }
+}
+
+/// One step's surviving rows, in the order upstream's heap would hold
+/// them.
+///
+/// `candidates` is `(row, value)` in input order, which is the order that
+/// settles every tie: upstream only displaces a heap entry on a strict
+/// comparison, so the series seen first keeps its place. NaN loses to
+/// every number in both directions — it is the worst value for `topk` and
+/// for `bottomk` alike, which is why this is not a plain reversal.
+fn survivors(op: OpK, k: usize, candidates: &mut Vec<(usize, f64)>) {
+    if op != OpK::Limitk {
+        let worse = |a: f64, b: f64| match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ if op == OpK::Topk => b.partial_cmp(&a).expect("neither side is NaN"),
+            _ => a.partial_cmp(&b).expect("neither side is NaN"),
+        };
+        candidates.sort_by(|a, b| worse(a.1, b.1));
+    }
+    candidates.truncate(k);
+}
+
+/// The window evaluator: one partition is one PromQL group.
+#[derive(Debug)]
+struct SelectK {
+    op: OpK,
+    k: usize,
+    grid: Grid,
+}
+
+impl PartitionEvaluator for SelectK {
+    /// Whole-partition evaluation, and it must stay that way: which rows
+    /// survive a step is a property of every series in the group at once,
+    /// which no window frame narrower than the partition can answer.
+    fn uses_window_frame(&self) -> bool {
+        false
+    }
+
+    fn supports_bounded_execution(&self) -> bool {
+        false
+    }
+
+    fn evaluate_all(&mut self, values: &[ArrayRef], num_rows: usize) -> Result<ArrayRef> {
+        let list = values[0].as_list::<i32>();
+        let (ts, vs) = Grouped::samples(list)?;
+        let offsets = list.offsets();
+
+        // Every sample of the partition, bucketed by step, so one pass
+        // over the rows answers every step's ranking at once.
+        let mut per_step: Vec<Vec<(usize, f64)>> = vec![Vec::new(); self.grid.len];
+        for row in 0..num_rows {
+            if list.is_null(row) {
+                continue;
+            }
+            for k in offsets[row] as usize..offsets[row + 1] as usize {
+                per_step[self.grid.index(ts[k])?].push((k, vs[k]));
+            }
+        }
+
+        let mut keep = vec![false; ts.len()];
+        for candidates in &mut per_step {
+            survivors(self.op, self.k, candidates);
+            for (k, _) in candidates.iter() {
+                keep[*k] = true;
+            }
+        }
+
+        let (mut out_ts, mut out_vs) = (Vec::new(), Vec::new());
+        let mut out_offsets = Vec::with_capacity(num_rows + 1);
+        out_offsets.push(0i32);
+        for row in 0..num_rows {
+            if !list.is_null(row) {
+                for k in offsets[row] as usize..offsets[row + 1] as usize {
+                    if keep[k] {
+                        out_ts.push(ts[k]);
+                        out_vs.push(vs[k]);
+                    }
+                }
+            }
+            out_offsets.push(out_ts.len() as i32);
+        }
+        let entries = StructArray::new(
+            series::sample_fields(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(out_ts)),
+                Arc::new(Float64Array::from(out_vs)),
+            ],
+            None,
+        );
+        Ok(Arc::new(list_per_group(
+            series::sample_item(),
+            out_offsets,
+            entries,
+        )))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct AggregationK {
+    signature: Signature,
+}
+
+impl Default for AggregationK {
+    fn default() -> Self {
+        Self {
+            signature: Signature::exact(
+                vec![
+                    series::samples_type(),
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                ],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+pub fn udwf() -> WindowUDF {
+    WindowUDF::new_from_impl(AggregationK::default())
+}
+
+/// The `OVER` clause of a [`call_k`]: which rows form one PromQL group,
+/// and in what order they reach the evaluator.
+pub struct Over {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<Expr>,
+}
+
+/// `promql_aggregation_k(samples, '<op>', k, start, end, step) OVER
+/// (PARTITION BY <group keys> ORDER BY <label values>)`.
+///
+/// `k` is already clamped to a `usize` by the planner: PromQL's parameter
+/// is a float, and a group can only ever have as many survivors as it has
+/// series.
+///
+/// [`Over::order_by`] is what makes the answer a function of the data
+/// alone. Upstream reads its input vector in storage order — sorted by
+/// label set — and `limitk` takes the first `k` of it; without an
+/// ordering here the row order inside a partition would be whatever the
+/// repartition merge happened to produce, so the same query over the same
+/// data could keep different series. It settles `topk`'s and `bottomk`'s
+/// ties for the same reason.
+pub fn call_k(
+    samples: Expr,
+    op: OpK,
+    k: usize,
+    start_ms: i64,
+    end_ms: i64,
+    step_ms: i64,
+    over: Over,
+) -> Expr {
+    let mut window = WindowFunction::new(
+        WindowFunctionDefinition::WindowUDF(Arc::new(udwf())),
+        vec![
+            samples,
+            lit(op.as_str()),
+            lit(k as i64),
+            lit(start_ms),
+            lit(end_ms),
+            lit(step_ms),
+        ],
+    );
+    window.params.partition_by = over.partition_by;
+    window.params.order_by = over
+        .order_by
+        .into_iter()
+        .map(|e| e.sort(true, false))
+        .collect();
+    // An `ORDER BY` would otherwise narrow the frame to everything up to
+    // the current row, and a step's ranking is over the whole group.
+    window.params.window_frame = WindowFrame::new(None);
+    Expr::from(window)
+}
+
+impl WindowUDFImpl for AggregationK {
+    fn name(&self) -> &str {
+        K_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    /// Only the samples column reaches the evaluator; the rest of the
+    /// call is literals it reads off the plan once.
+    fn expressions(&self, expr_args: ExpressionArgs) -> Vec<Arc<dyn PhysicalExpr>> {
+        expr_args.input_exprs().iter().take(1).cloned().collect()
+    }
+
+    fn partition_evaluator(
+        &self,
+        args: PartitionEvaluatorArgs,
+    ) -> Result<Box<dyn PartitionEvaluator>> {
+        let literal = |i: usize| {
+            args.input_exprs()
+                .get(i)
+                .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
+                .map(Literal::value)
+        };
+        let op = literal(1)
+            .and_then(|v| match v {
+                ScalarValue::Utf8(Some(s)) => OpK::parse(s.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "{K_NAME}: second argument must be one of topk, bottomk, limitk as a string literal"
+                ))
+            })?;
+        let int = |i: usize, what: &str| {
+            literal(i)
+                .and_then(|v| match v {
+                    ScalarValue::Int64(Some(n)) => Some(*n),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!("{K_NAME}: {what} must be an Int64 literal"))
+                })
+        };
+        let k = int(2, "k")?;
+        Ok(Box::new(SelectK {
+            op,
+            k: usize::try_from(k).unwrap_or(0),
+            grid: Grid::new(int(3, "start")?, int(4, "end")?, int(5, "step")?)?,
+        }))
+    }
+
+    fn field(&self, args: WindowUDFFieldArgs) -> Result<FieldRef> {
+        Ok(Arc::new(Field::new(
+            args.name(),
+            series::samples_type(),
+            false,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1849,15 +2142,54 @@ mod tests {
     #[test]
     fn an_aggregation_this_engine_does_not_implement_has_no_operator() {
         for token in [
-            ItemType::Topk,
-            ItemType::Bottomk,
             ItemType::Quantile,
             ItemType::CountValues,
-            ItemType::Limitk,
             ItemType::LimitRatio,
         ] {
             assert_eq!(Op::from_token(token), None, "{token}");
+            assert_eq!(OpK::from_token(token), None, "{token}");
         }
+    }
+
+    /// The series-keeping aggregations are the window function's, and no
+    /// folding operator answers to their tokens.
+    #[test]
+    fn the_series_keeping_aggregations_dispatch_on_their_own_tokens() {
+        for (token, op) in [
+            (ItemType::Topk, OpK::Topk),
+            (ItemType::Bottomk, OpK::Bottomk),
+            (ItemType::Limitk, OpK::Limitk),
+        ] {
+            assert_eq!(OpK::from_token(token), Some(op), "{token}");
+            assert_eq!(Op::from_token(token), None, "{token}");
+            assert_eq!(op.as_str(), token.to_string(), "{token}");
+            assert_eq!(OpK::parse(op.as_str()), Some(op), "{token}");
+        }
+    }
+
+    /// `topk` keeps the k largest per step, `bottomk` the k smallest,
+    /// `limitk` the first k seen; NaN loses to every number in all three.
+    #[test]
+    fn the_series_keeping_aggregations_pick_what_upstream_picks() {
+        let pick = |op, k, vs: &[f64]| {
+            let mut candidates: Vec<(usize, f64)> = vs.iter().copied().enumerate().collect();
+            survivors(op, k, &mut candidates);
+            let mut rows: Vec<usize> = candidates.into_iter().map(|(r, _)| r).collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(pick(OpK::Topk, 2, &[1.0, 5.0, 3.0]), vec![1, 2]);
+        assert_eq!(pick(OpK::Bottomk, 2, &[1.0, 5.0, 3.0]), vec![0, 2]);
+        assert_eq!(pick(OpK::Limitk, 2, &[1.0, 5.0, 3.0]), vec![0, 1]);
+        // A tie goes to the series seen first, as upstream's strict
+        // heap comparison does.
+        assert_eq!(pick(OpK::Topk, 1, &[5.0, 5.0]), vec![0]);
+        assert_eq!(pick(OpK::Bottomk, 1, &[5.0, 5.0]), vec![0]);
+        // NaN is the worst value both ways round.
+        assert_eq!(pick(OpK::Topk, 1, &[f64::NAN, 1.0]), vec![1]);
+        assert_eq!(pick(OpK::Bottomk, 1, &[f64::NAN, 1.0]), vec![1]);
+        assert_eq!(pick(OpK::Topk, 2, &[f64::NAN, 1.0]), vec![0, 1]);
+        assert!(pick(OpK::Topk, 0, &[1.0]).is_empty());
     }
 
     #[test]
@@ -2175,6 +2507,102 @@ mod tests {
         for ((t1, a), (t2, b)) in got.iter().zip(&want) {
             assert_eq!(t1, t2);
             assert_eq!(a.to_bits(), b.to_bits(), "at {t1}: {a} vs {b}");
+        }
+    }
+
+    /// Two groups of four series, each series in its own batch, values
+    /// chosen so the largest belongs to the alphabetically last series:
+    /// picking by rank and picking by name disagree, which is what makes
+    /// the ordering observable.
+    fn k_batches() -> (Arc<Schema>, Vec<Vec<RecordBatch>>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("job", DataType::Utf8, false),
+            Field::new("series", DataType::Utf8, false),
+            Field::new(series::SAMPLES, series::samples_type(), false),
+        ]));
+        let mut partitions = Vec::new();
+        for job in ["api", "web"] {
+            for (rank, name) in ["a", "b", "c", "d"].iter().enumerate() {
+                let samples: Vec<(i64, f64)> = (0..3)
+                    .map(|t| (t, (rank * 10 + t as usize) as f64))
+                    .collect();
+                partitions.push(vec![RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec![job])),
+                        Arc::new(StringArray::from(vec![*name])),
+                        samples_column(&[samples]),
+                    ],
+                )
+                .unwrap()]);
+            }
+        }
+        (schema, partitions)
+    }
+
+    /// Which series each group kept, sorted, from the window function run
+    /// over `partitions` input partitions.
+    async fn window_sql(op: OpK, k: i64, partitions: usize) -> Vec<(String, String)> {
+        let (schema, input) = k_batches();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(partitions),
+        );
+        ctx.register_udwf(udwf());
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema, input).unwrap()))
+            .unwrap();
+        let frame = ctx
+            .sql(&format!(
+                "SELECT job, series, {K_NAME}(samples, '{}', {k}, 0, 2, 1) \
+                 OVER (PARTITION BY job ORDER BY series) AS out FROM t",
+                op.as_str()
+            ))
+            .await
+            .unwrap();
+        let out = frame.collect().await.unwrap();
+        let mut got = Vec::new();
+        for batch in &out {
+            let jobs = batch.column(0).as_string::<i32>();
+            let names = batch.column(1).as_string::<i32>();
+            let lists = batch.column(2).as_list::<i32>();
+            for row in 0..batch.num_rows() {
+                if !rows(lists, row).is_empty() {
+                    got.push((jobs.value(row).to_string(), names.value(row).to_string()));
+                }
+            }
+        }
+        got.sort();
+        got
+    }
+
+    /// `limitk` has no value to rank by, so what it keeps is decided by
+    /// the row order alone — and that order must be the series' own, not
+    /// whatever a repartition merge produced. `topk` picks by value and
+    /// so disagrees, which is what shows the ordering is being read
+    /// rather than merely tolerated.
+    #[tokio::test]
+    async fn limitk_keeps_the_same_series_however_the_input_is_partitioned() {
+        let job = |name: &str| ("api".to_string(), name.to_string());
+        for partitions in [1, 4] {
+            assert_eq!(
+                window_sql(OpK::Limitk, 2, partitions).await,
+                vec![
+                    job("a"),
+                    job("b"),
+                    ("web".into(), "a".into()),
+                    ("web".into(), "b".into())
+                ],
+                "{partitions} partitions"
+            );
+            assert_eq!(
+                window_sql(OpK::Topk, 2, partitions).await,
+                vec![
+                    job("c"),
+                    job("d"),
+                    ("web".into(), "c".into()),
+                    ("web".into(), "d".into())
+                ],
+                "{partitions} partitions"
+            );
         }
     }
 }
