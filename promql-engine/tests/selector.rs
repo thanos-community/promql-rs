@@ -123,7 +123,6 @@ fn anything_but_a_selector_is_unsupported_by_name() {
             "the absent_over_time function",
         ),
         ("http_requests_total + 1", "a binary operator"),
-        ("http_requests_total[5m]", "a range selector"),
     ] {
         let err = engine
             .range_query(envoy().as_ref(), query, &RangeQuery::new(0, 60_000, 30_000))
@@ -133,6 +132,18 @@ fn anything_but_a_selector_is_unsupported_by_name() {
             other => panic!("{query}: expected Unsupported, got {other}"),
         }
     }
+
+    // A range selector is not a gap in the engine: a range query may
+    // not ask for one at all, which Prometheus rejects too.
+    let err = engine
+        .range_query(
+            envoy().as_ref(),
+            "http_requests_total[5m]",
+            &RangeQuery::new(0, 60_000, 30_000),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Query(_)), "{err}");
+    assert!(err.to_string().contains("range vector"), "{err}");
 }
 
 #[test]
