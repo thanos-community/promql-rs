@@ -50,10 +50,19 @@ pub enum Func {
     MinOverTime,
     MaxOverTime,
     CountOverTime,
+    FirstOverTime,
     LastOverTime,
     PresentOverTime,
+    StddevOverTime,
+    StdvarOverTime,
+    MadOverTime,
+    TsOfFirstOverTime,
+    TsOfLastOverTime,
+    TsOfMinOverTime,
+    TsOfMaxOverTime,
     Changes,
     Resets,
+    Deriv,
 }
 
 impl Func {
@@ -69,10 +78,19 @@ impl Func {
             "min_over_time" => Func::MinOverTime,
             "max_over_time" => Func::MaxOverTime,
             "count_over_time" => Func::CountOverTime,
+            "first_over_time" => Func::FirstOverTime,
             "last_over_time" => Func::LastOverTime,
             "present_over_time" => Func::PresentOverTime,
+            "stddev_over_time" => Func::StddevOverTime,
+            "stdvar_over_time" => Func::StdvarOverTime,
+            "mad_over_time" => Func::MadOverTime,
+            "ts_of_first_over_time" => Func::TsOfFirstOverTime,
+            "ts_of_last_over_time" => Func::TsOfLastOverTime,
+            "ts_of_min_over_time" => Func::TsOfMinOverTime,
+            "ts_of_max_over_time" => Func::TsOfMaxOverTime,
             "changes" => Func::Changes,
             "resets" => Func::Resets,
+            "deriv" => Func::Deriv,
             _ => return None,
         })
     }
@@ -89,17 +107,27 @@ impl Func {
             Func::MinOverTime => "min_over_time",
             Func::MaxOverTime => "max_over_time",
             Func::CountOverTime => "count_over_time",
+            Func::FirstOverTime => "first_over_time",
             Func::LastOverTime => "last_over_time",
             Func::PresentOverTime => "present_over_time",
+            Func::StddevOverTime => "stddev_over_time",
+            Func::StdvarOverTime => "stdvar_over_time",
+            Func::MadOverTime => "mad_over_time",
+            Func::TsOfFirstOverTime => "ts_of_first_over_time",
+            Func::TsOfLastOverTime => "ts_of_last_over_time",
+            Func::TsOfMinOverTime => "ts_of_min_over_time",
+            Func::TsOfMaxOverTime => "ts_of_max_over_time",
             Func::Changes => "changes",
             Func::Resets => "resets",
+            Func::Deriv => "deriv",
         }
     }
 
-    /// Every range function drops `__name__` except `last_over_time`,
-    /// which "acts like offset" (`dropName` in `evalCall`).
+    /// Every range function drops `__name__` except the two that pick a
+    /// sample out of the window unchanged, which "act like offset"
+    /// (`dropName` in `evalCall`).
     pub fn drops_metric_name(&self) -> bool {
-        !matches!(self, Func::LastOverTime)
+        !matches!(self, Func::FirstOverTime | Func::LastOverTime)
     }
 }
 
@@ -136,15 +164,56 @@ pub fn evaluate(func: Func, w: &Window) -> Option<f64> {
         Func::MinOverTime => math::min_of(w.vs),
         Func::MaxOverTime => math::max_of(w.vs),
         Func::CountOverTime => Some(w.vs.len() as f64),
+        Func::FirstOverTime => Some(w.vs[0]),
         Func::LastOverTime => Some(w.vs[w.vs.len() - 1]),
         Func::PresentOverTime => Some(1.0),
+        Func::StddevOverTime => Some(math::variance_of(w.vs).sqrt()),
+        Func::StdvarOverTime => Some(math::variance_of(w.vs)),
+        Func::MadOverTime => Some(math::mad_of(w.vs)),
+        Func::TsOfFirstOverTime => Some(seconds(w.ts[0])),
+        Func::TsOfLastOverTime => Some(seconds(w.ts[w.ts.len() - 1])),
+        Func::TsOfMinOverTime => Some(seconds(ts_of_extremum(w, false))),
+        Func::TsOfMaxOverTime => Some(seconds(ts_of_extremum(w, true))),
         Func::Changes => Some(
             w.vs.windows(2)
                 .filter(|p| p[1] != p[0] && !(p[1].is_nan() && p[0].is_nan()))
                 .count() as f64,
         ),
         Func::Resets => Some(w.vs.windows(2).filter(|p| p[1] < p[0]).count() as f64),
+        Func::Deriv => deriv(w),
     }
+}
+
+/// Timestamps leave the engine in seconds, as `ts_of_*_over_time`
+/// reports them.
+fn seconds(ms: i64) -> f64 {
+    ms as f64 / 1000.0
+}
+
+/// `compareOverTime`'s timestamp. The comparison there is `>=`/`<=`,
+/// not the strict one `min_over_time`/`max_over_time` fold with, so
+/// among equal extremes the *last* one's timestamp wins; a NaN loses to
+/// any number that follows it.
+fn ts_of_extremum(w: &Window, max: bool) -> i64 {
+    let (mut best, mut at) = (w.vs[0], w.ts[0]);
+    for (t, v) in w.ts.iter().zip(w.vs) {
+        let beats = if max { *v >= best } else { *v <= best };
+        if beats || best.is_nan() {
+            best = *v;
+            at = *t;
+        }
+    }
+    at
+}
+
+/// `deriv`: the least-squares slope per second. The intercept sits at
+/// the first sample rather than at the epoch, so `x` stays small enough
+/// for the covariance to survive (`funcDeriv`).
+fn deriv(w: &Window) -> Option<f64> {
+    if w.ts.len() < 2 {
+        return None;
+    }
+    Some(math::linear_regression(w.ts, w.vs, w.ts[0]).0)
 }
 
 /// `result` in `extrapolatedRate`: the span of the window plus, for a
@@ -832,6 +901,82 @@ mod tests {
         assert_eq!(one(Func::Idelta), 1.0);
     }
 
+    /// The window is 2..=11 at 30s..=300s: mean 6.5, population
+    /// variance (n²-1)/12 = 8.25, median 6.5 and a deviation median of
+    /// 2.5, a line rising one per 30s.
+    #[test]
+    fn the_spread_and_slope_of_a_straight_line() {
+        let (ts, vs) = counter();
+        let one = |f: Func| run(f, &ts, &vs, at_5m())[0].1;
+        assert!((one(Func::StdvarOverTime) - 8.25).abs() < 1e-12);
+        assert!((one(Func::StddevOverTime) - 8.25f64.sqrt()).abs() < 1e-12);
+        assert!((one(Func::MadOverTime) - 2.5).abs() < 1e-12);
+        assert!((one(Func::Deriv) - 1.0 / 30.0).abs() < 1e-12);
+        assert_eq!(one(Func::FirstOverTime), 2.0);
+        assert_eq!(one(Func::TsOfFirstOverTime), 30.0);
+        assert_eq!(one(Func::TsOfLastOverTime), 300.0);
+        assert_eq!(one(Func::TsOfMinOverTime), 30.0);
+        assert_eq!(one(Func::TsOfMaxOverTime), 300.0);
+    }
+
+    #[test]
+    fn one_sample_has_no_slope_and_no_spread() {
+        let ts = [60 * S];
+        let vs = [5.0];
+        let one = |f: Func| run(f, &ts, &vs, at_5m())[0].1;
+        // Two points are the minimum a regression needs.
+        assert!(run(Func::Deriv, &ts, &vs, at_5m()).is_empty());
+        assert_eq!(one(Func::StdvarOverTime), 0.0);
+        assert_eq!(one(Func::StddevOverTime), 0.0);
+        assert_eq!(one(Func::MadOverTime), 0.0);
+        assert_eq!(one(Func::FirstOverTime), 5.0);
+        assert_eq!(one(Func::TsOfFirstOverTime), 60.0);
+        assert_eq!(one(Func::TsOfMinOverTime), 60.0);
+    }
+
+    /// A constant series short-circuits `linearRegression`, and an
+    /// infinite constant is the case that would otherwise divide two
+    /// infinities.
+    #[test]
+    fn a_flat_line_has_a_zero_slope_unless_it_is_infinite() {
+        let ts = [30 * S, 60 * S, 90 * S];
+        let p = Params {
+            start_ms: 90 * S,
+            end_ms: 90 * S,
+            window_ms: 2 * M,
+            ..at_5m()
+        };
+        assert_eq!(run(Func::Deriv, &ts, &[7.0; 3], p)[0].1, 0.0);
+        assert!(run(Func::Deriv, &ts, &[f64::INFINITY; 3], p)[0].1.is_nan());
+    }
+
+    #[test]
+    fn nan_rules_in_the_spread_and_the_timestamps() {
+        let ts = [30 * S, 60 * S, 90 * S];
+        let p = Params {
+            start_ms: 90 * S,
+            end_ms: 90 * S,
+            window_ms: 2 * M,
+            ..at_5m()
+        };
+        let vs = [f64::NAN, 3.0, 5.0];
+        // A NaN sorts below every number, so the median of three is
+        // still the number in the middle: deviations NaN, 0, 2 → 0.
+        assert_eq!(run(Func::MadOverTime, &ts, &vs, p)[0].1, 0.0);
+        // The variance has no such escape: it adds every sample.
+        assert!(run(Func::StdvarOverTime, &ts, &vs, p)[0].1.is_nan());
+        // A NaN in front loses to the first number after it.
+        assert_eq!(run(Func::TsOfMinOverTime, &ts, &vs, p)[0].1, 60.0);
+        assert_eq!(run(Func::TsOfMaxOverTime, &ts, &vs, p)[0].1, 90.0);
+        // Equal extremes keep the last timestamp, `>=`/`<=` in
+        // `compareOverTime`, which is the opposite of the strict fold
+        // `min_over_time` uses.
+        let vs = [4.0, 4.0, 9.0];
+        assert_eq!(run(Func::TsOfMinOverTime, &ts, &vs, p)[0].1, 60.0);
+        let vs = [9.0, 4.0, 9.0];
+        assert_eq!(run(Func::TsOfMaxOverTime, &ts, &vs, p)[0].1, 90.0);
+    }
+
     #[test]
     fn irate_on_a_reset_keeps_the_new_value() {
         let ts = [0, 30 * S];
@@ -900,7 +1045,7 @@ mod tests {
     /// recomputes both bounds per step with `partition_point`, so it
     /// pins each walk against an independent oracle rather than
     /// against itself.
-    const ALL: [Func; 14] = [
+    const ALL: [Func; 23] = [
         Func::Rate,
         Func::Increase,
         Func::Delta,
@@ -911,11 +1056,29 @@ mod tests {
         Func::MinOverTime,
         Func::MaxOverTime,
         Func::CountOverTime,
+        Func::FirstOverTime,
         Func::LastOverTime,
         Func::PresentOverTime,
+        Func::StddevOverTime,
+        Func::StdvarOverTime,
+        Func::MadOverTime,
+        Func::TsOfFirstOverTime,
+        Func::TsOfLastOverTime,
+        Func::TsOfMinOverTime,
+        Func::TsOfMaxOverTime,
         Func::Changes,
         Func::Resets,
+        Func::Deriv,
     ];
+
+    /// Every variant round-trips its PromQL name, so a variant added
+    /// without a `parse` arm cannot reach the planner unnoticed.
+    #[test]
+    fn every_function_parses_from_the_name_it_prints() {
+        for func in ALL {
+            assert_eq!(Func::parse(func.as_str()), Some(func));
+        }
+    }
 
     /// Counter resets, NaN runs, a staleness marker, signed zeros and a
     /// gap wider than the window: one series that reaches every branch

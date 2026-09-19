@@ -284,6 +284,121 @@ pub fn mean_of(values: &[f64]) -> f64 {
     m.result()
 }
 
+/// Population variance the way `varianceOverTime` computes it: the same
+/// Welford recurrence as [`Welford`], with the mean and the sum of
+/// squared deviations each Kahan-compensated.
+///
+/// Not [`Welford`], deliberately. `stddev`/`stdvar` as an aggregation
+/// (`engine.go`) run the recurrence uncompensated while the
+/// `*_over_time` pair (`functions.go`) compensates it, so the two
+/// disagree in the last bits and cannot share an accumulator.
+pub fn variance_of(values: &[f64]) -> f64 {
+    let (mut count, mut mean, mut c_mean) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut aux, mut c_aux) = (0.0f64, 0.0f64);
+    for f in values {
+        count += 1.0;
+        let delta = f - (mean + c_mean);
+        (mean, c_mean) = kahan_inc(delta / count, mean, c_mean);
+        (aux, c_aux) = kahan_inc(delta * (f - (mean + c_mean)), aux, c_aux);
+    }
+    (aux + c_aux) / count
+}
+
+/// `vectorByValueHeap.Less`: a NaN sorts below every number, and ties
+/// keep whatever order the sort leaves them in.
+///
+/// Sorting NaNs to the front rather than dropping or rejecting them is
+/// what decides whether a NaN reaches the central pair, and that is the
+/// only way it can reach the answer.
+fn nan_sorts_first(a: &f64, b: &f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// `quantile(0.5, …)` over a slice the caller is done with: sorted in
+/// place, then interpolated between the two central samples.
+///
+/// The interpolation runs even when it lands exactly on one sample,
+/// because the zero-weight term is `NaN * 0.0` whenever its neighbour is
+/// a NaN, and upstream lets that poison the result.
+fn median_in_place(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    values.sort_by(nan_sorts_first);
+    let rank = 0.5 * (values.len() - 1) as f64;
+    let lower = rank.floor();
+    let upper = (lower + 1.0).min((values.len() - 1) as f64);
+    let weight = rank - lower;
+    values[lower as usize] * (1.0 - weight) + values[upper as usize] * weight
+}
+
+/// `mad_over_time`: the median of the absolute deviations from the
+/// median.
+///
+/// A NaN is an ordinary sample here, not a poison pill. It sorts to the
+/// front of both medians, so it only reaches the answer when it lands on
+/// the central pair — an odd-length window with one NaN still has a
+/// number in the middle.
+pub fn mad_of(values: &[f64]) -> f64 {
+    let mut scratch = values.to_vec();
+    let median = median_in_place(&mut scratch);
+    for v in &mut scratch {
+        *v = (*v - median).abs();
+    }
+    median_in_place(&mut scratch)
+}
+
+/// `linearRegression`: the least-squares fit of `vs` against time,
+/// returning `(slope per second, value at intercept_ms)`.
+///
+/// `x` is seconds from `intercept_ms`, not from the epoch, so callers
+/// pass a time near the window: epoch-sized `x` would swamp the
+/// covariance (Prometheus #2674). A constant series short-circuits,
+/// because `varX` is then a subtraction of two equal sums and the slope
+/// would come out as noise divided by noise.
+pub fn linear_regression(ts: &[i64], vs: &[f64], intercept_ms: i64) -> (f64, f64) {
+    debug_assert_eq!(ts.len(), vs.len());
+    let init_y = vs[0];
+    let mut const_y = true;
+    let mut n = 0.0f64;
+    let (mut sum_x, mut c_x) = (0.0f64, 0.0f64);
+    let (mut sum_y, mut c_y) = (0.0f64, 0.0f64);
+    let (mut sum_xy, mut c_xy) = (0.0f64, 0.0f64);
+    let (mut sum_x2, mut c_x2) = (0.0f64, 0.0f64);
+    for (i, (t, y)) in ts.iter().zip(vs).enumerate() {
+        if const_y && i > 0 && *y != init_y {
+            const_y = false;
+        }
+        n += 1.0;
+        let x = (t - intercept_ms) as f64 / 1e3;
+        (sum_x, c_x) = kahan_inc(x, sum_x, c_x);
+        (sum_y, c_y) = kahan_inc(*y, sum_y, c_y);
+        (sum_xy, c_xy) = kahan_inc(x * y, sum_xy, c_xy);
+        (sum_x2, c_x2) = kahan_inc(x * x, sum_x2, c_x2);
+    }
+    if const_y {
+        if init_y.is_infinite() {
+            return (f64::NAN, f64::NAN);
+        }
+        return (0.0, init_y);
+    }
+    sum_x += c_x;
+    sum_y += c_y;
+    sum_xy += c_xy;
+    sum_x2 += c_x2;
+
+    let cov_xy = sum_xy - sum_x * sum_y / n;
+    let var_x = sum_x2 - sum_x * sum_x / n;
+    let slope = cov_xy / var_x;
+    (slope, sum_y / n - slope * sum_x / n)
+}
+
 /// The smallest value, where any number beats a NaN. `None` if empty.
 pub fn min_of(values: &[f64]) -> Option<f64> {
     values
@@ -613,6 +728,54 @@ mod tests {
         other.add(9.0);
         fresh.merge(&other);
         assert_eq!(fresh.result(), 4.0);
+    }
+
+    #[test]
+    fn the_compensated_variance_agrees_with_the_two_pass_one() {
+        let xs = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+        assert!((variance_of(&xs) - 4.0).abs() < 1e-12);
+        assert_eq!(variance_of(&[3.0]), 0.0);
+        assert!(variance_of(&[1.0, f64::INFINITY]).is_nan());
+        assert!(variance_of(&[]).is_nan());
+    }
+
+    #[test]
+    fn the_median_deviation_interpolates_between_the_central_pair() {
+        // Median 3.5; deviations sorted 0.5, 0.5, 1.5, 1.5, 2.5, 2.5.
+        assert_eq!(mad_of(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 1.5);
+        // Odd length takes the central sample outright.
+        assert_eq!(mad_of(&[1.0, 2.0, 100.0]), 1.0);
+        assert_eq!(mad_of(&[7.0]), 0.0);
+    }
+
+    /// A NaN sorts to the front of both medians, so an odd-length
+    /// window still has a number in the middle and answers with it.
+    #[test]
+    fn a_nan_only_reaches_the_median_deviation_by_landing_in_the_middle() {
+        // [NaN, 3, 5] → median 3 → deviations [NaN, 0, 2] → 0.
+        assert_eq!(mad_of(&[f64::NAN, 3.0, 5.0]), 0.0);
+        assert_eq!(mad_of(&[3.0, 5.0, f64::NAN]), 0.0);
+        // Two NaNs in four take the lower half of the central pair.
+        assert!(mad_of(&[f64::NAN, 1.0, f64::NAN, 2.0]).is_nan());
+        // One NaN in four leaves the central pair numeric.
+        assert_eq!(mad_of(&[f64::NAN, 1.0, 2.0, 3.0]), 0.5);
+        assert!(mad_of(&[f64::NAN]).is_nan());
+    }
+
+    #[test]
+    fn the_regression_recovers_a_lines_slope_and_its_value_at_the_intercept() {
+        // y = 2 + 3·(t − 10s), sampled every 10s from 10s.
+        let ts = [10_000, 20_000, 30_000, 40_000];
+        let vs = [2.0, 32.0, 62.0, 92.0];
+        let (slope, intercept) = linear_regression(&ts, &vs, ts[0]);
+        assert!((slope - 3.0).abs() < 1e-9);
+        assert!((intercept - 2.0).abs() < 1e-9);
+
+        // A constant never reaches the division; an infinite one is the
+        // reason that short-circuit has to be checked.
+        assert_eq!(linear_regression(&ts, &[5.0; 4], ts[0]), (0.0, 5.0));
+        let (slope, intercept) = linear_regression(&ts, &[f64::INFINITY; 4], ts[0]);
+        assert!(slope.is_nan() && intercept.is_nan());
     }
 
     #[test]

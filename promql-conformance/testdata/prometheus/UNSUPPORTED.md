@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are blocked on the features below.
+Against the vendored corpus: **274 of 2098 evals pass** (13.1%), and **678** are blocked on the features below.
 
 ## Missing features
 
@@ -16,7 +16,7 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 |---:|---|
 | 199 | a binary operator |
 | 78 | the histogram_quantile function |
-| 57 | a subquery |
+| 62 | a subquery |
 | 56 | the histogram_fraction function |
 | 41 | the info function |
 | 18 | the label_replace function |
@@ -36,33 +36,26 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | 4 | the day_of_year function |
 | 4 | the exp function |
 | 4 | the sort_by_label_desc function |
-| 4 | the stddev_over_time function |
 | 4 | the vector function |
 | 4 | the year function |
 | 3 | the bottomk aggregation |
 | 3 | the deg function |
-| 3 | the deriv function |
 | 3 | the ln function |
 | 3 | the log10 function |
 | 3 | the log2 function |
 | 3 | the minute function |
 | 3 | the rad function |
-| 3 | the stdvar_over_time function |
-| 3 | the ts_of_first_over_time function |
 | 2 | a range selector |
 | 2 | the day_of_month function |
 | 2 | the day_of_week function |
 | 2 | the days_in_month function |
 | 2 | the double_exponential_smoothing function |
-| 2 | the first_over_time function |
 | 2 | the histogram_count function |
 | 2 | the histogram_sum function |
 | 2 | the hour function |
-| 2 | the mad_over_time function |
 | 2 | the month function |
 | 2 | the sort function |
 | 2 | the time function |
-| 2 | the ts_of_last_over_time function |
 | 1 | the SUM function |
 | 1 | the abs function |
 | 1 | the acos function |
@@ -87,10 +80,9 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | 1 | the sinh function |
 | 1 | the sort_desc function |
 | 1 | the sqrt function |
+| 1 | the stddev_over_time function over a parenthesized expression |
 | 1 | the tan function |
 | 1 | the tanh function |
-| 1 | the ts_of_max_over_time function |
-| 1 | the ts_of_min_over_time function |
 
 ## By file
 
@@ -101,9 +93,9 @@ Against the vendored corpus: **259 of 2098 evals pass** (12.3%), and **693** are
 | selectors | 31 | 11 (35%) |  |
 | range_queries | 18 | 6 (33%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
-| name_label_dropping | 30 | 8 (27%) |  |
+| name_label_dropping | 30 | 9 (30%) |  |
+| functions | 413 | 109 (26%) |  |
 | at_modifier | 71 | 18 (25%) |  |
-| functions | 413 | 95 (23%) |  |
 | subquery | 34 | 2 (6%) |  |
 | duration_expression | 59 | 3 (5%) |  |
 | histograms | 185 | 4 (2%) |  |
