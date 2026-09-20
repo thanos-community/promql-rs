@@ -31,6 +31,7 @@
 
 pub mod aggregate;
 mod buffer;
+pub mod elementwise;
 pub mod engine;
 pub mod error;
 pub mod explain;
