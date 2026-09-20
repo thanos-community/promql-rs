@@ -36,8 +36,15 @@ use crate::series;
 pub const NAME: &str = "promql_elementwise";
 
 /// The instant-vector functions that map a value to a value.
+///
+/// A binary operator with a scalar on one side is one of these too:
+/// upstream's `VectorscalarBinop` (`promql/engine.go:3177` at 83962c35)
+/// walks the vector and writes the value back into the same sample,
+/// which is this kernel exactly. The scalar is folded while planning,
+/// so the operator arrives here with one operand already a number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
+    Binary(crate::binary::Op),
     Abs,
     Ceil,
     Floor,
@@ -97,12 +104,16 @@ impl Func {
             "atanh" => Func::Atanh,
             "deg" => Func::Deg,
             "rad" => Func::Rad,
-            _ => return None,
+            // Last, and reachable only from a plan's own literal: an
+            // operator's spelling is never a function name, so no call
+            // can land here.
+            other => return crate::binary::Op::parse(other).map(Func::Binary),
         })
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Func::Binary(op) => op.as_str(),
             Func::Abs => "abs",
             Func::Ceil => "ceil",
             Func::Floor => "floor",
@@ -142,8 +153,28 @@ impl Func {
     /// The function with its scalar arguments folded in, ready to run
     /// over values. `a` and `b` are the call's arguments after the
     /// vector, absent where the call did not give them.
+    ///
+    /// A binary operator has no second argument to spend, so the two
+    /// slots say which side its scalar was written on: `a` for
+    /// `vector op scalar`, `b` for `scalar op vector`. Upstream's
+    /// `VectorscalarBinop` carries the same fact as its `swap` flag.
     pub fn bind(self, a: Option<f64>, b: Option<f64>) -> Bound {
         match self {
+            Func::Binary(op) => match (a, b) {
+                (None, Some(scalar)) => Bound::Binary {
+                    op,
+                    scalar,
+                    swap: true,
+                },
+                // A call with neither operand cannot come from the
+                // planner; reachable from SQL, where a missing number
+                // is a NaN rather than a panic.
+                (a, _) => Bound::Binary {
+                    op,
+                    scalar: a.unwrap_or(f64::NAN),
+                    swap: false,
+                },
+            },
             // `round(v)` is `round(v, 1)`: the default is in upstream's
             // signature, not in a branch.
             Func::Round => Bound::Round(a.unwrap_or(1.0)),
@@ -180,7 +211,7 @@ impl Func {
             Func::Atanh => f64::atanh,
             Func::Deg => |v| v * 180.0 / std::f64::consts::PI,
             Func::Rad => |v| v * std::f64::consts::PI / 180.0,
-            Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
+            Func::Binary(_) | Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
                 unreachable!("{} takes its arguments through bind", self.as_str())
             }
         }
@@ -206,6 +237,14 @@ fn sgn(v: f64) -> f64 {
 #[derive(Debug, Clone, Copy)]
 pub enum Bound {
     Map(fn(f64) -> f64),
+    /// A binary operator with the scalar operand folded in. `swap` is
+    /// upstream's: it says the scalar was written on the left, and the
+    /// operands go back in that order for the ones that care.
+    Binary {
+        op: crate::binary::Op,
+        scalar: f64,
+        swap: bool,
+    },
     Round(f64),
     Clamp {
         min: f64,
@@ -229,6 +268,13 @@ impl Bound {
     pub fn value(&self, v: f64) -> f64 {
         match self {
             Bound::Map(f) => f(v),
+            Bound::Binary { op, scalar, swap } => {
+                if *swap {
+                    op.value(*scalar, v)
+                } else {
+                    op.value(v, *scalar)
+                }
+            }
             // Inverted as upstream inverts it: dividing by `to_nearest`
             // and multiplying back is a different float from multiplying
             // by its reciprocal, and upstream took the reciprocal.

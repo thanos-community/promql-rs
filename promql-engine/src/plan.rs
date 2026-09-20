@@ -31,10 +31,13 @@ use std::time::Duration;
 
 use datafusion::catalog::Session;
 use datafusion::datasource::{provider_as_source, MemTable};
-use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
-use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
+use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
+use promql_parser::ast::{
+    AggregateExpr, AtModifier, BinaryExpr, Call, Expr, VectorMatchCardinality, VectorSelector,
+};
 
 use crate::aggregate::{self, Op};
+use crate::binary;
 use crate::elementwise;
 use crate::error::EngineError;
 use crate::labels;
@@ -44,6 +47,7 @@ use crate::range::{self, Func};
 use crate::selector;
 use crate::series::{Series, LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
+use crate::value_type::{value_type, ValueType};
 use crate::{scalar, series};
 
 /// The range a query is evaluated over.
@@ -99,6 +103,7 @@ pub async fn plan(
             aggregate::MAX_STEPS
         )));
     }
+    check_expr(expr)?;
     let mut planner = Planner {
         state,
         source,
@@ -107,6 +112,135 @@ pub async fn plan(
         stages: 0,
     };
     Ok(planner.expr(expr, Above::default()).await?.plan)
+}
+
+/// The parse-time rules upstream holds an expression to before any of
+/// it runs, for the ones our parser does not.
+///
+/// A whole-tree walk, as upstream's `checkAST` is, and for the same
+/// reason: `1 > 1` is rejected wherever it sits, not only at the top.
+/// These are `Query` errors — Prometheus refuses the query too, so the
+/// engine is answering rather than admitting a gap — and they must come
+/// before planning, or the scalar fold would quietly answer one of them.
+fn check_expr(expr: &Expr) -> Result<(), EngineError> {
+    match expr {
+        Expr::Binary(b) => {
+            check_binary(b)?;
+            check_expr(&b.lhs)?;
+            check_expr(&b.rhs)
+        }
+        Expr::Aggregate(a) => {
+            if let Some(param) = &a.param {
+                check_expr(param)?;
+            }
+            check_expr(&a.expr)
+        }
+        Expr::Call(c) => c.args.iter().try_for_each(check_expr),
+        Expr::MatrixSelector(ms) => check_expr(&ms.vector_selector),
+        Expr::Subquery(s) => check_expr(&s.expr),
+        Expr::Paren(p) => check_expr(&p.expr),
+        Expr::Unary(u) => check_expr(&u.expr),
+        Expr::StepInvariant(e) => check_expr(e),
+        Expr::VectorSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Duration(_) => Ok(()),
+    }
+}
+
+/// Upstream's `checkAST` arm for a binary expression
+/// (`promql/parser/parse.go:779-802` at 83962c35), in its order and its
+/// words.
+///
+/// The `bool` rule is here because the operators need it: a comparison
+/// between two scalars folds to a 1 or a 0 either way, so without the
+/// rule `1 > 1` would be answered rather than refused. The
+/// `instant-query` branch adds the same rule for the same reason, and
+/// the merge collapses the two into one.
+fn check_binary(b: &BinaryExpr) -> Result<(), EngineError> {
+    let (lhs, rhs) = (value_type(&b.lhs), value_type(&b.rhs));
+    // `1 > 1` is not a filter — there is nothing to filter — so upstream
+    // makes the author write `bool` and say which of the two they meant.
+    if is_comparison(b.op) && !b.return_bool && lhs == ValueType::Scalar && rhs == ValueType::Scalar
+    {
+        return Err(EngineError::Query(
+            "comparisons between scalars must use BOOL modifier".into(),
+        ));
+    }
+    for side in [lhs, rhs] {
+        if !matches!(side, ValueType::Scalar | ValueType::Vector) {
+            return Err(EngineError::Query(
+                "binary expression must contain only scalar and instant vector types".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The operators upstream's `IsComparisonOperator` answers for.
+fn is_comparison(op: promql_parser::token::ItemType) -> bool {
+    use promql_parser::token::ItemType::*;
+    matches!(op, EqlC | Neq | Gtr | Lss | Gte | Lte)
+}
+
+/// The name both binary shapes give the node they add, so a plan reads
+/// the same whichever side the scalar was on. Not the operator's own
+/// spelling: `+_0` as a relation alias is a name nothing else in the
+/// plan text would survive being asked to parse.
+const BINARY_STAGE: &str = "binary";
+
+/// The operator a binary expression is, or the feature that stands in
+/// the way of planning it.
+///
+/// Everything named here is a gap rather than a mistake — Prometheus
+/// answers all of it — so each gets its own name: what the differential
+/// suite counts is how many evaluations wait on which feature.
+fn binary_op(b: &BinaryExpr) -> Result<binary::Op, EngineError> {
+    use promql_parser::token::ItemType;
+
+    let op = match b.op {
+        _ if is_comparison(b.op) => {
+            return Err(EngineError::Unsupported(format!(
+                "the {} comparison operator",
+                b.op
+            )))
+        }
+        ItemType::Land | ItemType::Lor | ItemType::Lunless => {
+            return Err(EngineError::Unsupported(format!(
+                "the {} set operator",
+                b.op
+            )))
+        }
+        op => binary::Op::from_token(op)
+            .ok_or_else(|| EngineError::Unsupported(format!("the {op} operator")))?,
+    };
+    // Only a comparison takes `bool`, so this is out of reach until
+    // comparisons land; it is here so that adding them cannot forget it.
+    if b.return_bool {
+        return Err(EngineError::Unsupported("the bool modifier".into()));
+    }
+    if let Some(matching) = &b.vector_matching {
+        let unsupported =
+            |what: &str| Err(EngineError::Unsupported(format!("the {what} modifier")));
+        match matching.card {
+            VectorMatchCardinality::OneToOne => {}
+            VectorMatchCardinality::ManyToOne => return unsupported("group_left"),
+            VectorMatchCardinality::OneToMany => return unsupported("group_right"),
+            // Set operators are the only many-to-many, and they are
+            // already refused above.
+            VectorMatchCardinality::ManyToMany => return unsupported("many-to-many matching"),
+        }
+        if matching.on {
+            return unsupported("on");
+        }
+        if !matching.matching_labels.is_empty() {
+            return unsupported("ignoring");
+        }
+        if matching.fill_values.lhs.is_some() || matching.fill_values.rhs.is_some() {
+            return unsupported("fill");
+        }
+    }
+    Ok(op)
 }
 
 /// The step grid alone, for the expressions that are a function of the
@@ -197,6 +331,7 @@ impl Planner<'_> {
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c).await,
+                Expr::Binary(b) => self.binary(expr, b).await,
                 other => Err(EngineError::Unsupported(describe(other))),
             }
         })
@@ -304,7 +439,7 @@ impl Planner<'_> {
     ) -> Result<Planned, EngineError> {
         let mut args = Vec::new();
         for arg in &call.args[1..] {
-            args.push(self.constant(arg, func.as_str())?);
+            args.push(self.constant(arg, &format!("the {} function", func.as_str()))?);
         }
         // Upstream's `extractFuncFromPath` tells the store the innermost
         // call it sits under, which for `abs(x)` is this one.
@@ -344,6 +479,137 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
+    /// One binary operator, sent to the shape its operand types call
+    /// for. `expr` is `b` again, for the scalar fold that needs the
+    /// whole node.
+    async fn binary(&mut self, expr: &Expr, b: &BinaryExpr) -> Result<Planned, EngineError> {
+        let op = binary_op(b)?;
+        match (value_type(&b.lhs), value_type(&b.rhs)) {
+            (ValueType::Vector, ValueType::Scalar) => {
+                self.vector_scalar(&b.lhs, &b.rhs, op, false).await
+            }
+            (ValueType::Scalar, ValueType::Vector) => {
+                self.vector_scalar(&b.rhs, &b.lhs, op, true).await
+            }
+            (ValueType::Vector, ValueType::Vector) => self.vector_vector(b, op).await,
+            // Two scalars are a value per step and nothing else, which
+            // is the table [`Planner::scalar_series`] already builds.
+            _ => Ok(Planned {
+                plan: self.scalar_series(expr)?,
+                label_names: Vec::new(),
+            }),
+        }
+    }
+
+    /// A vector against a scalar: upstream's `VectorscalarBinop`, which
+    /// writes the value back into the sample it read and drops
+    /// `__name__`. That is [`Planner::elementwise`]'s shape with the
+    /// scalar folded in, so it is that kernel that runs.
+    async fn vector_scalar(
+        &mut self,
+        vector: &Expr,
+        scalar: &Expr,
+        op: binary::Op,
+        swap: bool,
+    ) -> Result<Planned, EngineError> {
+        let what = format!("the {} operator", op.as_str());
+        let value = self.constant(scalar, &what)?;
+        let input = self.expr(vector, Above::default()).await?;
+        let (labels_expr, label_names) = if op.drops_metric_name() {
+            labels::keep(&input.label_names, |n| n != METRIC_NAME)
+        } else {
+            (col(LABELS), input.label_names)
+        };
+        // The scalar goes in the slot that says which side it was on;
+        // see `elementwise::Func::bind`.
+        let (a, b) = if swap {
+            (None, Some(value))
+        } else {
+            (Some(value), None)
+        };
+        // Named for the same reason `elementwise` names its stage.
+        let stage = self.stage(BINARY_STAGE);
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(stage)?
+            .project(vec![
+                labels_expr.alias(LABELS),
+                elementwise::call(col(SAMPLES), elementwise::Func::Binary(op), a, b).alias(SAMPLES),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// Two vectors, matched one to one on everything but `__name__`.
+    ///
+    /// Both sides are widened to one label schema and unioned, so a
+    /// single `Aggregate` over the match signature is the pairing: for
+    /// default matching the signature *is* the result's label set, and
+    /// [`crate::binary`] says why that makes a grouping the right node.
+    async fn vector_vector(
+        &mut self,
+        b: &BinaryExpr,
+        op: binary::Op,
+    ) -> Result<Planned, EngineError> {
+        let lhs = self.expr(&b.lhs, Above::default()).await?;
+        let rhs = self.expr(&b.rhs, Above::default()).await?;
+        let mut names: Vec<String> = lhs
+            .label_names
+            .iter()
+            .chain(rhs.label_names.iter())
+            .cloned()
+            .collect();
+        names.sort();
+        names.dedup();
+        let keys: Vec<String> = names
+            .iter()
+            .filter(|n| *n != METRIC_NAME)
+            .cloned()
+            .collect();
+
+        let left = self.operand(lhs, &names, false)?;
+        let right = self.operand(rhs, &names, true)?;
+        let plan = LogicalPlanBuilder::from(left)
+            .union(right)?
+            .aggregate(
+                labels::group_exprs(&keys),
+                vec![binary::call(
+                    col(SAMPLES),
+                    col(binary::SIDE),
+                    col(LABELS),
+                    op,
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
+            )?
+            .project(vec![labels::regroup(&keys).alias(LABELS), col(SAMPLES)])?
+            .build()?;
+        Ok(Planned {
+            plan,
+            label_names: keys,
+        })
+    }
+
+    /// One operand in the shape the union takes: the shared label
+    /// schema, the samples, and which side it is.
+    fn operand(
+        &mut self,
+        operand: Planned,
+        names: &[String],
+        is_rhs: bool,
+    ) -> Result<LogicalPlan, EngineError> {
+        let stage = self.stage(BINARY_STAGE);
+        Ok(LogicalPlanBuilder::from(operand.plan)
+            .alias(stage)?
+            .project(vec![
+                labels::widen(&operand.label_names, names).alias(LABELS),
+                col(SAMPLES),
+                lit(is_rhs).alias(binary::SIDE),
+            ])?
+            .build()?)
+    }
+
     /// A scalar argument as the one number the whole plan will use.
     ///
     /// Upstream evaluates a function's scalar arguments at every step,
@@ -351,14 +617,14 @@ impl Planner<'_> {
     /// Here they are folded while planning, which only holds for an
     /// argument that does not move; one that does is named as the gap it
     /// is rather than silently taken at its first value.
-    fn constant(&self, expr: &Expr, func: &str) -> Result<f64, EngineError> {
+    fn constant(&self, expr: &Expr, what: &str) -> Result<f64, EngineError> {
         let mut folded: Option<f64> = None;
         for ts in grid_of(self.query).steps() {
             let v = scalar::fold(expr, ts)?;
             match folded {
                 Some(first) if first.to_bits() != v.to_bits() => {
                     return Err(EngineError::Unsupported(format!(
-                        "the {func} function with a scalar argument that changes between steps"
+                        "{what} with a scalar argument that changes between steps"
                     )))
                 }
                 _ => folded = Some(v),
@@ -755,6 +1021,45 @@ mod tests {
             let err = plan_of(&query, range).await.unwrap_err();
             assert!(matches!(err, EngineError::Unsupported(_)), "{query}: {err}");
             assert!(err.to_string().contains(op), "{query}: {err}");
+        }
+    }
+
+    /// Upstream's parser refuses `1 > 1` because it cannot mean the
+    /// filter a comparison usually is. Ours accepts it, so the rule is
+    /// held here, in upstream's words.
+    #[tokio::test]
+    async fn a_comparison_between_scalars_needs_the_bool_modifier() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for query in ["1 > 1", "(1 > 1)", "time() <= 100", "2 * (1 == 1)"] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "comparisons between scalars must use BOOL modifier",
+                "{query}"
+            );
+            assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
+        }
+
+        // With a vector on one side the comparison is allowed — still
+        // unsupported here, but as a missing feature rather than a bad
+        // query.
+        let err = plan_of("up > 1", range).await.unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+    }
+
+    /// A string or a range vector as an operand is a query error, not a
+    /// gap: no operator upstream has ever taken one.
+    #[tokio::test]
+    async fn a_binary_operand_must_be_a_scalar_or_an_instant_vector() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for query in [r#""foo" + 1"#, r#"1 + "foo""#, "foo[5m] + 1", "1 + foo[5m]"] {
+            let err = plan_of(query, range).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "binary expression must contain only scalar and instant vector types",
+                "{query}"
+            );
+            assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
         }
     }
 

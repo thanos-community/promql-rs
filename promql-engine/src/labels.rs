@@ -243,6 +243,30 @@ pub fn regroup(keys: &[String]) -> Expr {
     )
 }
 
+/// The `labels` struct over `names`, reading the fields `input` has and
+/// spelling the rest absent.
+///
+/// Two operands of a binary operator rarely carry the same label names,
+/// and they have to share one schema before a single grouping can find
+/// the match groups. A name one side never carried is `""`, which is
+/// how the shape spells absent — so a series without it matches one
+/// whose value is empty, exactly as two label sets compare upstream.
+pub fn widen(input: &[String], names: &[String]) -> Expr {
+    call(
+        names
+            .iter()
+            .map(|n| {
+                let value = if input.iter().any(|have| have == n) {
+                    get_field(col(LABELS), n.as_str())
+                } else {
+                    lit("")
+                };
+                (n.clone(), value)
+            })
+            .collect(),
+    )
+}
+
 /// The `labels` struct with only the names passing `keep`, read from the
 /// existing struct. Returns the expression and the names it carries.
 pub fn keep(input: &[String], mut keep: impl FnMut(&str) -> bool) -> (Expr, Vec<String>) {

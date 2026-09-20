@@ -63,18 +63,16 @@ pub fn fold(expr: &Expr, ts_ms: i64) -> Result<f64, EngineError> {
 }
 
 /// Upstream's `scalarBinop`. A comparison yields 1 or 0 — Go's `btos`.
+///
+/// The arithmetic is [`crate::binary::Op`], shared with the two shapes
+/// that read series: `scalarBinop` and `vectorElemBinop` agree operator
+/// for operator upstream, and one of them here would drift.
 fn binop(op: ItemType, lhs: f64, rhs: f64) -> Result<f64, EngineError> {
+    if let Some(arithmetic) = crate::binary::Op::from_token(op) {
+        return Ok(arithmetic.value(lhs, rhs));
+    }
     let b = |yes: bool| Ok(if yes { 1.0 } else { 0.0 });
     match op {
-        ItemType::Add => Ok(lhs + rhs),
-        ItemType::Sub => Ok(lhs - rhs),
-        ItemType::Mul => Ok(lhs * rhs),
-        ItemType::Div => Ok(lhs / rhs),
-        // Go's `math.Mod`, which is Rust's `%`: the result takes the
-        // sign of the dividend, unlike a Euclidean remainder.
-        ItemType::Mod => Ok(lhs % rhs),
-        ItemType::Pow => Ok(lhs.powf(rhs)),
-        ItemType::Atan2 => Ok(lhs.atan2(rhs)),
         ItemType::EqlC => b(lhs == rhs),
         ItemType::Neq => b(lhs != rhs),
         ItemType::Gtr => b(lhs > rhs),

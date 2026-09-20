@@ -169,6 +169,37 @@ fn elementwise(c: &mut Criterion) {
     g.finish();
 }
 
+/// The two shapes a binary operator takes, over the same source.
+///
+/// A scalar operand is folded while planning, so `vector_scalar` is one
+/// more pass over the values and nothing else — the same price as
+/// `engine/elementwise`. `vector_vector` is what the pairing costs: both
+/// sides widened to one schema, unioned, and grouped by the match
+/// signature, which over this source is one group per series. Ids are
+/// `engine/binary/<shape>/<series>x<samples>`.
+fn binary(c: &mut Criterion) {
+    let engine = Engine::blocking().unwrap();
+    let shape = &SHAPES[2];
+    let source = synthetic(shape);
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    let mut g = c.benchmark_group("engine/binary");
+    g.throughput(Throughput::Elements(shape.elements()));
+    for (qname, q) in [
+        ("vector_scalar", "http_requests_total * 2"),
+        ("vector_vector", "http_requests_total + http_requests_total"),
+    ] {
+        g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
+            b.iter(|| {
+                engine
+                    .range_query(source.as_ref(), black_box(q), &range)
+                    .unwrap()
+            })
+        });
+    }
+    g.finish();
+}
+
 /// Parsing and planning alone. The store's `select` runs here, so the gap
 /// to `engine/query` is execution proper.
 fn plan(c: &mut Criterion) {
@@ -205,6 +236,6 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(20);
-    targets = query, elementwise, plan
+    targets = query, elementwise, binary, plan
 }
 criterion_main!(benches);
