@@ -508,7 +508,8 @@ fn binary_pairing(c: &mut Criterion) {
                 Series::new(&labels, ts, vs).unwrap()
             })
             .collect();
-        let batch = series::encode(&series::label_names_of(&rows), &rows, WHOLE).unwrap();
+        let names = series::label_names_of(&rows);
+        let batch = series::encode(&names, &rows, WHOLE).unwrap();
         let samples = batch.column_by_name(series::SAMPLES).unwrap();
         let labels = batch.column_by_name(series::LABELS).unwrap();
         let sides: ArrayRef = Arc::new(BooleanArray::from(vec![false, true]));
@@ -541,6 +542,7 @@ fn binary_pairing(c: &mut Criterion) {
             exprs.extend(
                 [
                     ScalarValue::from(binary::literal(op, return_bool)),
+                    ScalarValue::from(""),
                     ScalarValue::Int64(Some(0)),
                     ScalarValue::Int64(Some(end_ms)),
                     ScalarValue::Int64(Some(step_ms)),
@@ -554,7 +556,7 @@ fn binary_pairing(c: &mut Criterion) {
                 .collect();
             let udaf = binary::udaf();
             let args = AccumulatorArgs {
-                return_field: Arc::new(Field::new("out", binary::output_type(), false)),
+                return_field: Arc::new(Field::new("out", binary::output_type(&names), false)),
                 schema: &schema,
                 ignore_nulls: false,
                 order_bys: &[],

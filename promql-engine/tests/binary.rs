@@ -348,6 +348,227 @@ fn a_kept_name_splits_a_match_group_into_a_series_each() {
     assert_eq!(series[0].values(), [1.0, 1.0]);
 }
 
+/// Two metrics that agree on `pod` and nothing else, plus a per-pod
+/// one the fan-out modifiers have something to copy from.
+fn zoned() -> MemorySeriesSource {
+    MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"requests{pod="a", path="/x"} 10"#,
+            r#"requests{pod="a", path="/y"} 20"#,
+            r#"requests{pod="b", path="/x"} 30"#,
+            r#"limit{pod="a", zone="eu"} 2"#,
+            r#"limit{pod="b", zone="us"} 3"#,
+        ]),
+        30.0,
+    )
+}
+
+/// The result of `query` over `zoned()` at 0, as label sets with their
+/// value, sorted.
+fn matched(query: &str) -> Vec<Row> {
+    vector_of(&zoned(), query, &RangeQuery::new(0, 0, 30_000))
+}
+
+fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// `on(…)` matches on exactly those labels and the result keeps only
+/// them; `ignoring(…)` matches on everything else and the result keeps
+/// everything the left side had but those.
+#[test]
+fn on_and_ignoring_decide_the_signature_and_the_result() {
+    // `path` would keep the two `requests` series apart, so `on(pod)`
+    // is what makes them one match group — and two of them, which is
+    // the error below. `pod="b"` is the one that is alone.
+    assert_eq!(
+        matched(r#"requests{path="/x", pod="b"} / on(pod) limit"#),
+        [(labels(&[("pod", "b")]), 10.0)]
+    );
+    // Without `on`, `ignoring` has to name every label the two sides
+    // disagree on, and the result keeps the rest of the left side's.
+    assert_eq!(
+        matched(r#"requests{path="/x"} / ignoring(path, zone) limit"#),
+        [
+            (labels(&[("pod", "a")]), 5.0),
+            (labels(&[("pod", "b")]), 10.0),
+        ]
+    );
+}
+
+/// `group_left` lets the left side be many: every one of its series
+/// pairs with the single right-hand one, keeps all of its own labels,
+/// and takes the named ones along from the right.
+#[test]
+fn group_left_fans_out_and_copies_the_named_labels() {
+    assert_eq!(
+        matched("requests / on(pod) group_left(zone) limit"),
+        [
+            (labels(&[("path", "/x"), ("pod", "a"), ("zone", "eu")]), 5.0),
+            (
+                labels(&[("path", "/x"), ("pod", "b"), ("zone", "us")]),
+                10.0
+            ),
+            (
+                labels(&[("path", "/y"), ("pod", "a"), ("zone", "eu")]),
+                10.0
+            ),
+        ]
+    );
+    // Without a label to copy, the fan-out is the only thing the
+    // modifier does.
+    assert_eq!(
+        matched("requests / on(pod) group_left limit"),
+        [
+            (labels(&[("path", "/x"), ("pod", "a")]), 5.0),
+            (labels(&[("path", "/x"), ("pod", "b")]), 10.0),
+            (labels(&[("path", "/y"), ("pod", "a")]), 10.0),
+        ]
+    );
+}
+
+/// `group_right` is the mirror image, and the operands keep the order
+/// the query wrote them in: this is limit divided by requests.
+#[test]
+fn group_right_lets_the_right_side_be_many() {
+    assert_eq!(
+        matched("limit / on(pod) group_right(zone) requests"),
+        [
+            (labels(&[("path", "/x"), ("pod", "a"), ("zone", "eu")]), 0.2),
+            (labels(&[("path", "/x"), ("pod", "b"), ("zone", "us")]), 0.1),
+            (labels(&[("path", "/y"), ("pod", "a"), ("zone", "eu")]), 0.1),
+        ]
+    );
+}
+
+/// A comparison keeps the many side's `__name__` through the fan-out,
+/// because `changesMetricSchema` is false for it.
+#[test]
+fn a_fan_out_comparison_keeps_the_metric_name() {
+    assert_eq!(
+        matched("requests > on(pod) group_left(zone) limit"),
+        [
+            (
+                labels(&[
+                    ("__name__", "requests"),
+                    ("path", "/x"),
+                    ("pod", "a"),
+                    ("zone", "eu")
+                ]),
+                10.0
+            ),
+            (
+                labels(&[
+                    ("__name__", "requests"),
+                    ("path", "/x"),
+                    ("pod", "b"),
+                    ("zone", "us")
+                ]),
+                30.0
+            ),
+            (
+                labels(&[
+                    ("__name__", "requests"),
+                    ("path", "/y"),
+                    ("pod", "a"),
+                    ("zone", "eu")
+                ]),
+                20.0
+            ),
+        ]
+    );
+}
+
+/// Every way a match can fail, in upstream's words.
+#[test]
+fn the_matching_errors_are_upstreams() {
+    let engine = Engine::blocking().unwrap();
+    let source = zoned();
+    // Every one of these is a rejection Prometheus also makes, so it has
+    // to reach the caller as `Query` and not as the DataFusion error the
+    // UDAF had no choice but to raise.
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    let fails = |query: &str| match engine.range_query(&source, query, &at_0).expect_err(query) {
+        EngineError::Query(message) => message,
+        other => panic!("{query}: expected a query error, got {other:?}"),
+    };
+
+    // Two left series in one match group, and no modifier saying so.
+    let err = fails("requests / on(pod) limit");
+    assert!(
+        err.contains(
+            "multiple matches for labels: many-to-one matching must be explicit \
+             (group_left/group_right)"
+        ),
+        "{err}"
+    );
+
+    // Two right-hand series in one match group is many-to-many.
+    let err = fails("limit / on(pod) requests");
+    assert!(
+        err.contains("found duplicate series for the match group")
+            && err.contains("on the right hand-side of the operation: ["),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            ";many-to-many matching not allowed: matching labels must be unique on one side"
+        ),
+        "{err}"
+    );
+
+    // group_right moves the "one" to the left, and the message with it.
+    let err = fails("requests / on(pod) group_right() limit");
+    assert!(
+        err.contains("on the left hand-side of the operation: ["),
+        "{err}"
+    );
+
+    // A fan-out whose result labels collide: the two left series
+    // differ only in `__name__`, which the division takes away.
+    let same = MemorySeriesSource::from_descriptions(
+        &load(&[r#"a{pod="x"} 1"#, r#"b{pod="x"} 2"#, r#"c{pod="x"} 4"#]),
+        30.0,
+    );
+    let err = match engine
+        .range_query(
+            &same,
+            r#"{__name__=~"a|b"} / on(pod) group_left() c"#,
+            &at_0,
+        )
+        .expect_err("the fan-out collides")
+    {
+        EngineError::Query(message) => message,
+        other => panic!("expected a query error, got {other:?}"),
+    };
+    assert!(
+        err.contains("multiple matches for labels: grouping labels must ensure unique matches"),
+        "{err}"
+    );
+}
+
+/// Upstream's parser refuses a label that both picks the match and is
+/// copied across it; ours has to say so itself.
+#[test]
+fn a_label_cannot_be_matched_on_and_copied_at_once() {
+    let err = Engine::blocking()
+        .unwrap()
+        .range_query(
+            &zoned(),
+            "requests / on(pod) group_left(pod) limit",
+            &RangeQuery::new(0, 0, 30_000),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Query(q)
+            if q == "label \"pod\" must not occur in ON and GROUP clause at once"),
+        "{err}"
+    );
+}
+
 /// The operators this commit does not implement are named one by one:
 /// the count per feature is what says which is worth doing next.
 #[test]
@@ -356,16 +577,6 @@ fn the_rest_of_the_operators_are_unsupported_by_name() {
         ("requests and errors", "the and set operator"),
         ("requests or errors", "the or set operator"),
         ("requests unless errors", "the unless set operator"),
-        ("requests / on(pod) errors", "the on modifier"),
-        ("requests / ignoring(zone) errors", "the ignoring modifier"),
-        (
-            "requests / on(pod) group_left errors",
-            "the group_left modifier",
-        ),
-        (
-            "requests / on(pod) group_right errors",
-            "the group_right modifier",
-        ),
     ] {
         let err = error(query);
         assert!(

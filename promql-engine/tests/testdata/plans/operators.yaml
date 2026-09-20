@@ -97,6 +97,36 @@ tests:
                       Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
                         TableScan: selector_1 errors
 
+  - name: a fan-out matched on one label
+    description: >
+      on(job) makes the signature one column rather than every label
+      the two sides share, and group_left(zone) says the left may be
+      many. Neither shows in the plan's shape: the modifiers ride into
+      the aggregation as their own PromQL spelling, because which
+      series pair and which labels survive is one decision and it is
+      made where the rows meet.
+    load:
+      - requests{job="api", pod="api-1"} 0
+      - limit{job="api", zone="eu"} 0
+    query: |
+      requests / on(job) group_left(zone) limit
+    plan: |
+      Projection: __pairs__.labels AS labels, __pairs__.samples AS samples
+        Unnest: lists[] structs[__pairs__]
+          Unnest: lists[__pairs__|depth=1] structs[]
+            Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("/"), Utf8("on(job) group_left(zone)"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+              Union
+                Projection: binary_0.labels{__name__, job, pod, zone: Utf8("")} AS labels, binary_0.samples, Boolean(false) AS __rhs
+                  SubqueryAlias: binary_0
+                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
+                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        TableScan: selector_0 requests
+                Projection: binary_1.labels{__name__, job, pod: Utf8(""), zone} AS labels, binary_1.samples, Boolean(true) AS __rhs
+                  SubqueryAlias: binary_1
+                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
+                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        TableScan: selector_1 errors
+
   - name: a filtering comparison as an operand
     description: >
       The inner comparison keeps every label, __name__ included, and

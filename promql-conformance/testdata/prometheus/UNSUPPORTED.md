@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **463 of 2098 evals pass** (22.1%), and **563** are blocked on the features below.
+Against the vendored corpus: **485 of 2098 evals pass** (23.1%), and **541** are blocked on the features below.
 
 ## Missing features
 
@@ -17,10 +17,9 @@ Against the vendored corpus: **463 of 2098 evals pass** (22.1%), and **563** are
 | 86 | the histogram_quantile function |
 | 57 | a subquery |
 | 56 | the histogram_fraction function |
+| 44 | the fill modifier |
 | 41 | the info function |
-| 33 | the fill modifier |
 | 21 | the label_replace function |
-| 20 | the group_left modifier |
 | 16 | a unary operator |
 | 16 | the absent_over_time function |
 | 16 | the histogram_quantiles function |
@@ -32,12 +31,10 @@ Against the vendored corpus: **463 of 2098 evals pass** (22.1%), and **563** are
 | 9 | the quantile_over_time function |
 | 9 | the sort_by_label function |
 | 8 | the and set operator |
+| 8 | the or set operator |
 | 7 | the label_join function |
-| 7 | the on modifier |
-| 7 | the or set operator |
 | 6 | the quantile aggregation |
 | 5 | a string literal |
-| 5 | the group_right modifier |
 | 4 | the day_of_year function |
 | 4 | the month function |
 | 4 | the sort_by_label_desc function |
@@ -57,7 +54,6 @@ Against the vendored corpus: **463 of 2098 evals pass** (22.1%), and **563** are
 | 2 | the histogram_count function |
 | 2 | the histogram_sum function |
 | 2 | the hour function |
-| 2 | the ignoring modifier |
 | 2 | the mad_over_time function |
 | 2 | the sort function |
 | 2 | the time function |
@@ -79,13 +75,13 @@ Against the vendored corpus: **463 of 2098 evals pass** (22.1%), and **563** are
 | file | evals | passing | |
 |---|---:|---:|---|
 | staleness | 17 | 17 (100%) | fully green |
+| collision | 2 | 2 (100%) | fully green |
 | trig_functions | 19 | 18 (95%) |  |
-| collision | 2 | 1 (50%) |  |
 | aggregators | 160 | 76 (48%) |  |
 | name_label_dropping | 30 | 14 (47%) |  |
+| operators | 213 | 96 (45%) |  |
 | range_queries | 18 | 7 (39%) |  |
 | selectors | 31 | 12 (39%) |  |
-| operators | 213 | 77 (36%) |  |
 | type_and_unit | 58 | 20 (34%) |  |
 | functions | 413 | 140 (34%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
@@ -93,7 +89,7 @@ Against the vendored corpus: **463 of 2098 evals pass** (22.1%), and **563** are
 | literals | 25 | 7 (28%) |  |
 | duration_expression | 59 | 8 (14%) |  |
 | subquery | 34 | 2 (6%) |  |
-| histograms | 185 | 6 (3%) |  |
+| histograms | 185 | 8 (4%) |  |
 | native_histograms | 521 | 0 (0%) |  |
 | fill-modifier | 45 | 0 (0%) |  |
 | info | 42 | 0 (0%) |  |
