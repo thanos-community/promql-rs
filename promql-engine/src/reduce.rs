@@ -13,6 +13,12 @@
 //! saw, and the value of the last of them. Nothing more is needed —
 //! `scalar` reads the value only where the count is exactly one, and
 //! `absent` reads only whether the count is zero.
+//!
+//! The same two lanes answer a third question, which is why `merge` is
+//! here and not in a module of its own: the label functions can give
+//! two series one label set, and upstream folds those together while
+//! refusing the step where both hold a sample. That is the count read
+//! once more. It is the one mode that groups.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -37,11 +43,24 @@ use crate::series;
 
 pub const NAME: &str = "promql_reduce";
 
-/// The two functions that reduce a whole instant vector per step.
+/// What upstream says when a merge cannot happen, word for word
+/// (`ev.errorf`, `promql/engine.go:4101` at 83962c35).
+///
+/// A constant because it is raised inside an [`Accumulator`], which can
+/// only fail with a [`DataFusionError`], and lifted back to a query
+/// error by [`crate::engine`] — the two ends have to agree on the text.
+pub const SAME_LABELSET: &str = "vector cannot contain metrics with the same labelset";
+
+/// What one group of series reduces to, per step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
     Scalar,
     Absent,
+    /// `mergeSeriesWithSameLabelset` (`promql/engine.go:4054-4113` at
+    /// 83962c35): series that a label function gave the same label set
+    /// become one, which is allowed exactly while no two of them hold a
+    /// sample at the same step. Grouped, where the other two are not.
+    Merge,
 }
 
 impl Func {
@@ -49,6 +68,7 @@ impl Func {
         Some(match s {
             "scalar" => Func::Scalar,
             "absent" => Func::Absent,
+            "merge" => Func::Merge,
             _ => return None,
         })
     }
@@ -57,6 +77,7 @@ impl Func {
         match self {
             Func::Scalar => "scalar",
             Func::Absent => "absent",
+            Func::Merge => "merge",
         }
     }
 
@@ -65,14 +86,21 @@ impl Func {
     /// `funcScalar` (`promql/functions.go:763-785` at 83962c35) answers
     /// the one value a step holds and a NaN for any other count, so it
     /// always emits; `funcAbsent` (`promql/functions.go:1302-1311`)
-    /// emits only where the vector was empty.
-    fn value(&self, count: i64, value: f64) -> Option<f64> {
-        match self {
+    /// emits only where the vector was empty. `merge` is the third
+    /// reading of the same count: one sample passes through, none emits
+    /// nothing, and two is the collision upstream refuses.
+    fn value(&self, count: i64, value: f64) -> Result<Option<f64>> {
+        Ok(match self {
             Func::Scalar if count == 1 => Some(value),
             Func::Scalar => Some(f64::NAN),
             Func::Absent if count == 0 => Some(1.0),
             Func::Absent => None,
-        }
+            Func::Merge if count > 1 => {
+                return Err(DataFusionError::Execution(SAME_LABELSET.into()))
+            }
+            Func::Merge if count == 1 => Some(value),
+            Func::Merge => None,
+        })
     }
 }
 
@@ -133,7 +161,7 @@ impl Accumulator for Steps {
         let mut timestamps = Vec::new();
         let mut values = Vec::new();
         for step in 0..self.grid.len() {
-            if let Some(v) = self.func.value(self.counts[step], self.values[step]) {
+            if let Some(v) = self.func.value(self.counts[step], self.values[step])? {
                 timestamps.push(self.grid.timestamp(step));
                 values.push(v);
             }
@@ -317,7 +345,7 @@ fn from_args(args: &AccumulatorArgs) -> Result<Steps> {
         })
         .ok_or_else(|| {
             DataFusionError::Plan(format!(
-                "{NAME}: second argument must be scalar or absent as a string literal"
+                "{NAME}: second argument must be scalar, absent or merge as a string literal"
             ))
         })?;
     let grid = |i: usize, what: &str| {
@@ -394,12 +422,22 @@ mod tests {
     /// crowded, and each of the three has its own answer.
     #[test]
     fn the_answer_at_a_step_follows_its_count() {
-        assert_eq!(Func::Scalar.value(1, 7.5), Some(7.5));
-        assert!(Func::Scalar.value(0, 7.5).unwrap().is_nan());
-        assert!(Func::Scalar.value(2, 7.5).unwrap().is_nan());
-        assert_eq!(Func::Absent.value(0, 7.5), Some(1.0));
-        assert_eq!(Func::Absent.value(1, 7.5), None);
-        assert_eq!(Func::Absent.value(2, 7.5), None);
+        let v = |func: Func, count| func.value(count, 7.5).unwrap();
+        assert_eq!(v(Func::Scalar, 1), Some(7.5));
+        assert!(v(Func::Scalar, 0).unwrap().is_nan());
+        assert!(v(Func::Scalar, 2).unwrap().is_nan());
+        assert_eq!(v(Func::Absent, 0), Some(1.0));
+        assert_eq!(v(Func::Absent, 1), None);
+        assert_eq!(v(Func::Absent, 2), None);
+        assert_eq!(v(Func::Merge, 0), None);
+        assert_eq!(v(Func::Merge, 1), Some(7.5));
+        // Two series at one step under one label set is the collision
+        // upstream refuses, in its words.
+        let err = Func::Merge.value(2, 7.5).unwrap_err().to_string();
+        assert!(
+            err.contains("vector cannot contain metrics with the same labelset"),
+            "{err}"
+        );
     }
 
     /// A grid no series reached is where these two differ from every

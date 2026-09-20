@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
+use datafusion::functions::expr_fn::concat_ws;
 use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, MatchOp, VectorSelector};
 
@@ -104,6 +105,7 @@ pub async fn plan(
         source,
         query,
         selectors: 0,
+        stages: 0,
     };
     Ok(planner.expr(expr, Above::default()).await?.plan)
 }
@@ -120,6 +122,8 @@ struct Planner<'a> {
     query: &'a RangeQuery,
     /// Selectors seen so far; each becomes its own table `selector_N`.
     selectors: usize,
+    /// Nodes the planner named itself; see [`Planner::stage`].
+    stages: usize,
 }
 
 type Planning<'f> = Pin<Box<dyn Future<Output = Result<Planned, EngineError>> + Send + 'f>>;
@@ -134,6 +138,14 @@ struct Above<'a> {
 }
 
 impl Planner<'_> {
+    /// A name nothing else in this plan has, for a node the planner
+    /// invents rather than one the store named.
+    fn stage(&mut self, what: &str) -> String {
+        let n = self.stages;
+        self.stages += 1;
+        format!("{what}_{n}")
+    }
+
     /// Plan one node. `above` is what the store will be told sits over
     /// the selector this subtree bottoms out in.
     fn expr<'f>(&'f mut self, expr: &'f Expr, above: Above<'f>) -> Planning<'f> {
@@ -238,8 +250,10 @@ impl Planner<'_> {
             )
             .await?;
         let pairs = match func {
-            reduce::Func::Scalar => Vec::new(),
             reduce::Func::Absent => absent_labels(arg),
+            // `merge` is grouped and reaches the plan through
+            // `label_function`, never as a PromQL call.
+            reduce::Func::Scalar | reduce::Func::Merge => Vec::new(),
         };
         let label_names: Vec<String> = pairs.iter().map(|(name, _)| name.clone()).collect();
         let plan = LogicalPlanBuilder::from(input.plan)
@@ -262,6 +276,133 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
+    /// `label_replace(v, dst, repl, src, regex)` and
+    /// `label_join(v, dst, sep, src…)`.
+    ///
+    /// Upstream evaluates these once for the whole query, not per step:
+    /// they are `evaluator` methods that take the inner expression's
+    /// entire matrix and rewrite each series' label set in place
+    /// (`evalLabelReplace`/`evalLabelJoin`, `promql/functions.go:1988`
+    /// and `:2037` at 83962c35), because a label set does not move with
+    /// the step. Here that is not a special case but the natural shape:
+    /// a row is a series, so one projection over the `labels` column is
+    /// the whole function and the samples pass through untouched.
+    ///
+    /// The string arguments are checked before the input is planned,
+    /// in upstream's order, so a bad regex is a bad regex whatever the
+    /// store would have said.
+    async fn label_function(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        let name = call.func.name.as_str();
+        let join = name == "label_join";
+        let arg = |i: usize| string_arg(&call.args[i], name);
+        let dst = arg(1)?;
+        let mut sources = Vec::new();
+        let mut repl = String::new();
+        let mut pattern = String::new();
+        if join {
+            for i in 3..call.args.len() {
+                let src = arg(i)?;
+                if !labels::valid_name(&src) {
+                    return Err(EngineError::Query(format!(
+                        "invalid source label name in {name}(): {src}"
+                    )));
+                }
+                sources.push(src);
+            }
+        } else {
+            (repl, pattern) = (arg(2)?, arg(4)?);
+            sources.push(arg(3)?);
+            // Compiled here only to refuse the query; the operator
+            // compiles its own, so nothing has to carry a regex through
+            // a plan that may be serialized.
+            regex::Regex::new(&labels::anchored(&pattern)).map_err(|_| {
+                EngineError::Query(format!("invalid regular expression in {name}(): {pattern}"))
+            })?;
+        }
+        if !labels::valid_name(&dst) {
+            return Err(EngineError::Query(format!(
+                "invalid destination label name in {name}(): {dst}"
+            )));
+        }
+
+        let input = self
+            .expr(
+                &call.args[0],
+                Above {
+                    func: Some(name),
+                    grouping: None,
+                },
+            )
+            .await?;
+        let read = |src: &String| labels::get(&input.label_names, src);
+        let value = if join {
+            // `label_join(v, "dst", sep)` names no source at all, which
+            // upstream's `strings.Join` of nothing answers with "" —
+            // the destination is written and so removed. DataFusion's
+            // `concat_ws` refuses an empty list rather than agreeing.
+            match sources.is_empty() {
+                true => lit(""),
+                false => concat_ws(lit(arg(2)?), sources.iter().map(read).collect()),
+            }
+        } else {
+            labels::replace_call(
+                read(&sources[0]),
+                labels::get(&input.label_names, &dst),
+                &repl,
+                &pattern,
+            )
+        };
+        let (labels_expr, label_names) = labels::set(&input.label_names, &dst, value);
+
+        let stage = self.stage(name);
+        let written = LogicalPlanBuilder::from(input.plan)
+            .alias(stage)?
+            .project(vec![labels_expr.alias(LABELS), col(SAMPLES)])?;
+
+        // Writing a label can give two series one label set, which
+        // upstream answers by merging them and refusing only where two
+        // of them hold a sample at the same step. Grouping on the new
+        // labels is that merge; the operator decides the collision.
+        //
+        // Unless the destination is a label the input did not have: then
+        // every output label set still carries the whole of its input
+        // one, which was distinct from every other, so no two of them
+        // can have become equal and there is nothing to merge. Worth
+        // the branch — the grouping is most of the cost of a label
+        // function, and this is the common case.
+        //
+        // What that trades away: an input already carrying two series
+        // with one label set passes through unmerged. That is reachable
+        // today, because this engine drops `__name__` eagerly where
+        // upstream defers it, so `rate()` can hand up a duplicate this
+        // would no longer catch.
+        if !input.label_names.contains(&dst) {
+            return Ok(Planned {
+                plan: written.build()?,
+                label_names,
+            });
+        }
+
+        let plan = written
+            .aggregate(
+                labels::group_exprs(&label_names),
+                vec![reduce::call(
+                    col(SAMPLES),
+                    reduce::Func::Merge,
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
+            )?
+            .project(vec![
+                labels::regroup(&label_names).alias(LABELS),
+                col(SAMPLES),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
     /// A function of one range selector: `rate(x[5m])` and its family.
     ///
     /// Takes no `Above`: this call is itself what stands directly over the
@@ -271,6 +412,9 @@ impl Planner<'_> {
         let name = call.func.name.as_str();
         if let Some(func) = reduce::Func::parse(name) {
             return self.reduce(&call.args[0], func).await;
+        }
+        if name == "label_replace" || name == "label_join" {
+            return self.label_function(call).await;
         }
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
@@ -386,6 +530,25 @@ impl Planner<'_> {
             plan,
             label_names: keys,
         })
+    }
+}
+
+/// The string a string-typed expression is, through the wrappers that
+/// only pass a value along.
+///
+/// Upstream's `stringFromArg` reads exactly this and no more: no
+/// function returns a string and no operator combines two, so a string
+/// argument is always the literal itself. `what` names the caller, so
+/// an expression that is not one is refused as the caller's gap.
+fn string_arg(expr: &Expr, what: &str) -> Result<String, EngineError> {
+    match expr {
+        Expr::StringLiteral(s) => Ok(s.val.clone()),
+        Expr::Paren(p) => string_arg(&p.expr, what),
+        Expr::StepInvariant(e) => string_arg(e, what),
+        other => Err(EngineError::Unsupported(format!(
+            "{what} with {} where a string literal belongs",
+            describe(other)
+        ))),
     }
 }
 

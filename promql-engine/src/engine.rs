@@ -41,6 +41,7 @@ impl Engine {
         ctx.register_udaf(aggregate::udaf());
         ctx.register_udf(range::udf());
         ctx.register_udaf(reduce::udaf());
+        ctx.register_udf(labels::replace_udf());
         Self { ctx, rt: None }
     }
 
@@ -79,8 +80,8 @@ impl Engine {
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
         let plan = self.plan_async(source, query, range).await?;
-        let df = self.ctx.execute_logical_plan(plan).await?;
-        let batches = df.collect().await?;
+        let df = self.ctx.execute_logical_plan(plan).await.map_err(lift)?;
+        let batches = df.collect().await.map_err(lift)?;
         // One `collect()` shares a single output schema across all its
         // batches, so validating it once and comparing later batches by
         // pointer skips the redundant re-walk of the label fields.
@@ -116,6 +117,26 @@ impl Engine {
             )
         })
     }
+}
+
+/// A PromQL error raised from inside an operator, lifted back out.
+///
+/// An [`Accumulator`](datafusion::logical_expr::Accumulator) can only
+/// fail with a `DataFusionError`, so a failure that is the *query's*
+/// fault — the colliding label sets a label function can produce, the
+/// only one so far — arrives here wrapped, and a caller reading the
+/// variants would call it the engine breaking rather than the answer
+/// Prometheus gives too.
+///
+/// Recognized by its text, which is as unpleasant as it looks: the
+/// message is the only part of the error DataFusion promises to carry
+/// through an aggregate's execution unchanged, so a typed error would
+/// have to be matched the same way at the other end.
+fn lift(e: datafusion::error::DataFusionError) -> EngineError {
+    if e.to_string().contains(reduce::SAME_LABELSET) {
+        return EngineError::Query(reduce::SAME_LABELSET.to_string());
+    }
+    EngineError::DataFusion(e)
 }
 
 impl Default for Engine {

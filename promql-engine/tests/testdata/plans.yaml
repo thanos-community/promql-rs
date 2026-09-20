@@ -75,3 +75,38 @@ tests:
         Aggregate: groupBy=[[]], aggr=[[promql_reduce(samples, Utf8("absent"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
           Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
             TableScan: selector_0
+
+  - name: label_replace writing a label the input did not have
+    description: >
+      A projection over the labels column alone — the samples pass
+      through, because a label set does not move with the step and
+      upstream rewrites it once for the whole query. No merge above it:
+      the destination is a new label, so every output label set still
+      carries the whole of its input one and no two of them can have
+      become equal.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      label_replace(temperature, "region", "north-$1", "city", "(.*)")
+    plan: |
+      Projection: promql_labels(Utf8("__name__"), get_field(label_replace_0.labels, Utf8("__name__")), Utf8("city"), get_field(label_replace_0.labels, Utf8("city")), Utf8("region"), promql_label_replace(get_field(label_replace_0.labels, Utf8("city")), Utf8(""), Utf8("north-$1"), Utf8("(.*)"))) AS labels, label_replace_0.samples
+        SubqueryAlias: label_replace_0
+          Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+            TableScan: selector_0
+
+  - name: label_replace overwriting a label the input has
+    description: >
+      The same projection with the merge above it: overwriting a label
+      can give two series one label set, so the plan groups on the new
+      labels and lets the reduce operator settle the collision.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      label_replace(temperature, "city", "north-$1", "city", "(.*)")
+    plan: |
+      Projection: promql_labels(Utf8("__name__"), __group____name__, Utf8("city"), __group__city) AS labels, samples
+        Aggregate: groupBy=[[get_field(labels, Utf8("__name__")) AS __group____name__, get_field(labels, Utf8("city")) AS __group__city]], aggr=[[promql_reduce(label_replace_0.samples, Utf8("merge"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: promql_labels(Utf8("__name__"), get_field(label_replace_0.labels, Utf8("__name__")), Utf8("city"), promql_label_replace(get_field(label_replace_0.labels, Utf8("city")), get_field(label_replace_0.labels, Utf8("city")), Utf8("north-$1"), Utf8("(.*)"))) AS labels, label_replace_0.samples
+            SubqueryAlias: label_replace_0
+              Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                TableScan: selector_0

@@ -16,7 +16,9 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, StringViewArray, StructArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, StringViewArray, StringViewBuilder, StructArray,
+};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::compute::kernels::boolean::is_not_null;
 use datafusion::arrow::compute::kernels::zip::zip;
@@ -241,6 +243,155 @@ pub fn regroup(keys: &[String]) -> Expr {
             })
             .collect(),
     )
+}
+
+/// The `labels` struct of the input with one label written over:
+/// `value` under `dst`, whatever `dst` held before. Returns the
+/// expression and the names it carries.
+///
+/// The label functions are the only operators that add a label rather
+/// than drop one, and what they write is a value per row, not a column
+/// the input already has.
+pub fn set(input: &[String], dst: &str, value: Expr) -> (Expr, Vec<String>) {
+    let mut names: Vec<String> = input.to_vec();
+    names.push(dst.to_string());
+    names.sort();
+    names.dedup();
+    let expr = call(
+        names
+            .iter()
+            .map(|n| {
+                let read = if n == dst {
+                    value.clone()
+                } else {
+                    get_field(col(LABELS), n.as_str())
+                };
+                (n.clone(), read)
+            })
+            .collect(),
+    );
+    (expr, names)
+}
+
+/// One label's value, or `""` where the series has no such label —
+/// upstream's `Labels.Get`, which is what both label functions read
+/// their sources through.
+pub fn get(input: &[String], name: &str) -> Expr {
+    if input.iter().any(|n| n == name) {
+        get_field(col(LABELS), name)
+    } else {
+        lit("")
+    }
+}
+
+/// Whether a label name may be written to.
+///
+/// Upstream asks `model.UTF8Validation.IsValidLabelName`, which under
+/// the UTF-8 scheme this pin runs is only "not empty, and valid UTF-8".
+/// A Rust `str` is always the second, so the empty name is the whole
+/// rule — `0invalid` is a label name here, as it is at 83962c35.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+}
+
+pub const REPLACE_NAME: &str = "promql_label_replace";
+
+/// `promql_label_replace(src, current, repl, regex)`: the value `dst`
+/// takes, one row at a time.
+///
+/// `current` is what the series already has under `dst`, which is the
+/// answer wherever the regex does not match — upstream only writes the
+/// label when `FindStringSubmatchIndex` returns something
+/// (`evalLabelReplace`, `promql/functions.go:2007-2013` at 83962c35).
+pub fn replace_call(src: Expr, current: Expr, repl: &str, regex: &str) -> Expr {
+    ScalarUDF::new_from_impl(LabelReplace::default()).call(vec![
+        src,
+        current,
+        lit(repl.to_string()),
+        lit(regex.to_string()),
+    ])
+}
+
+pub fn replace_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(LabelReplace::default())
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LabelReplace {
+    signature: Signature,
+}
+
+impl Default for LabelReplace {
+    fn default() -> Self {
+        Self {
+            signature: Signature::any(4, Volatility::Immutable),
+        }
+    }
+}
+
+/// The anchored form upstream compiles, `(?s:…)` and all: the `s` flag
+/// makes `.` match a newline, so a label value with one in it is still
+/// matched whole rather than only up to the break.
+pub fn anchored(regex: &str) -> String {
+    format!("^(?s:{regex})$")
+}
+
+impl ScalarUDFImpl for LabelReplace {
+    fn name(&self) -> &str {
+        REPLACE_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(series::label_type())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        let text = |i: usize| -> Result<ArrayRef> {
+            match &args.args[i] {
+                ColumnarValue::Array(a) => canonical(a),
+                ColumnarValue::Scalar(s) => canonical(&s.to_array_of_size(n)?),
+            }
+        };
+        let literal = |i: usize| match &args.args[i] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => Ok(s.clone()),
+            other => Err(DataFusionError::Execution(format!(
+                "{REPLACE_NAME}: argument {i} must be a string literal, got {:?}",
+                other.data_type()
+            ))),
+        };
+        let (src, current) = (text(0)?, text(1)?);
+        let (repl, pattern) = (literal(2)?, literal(3)?);
+        // The planner has already compiled this to reject the query;
+        // compiling again per batch is cheaper than carrying a regex
+        // through a plan that may be serialized.
+        let regex = regex::Regex::new(&anchored(&pattern)).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "{REPLACE_NAME}: invalid regular expression {pattern:?}: {e}"
+            ))
+        })?;
+        let (src, current) = (
+            src.as_ref().as_string_view(),
+            current.as_ref().as_string_view(),
+        );
+        let mut out = StringViewBuilder::with_capacity(n);
+        let mut expanded = String::new();
+        for row in 0..n {
+            match regex.captures(src.value(row)) {
+                Some(caps) => {
+                    expanded.clear();
+                    caps.expand(&repl, &mut expanded);
+                    out.append_value(&expanded);
+                }
+                None => out.append_value(current.value(row)),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
 }
 
 /// The `labels` struct with only the names passing `keep`, read from the

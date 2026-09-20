@@ -151,6 +151,16 @@ fn reduce(c: &mut Criterion) {
     for (qname, q) in [
         ("scalar_selector", "scalar(http_requests_total)"),
         ("absent_selector", "absent(http_requests_total)"),
+        // A label function is the same reduction with a regex and a
+        // group key per series in front of it.
+        (
+            "label_replace_selector",
+            r#"label_replace(http_requests_total, "shard", "s-$1", "pod", "(.*)")"#,
+        ),
+        (
+            "label_join_selector",
+            r#"label_join(http_requests_total, "key", "-", "__name__", "pod")"#,
+        ),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
             b.iter(|| {
