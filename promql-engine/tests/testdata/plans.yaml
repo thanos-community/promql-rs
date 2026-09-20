@@ -170,3 +170,33 @@ tests:
                   SubqueryAlias: binary_1
                     Projection: selector_1.labels, promql_vector_selector(selector_1.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
                       TableScan: selector_1
+  - name: a filtering comparison as an operand
+    description: >
+      The inner comparison keeps every label, __name__ included, and
+      still rebuilds the struct rather than passing the column through.
+      A passed-through column keeps the qualifier of the stage below
+      it, so this branch of the union would answer with binary_0.labels
+      where the other answers with labels, and the union would be
+      ambiguous. The promql_labels call that copies every field across
+      is what makes the name plain again.
+    load:
+      - requests{job="api", pod="api-1"} 0
+      - errors{job="api", pod="api-1"} 0
+    query: |
+      (requests > 100) + errors
+    plan: |
+      Projection: promql_labels(Utf8("job"), __group__job, Utf8("pod"), __group__pod) AS labels, __pairs__.samples AS samples
+        Unnest: lists[] structs[__pairs__]
+          Unnest: lists[__pairs__|depth=1] structs[]
+            Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job, get_field(labels, Utf8("pod")) AS __group__pod]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("+"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+              Union
+                Projection: promql_labels(Utf8("__name__"), get_field(binary_1.labels, Utf8("__name__")), Utf8("job"), get_field(binary_1.labels, Utf8("job")), Utf8("pod"), get_field(binary_1.labels, Utf8("pod"))) AS labels, binary_1.samples, Boolean(false) AS __rhs
+                  SubqueryAlias: binary_1
+                    Projection: promql_labels(Utf8("__name__"), get_field(binary_0.labels, Utf8("__name__")), Utf8("job"), get_field(binary_0.labels, Utf8("job")), Utf8("pod"), get_field(binary_0.labels, Utf8("pod"))) AS labels, promql_elementwise(binary_0.samples, Utf8(">"), Float64(100), Float64(NULL)) AS samples
+                      SubqueryAlias: binary_0
+                        Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                          TableScan: selector_0
+                Projection: promql_labels(Utf8("__name__"), get_field(binary_2.labels, Utf8("__name__")), Utf8("job"), get_field(binary_2.labels, Utf8("job")), Utf8("pod"), get_field(binary_2.labels, Utf8("pod"))) AS labels, binary_2.samples, Boolean(true) AS __rhs
+                  SubqueryAlias: binary_2
+                    Projection: selector_1.labels, promql_vector_selector(selector_1.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                      TableScan: selector_1

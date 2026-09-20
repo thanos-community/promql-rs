@@ -462,11 +462,9 @@ impl Planner<'_> {
                 },
             )
             .await?;
-        let (labels_expr, label_names) = if func.drops_metric_name() {
-            labels::keep(&input.label_names, |n| n != METRIC_NAME)
-        } else {
-            (col(LABELS), input.label_names)
-        };
+        let (labels_expr, label_names) = labels::keep(&input.label_names, |n| {
+            !func.drops_metric_name() || n != METRIC_NAME
+        });
         // A name of its own for what this function reads. Without it the
         // projection below can be merged into the one under it, and the
         // merged node would hold both the input's qualified `labels` and
@@ -529,11 +527,15 @@ impl Planner<'_> {
         let what = format!("the {} operator", op.as_str());
         let value = self.constant(scalar, &what)?;
         let input = self.expr(vector, Above::default()).await?;
-        let (labels_expr, label_names) = if op.drops_metric_name(return_bool) {
-            labels::keep(&input.label_names, |n| n != METRIC_NAME)
-        } else {
-            (col(LABELS), input.label_names)
-        };
+        // Rebuilt even when every label survives. Passing `col(LABELS)`
+        // through keeps the input's own qualifier on the output field,
+        // so the stage answers with `binary_0.labels` where every other
+        // stage answers with `labels`; the next operator up then unions
+        // two branches that disagree about the name and DataFusion
+        // calls it ambiguous. A computed struct is unqualified.
+        let (labels_expr, label_names) = labels::keep(&input.label_names, |n| {
+            !op.drops_metric_name(return_bool) || n != METRIC_NAME
+        });
         // The scalar goes in the slot that says which side it was on;
         // see `elementwise::Func::bind`.
         let (a, b) = if swap {

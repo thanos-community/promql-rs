@@ -223,6 +223,22 @@ fn named(metric: &str, pod_name: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// A filtering comparison feeding another operator. At 150s requests
+/// are 60, 120, 180 and errors 6, 12, so `requests > 100` is pods `b`
+/// and `c`, still called `requests`.
+#[test]
+fn a_filtering_comparison_can_be_an_operand() {
+    // Arithmetic on either side: pod `b` is the only one both reach.
+    assert_eq!(vector("(requests > 100) + errors"), [(pod("b"), 132.0)]);
+    assert_eq!(vector("errors + (requests > 100)"), [(pod("b"), 132.0)]);
+
+    // And a function above it, which is the same shape one stage down.
+    assert_eq!(
+        vector("abs(requests > 100)"),
+        [(pod("b"), 120.0), (pod("c"), 180.0)]
+    );
+}
+
 /// A comparison against a scalar keeps the samples that pass and the
 /// metric they came from; `bool` scores every sample instead and drops
 /// the name, because a 1 is no longer that metric.
