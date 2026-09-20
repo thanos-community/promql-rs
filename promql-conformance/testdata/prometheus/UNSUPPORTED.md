@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **401 of 2098 evals pass** (19.1%), and **625** are blocked on the features below.
+Against the vendored corpus: **463 of 2098 evals pass** (22.1%), and **563** are blocked on the features below.
 
 ## Missing features
 
@@ -18,34 +18,28 @@ Against the vendored corpus: **401 of 2098 evals pass** (19.1%), and **625** are
 | 57 | a subquery |
 | 56 | the histogram_fraction function |
 | 41 | the info function |
-| 33 | the == comparison operator |
-| 27 | the fill modifier |
+| 33 | the fill modifier |
 | 21 | the label_replace function |
-| 18 | the group_left modifier |
+| 20 | the group_left modifier |
 | 16 | a unary operator |
 | 16 | the absent_over_time function |
 | 16 | the histogram_quantiles function |
-| 14 | the > comparison operator |
+| 16 | the topk aggregation |
 | 13 | a scalar literal |
 | 13 | the absent function |
 | 13 | the timestamp function |
-| 12 | the topk aggregation |
-| 10 | the != comparison operator |
 | 9 | the predict_linear function |
 | 9 | the quantile_over_time function |
 | 9 | the sort_by_label function |
-| 8 | the <= comparison operator |
 | 8 | the and set operator |
-| 7 | the < comparison operator |
 | 7 | the label_join function |
+| 7 | the on modifier |
 | 7 | the or set operator |
 | 6 | the quantile aggregation |
 | 5 | a string literal |
-| 5 | the >= comparison operator |
 | 5 | the group_right modifier |
 | 4 | the day_of_year function |
 | 4 | the month function |
-| 4 | the on modifier |
 | 4 | the sort_by_label_desc function |
 | 4 | the stddev_over_time function |
 | 4 | the year function |
@@ -87,17 +81,17 @@ Against the vendored corpus: **401 of 2098 evals pass** (19.1%), and **625** are
 | staleness | 17 | 17 (100%) | fully green |
 | trig_functions | 19 | 18 (95%) |  |
 | collision | 2 | 1 (50%) |  |
-| aggregators | 160 | 75 (47%) |  |
-| name_label_dropping | 30 | 12 (40%) |  |
+| aggregators | 160 | 76 (48%) |  |
+| name_label_dropping | 30 | 14 (47%) |  |
 | range_queries | 18 | 7 (39%) |  |
 | selectors | 31 | 12 (39%) |  |
-| functions | 413 | 136 (33%) |  |
+| operators | 213 | 77 (36%) |  |
+| type_and_unit | 58 | 20 (34%) |  |
+| functions | 413 | 140 (34%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
 | at_modifier | 71 | 20 (28%) |  |
 | literals | 25 | 7 (28%) |  |
-| type_and_unit | 58 | 14 (24%) |  |
 | duration_expression | 59 | 8 (14%) |  |
-| operators | 213 | 28 (13%) |  |
 | subquery | 34 | 2 (6%) |  |
 | histograms | 185 | 6 (3%) |  |
 | native_histograms | 521 | 0 (0%) |  |

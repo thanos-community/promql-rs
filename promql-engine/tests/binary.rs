@@ -214,13 +214,129 @@ fn a_match_group_with_two_series_on_a_side_fails() {
     );
 }
 
+/// One vector element with its `__name__`, which is the whole point of
+/// a comparison: it answers with a sample that was already there.
+fn named(metric: &str, pod_name: &str) -> Vec<(String, String)> {
+    vec![
+        ("__name__".to_string(), metric.to_string()),
+        ("pod".to_string(), pod_name.to_string()),
+    ]
+}
+
+/// A comparison against a scalar keeps the samples that pass and the
+/// metric they came from; `bool` scores every sample instead and drops
+/// the name, because a 1 is no longer that metric.
+#[test]
+fn a_comparison_against_a_scalar_filters_and_keeps_the_name() {
+    assert_eq!(
+        vector("requests > 100"),
+        [
+            (named("requests", "b"), 120.0),
+            (named("requests", "c"), 180.0)
+        ]
+    );
+    assert_eq!(
+        vector("requests > bool 100"),
+        [(pod("a"), 0.0), (pod("b"), 1.0), (pod("c"), 1.0)]
+    );
+    // Upstream keeps the vector element's value whichever side the
+    // scalar was on, so the answer is the series' own number, not 100.
+    assert_eq!(
+        vector("100 < requests"),
+        [
+            (named("requests", "b"), 120.0),
+            (named("requests", "c"), 180.0)
+        ]
+    );
+    assert_eq!(
+        vector("100 < bool requests"),
+        [(pod("a"), 0.0), (pod("b"), 1.0), (pod("c"), 1.0)]
+    );
+}
+
+/// The same rules between two vectors, over the match groups the
+/// arithmetic already pairs: the left sample survives with its own
+/// labels, `bool` replaces it with a score and takes the name away.
+#[test]
+fn a_comparison_between_vectors_answers_with_the_left_sample() {
+    assert_eq!(
+        vector("requests > errors"),
+        [
+            (named("requests", "a"), 60.0),
+            (named("requests", "b"), 120.0)
+        ]
+    );
+    assert_eq!(vector("requests < errors"), []);
+    assert_eq!(
+        vector("requests < bool errors"),
+        [(pod("a"), 0.0), (pod("b"), 0.0)]
+    );
+    // `pod="c"` has nothing to compare against, so it is gone either
+    // way — matching happens before the filter.
+    assert_eq!(
+        vector("requests >= bool errors"),
+        [(pod("a"), 1.0), (pod("b"), 1.0)]
+    );
+}
+
+/// Two left series that differ only in `__name__` are one match group,
+/// because the signature drops the name — and a filtering comparison
+/// gives it back, so upstream answers with both of them. Their samples
+/// never meet at a step, so they are no duplicate either.
+///
+/// With `bool` the name goes away and the two become one label set,
+/// which is one series in the answer. Upstream reaches the same place
+/// from the other end: `VectorBinop` still emits a sample per left
+/// series, and the range evaluation collects them into a series per
+/// label set. Were the two to meet at a step, both engines would have
+/// failed the match long before that.
+#[test]
+fn a_kept_name_splits_a_match_group_into_a_series_each() {
+    // 350s apart, so that the 5m lookback has let `a` go stale before
+    // `b` arrives: two series that overlap at a step are a duplicate,
+    // and that is the other test.
+    let source = MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"a{x="1"} 1 _ _"#,
+            r#"b{x="1"} _ _ 4"#,
+            r#"c{x="1"} 2 2 2"#,
+        ]),
+        350.0,
+    );
+    let engine = Engine::blocking().unwrap();
+    let range = promql_engine::RangeQuery::new(0, 700_000, 700_000);
+
+    let batches = engine
+        .range_query(&source, r#"{__name__=~"a|b"} != c"#, &range)
+        .expect("the query runs");
+    let mut series = promql_engine::series::decode(&batches).expect("the canonical shape decodes");
+    series.sort_by_key(|s| s.label("__name__").to_string());
+    let seen: Vec<_> = series
+        .iter()
+        .map(|s| (s.label("__name__").to_string(), s.timestamps(), s.values()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("a".to_string(), &[0i64][..], &[1.0f64][..]),
+            ("b".to_string(), &[700_000][..], &[4.0][..]),
+        ]
+    );
+
+    let batches = engine
+        .range_query(&source, r#"{__name__=~"a|b"} != bool c"#, &range)
+        .expect("the query runs");
+    let series = promql_engine::series::decode(&batches).expect("the canonical shape decodes");
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].timestamps(), [0, 700_000]);
+    assert_eq!(series[0].values(), [1.0, 1.0]);
+}
+
 /// The operators this commit does not implement are named one by one:
 /// the count per feature is what says which is worth doing next.
 #[test]
 fn the_rest_of_the_operators_are_unsupported_by_name() {
     for (query, feature) in [
-        ("requests > errors", "the > comparison operator"),
-        ("requests == bool errors", "the == comparison operator"),
         ("requests and errors", "the and set operator"),
         ("requests or errors", "the or set operator"),
         ("requests unless errors", "the unless set operator"),

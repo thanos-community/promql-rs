@@ -23,16 +23,29 @@
 //! side. One-to-one means a step may hold at most one sample per side,
 //! so the counts are what the two matching errors are raised from and
 //! the values are only ever read where the count is one.
+//!
+//! # Why the result is a list of series
+//!
+//! A comparison answers with the left sample as it stood, `__name__` and
+//! all, and `__name__` is exactly what the match signature forgets. Two
+//! left series that differ only in it therefore share a match group
+//! while upstream's `resultMetric` keeps them apart — and they are not a
+//! duplicate as long as their samples never meet at a step. So the
+//! aggregation carries a fifth lane, the name the left sample at each
+//! step wore, and hands back one `(name, samples)` pair per distinct
+//! name; the planner unnests that into the rows a group splits into.
+//! The shapes that drop the name intern nothing and leave through the
+//! single unnamed pair.
 
 use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Int64Array, ListArray, StringArray, StructArray,
-    TimestampMillisecondArray,
+    Array, ArrayRef, AsArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray,
+    StructArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Int64Type};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Float64Type, Int64Type};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -60,11 +73,10 @@ pub const SIDE: &str = "__rhs";
 const LHS: usize = 0;
 const RHS: usize = 1;
 
-/// The binary operators that compute a value rather than filter one.
+/// The binary operators that take a value on each side.
 ///
-/// Comparisons are absent on purpose: they keep the left value and drop
-/// the sample instead, which is a different operator shape and not
-/// implemented yet.
+/// The set operators are not here: `and`, `or` and `unless` never look
+/// at a value, so they are a different operator shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Add,
@@ -74,6 +86,12 @@ pub enum Op {
     Mod,
     Pow,
     Atan2,
+    Eql,
+    Neq,
+    Gtr,
+    Lss,
+    Gte,
+    Lte,
 }
 
 impl Op {
@@ -86,21 +104,12 @@ impl Op {
             ItemType::Mod => Op::Mod,
             ItemType::Pow => Op::Pow,
             ItemType::Atan2 => Op::Atan2,
-            _ => return None,
-        })
-    }
-
-    /// The operator back from the literal a plan carries, which is its
-    /// PromQL spelling.
-    pub fn parse(s: &str) -> Option<Op> {
-        Some(match s {
-            "+" => Op::Add,
-            "-" => Op::Sub,
-            "*" => Op::Mul,
-            "/" => Op::Div,
-            "%" => Op::Mod,
-            "^" => Op::Pow,
-            "atan2" => Op::Atan2,
+            ItemType::EqlC => Op::Eql,
+            ItemType::Neq => Op::Neq,
+            ItemType::Gtr => Op::Gtr,
+            ItemType::Lss => Op::Lss,
+            ItemType::Gte => Op::Gte,
+            ItemType::Lte => Op::Lte,
             _ => return None,
         })
     }
@@ -114,45 +123,175 @@ impl Op {
             Op::Mod => "%",
             Op::Pow => "^",
             Op::Atan2 => "atan2",
+            Op::Eql => "==",
+            Op::Neq => "!=",
+            Op::Gtr => ">",
+            Op::Lss => "<",
+            Op::Gte => ">=",
+            Op::Lte => "<=",
         }
     }
 
-    /// Whether the operator rewrites the metric's schema, which for
-    /// every operator here it does: upstream's `changesMetricSchema`
-    /// (`promql/engine.go:4208` at 83962c35) names exactly this set, and
-    /// a result whose `__name__` survived would claim to be a metric it
-    /// is no longer.
-    pub fn drops_metric_name(&self) -> bool {
-        true
+    /// The operators upstream's `IsComparisonOperator` answers for.
+    /// They filter rather than compute: the sample keeps its own value
+    /// and is dropped where the comparison does not hold.
+    pub fn is_comparison(&self) -> bool {
+        matches!(
+            self,
+            Op::Eql | Op::Neq | Op::Gtr | Op::Lss | Op::Gte | Op::Lte
+        )
     }
 
-    /// One pair of floats, upstream's `vectorElemBinop`.
+    /// Whether the result stops being the metric it was computed from.
+    ///
+    /// Upstream's `changesMetricSchema` (`promql/engine.go:4208` at
+    /// 83962c35) names the arithmetic operators and nothing else, so a
+    /// comparison keeps `__name__` — it answers with a sample that was
+    /// already there. `bool` replaces the value with a 1 or a 0, which
+    /// is no longer that metric either, and drops it too.
+    pub fn drops_metric_name(&self, return_bool: bool) -> bool {
+        !self.is_comparison() || return_bool
+    }
+
+    /// One pair of floats, upstream's `vectorElemBinop` with the
+    /// `returnBool` wrapper its callers apply: `None` is the sample
+    /// upstream leaves out of the result.
     ///
     /// Rust's `%` is Go's `math.Mod` — the remainder takes the sign of
     /// the dividend — and `powf` is `math.Pow`; the division by zero
     /// that yields an infinity or a NaN is IEEE in both languages, so
     /// none of these needs a Go-shaped wrapper the way `clamp`'s
-    /// `math.Min` did.
-    pub fn value(&self, lhs: f64, rhs: f64) -> f64 {
+    /// `math.Min` did. A NaN compares false to everything, in Go and in
+    /// Rust alike, so it is simply filtered away.
+    pub fn value(&self, lhs: f64, rhs: f64, return_bool: bool) -> Option<f64> {
+        if !self.is_comparison() {
+            return Some(match self {
+                Op::Add => lhs + rhs,
+                Op::Sub => lhs - rhs,
+                Op::Mul => lhs * rhs,
+                Op::Div => lhs / rhs,
+                Op::Mod => lhs % rhs,
+                Op::Pow => lhs.powf(rhs),
+                Op::Atan2 => lhs.atan2(rhs),
+                _ => unreachable!("every comparison is handled below"),
+            });
+        }
+        let keep = self.compare(lhs, rhs);
+        match (return_bool, keep) {
+            (true, keep) => Some(if keep { 1.0 } else { 0.0 }),
+            (false, true) => Some(lhs),
+            (false, false) => None,
+        }
+    }
+
+    /// Whether the comparison holds. Meaningless for the arithmetic
+    /// operators, which never ask.
+    pub fn compare(&self, lhs: f64, rhs: f64) -> bool {
         match self {
-            Op::Add => lhs + rhs,
-            Op::Sub => lhs - rhs,
-            Op::Mul => lhs * rhs,
-            Op::Div => lhs / rhs,
-            Op::Mod => lhs % rhs,
-            Op::Pow => lhs.powf(rhs),
-            Op::Atan2 => lhs.atan2(rhs),
+            Op::Eql => lhs == rhs,
+            Op::Neq => lhs != rhs,
+            Op::Gtr => lhs > rhs,
+            Op::Lss => lhs < rhs,
+            Op::Gte => lhs >= rhs,
+            Op::Lte => lhs <= rhs,
+            _ => unreachable!("only a comparison compares"),
         }
     }
 }
+
+/// The `__name__` an output series kept, and the samples that came out
+/// under it. Field names of the struct [`udaf`] answers with.
+pub const PAIR_NAME: &str = "name";
+pub const PAIR_SAMPLES: &str = "samples";
+
+fn pair_fields() -> Fields {
+    Fields::from(vec![
+        Field::new(PAIR_NAME, series::label_type(), false),
+        Field::new(PAIR_SAMPLES, series::samples_type(), false),
+    ])
+}
+
+fn pair_item() -> FieldRef {
+    Arc::new(Field::new("item", DataType::Struct(pair_fields()), false))
+}
+
+/// What one match group answers with: the series it splits into.
+pub fn output_type() -> DataType {
+    DataType::List(pair_item())
+}
+
+/// The operator as a plan carries it: its PromQL spelling, with the
+/// modifier written in where the query had one. One literal rather than
+/// two arguments, so a plan text reads back as the query it came from.
+pub fn literal(op: Op, return_bool: bool) -> &'static str {
+    if !return_bool {
+        return op.as_str();
+    }
+    match op {
+        Op::Eql => "== bool",
+        Op::Neq => "!= bool",
+        Op::Gtr => "> bool",
+        Op::Lss => "< bool",
+        Op::Gte => ">= bool",
+        Op::Lte => "<= bool",
+        // `bool` is only ever written on a comparison; upstream's
+        // parser refuses it anywhere else.
+        other => other.as_str(),
+    }
+}
+
+/// [`literal`] read back.
+pub fn parse_literal(s: &str) -> Option<(Op, bool)> {
+    let (spelling, return_bool) = match s.strip_suffix(" bool") {
+        Some(spelling) => (spelling, true),
+        None => (s, false),
+    };
+    let op = [
+        Op::Add,
+        Op::Sub,
+        Op::Mul,
+        Op::Div,
+        Op::Mod,
+        Op::Pow,
+        Op::Atan2,
+        Op::Eql,
+        Op::Neq,
+        Op::Gtr,
+        Op::Lss,
+        Op::Gte,
+        Op::Lte,
+    ]
+    .into_iter()
+    .find(|op| op.as_str() == spelling)?;
+    // `1 + bool 2` is not a query upstream's parser accepts, so it is
+    // not a plan this reads back either.
+    if return_bool && !op.is_comparison() {
+        return None;
+    }
+    Some((op, return_bool))
+}
+
+/// The samples one output series ends up with, timestamps beside
+/// values as the canonical shape wants them.
+type Bucket = (Vec<i64>, Vec<f64>);
 
 /// One match group: what each side put at each step of the grid.
 #[derive(Debug)]
 struct Pairing {
     op: Op,
+    return_bool: bool,
+    /// Whether the left sample's `__name__` reaches the result, so that
+    /// the group has to split by it. Only a comparison without `bool`
+    /// answers yes; the rest never intern a name.
+    named: bool,
     grid: Grid,
     counts: [Vec<i64>; 2],
     values: [Vec<f64>; 2],
+    /// The name the left sample at each step wore, as an index into
+    /// [`Pairing::pool`]. Index 0 is the empty name, which is how the
+    /// canonical shape spells a label that is not there.
+    names: Vec<u32>,
+    pool: Vec<String>,
     /// The match group's own labels, for the message a duplicate has to
     /// name. Every row of the group renders the same text, so the first
     /// one to arrive settles it.
@@ -164,15 +303,30 @@ struct Pairing {
 }
 
 impl Pairing {
-    fn new(op: Op, grid: Grid) -> Self {
+    fn new(op: Op, return_bool: bool, grid: Grid) -> Self {
         Self {
             op,
+            return_bool,
+            named: !op.drops_metric_name(return_bool),
             grid,
             counts: [vec![0; grid.len()], vec![0; grid.len()]],
             values: [vec![f64::NAN; grid.len()], vec![f64::NAN; grid.len()]],
+            names: vec![0; grid.len()],
+            pool: vec![String::new()],
             group: None,
             metrics: [Vec::new(), Vec::new()],
         }
+    }
+
+    /// A name's lane index, added to the pool the first time it is
+    /// seen. A match group holds a handful of names at most, so the
+    /// scan is cheaper than a map would be to build.
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(index) = self.pool.iter().position(|held| held == name) {
+            return index as u32;
+        }
+        self.pool.push(name.to_string());
+        (self.pool.len() - 1) as u32
     }
 
     /// Keep what a failure would have to quote, before the row's
@@ -189,16 +343,24 @@ impl Pairing {
         }
     }
 
-    fn fold(&mut self, side: usize, timestamps: &[i64], values: &[f64]) -> Result<()> {
+    fn fold(&mut self, side: usize, timestamps: &[i64], values: &[f64], name: u32) -> Result<()> {
         // `self.grid` is `Copy`, so the closure below can hold the lanes
         // mutably while it reads the grid.
         let grid = self.grid;
-        let (counts, lanes) = (&mut self.counts[side], &mut self.values[side]);
+        // Only the left side's name survives, and only where the
+        // operator keeps one.
+        let wears_a_name = self.named && side == LHS;
+        let counts = &mut self.counts[side];
+        let lanes = &mut self.values[side];
+        let names = &mut self.names;
         grid.runs(timestamps, |index, from, len| {
             for count in &mut counts[index..index + len] {
                 *count += 1;
             }
             lanes[index..index + len].copy_from_slice(&values[from..from + len]);
+            if wears_a_name {
+                names[index..index + len].fill(name);
+            }
         })
     }
 
@@ -266,8 +428,13 @@ impl Accumulator for Pairing {
                 LHS
             };
             self.remember(which, labels, row);
+            let name = if self.named && which == LHS {
+                self.intern(name_of(labels, row))
+            } else {
+                0
+            };
             let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
-            self.fold(which, &timestamps[lo..hi], &samples[lo..hi])?;
+            self.fold(which, &timestamps[lo..hi], &samples[lo..hi], name)?;
         }
         Ok(())
     }
@@ -283,8 +450,12 @@ impl Accumulator for Pairing {
     /// had a left-hand sample at that step. Seeing that would take a
     /// second pass over every group.
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let mut timestamps = Vec::new();
-        let mut values = Vec::new();
+        // One bucket per name the left side wore. The shapes that drop
+        // the name never intern, so they all land in bucket 0 and the
+        // group answers with the single series it always did.
+        let mut buckets: Vec<Bucket> = (0..self.pool.len())
+            .map(|_| (Vec::new(), Vec::new()))
+            .collect();
         for step in 0..self.grid.len() {
             let (left, right) = (self.counts[LHS][step], self.counts[RHS][step]);
             if left == 0 {
@@ -303,11 +474,38 @@ impl Accumulator for Pairing {
                         .into(),
                 ));
             }
-            timestamps.push(self.grid.timestamp(step));
-            values.push(
-                self.op
-                    .value(self.values[LHS][step], self.values[RHS][step]),
-            );
+            // A comparison that does not hold leaves the step out
+            // entirely, which is what upstream's `keep` decides.
+            if let Some(value) = self.op.value(
+                self.values[LHS][step],
+                self.values[RHS][step],
+                self.return_bool,
+            ) {
+                let bucket = &mut buckets[self.names[step] as usize];
+                bucket.0.push(self.grid.timestamp(step));
+                bucket.1.push(value);
+            }
+        }
+
+        // Sorted by name, because DataFusion is free to hand the rows
+        // of a group over in any order and the answer must not be.
+        let mut out: Vec<(&str, &Bucket)> = self
+            .pool
+            .iter()
+            .map(String::as_str)
+            .zip(buckets.iter())
+            .filter(|(_, bucket)| !bucket.0.is_empty())
+            .collect();
+        out.sort_by_key(|(name, _)| *name);
+
+        let mut offsets = Vec::with_capacity(out.len() + 1);
+        offsets.push(0i32);
+        let mut timestamps = Vec::new();
+        let mut values = Vec::new();
+        for (_, bucket) in &out {
+            timestamps.extend_from_slice(&bucket.0);
+            values.extend_from_slice(&bucket.1);
+            offsets.push(timestamps.len() as i32);
         }
         let entries = StructArray::new(
             series::sample_fields(),
@@ -317,7 +515,19 @@ impl Accumulator for Pairing {
             ],
             None,
         );
-        Ok(one_row(series::sample_item(), Arc::new(entries)))
+        let samples = ListArray::new(
+            series::sample_item(),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(entries),
+            None,
+        );
+        let names: Vec<&str> = out.iter().map(|(name, _)| *name).collect();
+        let pairs = StructArray::new(
+            pair_fields(),
+            vec![Arc::new(StringViewArray::from(names)), Arc::new(samples)],
+            None,
+        );
+        Ok(one_row(pair_item(), Arc::new(pairs)))
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
@@ -337,6 +547,23 @@ impl Accumulator for Pairing {
             ));
         }
         out.push(ScalarValue::Utf8(self.group.clone()));
+        // The lane spelled out, rather than pool plus indices: the
+        // indices of two partials mean different things, and a string
+        // per step needs no remapping on the way back in. Empty when
+        // no name can reach the result, so the common shapes carry no
+        // lane at all.
+        let lane: Vec<&str> = match self.named {
+            true => self
+                .names
+                .iter()
+                .map(|i| self.pool[*i as usize].as_str())
+                .collect(),
+            false => Vec::new(),
+        };
+        out.push(one_row(
+            state_item(STATE_LHS_NAMES, DataType::Utf8),
+            Arc::new(StringArray::from(lane)),
+        ));
         Ok(out)
     }
 
@@ -397,6 +624,30 @@ impl Accumulator for Pairing {
                 }
             }
         }
+        if let Some(lanes) = states.get(7).and_then(|s| s.as_list_opt::<i32>()) {
+            for row in 0..lanes.len() {
+                let lane = lanes.value(row);
+                let lane = lane.as_string::<i32>();
+                // A partial that carried no name says so by carrying no
+                // lane; anything else is a state from another grid.
+                if lane.is_empty() {
+                    continue;
+                }
+                if lane.len() != self.grid.len() {
+                    return Err(DataFusionError::Internal(format!(
+                        "{NAME}: partial name lane is {} steps, not the {} of this grid",
+                        lane.len(),
+                        self.grid.len()
+                    )));
+                }
+                for step in 0..lane.len() {
+                    if !lane.value(step).is_empty() {
+                        let id = self.intern(lane.value(step));
+                        self.names[step] = id;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -410,7 +661,9 @@ impl Accumulator for Pairing {
                 .values
                 .iter()
                 .map(|v| v.capacity() * std::mem::size_of::<f64>())
-                .sum::<usize>();
+                .sum::<usize>()
+            + self.names.capacity() * std::mem::size_of::<u32>()
+            + self.pool.iter().map(String::capacity).sum::<usize>();
         std::mem::size_of::<Self>() + lanes
     }
 }
@@ -438,6 +691,9 @@ const STATE_NAMES: [StateNames; 2] = [
 ];
 
 const STATE_GROUP: &str = "group";
+
+/// Only the left side has one, so it sits outside [`STATE_NAMES`].
+const STATE_LHS_NAMES: &str = "lhs_names";
 
 fn state_item(name: &str, of: DataType) -> FieldRef {
     Arc::new(Field::new(name, of, false))
@@ -486,6 +742,19 @@ fn lanes<T: datafusion::arrow::datatypes::ArrowPrimitiveType>(
         )));
     }
     Ok(list)
+}
+
+/// One row's `__name__`, or the empty string where the operand has no
+/// such label at all — which is the same thing in the canonical shape.
+fn name_of(labels: &StructArray, row: usize) -> &str {
+    let Some(column) = labels.column_by_name(METRIC_NAME) else {
+        return "";
+    };
+    match column.data_type() {
+        DataType::Utf8View => column.as_string_view().value(row),
+        DataType::Utf8 => column.as_string::<i32>().value(row),
+        _ => "",
+    }
 }
 
 /// One row of a label struct as Prometheus prints a label set.
@@ -544,14 +813,17 @@ pub fn udaf() -> AggregateUDF {
 /// `promql_binary(samples, <side>, labels, '<op>', start, end, step)`.
 ///
 /// The grid is an argument for the same reason [`crate::aggregate`]
-/// takes one: it turns a timestamp into a lane index. `labels` is read
-/// only to quote a match group in a failure, so it is the *input's*
-/// label set, `__name__` included, not the grouping's.
+/// takes one: it turns a timestamp into a lane index. `labels` is the
+/// *input's* label set, `__name__` included, not the grouping's: the
+/// name a comparison keeps is read off it, and so is the label set a
+/// failure has to quote.
+#[allow(clippy::too_many_arguments)]
 pub fn call(
     samples: Expr,
     side: Expr,
     labels: Expr,
     op: Op,
+    return_bool: bool,
     start_ms: i64,
     end_ms: i64,
     step_ms: i64,
@@ -560,7 +832,7 @@ pub fn call(
         samples,
         side,
         labels,
-        lit(op.as_str()),
+        lit(literal(op, return_bool)),
         lit(start_ms),
         lit(end_ms),
         lit(step_ms),
@@ -575,14 +847,14 @@ fn from_args(args: &AccumulatorArgs) -> Result<Pairing> {
             .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
             .map(Literal::value)
     };
-    let op = literal(3)
+    let (op, return_bool) = literal(3)
         .and_then(|v| match v {
-            ScalarValue::Utf8(Some(s)) => Op::parse(s.as_str()),
+            ScalarValue::Utf8(Some(s)) => parse_literal(s.as_str()),
             _ => None,
         })
         .ok_or_else(|| {
             DataFusionError::Plan(format!(
-                "{NAME}: fourth argument must be an arithmetic operator as a string literal"
+                "{NAME}: fourth argument must be a binary operator as a string literal"
             ))
         })?;
     let grid = |i: usize, what: &str| {
@@ -596,7 +868,7 @@ fn from_args(args: &AccumulatorArgs) -> Result<Pairing> {
             })
     };
     let grid = Grid::new(NAME, grid(4, "start")?, grid(5, "end")?, grid(6, "step")?)?;
-    Ok(Pairing::new(op, grid))
+    Ok(Pairing::new(op, return_bool, grid))
 }
 
 impl AggregateUDFImpl for Binary {
@@ -622,11 +894,11 @@ impl AggregateUDFImpl for Binary {
         if !matches!(arg_types.get(2), Some(DataType::Struct(_))) {
             return plan_err!("{NAME}: third argument must be a label struct");
         }
-        Ok(series::samples_type())
+        Ok(output_type())
     }
 
-    /// A match group with nothing to pair still yields its row; it holds
-    /// no samples, and `series::drop_empty` takes it out of the result.
+    /// A match group with nothing to pair answers with an empty list,
+    /// which the planner's `Unnest` drops on its own.
     fn is_nullable(&self) -> bool {
         false
     }
@@ -639,7 +911,7 @@ impl AggregateUDFImpl for Binary {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        let mut fields = Vec::with_capacity(7);
+        let mut fields = Vec::with_capacity(8);
         for names in &STATE_NAMES {
             fields.push(Arc::new(Field::new(
                 format_state_name(args.name, names.counts),
@@ -662,6 +934,11 @@ impl AggregateUDFImpl for Binary {
             DataType::Utf8,
             true,
         )));
+        fields.push(Arc::new(Field::new(
+            format_state_name(args.name, STATE_LHS_NAMES),
+            state_type(STATE_LHS_NAMES, DataType::Utf8),
+            false,
+        )));
         Ok(fields)
     }
 }
@@ -674,26 +951,48 @@ mod tests {
     use super::*;
 
     fn pairing(op: Op) -> Pairing {
-        Pairing::new(op, Grid::new(NAME, 0, 30_000, 10_000).unwrap())
+        Pairing::new(op, false, Grid::new(NAME, 0, 30_000, 10_000).unwrap())
     }
 
-    fn samples_of(value: ScalarValue) -> Vec<(i64, f64)> {
+    /// Every output series of one match group: the name it kept and the
+    /// samples under it, in the order the accumulator promised.
+    fn pairs_of(value: ScalarValue) -> Vec<(String, Vec<(i64, f64)>)> {
         let ScalarValue::List(list) = value else {
-            panic!("a samples list")
+            panic!("a list of output series")
         };
-        let entries = list.value(0);
-        let entries = entries.as_struct();
-        let timestamps = entries
-            .column_by_name(series::TIMESTAMP)
-            .unwrap()
-            .as_primitive::<datafusion::arrow::datatypes::TimestampMillisecondType>();
-        let values = entries
-            .column_by_name(series::VALUE)
-            .unwrap()
-            .as_primitive::<Float64Type>();
-        (0..entries.len())
-            .map(|i| (timestamps.value(i), values.value(i)))
+        let pairs = list.value(0);
+        let pairs = pairs.as_struct();
+        let names = pairs.column_by_name(PAIR_NAME).unwrap().as_string_view();
+        let samples = pairs.column_by_name(PAIR_SAMPLES).unwrap().as_list::<i32>();
+        (0..pairs.len())
+            .map(|row| {
+                let entries = samples.value(row);
+                let entries = entries.as_struct();
+                let timestamps = entries
+                    .column_by_name(series::TIMESTAMP)
+                    .unwrap()
+                    .as_primitive::<datafusion::arrow::datatypes::TimestampMillisecondType>(
+                );
+                let values = entries
+                    .column_by_name(series::VALUE)
+                    .unwrap()
+                    .as_primitive::<Float64Type>();
+                let samples = (0..entries.len())
+                    .map(|i| (timestamps.value(i), values.value(i)))
+                    .collect();
+                (names.value(row).to_string(), samples)
+            })
             .collect()
+    }
+
+    /// The samples of a group that answers with one series, which is
+    /// every shape but a comparison over two differently named metrics.
+    fn samples_of(value: ScalarValue) -> Vec<(i64, f64)> {
+        match pairs_of(value).as_slice() {
+            [] => Vec::new(),
+            [(_, samples)] => samples.clone(),
+            many => panic!("{} output series, not one", many.len()),
+        }
     }
 
     /// Upstream's `vectorElemBinop`, including the two Go functions the
@@ -701,21 +1000,57 @@ mod tests {
     /// by zero is an infinity rather than an error.
     #[test]
     fn the_arithmetic_is_upstreams_vector_elem_binop() {
-        assert_eq!(Op::Add.value(1.0, 2.0), 3.0);
-        assert_eq!(Op::Sub.value(1.0, 2.0), -1.0);
-        assert_eq!(Op::Mul.value(3.0, 4.0), 12.0);
-        assert_eq!(Op::Div.value(1.0, 4.0), 0.25);
-        assert_eq!(Op::Pow.value(2.0, 10.0), 1024.0);
-        assert_eq!(Op::Atan2.value(1.0, 1.0), std::f64::consts::FRAC_PI_4);
+        let v = |op: Op, l, r| op.value(l, r, false).expect("arithmetic always keeps");
+        assert_eq!(v(Op::Add, 1.0, 2.0), 3.0);
+        assert_eq!(v(Op::Sub, 1.0, 2.0), -1.0);
+        assert_eq!(v(Op::Mul, 3.0, 4.0), 12.0);
+        assert_eq!(v(Op::Div, 1.0, 4.0), 0.25);
+        assert_eq!(v(Op::Pow, 2.0, 10.0), 1024.0);
+        assert_eq!(v(Op::Atan2, 1.0, 1.0), std::f64::consts::FRAC_PI_4);
 
-        assert_eq!(Op::Mod.value(7.0, 3.0), 1.0);
-        assert_eq!(Op::Mod.value(-7.0, 3.0), -1.0);
-        assert_eq!(Op::Mod.value(7.0, -3.0), 1.0);
-        assert!(Op::Mod.value(1.0, 0.0).is_nan());
+        assert_eq!(v(Op::Mod, 7.0, 3.0), 1.0);
+        assert_eq!(v(Op::Mod, -7.0, 3.0), -1.0);
+        assert_eq!(v(Op::Mod, 7.0, -3.0), 1.0);
+        assert!(v(Op::Mod, 1.0, 0.0).is_nan());
 
-        assert_eq!(Op::Div.value(1.0, 0.0), f64::INFINITY);
-        assert_eq!(Op::Div.value(-1.0, 0.0), f64::NEG_INFINITY);
-        assert!(Op::Div.value(0.0, 0.0).is_nan());
+        assert_eq!(v(Op::Div, 1.0, 0.0), f64::INFINITY);
+        assert_eq!(v(Op::Div, -1.0, 0.0), f64::NEG_INFINITY);
+        assert!(v(Op::Div, 0.0, 0.0).is_nan());
+    }
+
+    /// A comparison answers with the sample it was given or with
+    /// nothing at all; `bool` turns that into a 1 or a 0 and always
+    /// answers.
+    #[test]
+    fn a_comparison_filters_and_bool_scores() {
+        assert_eq!(Op::Gtr.value(3.0, 2.0, false), Some(3.0));
+        assert_eq!(Op::Gtr.value(2.0, 3.0, false), None);
+        assert_eq!(Op::Gtr.value(3.0, 2.0, true), Some(1.0));
+        assert_eq!(Op::Gtr.value(2.0, 3.0, true), Some(0.0));
+
+        assert_eq!(Op::Eql.value(2.0, 2.0, false), Some(2.0));
+        assert_eq!(Op::Neq.value(2.0, 2.0, false), None);
+        assert_eq!(Op::Gte.value(2.0, 2.0, false), Some(2.0));
+        assert_eq!(Op::Lte.value(2.0, 2.0, false), Some(2.0));
+        assert_eq!(Op::Lss.value(2.0, 2.0, false), None);
+
+        // A NaN compares false to everything, `!=` included by
+        // negation, so it survives only that one.
+        for op in [Op::Eql, Op::Gtr, Op::Lss, Op::Gte, Op::Lte] {
+            assert_eq!(op.value(f64::NAN, 1.0, false), None, "{}", op.as_str());
+            assert_eq!(op.value(f64::NAN, 1.0, true), Some(0.0), "{}", op.as_str());
+        }
+        assert!(Op::Neq.value(f64::NAN, 1.0, false).unwrap().is_nan());
+    }
+
+    /// Only a comparison without `bool` answers with the metric it was
+    /// given, so only that one keeps its name.
+    #[test]
+    fn what_drops_the_metric_name_is_changes_metric_schema_plus_bool() {
+        assert!(Op::Add.drops_metric_name(false));
+        assert!(Op::Atan2.drops_metric_name(false));
+        assert!(!Op::Gtr.drops_metric_name(false));
+        assert!(Op::Gtr.drops_metric_name(true));
     }
 
     #[test]
@@ -728,12 +1063,27 @@ mod tests {
             Op::Mod,
             Op::Pow,
             Op::Atan2,
+            Op::Eql,
+            Op::Neq,
+            Op::Gtr,
+            Op::Lss,
+            Op::Gte,
+            Op::Lte,
         ] {
-            assert_eq!(Op::parse(op.as_str()), Some(op));
+            assert_eq!(parse_literal(literal(op, false)), Some((op, false)));
+            if op.is_comparison() {
+                assert_eq!(parse_literal(literal(op, true)), Some((op, true)));
+                assert_eq!(literal(op, true), format!("{} bool", op.as_str()));
+            }
         }
         assert_eq!(Op::from_token(ItemType::Add), Some(Op::Add));
-        assert_eq!(Op::from_token(ItemType::Gtr), None);
+        assert_eq!(Op::from_token(ItemType::Gtr), Some(Op::Gtr));
         assert_eq!(Op::from_token(ItemType::Land), None);
+        assert_eq!(parse_literal("and"), None);
+        // `bool` belongs to a comparison and to nothing else, so a plan
+        // that spells it anywhere else is not one this wrote.
+        assert_eq!(parse_literal("+ bool"), None);
+        assert_eq!(parse_literal("atan2 bool"), None);
     }
 
     /// A step only one side reached is not in the result: upstream's
@@ -743,10 +1093,31 @@ mod tests {
     fn only_the_steps_both_sides_reached_are_paired() {
         let mut pairing = pairing(Op::Add);
         pairing
-            .fold(LHS, &[0, 10_000, 20_000], &[1.0, 2.0, 3.0])
+            .fold(LHS, &[0, 10_000, 20_000], &[1.0, 2.0, 3.0], 0)
             .unwrap();
-        pairing.fold(RHS, &[10_000, 30_000], &[10.0, 30.0]).unwrap();
+        pairing
+            .fold(RHS, &[10_000, 30_000], &[10.0, 30.0], 0)
+            .unwrap();
         assert_eq!(samples_of(pairing.evaluate().unwrap()), [(10_000, 12.0)]);
+    }
+
+    /// A comparison between two vectors answers with the left sample
+    /// where it holds and leaves the step out where it does not — the
+    /// filter upstream's `keep` is, one step at a time.
+    #[test]
+    fn a_comparison_between_vectors_filters_step_by_step() {
+        let mut filtered = pairing(Op::Gtr);
+        filtered.fold(LHS, &[0, 10_000], &[5.0, 1.0], 0).unwrap();
+        filtered.fold(RHS, &[0, 10_000], &[2.0, 9.0], 0).unwrap();
+        assert_eq!(samples_of(filtered.evaluate().unwrap()), [(0, 5.0)]);
+
+        let mut scored = Pairing::new(Op::Gtr, true, Grid::new(NAME, 0, 30_000, 10_000).unwrap());
+        scored.fold(LHS, &[0, 10_000], &[5.0, 1.0], 0).unwrap();
+        scored.fold(RHS, &[0, 10_000], &[2.0, 9.0], 0).unwrap();
+        assert_eq!(
+            samples_of(scored.evaluate().unwrap()),
+            [(0, 1.0), (10_000, 0.0)]
+        );
     }
 
     /// Two series on the same side of one match group are the two
@@ -754,9 +1125,9 @@ mod tests {
     #[test]
     fn two_series_in_a_match_group_fail_where_they_overlap() {
         let mut both = pairing(Op::Add);
-        both.fold(LHS, &[0], &[1.0]).unwrap();
-        both.fold(LHS, &[0], &[2.0]).unwrap();
-        both.fold(RHS, &[0], &[3.0]).unwrap();
+        both.fold(LHS, &[0], &[1.0], 0).unwrap();
+        both.fold(LHS, &[0], &[2.0], 0).unwrap();
+        both.fold(RHS, &[0], &[3.0], 0).unwrap();
         let err = both.evaluate().unwrap_err().to_string();
         assert!(
             err.contains("many-to-one matching must be explicit"),
@@ -764,9 +1135,9 @@ mod tests {
         );
 
         let mut right = pairing(Op::Add);
-        right.fold(LHS, &[0], &[1.0]).unwrap();
-        right.fold(RHS, &[0], &[2.0]).unwrap();
-        right.fold(RHS, &[0], &[3.0]).unwrap();
+        right.fold(LHS, &[0], &[1.0], 0).unwrap();
+        right.fold(RHS, &[0], &[2.0], 0).unwrap();
+        right.fold(RHS, &[0], &[3.0], 0).unwrap();
         let err = right.evaluate().unwrap_err().to_string();
         assert!(
             err.contains("found duplicate series for the match group"),
@@ -777,12 +1148,45 @@ mod tests {
         // Apart in time is not a duplicate at all: upstream checks the
         // vector at one step, not the series over the range.
         let mut apart = pairing(Op::Add);
-        apart.fold(LHS, &[0], &[1.0]).unwrap();
-        apart.fold(LHS, &[10_000], &[2.0]).unwrap();
-        apart.fold(RHS, &[0, 10_000], &[3.0, 4.0]).unwrap();
+        apart.fold(LHS, &[0], &[1.0], 0).unwrap();
+        apart.fold(LHS, &[10_000], &[2.0], 0).unwrap();
+        apart.fold(RHS, &[0, 10_000], &[3.0, 4.0], 0).unwrap();
         assert_eq!(
             samples_of(apart.evaluate().unwrap()),
             [(0, 4.0), (10_000, 6.0)]
+        );
+    }
+
+    /// Two left series that differ only in `__name__` share a match
+    /// group, because the signature drops the name — but a comparison
+    /// gives that name back, so the group has to answer with both.
+    #[test]
+    fn a_kept_name_splits_the_match_group_back_up() {
+        let mut pairing = Pairing::new(Op::Gtr, false, Grid::new(NAME, 0, 30_000, 10_000).unwrap());
+        let b = pairing.intern("b");
+        let a = pairing.intern("a");
+        pairing.fold(LHS, &[0], &[5.0], b).unwrap();
+        pairing.fold(LHS, &[10_000], &[7.0], a).unwrap();
+        pairing.fold(RHS, &[0, 10_000], &[1.0, 1.0], 0).unwrap();
+        assert_eq!(
+            pairs_of(pairing.evaluate().unwrap()),
+            [
+                ("a".to_string(), vec![(10_000, 7.0)]),
+                ("b".to_string(), vec![(0, 5.0)]),
+            ]
+        );
+
+        // `bool` takes the name away again, so the same two series are
+        // one result — which is what upstream's `resultMetric` does
+        // once `changesMetricSchema` holds.
+        let mut scored = Pairing::new(Op::Gtr, true, Grid::new(NAME, 0, 30_000, 10_000).unwrap());
+        assert_eq!(scored.intern("b"), b);
+        scored.fold(LHS, &[0], &[5.0], b).unwrap();
+        scored.fold(LHS, &[10_000], &[7.0], a).unwrap();
+        scored.fold(RHS, &[0, 10_000], &[1.0, 1.0], 0).unwrap();
+        assert_eq!(
+            pairs_of(scored.evaluate().unwrap()),
+            [(String::new(), vec![(0, 1.0), (10_000, 1.0)])]
         );
     }
 
@@ -790,13 +1194,13 @@ mod tests {
     #[test]
     fn partial_states_merge_to_the_same_pairing() {
         let mut whole = pairing(Op::Mul);
-        whole.fold(LHS, &[0, 10_000], &[2.0, 3.0]).unwrap();
-        whole.fold(RHS, &[0, 10_000], &[5.0, 7.0]).unwrap();
+        whole.fold(LHS, &[0, 10_000], &[2.0, 3.0], 0).unwrap();
+        whole.fold(RHS, &[0, 10_000], &[5.0, 7.0], 0).unwrap();
 
         let mut left = pairing(Op::Mul);
-        left.fold(LHS, &[0, 10_000], &[2.0, 3.0]).unwrap();
+        left.fold(LHS, &[0, 10_000], &[2.0, 3.0], 0).unwrap();
         let mut right = pairing(Op::Mul);
-        right.fold(RHS, &[0, 10_000], &[5.0, 7.0]).unwrap();
+        right.fold(RHS, &[0, 10_000], &[5.0, 7.0], 0).unwrap();
 
         let mut merged = pairing(Op::Mul);
         for mut partial in [left, right] {
@@ -805,6 +1209,38 @@ mod tests {
             merged.merge_batch(&arrays).unwrap();
         }
         assert_eq!(merged.evaluate().unwrap(), whole.evaluate().unwrap());
+    }
+
+    /// The name lane survives the same round trip, and the pool indices
+    /// of one partial mean nothing in another — which is why the lane
+    /// travels as the names themselves.
+    #[test]
+    fn partial_states_merge_the_names_they_carried() {
+        let grid = Grid::new(NAME, 0, 30_000, 10_000).unwrap();
+        let mut left = Pairing::new(Op::Gtr, false, grid);
+        let name = left.intern("a");
+        left.fold(LHS, &[0], &[5.0], name).unwrap();
+
+        let mut right = Pairing::new(Op::Gtr, false, grid);
+        // A different pool, so "b" is index 1 here and would collide
+        // with "a" if the index were what crossed over.
+        let name = right.intern("b");
+        right.fold(LHS, &[10_000], &[7.0], name).unwrap();
+        right.fold(RHS, &[0, 10_000], &[1.0, 1.0], 0).unwrap();
+
+        let mut merged = Pairing::new(Op::Gtr, false, grid);
+        for mut partial in [left, right] {
+            let state = partial.state().unwrap();
+            let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
+            merged.merge_batch(&arrays).unwrap();
+        }
+        assert_eq!(
+            pairs_of(merged.evaluate().unwrap()),
+            [
+                ("a".to_string(), vec![(0, 5.0)]),
+                ("b".to_string(), vec![(10_000, 7.0)]),
+            ]
+        );
     }
 
     /// The label set as Prometheus prints it, with the canonical

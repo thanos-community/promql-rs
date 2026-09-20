@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::catalog::Session;
-use datafusion::common::ScalarValue;
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
@@ -236,22 +236,27 @@ fn is_comparison(op: promql_parser::token::ItemType) -> bool {
 /// plan text would survive being asked to parse.
 const BINARY_STAGE: &str = "binary";
 
+/// The column a match group's output series arrive in, before `Unnest`
+/// makes a row of each. Not a group alias and not a label name:
+/// `labels::group_exprs` prefixes every key it makes, so nothing it
+/// produces can be spelled this way.
+const PAIRS: &str = "__pairs__";
+
+/// What `Unnest` calls one field of an opened struct.
+fn pair_column(field: &str) -> Column {
+    Column::new_unqualified(format!("{PAIRS}.{field}"))
+}
+
 /// The operator a binary expression is, or the feature that stands in
 /// the way of planning it.
 ///
 /// Everything named here is a gap rather than a mistake — Prometheus
 /// answers all of it — so each gets its own name: what the differential
 /// suite counts is how many evaluations wait on which feature.
-fn binary_op(b: &BinaryExpr) -> Result<binary::Op, EngineError> {
+fn binary_op(b: &BinaryExpr) -> Result<(binary::Op, bool), EngineError> {
     use promql_parser::token::ItemType;
 
     let op = match b.op {
-        _ if is_comparison(b.op) => {
-            return Err(EngineError::Unsupported(format!(
-                "the {} comparison operator",
-                b.op
-            )))
-        }
         ItemType::Land | ItemType::Lor | ItemType::Lunless => {
             return Err(EngineError::Unsupported(format!(
                 "the {} set operator",
@@ -261,11 +266,6 @@ fn binary_op(b: &BinaryExpr) -> Result<binary::Op, EngineError> {
         op => binary::Op::from_token(op)
             .ok_or_else(|| EngineError::Unsupported(format!("the {op} operator")))?,
     };
-    // Only a comparison takes `bool`, so this is out of reach until
-    // comparisons land; it is here so that adding them cannot forget it.
-    if b.return_bool {
-        return Err(EngineError::Unsupported("the bool modifier".into()));
-    }
     if let Some(matching) = &b.vector_matching {
         let unsupported =
             |what: &str| Err(EngineError::Unsupported(format!("the {what} modifier")));
@@ -287,7 +287,16 @@ fn binary_op(b: &BinaryExpr) -> Result<binary::Op, EngineError> {
             return unsupported("fill");
         }
     }
-    Ok(op)
+    // `bool` is only ever written on a comparison — upstream's parser
+    // says so — so anywhere else it is a parse this engine should not
+    // quietly answer.
+    if b.return_bool && !op.is_comparison() {
+        return Err(EngineError::Query(format!(
+            "bool modifier can only be used on comparison operators, got {}",
+            b.op
+        )));
+    }
+    Ok((op, b.return_bool))
 }
 
 /// The step grid alone, for the expressions that are a function of the
@@ -548,15 +557,17 @@ impl Planner<'_> {
     /// for. `expr` is `b` again, for the scalar fold that needs the
     /// whole node.
     async fn binary(&mut self, expr: &Expr, b: &BinaryExpr) -> Result<Planned, EngineError> {
-        let op = binary_op(b)?;
+        let (op, return_bool) = binary_op(b)?;
         match (value_type(&b.lhs), value_type(&b.rhs)) {
             (ValueType::Vector, ValueType::Scalar) => {
-                self.vector_scalar(&b.lhs, &b.rhs, op, false).await
+                self.vector_scalar(&b.lhs, &b.rhs, op, return_bool, false)
+                    .await
             }
             (ValueType::Scalar, ValueType::Vector) => {
-                self.vector_scalar(&b.rhs, &b.lhs, op, true).await
+                self.vector_scalar(&b.rhs, &b.lhs, op, return_bool, true)
+                    .await
             }
-            (ValueType::Vector, ValueType::Vector) => self.vector_vector(b, op).await,
+            (ValueType::Vector, ValueType::Vector) => self.vector_vector(b, op, return_bool).await,
             // Two scalars are a value per step and nothing else, which
             // is the table [`Planner::scalar_series`] already builds.
             _ => Ok(Planned {
@@ -567,20 +578,22 @@ impl Planner<'_> {
     }
 
     /// A vector against a scalar: upstream's `VectorscalarBinop`, which
-    /// writes the value back into the sample it read and drops
-    /// `__name__`. That is [`Planner::elementwise`]'s shape with the
-    /// scalar folded in, so it is that kernel that runs.
+    /// writes the value back into the sample it read. That is
+    /// [`Planner::elementwise`]'s shape with the scalar folded in, so it
+    /// is that kernel that runs — a comparison included, which answers
+    /// for some samples and drops the rest.
     async fn vector_scalar(
         &mut self,
         vector: &Expr,
         scalar: &Expr,
         op: binary::Op,
+        return_bool: bool,
         swap: bool,
     ) -> Result<Planned, EngineError> {
         let what = format!("the {} operator", op.as_str());
         let value = self.constant(scalar, &what)?;
         let input = self.expr(vector, Above::default()).await?;
-        let (labels_expr, label_names) = if op.drops_metric_name() {
+        let (labels_expr, label_names) = if op.drops_metric_name(return_bool) {
             labels::keep(&input.label_names, |n| n != METRIC_NAME)
         } else {
             (col(LABELS), input.label_names)
@@ -598,7 +611,13 @@ impl Planner<'_> {
             .alias(stage)?
             .project(vec![
                 labels_expr.alias(LABELS),
-                elementwise::call(col(SAMPLES), elementwise::Func::Binary(op), a, b).alias(SAMPLES),
+                elementwise::call(
+                    col(SAMPLES),
+                    elementwise::Func::Binary { op, return_bool },
+                    a,
+                    b,
+                )
+                .alias(SAMPLES),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?
@@ -616,6 +635,7 @@ impl Planner<'_> {
         &mut self,
         b: &BinaryExpr,
         op: binary::Op,
+        return_bool: bool,
     ) -> Result<Planned, EngineError> {
         let lhs = self.expr(&b.lhs, Above::default()).await?;
         let rhs = self.expr(&b.rhs, Above::default()).await?;
@@ -633,6 +653,19 @@ impl Planner<'_> {
             .cloned()
             .collect();
 
+        // A comparison that keeps `__name__` answers with the left
+        // sample as it stood, name included — and the name is the one
+        // thing the match signature deliberately forgets. Two left
+        // series that differ only in it therefore share a match group
+        // and must still come out apart, so the aggregation answers
+        // with one pair per name and `Unnest` splits the group back up.
+        let named =
+            !op.drops_metric_name(return_bool) && lhs.label_names.iter().any(|n| n == METRIC_NAME);
+        let extra = match named {
+            true => vec![(METRIC_NAME.to_string(), col(pair_column(binary::PAIR_NAME)))],
+            false => Vec::new(),
+        };
+
         let left = self.operand(lhs, &names, false)?;
         let right = self.operand(rhs, &names, true)?;
         let plan = LogicalPlanBuilder::from(left)
@@ -644,18 +677,31 @@ impl Planner<'_> {
                     col(binary::SIDE),
                     col(LABELS),
                     op,
+                    return_bool,
                     self.query.start_ms,
                     self.query.end_ms,
                     self.query.step_ms,
                 )
-                .alias(SAMPLES)],
+                .alias(PAIRS)],
             )?
-            .project(whole_grid(labels::regroup(&keys).alias(LABELS)))?
+            // Twice: the first turns the list into one row per output
+            // series, the second opens the struct that row holds into
+            // its own columns. Reaching into it with `get_field`
+            // instead lets a projection pushdown float the read back
+            // under the `Unnest`, where the column is still a list.
+            .unnest_column(Column::new_unqualified(PAIRS))?
+            .unnest_column(Column::new_unqualified(PAIRS))?
+            .project(whole_grid(
+                labels::regroup(&keys, extra).alias(LABELS),
+                col(pair_column(binary::PAIR_SAMPLES)).alias(SAMPLES),
+            ))?
             .build()?;
-        Ok(Planned {
-            plan,
-            label_names: keys,
-        })
+        let mut label_names = keys;
+        if named {
+            label_names.push(METRIC_NAME.to_string());
+            label_names.sort();
+        }
+        Ok(Planned { plan, label_names })
     }
 
     /// One operand in the shape the union takes: the shared label
@@ -835,7 +881,7 @@ impl Planner<'_> {
                 )
                 .alias(SAMPLES)],
             )?
-            .project(canonical(labels::regroup(&keys).alias(LABELS)))?
+            .project(canonical(labels::regroup(&keys, Vec::new()).alias(LABELS)))?
             .build()?;
         Ok(Planned {
             plan,
@@ -855,11 +901,14 @@ fn series_keys() -> Vec<datafusion::logical_expr::Expr> {
 /// moves them, so the pairing groups by the match signature alone and
 /// holds the whole grid; grouping by block as well would split a pair
 /// whose sides fall in different blocks and drop it.
-fn whole_grid(labels: datafusion::logical_expr::Expr) -> Vec<datafusion::logical_expr::Expr> {
+fn whole_grid(
+    labels: datafusion::logical_expr::Expr,
+    samples: datafusion::logical_expr::Expr,
+) -> Vec<datafusion::logical_expr::Expr> {
     let edge = |ms: i64| lit(ScalarValue::TimestampMillisecond(Some(ms), None));
     vec![
         labels,
-        col(SAMPLES),
+        samples,
         edge(i64::MIN).alias(BLOCK_START),
         edge(i64::MAX).alias(BLOCK_END),
     ]
@@ -1152,10 +1201,12 @@ mod tests {
             assert!(matches!(err, EngineError::Query(_)), "{query}: {err}");
         }
 
-        // With a vector on one side the comparison is allowed — still
-        // unsupported here, but as a missing feature rather than a bad
-        // query.
-        let err = plan_of("up > 1", range).await.unwrap_err();
+        // With the modifier, or with a vector on either side, the
+        // comparison is a query the engine answers; only the matching
+        // modifiers on top of it are still a missing feature.
+        assert!(plan_of("1 > bool 1", range).await.is_ok());
+        assert!(plan_of("up > 1", range).await.is_ok());
+        let err = plan_of("up > on(job) up", range).await.unwrap_err();
         assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
     }
 

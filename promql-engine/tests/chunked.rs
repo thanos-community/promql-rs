@@ -185,7 +185,14 @@ fn binary_op_matching_the_selector_with_itself() {
 /// by label set would find no partner for most steps.
 #[test]
 fn binary_op_across_blocks_with_different_edges() {
-    for q in ["x + x", "x - x offset 2m", "rate(x[5m]) / x offset 1m"] {
+    for q in [
+        "x + x",
+        "x - x offset 2m",
+        "rate(x[5m]) / x offset 1m",
+        "x > 5",
+        "x > x offset 2m",
+        "x >= bool x offset 2m",
+    ] {
         assert_same_as_unchunked(q, multi_step());
     }
 }
