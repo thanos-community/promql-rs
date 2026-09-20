@@ -149,6 +149,128 @@ fn aggregations_compose_over_range_functions() {
     assert!(close(envoy1.values()[0], 10.0), "{out:?}");
 }
 
+/// The two functions that answer at a step their vector never reached.
+///
+/// envoy-1's samples stop at 450s and the lookback carries it to 750s,
+/// so 900s and 1200s are the steps with nothing in them — and they are
+/// the only steps `absent` emits at, while `scalar` emits at all five.
+#[test]
+fn absent_and_scalar_answer_where_the_selector_stops() {
+    let over = RangeQuery::new(0, 1_200_000, 300_000);
+    let out = query(r#"absent(http_requests_total{pod="envoy-1"})"#, over);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].labels().collect::<Vec<_>>(),
+        vec![("pod", "envoy-1")]
+    );
+    assert_eq!(out[0].timestamps(), &[900_000, 1_200_000]);
+    assert_eq!(out[0].values(), &[1.0, 1.0]);
+
+    let out = query(r#"scalar(http_requests_total{pod="envoy-1"})"#, over);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].labels().count(), 0);
+    assert_eq!(
+        out[0].timestamps(),
+        &[0, 300_000, 600_000, 900_000, 1_200_000]
+    );
+    assert_eq!(out[0].values()[..3], [1.0, 11.0, 16.0]);
+    assert!(out[0].values()[3..].iter().all(|v| v.is_nan()));
+}
+
+/// `funcScalar`: the value of the one element, and a NaN for any other
+/// count — two elements and none alike.
+#[test]
+fn scalar_is_the_value_of_a_vector_that_holds_exactly_one_series() {
+    let at = RangeQuery::new(0, 0, 30_000);
+    let one = |q: &str| query(q, at)[0].values()[0];
+    assert_eq!(one(r#"scalar(http_requests_total{pod="envoy-1"})"#), 1.0);
+    assert!(
+        one("scalar(http_requests_total)").is_nan(),
+        "two are not one"
+    );
+    assert!(one(r#"scalar(http_requests_total{pod="mars"})"#).is_nan());
+    // An aggregation collapses the two into the one it wants.
+    assert_eq!(one("scalar(sum(http_requests_total))"), 2.0);
+}
+
+/// `funcAbsent`: nothing where the vector has something, and one series
+/// where it has not — the step no aggregation can answer for.
+#[test]
+fn absent_answers_only_where_its_vector_is_empty() {
+    let at = RangeQuery::new(0, 0, 30_000);
+    assert!(query("absent(http_requests_total)", at).is_empty());
+    // The metric name is not among the labels it answers with.
+    assert_eq!(label_set("absent(nonexistent)", at), Some(vec![]));
+}
+
+/// `createLabelsForAbsentFunction`: equality matchers only, the first
+/// for a name only, and from a selector only.
+#[test]
+fn the_labels_absent_answers_with_are_the_selectors_equalities() {
+    let at = RangeQuery::new(0, 0, 30_000);
+    assert_eq!(
+        label_set(r#"absent(nonexistent{pod="mars"})"#, at),
+        Some(vec![("pod".to_string(), "mars".to_string())])
+    );
+    assert_eq!(
+        label_set(r#"absent(nonexistent{pod="mars",route=~"a.*"})"#, at),
+        Some(vec![("pod".to_string(), "mars".to_string())]),
+        "a regex matcher names nothing"
+    );
+    assert_eq!(
+        label_set(r#"absent(nonexistent{pod="mars",pod="venus"})"#, at),
+        Some(vec![]),
+        "two equalities on one name take it back out"
+    );
+    assert_eq!(
+        label_set(r#"absent((nonexistent{pod="mars"}))"#, at),
+        Some(vec![]),
+        "a parenthesis is not a selector, upstream's type switch included"
+    );
+    assert_eq!(
+        label_set("absent(sum(nonexistent))", at),
+        Some(vec![]),
+        "nor is anything else"
+    );
+}
+
+/// The label set of the one series a query answers with, owned so the
+/// batches it was decoded from can be dropped.
+fn label_set(q: &str, range: RangeQuery) -> Option<Vec<(String, String)>> {
+    query(q, range).first().map(|s| {
+        s.labels()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    })
+}
+
+/// A call this engine can plan is still held to upstream's table first,
+/// and says what upstream says: our parser types every call the same, so
+/// nothing before the planner has looked at the arity or the types.
+#[test]
+fn a_call_of_the_wrong_shape_is_refused_in_upstreams_words() {
+    let engine = Engine::blocking().unwrap();
+    for (q, want) in [
+        (
+            "scalar()",
+            r#"expected 1 argument(s) in call to "scalar", got 0"#,
+        ),
+        (
+            "absent(up, 1)",
+            r#"expected 1 argument(s) in call to "absent", got 2"#,
+        ),
+        (
+            "scalar(1)",
+            r#"expected type instant vector in call to function "scalar", got scalar"#,
+        ),
+    ] {
+        match engine.range_query(source().as_ref(), q, &RangeQuery::new(0, 0, 30_000)) {
+            Err(EngineError::Query(m)) => assert_eq!(m, want, "{q}"),
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn what_is_still_unsupported_is_named() {
     let engine = Engine::blocking().unwrap();

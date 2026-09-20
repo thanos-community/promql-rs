@@ -31,15 +31,17 @@ use std::time::Duration;
 
 use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
-use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
-use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
+use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
+use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, MatchOp, VectorSelector};
 
 use crate::aggregate::{self, Op};
 use crate::error::EngineError;
+use crate::function;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::params::{step_count, Params};
 use crate::range::{self, Func};
+use crate::reduce;
 use crate::selector;
 use crate::series::{LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
@@ -217,12 +219,59 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
+    /// `scalar(v)` and `absent(v)`: a whole instant vector at one step,
+    /// answered with one series.
+    ///
+    /// An aggregation over no grouping columns, which is the only shape
+    /// that still yields a row when the input has none — and a step
+    /// nothing reached is exactly what both of these have an answer for.
+    /// The labels are literals, not columns: whatever the input carried
+    /// is gone, and what replaces it is fixed while planning.
+    async fn reduce(&mut self, arg: &Expr, func: reduce::Func) -> Result<Planned, EngineError> {
+        let input = self
+            .expr(
+                arg,
+                Above {
+                    func: Some(func.as_str()),
+                    grouping: None,
+                },
+            )
+            .await?;
+        let pairs = match func {
+            reduce::Func::Scalar => Vec::new(),
+            reduce::Func::Absent => absent_labels(arg),
+        };
+        let label_names: Vec<String> = pairs.iter().map(|(name, _)| name.clone()).collect();
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .aggregate(
+                Vec::<datafusion::logical_expr::Expr>::new(),
+                vec![reduce::call(
+                    col(SAMPLES),
+                    func,
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
+            )?
+            .project(vec![
+                labels::call(pairs.into_iter().map(|(n, v)| (n, lit(v))).collect()).alias(LABELS),
+                col(SAMPLES),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
     /// A function of one range selector: `rate(x[5m])` and its family.
     ///
     /// Takes no `Above`: this call is itself what stands directly over the
     /// selector, so nothing higher reaches the store.
     async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        function::check_call(call)?;
         let name = call.func.name.as_str();
+        if let Some(func) = reduce::Func::parse(name) {
+            return self.reduce(&call.args[0], func).await;
+        }
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
         let (ms, vs) = match call.args.as_slice() {
@@ -338,6 +387,46 @@ impl Planner<'_> {
             label_names: keys,
         })
     }
+}
+
+/// The label set `absent(v)` answers with, from upstream's
+/// `createLabelsForAbsentFunction` (`promql/functions.go:2350` at
+/// 83962c35).
+///
+/// Only a selector has matchers to read, and the type switch upstream
+/// writes is literal: a parenthesis around one is not a selector, so
+/// `absent((up))` is unlabelled where `absent(up)` is not.
+///
+/// An equality matcher contributes its label unless the name has already
+/// been set, and anything else takes the name back out again — upstream
+/// keeps that rule for compatibility, so `absent(x{job="a",job="b"})`
+/// names no job rather than choosing one.
+fn absent_labels(expr: &Expr) -> Vec<(String, String)> {
+    let matchers = match expr {
+        Expr::VectorSelector(vs) => &vs.label_matchers,
+        Expr::MatrixSelector(ms) => match ms.vector_selector.as_ref() {
+            Expr::VectorSelector(vs) => &vs.label_matchers,
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut set: Vec<&str> = Vec::new();
+    for m in matchers {
+        if m.name == METRIC_NAME {
+            continue;
+        }
+        if m.op == MatchOp::Equal && !set.contains(&m.name.as_str()) {
+            out.push((m.name.clone(), m.value.clone()));
+            set.push(&m.name);
+        } else {
+            out.retain(|(name, _)| name != &m.name);
+        }
+    }
+    // `promql_labels` wants its pairs sorted; a matcher list is in the
+    // order it was written.
+    out.sort();
+    out
 }
 
 fn offset_ms(vs: &VectorSelector) -> i64 {

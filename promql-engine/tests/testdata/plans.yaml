@@ -59,3 +59,19 @@ tests:
         Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
           Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
             TableScan: selector_0
+
+  - name: absent over a selector
+    description: >
+      An aggregation with no grouping expressions, which is what makes
+      the operator answer once however many series arrive — none
+      included. The labels are literals: they come from the selector's
+      matchers while planning, not from any column.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      absent(temperature{city="oslo"})
+    plan: |
+      Projection: promql_labels(Utf8("city"), Utf8("oslo")) AS labels, samples
+        Aggregate: groupBy=[[]], aggr=[[promql_reduce(samples, Utf8("absent"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+            TableScan: selector_0

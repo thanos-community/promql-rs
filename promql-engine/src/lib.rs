@@ -39,6 +39,7 @@ pub mod memory;
 pub mod params;
 pub mod plan;
 pub mod range;
+pub mod reduce;
 pub mod scalar;
 pub mod selector;
 pub mod series;

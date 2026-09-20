@@ -133,6 +133,36 @@ fn query(c: &mut Criterion) {
     g.finish();
 }
 
+/// `scalar` and `absent` over the same shape: one pass over every
+/// series into two lanes the width of the grid, and a single row out.
+///
+/// The reduction is the same work either way, so the pair prices what
+/// separates them — `absent` emits at the steps nothing reached, which
+/// over a store that answers everywhere is no samples at all. Ids are
+/// `engine/reduce/<query>/<series>x<samples>`.
+fn reduce(c: &mut Criterion) {
+    let engine = Engine::blocking().unwrap();
+    let shape = &SHAPES[2];
+    let source = synthetic(shape);
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    let mut g = c.benchmark_group("engine/reduce");
+    g.throughput(Throughput::Elements(shape.elements()));
+    for (qname, q) in [
+        ("scalar_selector", "scalar(http_requests_total)"),
+        ("absent_selector", "absent(http_requests_total)"),
+    ] {
+        g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
+            b.iter(|| {
+                engine
+                    .range_query(source.as_ref(), black_box(q), &range)
+                    .unwrap()
+            })
+        });
+    }
+    g.finish();
+}
+
 /// Parsing and planning alone. The store's `select` runs here, so the gap
 /// to `engine/query` is execution proper.
 fn plan(c: &mut Criterion) {
@@ -168,6 +198,6 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(20);
-    targets = query, plan
+    targets = query, reduce, plan
 }
 criterion_main!(benches);
