@@ -133,6 +133,37 @@ fn query(c: &mut Criterion) {
     g.finish();
 }
 
+/// The elementwise operator's own cost, over the last hour at 30s.
+///
+/// Each case is a function wrapped round a query `engine/query` already
+/// measures, so the difference is one more projection and one pass over
+/// the values: `abs` is the cheapest of them, and `clamp` carries two
+/// scalar arguments through the same pass. Ids are
+/// `engine/elementwise/<query>/<series>x<samples>`.
+fn elementwise(c: &mut Criterion) {
+    let engine = Engine::blocking().unwrap();
+    let shape = &SHAPES[2];
+    let source = synthetic(shape);
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    let mut g = c.benchmark_group("engine/elementwise");
+    g.throughput(Throughput::Elements(shape.elements()));
+    for (qname, q) in [
+        ("abs_selector", "abs(http_requests_total)"),
+        ("clamp_selector", "clamp(http_requests_total, 0, 1000)"),
+        ("abs_rate_5m", "abs(rate(http_requests_total[5m]))"),
+    ] {
+        g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
+            b.iter(|| {
+                engine
+                    .range_query(source.as_ref(), black_box(q), &range)
+                    .unwrap()
+            })
+        });
+    }
+    g.finish();
+}
+
 /// Parsing and planning alone. The store's `select` runs here, so the gap
 /// to `engine/query` is execution proper.
 fn plan(c: &mut Criterion) {
@@ -168,6 +199,6 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(20);
-    targets = query, plan
+    targets = query, elementwise, plan
 }
 criterion_main!(benches);
