@@ -67,12 +67,20 @@ type Lexeme_ = lrlex::DefaultLexeme<u32>;
 /// perturbs the position ranges the actions compute.
 struct InjectingLexer<'lexer, 'input> {
     inner: &'lexer dyn NonStreamingLexer<'input, LexerTypes>,
+    input: &'input str,
     inject: u32,
 }
 
 impl lrpar::Lexer<LexerTypes> for InjectingLexer<'_, '_> {
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = Result<Lexeme_, lrlex::LRLexError>> + 'a> {
-        Box::new(std::iter::once(Ok(Lexeme_::new(self.inject, 0, 0))).chain(self.inner.iter()))
+        let input = self.input;
+        Box::new(
+            std::iter::once(Ok(Lexeme_::new(self.inject, 0, 0))).chain(
+                self.inner
+                    .iter()
+                    .map(move |l| l.map(|l| demote_fill_keyword(input, l))),
+            ),
+        )
     }
 }
 
@@ -88,6 +96,34 @@ impl<'input> NonStreamingLexer<'input, LexerTypes> for InjectingLexer<'_, 'input
     fn line_col(&self, span: cfgrammar::Span) -> ((usize, usize), (usize, usize)) {
         self.inner.line_col(span)
     }
+}
+
+/// `fill`, `fill_left` and `fill_right` are keywords only when the next
+/// non-space rune is `(` — upstream's `peekFollowedByLeftParen`, added
+/// so the modifiers could ship without breaking queries that already
+/// used those words as metric names. lrlex has no lookahead, so the
+/// decision moves one step downstream onto the lexeme stream; the `.l`
+/// rules and the generated grammar stay as upstream writes them.
+fn demote_fill_keyword(input: &str, lexeme: Lexeme_) -> Lexeme_ {
+    let tok = lexeme.tok_id();
+    if tok != start_tokens::FILL
+        && tok != start_tokens::FILL_LEFT
+        && tok != start_tokens::FILL_RIGHT
+    {
+        return lexeme;
+    }
+    let rest = &input[lexeme.span().end()..];
+    if rest
+        .trim_start_matches([' ', '\t', '\n', '\r'])
+        .starts_with('(')
+    {
+        return lexeme;
+    }
+    Lexeme_::new(
+        start_tokens::IDENT,
+        lexeme.span().start(),
+        lexeme.span().len(),
+    )
 }
 
 /// Which `start` alternative the grammar takes, and therefore which
@@ -142,6 +178,7 @@ fn parse_generated(input: &str, mode: ParseMode) -> Result<ParseResult, ParseErr
     };
     let injecting = InjectingLexer {
         inner: lexer.as_ref(),
+        input,
         inject: mode.start_token(),
     };
 
