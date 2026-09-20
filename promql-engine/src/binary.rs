@@ -1,6 +1,6 @@
-//! The arithmetic binary operators, and one-to-one vector matching as
-//! an aggregate function:
-//! `promql_binary(samples, __rhs, labels, '+', start, end, step)`.
+//! The binary operators between two vectors, and the matching that
+//! decides which series pair, as an aggregate function:
+//! `promql_binary(samples, __rhs, labels, '+', 'on(job) group_left()', start, end, step)`.
 //!
 //! [`Op`] is the arithmetic itself, upstream's `vectorElemBinop`
 //! (`promql/engine.go:3257` at 83962c35) restricted to the float/float
@@ -10,34 +10,37 @@
 //!
 //! # Why an aggregation and not a join
 //!
-//! Default matching pairs a left series with a right one when their
-//! label sets agree apart from `__name__`, and the result carries
-//! exactly those labels (`resultMetric` deletes nothing else for
-//! one-to-one `ignoring()`). So the match signature *is* the output
-//! label set, and grouping both sides by it gives the pairing, the
-//! output labels and the duplicate detection in one node — where a join
-//! would give the pairing and still need an aggregation to find the
-//! duplicates, which upstream reports per step rather than per series.
+//! Matching pairs a left series with a right one when their labels agree
+//! on the match signature — the `on` labels, or everything but
+//! `__name__` and the `ignoring` ones. Grouping both sides by that
+//! signature gives the pairing, the duplicate detection and the
+//! `group_left` fan-out in a single node, where a join would give the
+//! pairing and still need an aggregation to find the duplicates, which
+//! upstream reports per step rather than per series.
 //!
-//! The state is four lanes over the step grid, a count and a value per
-//! side. One-to-one means a step may hold at most one sample per side,
-//! so the counts are what the two matching errors are raised from and
-//! the values are only ever read where the count is one.
+//! # What a group holds
+//!
+//! One side of a match is the "one": at most one of its series may be
+//! in a group at any step, and [`Pairing`] keeps it as lanes over the
+//! step grid, a count and a value per step. The other side is the
+//! "many" — for `group_left` it really is many — so its series are kept
+//! one lane pair each. That is the cost of this shape: a group as wide
+//! as a `group_left` fan-out holds a lane per series of it.
 //!
 //! # Why the result is a list of series
 //!
-//! A comparison answers with the left sample as it stood, `__name__` and
-//! all, and `__name__` is exactly what the match signature forgets. Two
-//! left series that differ only in it therefore share a match group
-//! while upstream's `resultMetric` keeps them apart — and they are not a
-//! duplicate as long as their samples never meet at a step. So the
-//! aggregation carries a fifth lane, the name the left sample at each
-//! step wore, and hands back one `(name, samples)` pair per distinct
-//! name; the planner unnests that into the rows a group splits into.
-//! The shapes that drop the name intern nothing and leave through the
-//! single unnamed pair.
+//! A match group is not one output series. `group_left` answers with a
+//! series per left-hand one, and even plain one-to-one splits when the
+//! operator keeps `__name__`, which is exactly the label the signature
+//! forgets. So the aggregation builds the result label set upstream's
+//! `resultMetric` would, groups the samples under it, and hands back a
+//! `(labels, samples)` pair per distinct one; the planner unnests that
+//! into a row each. Two series of the "many" side reaching the same
+//! result labels at one step is upstream's matching error, in its own
+//! words — which words depends on the cardinality.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -69,7 +72,7 @@ pub const NAME: &str = "promql_binary";
 /// which side a series was on.
 pub const SIDE: &str = "__rhs";
 
-/// Lane index per side, so that `counts[LHS]` reads as what it is.
+/// The two sides, as the [`SIDE`] flag spells them.
 const LHS: usize = 0;
 const RHS: usize = 1;
 
@@ -199,25 +202,159 @@ impl Op {
     }
 }
 
-/// The `__name__` an output series kept, and the samples that came out
-/// under it. Field names of the struct [`udaf`] answers with.
-pub const PAIR_NAME: &str = "name";
+/// How many series on each side one match may pair, upstream's
+/// `VectorMatchCardinality` without the many-to-many the set operators
+/// alone are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Card {
+    #[default]
+    OneToOne,
+    /// `group_left`: many on the left, one on the right.
+    ManyToOne,
+    /// `group_right`: one on the left, many on the right.
+    OneToMany,
+}
+
+/// The `on`/`ignoring` and `group_left`/`group_right` modifiers, which
+/// together decide the match signature and the result's labels.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Matching {
+    pub card: Card,
+    /// `on(…)` rather than `ignoring(…)`.
+    pub on: bool,
+    /// The labels named by whichever of the two was written.
+    pub labels: Vec<String>,
+    /// The `group_left(…)` labels, copied from the "one" side.
+    pub include: Vec<String>,
+}
+
+impl Matching {
+    /// The modifiers as the query spelled them, so that a plan reads
+    /// back as PromQL. Default matching writes nothing at all.
+    pub fn literal(&self) -> String {
+        let mut out = String::new();
+        if self.on || !self.labels.is_empty() {
+            out.push_str(if self.on { "on(" } else { "ignoring(" });
+            out.push_str(&self.labels.join(", "));
+            out.push(')');
+        }
+        let group = match self.card {
+            Card::OneToOne => return out,
+            Card::ManyToOne => "group_left(",
+            Card::OneToMany => "group_right(",
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(group);
+        out.push_str(&self.include.join(", "));
+        out.push(')');
+        out
+    }
+
+    /// [`Matching::literal`] read back. Deliberately strict: anything
+    /// this cannot spell is a plan it did not write.
+    pub fn parse(s: &str) -> Option<Matching> {
+        let mut out = Matching::default();
+        let mut rest = s.trim();
+        for (prefix, on) in [("on(", true), ("ignoring(", false)] {
+            if let Some(tail) = rest.strip_prefix(prefix) {
+                let (names, tail) = tail.split_once(')')?;
+                out.on = on;
+                out.labels = split_names(names);
+                rest = tail.trim_start();
+                break;
+            }
+        }
+        if rest.is_empty() {
+            return Some(out);
+        }
+        for (prefix, card) in [
+            ("group_left(", Card::ManyToOne),
+            ("group_right(", Card::OneToMany),
+        ] {
+            if let Some(tail) = rest.strip_prefix(prefix) {
+                let (names, tail) = tail.split_once(')')?;
+                if !tail.trim().is_empty() {
+                    return None;
+                }
+                out.card = card;
+                out.include = split_names(names);
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// Which side of the union holds at most one series per group.
+    fn one_side(&self) -> usize {
+        match self.card {
+            Card::OneToMany => LHS,
+            _ => RHS,
+        }
+    }
+
+    /// The word upstream puts in the duplicate message for that side.
+    fn one_side_word(&self) -> &'static str {
+        match self.card {
+            Card::OneToMany => "left",
+            _ => "right",
+        }
+    }
+}
+
+fn split_names(names: &str) -> Vec<String> {
+    names
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The three ways a match fails, in upstream's words.
+///
+/// Exported because a UDAF can only fail with a `DataFusionError`, so
+/// the engine has to recognise these on the way out to report them as
+/// what they are: a query Prometheus also refuses, not a bug in here.
+/// [`DUPLICATE_SERIES`] is only the fixed head of its message — the
+/// rest names the group and the two series that collided.
+pub const DUPLICATE_SERIES: &str = "found duplicate series for the match group";
+pub const MULTIPLE_MATCHES: &str =
+    "multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)";
+pub const GROUPING_NOT_UNIQUE: &str =
+    "multiple matches for labels: grouping labels must ensure unique matches";
+
+/// Whether a failure out of [`udaf`] is one of them.
+pub fn is_matching_error(message: &str) -> bool {
+    message.starts_with(DUPLICATE_SERIES)
+        || message == MULTIPLE_MATCHES
+        || message == GROUPING_NOT_UNIQUE
+}
+
+/// The result label set and the samples under it, the shape [`udaf`]
+/// answers with.
+pub const PAIR_LABELS: &str = "labels";
 pub const PAIR_SAMPLES: &str = "samples";
 
-fn pair_fields() -> Fields {
+fn pair_fields(names: &[String]) -> Fields {
     Fields::from(vec![
-        Field::new(PAIR_NAME, series::label_type(), false),
+        Field::new(PAIR_LABELS, series::labels_type(names), false),
         Field::new(PAIR_SAMPLES, series::samples_type(), false),
     ])
 }
 
-fn pair_item() -> FieldRef {
-    Arc::new(Field::new("item", DataType::Struct(pair_fields()), false))
+fn pair_item(names: &[String]) -> FieldRef {
+    Arc::new(Field::new(
+        "item",
+        DataType::Struct(pair_fields(names)),
+        false,
+    ))
 }
 
 /// What one match group answers with: the series it splits into.
-pub fn output_type() -> DataType {
-    DataType::List(pair_item())
+pub fn output_type(names: &[String]) -> DataType {
+    DataType::List(pair_item(names))
 }
 
 /// The operator as a plan carries it: its PromQL spelling, with the
@@ -271,102 +408,188 @@ pub fn parse_literal(s: &str) -> Option<(Op, bool)> {
     Some((op, return_bool))
 }
 
-/// The samples one output series ends up with, timestamps beside
-/// values as the canonical shape wants them.
-type Bucket = (Vec<i64>, Vec<f64>);
+/// One series of the "many" side: its labels, and what it put at each
+/// step of the grid.
+#[derive(Debug)]
+struct Many {
+    labels: Vec<String>,
+    counts: Vec<i64>,
+    values: Vec<f64>,
+}
 
-/// One match group: what each side put at each step of the grid.
+/// One output series under construction.
+#[derive(Debug)]
+struct Bucket {
+    labels: Vec<String>,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
+    /// The step this last took a sample at, which is how two series of
+    /// the "many" side reaching it at once are caught.
+    claimed: Option<usize>,
+}
+
+/// One match group: the "one" side as lanes, the "many" side as a
+/// series each.
 #[derive(Debug)]
 struct Pairing {
     op: Op,
     return_bool: bool,
-    /// Whether the left sample's `__name__` reaches the result, so that
-    /// the group has to split by it. Only a comparison without `bool`
-    /// answers yes; the rest never intern a name.
-    named: bool,
+    matching: Matching,
     grid: Grid,
-    counts: [Vec<i64>; 2],
-    values: [Vec<f64>; 2],
-    /// The name the left sample at each step wore, as an index into
-    /// [`Pairing::pool`]. Index 0 is the empty name, which is how the
-    /// canonical shape spells a label that is not there.
-    names: Vec<u32>,
-    pool: Vec<String>,
+    /// The label columns, in the order the input struct carries them,
+    /// which is the order every label vector here is in.
+    schema: Vec<String>,
+    one_counts: Vec<i64>,
+    one_values: Vec<f64>,
+    /// Which of [`Pairing::one_pool`] the "one" side's sample at each
+    /// step came from, `-1` where it put none. Only the `group_x`
+    /// labels are read off it, but they are read per step: two series
+    /// may hold the "one" side at different steps without being a
+    /// duplicate of each other.
+    one_rows: Vec<i32>,
+    one_pool: Vec<Vec<String>>,
+    many: Vec<Many>,
     /// The match group's own labels, for the message a duplicate has to
     /// name. Every row of the group renders the same text, so the first
     /// one to arrive settles it.
     group: Option<String>,
-    /// Up to two label sets per side, again only for that message:
-    /// upstream prints the pair that collided and there is nothing to
-    /// say about a third.
-    metrics: [Vec<String>; 2],
+    /// Up to two label sets from the "one" side, again only for that
+    /// message: upstream prints the pair that collided and there is
+    /// nothing to say about a third.
+    one_metrics: Vec<String>,
 }
 
 impl Pairing {
-    fn new(op: Op, return_bool: bool, grid: Grid) -> Self {
+    fn new(op: Op, return_bool: bool, matching: Matching, grid: Grid, schema: Vec<String>) -> Self {
         Self {
             op,
             return_bool,
-            named: !op.drops_metric_name(return_bool),
+            matching,
             grid,
-            counts: [vec![0; grid.len()], vec![0; grid.len()]],
-            values: [vec![f64::NAN; grid.len()], vec![f64::NAN; grid.len()]],
-            names: vec![0; grid.len()],
-            pool: vec![String::new()],
+            schema,
+            one_counts: vec![0; grid.len()],
+            one_values: vec![f64::NAN; grid.len()],
+            one_rows: vec![-1; grid.len()],
+            one_pool: Vec::new(),
+            many: Vec::new(),
             group: None,
-            metrics: [Vec::new(), Vec::new()],
+            one_metrics: Vec::new(),
         }
     }
 
-    /// A name's lane index, added to the pool the first time it is
-    /// seen. A match group holds a handful of names at most, so the
-    /// scan is cheaper than a map would be to build.
-    fn intern(&mut self, name: &str) -> u32 {
-        if let Some(index) = self.pool.iter().position(|held| held == name) {
-            return index as u32;
+    fn intern_one(&mut self, labels: &[String]) -> i32 {
+        if let Some(index) = self.one_pool.iter().position(|held| held == labels) {
+            return index as i32;
         }
-        self.pool.push(name.to_string());
-        (self.pool.len() - 1) as u32
+        self.one_pool.push(labels.to_vec());
+        (self.one_pool.len() - 1) as i32
     }
 
-    /// Keep what a failure would have to quote, before the row's
-    /// samples are folded away into the lanes.
-    fn remember(&mut self, side: usize, labels: &StructArray, row: usize) {
-        if self.group.is_none() {
-            self.group = Some(render(labels, row, true));
+    fn intern_many(&mut self, labels: &[String]) -> usize {
+        if let Some(index) = self.many.iter().position(|held| held.labels == labels) {
+            return index;
         }
-        if self.metrics[side].len() < 2 {
-            let metric = render(labels, row, false);
-            if self.metrics[side].first() != Some(&metric) {
-                self.metrics[side].push(metric);
-            }
-        }
+        self.many.push(Many {
+            labels: labels.to_vec(),
+            counts: vec![0; self.grid.len()],
+            values: vec![f64::NAN; self.grid.len()],
+        });
+        self.many.len() - 1
     }
 
-    fn fold(&mut self, side: usize, timestamps: &[i64], values: &[f64], name: u32) -> Result<()> {
-        // `self.grid` is `Copy`, so the closure below can hold the lanes
-        // mutably while it reads the grid.
+    /// One input series folded into the group's lanes.
+    fn absorb(
+        &mut self,
+        side: usize,
+        labels: &[String],
+        timestamps: &[i64],
+        values: &[f64],
+    ) -> Result<()> {
         let grid = self.grid;
-        // Only the left side's name survives, and only where the
-        // operator keeps one.
-        let wears_a_name = self.named && side == LHS;
-        let counts = &mut self.counts[side];
-        let lanes = &mut self.values[side];
-        let names = &mut self.names;
+        if side == self.matching.one_side() {
+            self.remember(labels);
+            let row = self.intern_one(labels);
+            let (counts, lanes, rows) = (
+                &mut self.one_counts,
+                &mut self.one_values,
+                &mut self.one_rows,
+            );
+            return grid.runs(timestamps, |index, from, len| {
+                for count in &mut counts[index..index + len] {
+                    *count += 1;
+                }
+                lanes[index..index + len].copy_from_slice(&values[from..from + len]);
+                rows[index..index + len].fill(row);
+            });
+        }
+        let many = self.intern_many(labels);
+        let series = &mut self.many[many];
+        let (counts, lanes) = (&mut series.counts, &mut series.values);
         grid.runs(timestamps, |index, from, len| {
             for count in &mut counts[index..index + len] {
                 *count += 1;
             }
             lanes[index..index + len].copy_from_slice(&values[from..from + len]);
-            if wears_a_name {
-                names[index..index + len].fill(name);
+        })
+    }
+
+    /// Keep what a failure would have to quote.
+    fn remember(&mut self, labels: &[String]) {
+        if self.group.is_none() {
+            self.group = Some(self.signature_text(labels));
+        }
+        if self.one_metrics.len() < 2 {
+            let metric = print(&self.schema, labels, |_| true);
+            if self.one_metrics.first() != Some(&metric) {
+                self.one_metrics.push(metric);
+            }
+        }
+    }
+
+    /// The match group as upstream's `MatchLabels` renders it: the `on`
+    /// labels, or everything but `__name__` and the `ignoring` ones.
+    fn signature_text(&self, labels: &[String]) -> String {
+        let m = &self.matching;
+        print(&self.schema, labels, |name| {
+            if m.on {
+                m.labels.iter().any(|l| l == name)
+            } else {
+                name != METRIC_NAME && !m.labels.iter().any(|l| l == name)
             }
         })
     }
 
+    /// Upstream's `resultMetric` (`promql/engine.go:3132` at 83962c35),
+    /// in its order: the metadata labels go first where the operator
+    /// changed what the metric means, then one-to-one narrows to the
+    /// match labels, then the `group_x` labels are copied over from the
+    /// "one" side — or deleted where it has none.
+    fn result_labels(&self, many: usize, one: i32) -> Vec<String> {
+        let mut out = self.many[many].labels.clone();
+        let m = &self.matching;
+        for (index, name) in self.schema.iter().enumerate() {
+            // `on` keeps only what it names and `ignoring` drops only
+            // what it names, which is one test: the label goes where
+            // being named is not what the modifier wanted.
+            let drop = (name == METRIC_NAME && self.op.drops_metric_name(self.return_bool))
+                || (m.card == Card::OneToOne && m.on != m.labels.iter().any(|l| l == name));
+            if drop {
+                out[index].clear();
+            }
+        }
+        for name in &m.include {
+            if let Some(index) = self.schema.iter().position(|held| held == name) {
+                out[index] = match one {
+                    -1 => String::new(),
+                    one => self.one_pool[one as usize][index].clone(),
+                };
+            }
+        }
+        out
+    }
+
     /// Upstream's message for two series on the "one" side of a match
-    /// (`promql/engine.go:2999` at 83962c35). For one-to-one matching
-    /// that side is always the right one.
+    /// (`promql/engine.go:2999` at 83962c35).
     ///
     /// The pair inside the brackets is the first two label sets this
     /// group saw on that side, which is arrival order and not
@@ -379,17 +602,98 @@ impl Pairing {
     /// pair would be a flake waiting to happen.
     fn duplicate(&self) -> DataFusionError {
         let group = self.group.as_deref().unwrap_or("{}");
-        let metrics = &self.metrics[RHS];
+        let side = self.matching.one_side_word();
         // Upstream names the series it collided on first and the one
         // already held second; a side with fewer than two is out of
         // reach here, and an empty string is all there would be to say.
-        let second = metrics.get(1).map(String::as_str).unwrap_or_default();
-        let first = metrics.first().map(String::as_str).unwrap_or_default();
+        let second = self.one_metrics.get(1).map(String::as_str).unwrap_or("");
+        let first = self.one_metrics.first().map(String::as_str).unwrap_or("");
         DataFusionError::Execution(format!(
-            "found duplicate series for the match group {group} on the right hand-side of the \
+            "{DUPLICATE_SERIES} {group} on the {side} hand-side of the \
              operation: [{second}, {first}];many-to-many matching not allowed: matching labels \
              must be unique on one side"
         ))
+    }
+
+    /// The step grid walked once, in upstream's order: a duplicate on
+    /// the "one" side is reported before a "many" side that matched
+    /// twice, and both before any value is emitted.
+    ///
+    /// A step whose "many" side is empty is skipped rather than checked,
+    /// which is where this parts company with upstream: there the
+    /// short-circuit is on the whole vector, so a duplicate in *this*
+    /// match group still fails the query as long as some other group
+    /// had a sample on the "many" side at that step. Seeing that would
+    /// take a second pass over every group.
+    fn pairs(&self) -> Result<Vec<Bucket>> {
+        let mut buckets: Vec<Bucket> = Vec::new();
+        let mut by_labels: HashMap<Vec<String>, usize> = HashMap::new();
+        let mut by_pair: HashMap<(usize, i32), usize> = HashMap::new();
+        let one_to_one = self.matching.card == Card::OneToOne;
+
+        for step in 0..self.grid.len() {
+            let total: i64 = self.many.iter().map(|series| series.counts[step]).sum();
+            if total == 0 {
+                continue;
+            }
+            if self.one_counts[step] > 1 {
+                return Err(self.duplicate());
+            }
+            if self.one_counts[step] == 0 {
+                continue;
+            }
+            // One to one is the cardinality that says there is nothing
+            // to fan out over, so a second series here is the query
+            // asking for a fan-out without saying so.
+            if one_to_one && total > 1 {
+                return Err(DataFusionError::Execution(MULTIPLE_MATCHES.into()));
+            }
+            let one = self.one_rows[step];
+            for many in 0..self.many.len() {
+                if self.many[many].counts[step] == 0 {
+                    continue;
+                }
+                let bucket = match by_pair.get(&(many, one)) {
+                    Some(bucket) => *bucket,
+                    None => {
+                        let labels = self.result_labels(many, one);
+                        let bucket = *by_labels.entry(labels.clone()).or_insert_with(|| {
+                            buckets.push(Bucket {
+                                labels,
+                                timestamps: Vec::new(),
+                                values: Vec::new(),
+                                claimed: None,
+                            });
+                            buckets.len() - 1
+                        });
+                        by_pair.insert((many, one), bucket);
+                        bucket
+                    }
+                };
+                // The claim happens before the comparison is applied,
+                // because upstream checks the match before it decides
+                // whether the sample survives the operator.
+                if buckets[bucket].claimed == Some(step) {
+                    return Err(DataFusionError::Execution(GROUPING_NOT_UNIQUE.into()));
+                }
+                buckets[bucket].claimed = Some(step);
+
+                let (lhs, rhs) = match self.matching.one_side() {
+                    LHS => (self.one_values[step], self.many[many].values[step]),
+                    _ => (self.many[many].values[step], self.one_values[step]),
+                };
+                if let Some(value) = self.op.value(lhs, rhs, self.return_bool) {
+                    buckets[bucket].timestamps.push(self.grid.timestamp(step));
+                    buckets[bucket].values.push(value);
+                }
+            }
+        }
+
+        buckets.retain(|bucket| !bucket.timestamps.is_empty());
+        // Sorted, because DataFusion is free to hand the rows of a
+        // group over in any order and the answer must not be.
+        buckets.sort_by(|a, b| a.labels.cmp(&b.labels));
+        Ok(buckets)
     }
 }
 
@@ -427,84 +731,23 @@ impl Accumulator for Pairing {
             } else {
                 LHS
             };
-            self.remember(which, labels, row);
-            let name = if self.named && which == LHS {
-                self.intern(name_of(labels, row))
-            } else {
-                0
-            };
+            let labels = read_labels(&self.schema, labels, row);
             let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
-            self.fold(which, &timestamps[lo..hi], &samples[lo..hi], name)?;
+            self.absorb(which, &labels, &timestamps[lo..hi], &samples[lo..hi])?;
         }
         Ok(())
     }
 
-    /// The step grid walked once, in upstream's order: a duplicate on
-    /// the "one" side is reported before a left side that matched twice,
-    /// and both before any value is emitted.
-    ///
-    /// A step whose left side is empty is skipped rather than checked,
-    /// which is where this parts company with upstream: there the
-    /// short-circuit is on the whole vector, so a duplicate in *this*
-    /// match group still fails the query as long as some other group
-    /// had a left-hand sample at that step. Seeing that would take a
-    /// second pass over every group.
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        // One bucket per name the left side wore. The shapes that drop
-        // the name never intern, so they all land in bucket 0 and the
-        // group answers with the single series it always did.
-        let mut buckets: Vec<Bucket> = (0..self.pool.len())
-            .map(|_| (Vec::new(), Vec::new()))
-            .collect();
-        for step in 0..self.grid.len() {
-            let (left, right) = (self.counts[LHS][step], self.counts[RHS][step]);
-            if left == 0 {
-                continue;
-            }
-            if right > 1 {
-                return Err(self.duplicate());
-            }
-            if right == 0 {
-                continue;
-            }
-            if left > 1 {
-                return Err(DataFusionError::Execution(
-                    "multiple matches for labels: many-to-one matching must be explicit \
-                     (group_left/group_right)"
-                        .into(),
-                ));
-            }
-            // A comparison that does not hold leaves the step out
-            // entirely, which is what upstream's `keep` decides.
-            if let Some(value) = self.op.value(
-                self.values[LHS][step],
-                self.values[RHS][step],
-                self.return_bool,
-            ) {
-                let bucket = &mut buckets[self.names[step] as usize];
-                bucket.0.push(self.grid.timestamp(step));
-                bucket.1.push(value);
-            }
-        }
+        let buckets = self.pairs()?;
 
-        // Sorted by name, because DataFusion is free to hand the rows
-        // of a group over in any order and the answer must not be.
-        let mut out: Vec<(&str, &Bucket)> = self
-            .pool
-            .iter()
-            .map(String::as_str)
-            .zip(buckets.iter())
-            .filter(|(_, bucket)| !bucket.0.is_empty())
-            .collect();
-        out.sort_by_key(|(name, _)| *name);
-
-        let mut offsets = Vec::with_capacity(out.len() + 1);
+        let mut offsets = Vec::with_capacity(buckets.len() + 1);
         offsets.push(0i32);
         let mut timestamps = Vec::new();
         let mut values = Vec::new();
-        for (_, bucket) in &out {
-            timestamps.extend_from_slice(&bucket.0);
-            values.extend_from_slice(&bucket.1);
+        for bucket in &buckets {
+            timestamps.extend_from_slice(&bucket.timestamps);
+            values.extend_from_slice(&bucket.values);
             offsets.push(timestamps.len() as i32);
         }
         let entries = StructArray::new(
@@ -521,50 +764,78 @@ impl Accumulator for Pairing {
             Arc::new(entries),
             None,
         );
-        let names: Vec<&str> = out.iter().map(|(name, _)| *name).collect();
+
+        // Rebuilt through `series::labels_type` rather than from the
+        // input's own fields, so that the struct this hands back is the
+        // one `promql_labels` would have built for the same names.
+        let DataType::Struct(fields) = series::labels_type(&self.schema) else {
+            unreachable!("a labels type is a struct")
+        };
+        let columns: Vec<ArrayRef> = fields
+            .iter()
+            .map(|field| {
+                let index = self
+                    .schema
+                    .iter()
+                    .position(|name| name == field.name())
+                    .expect("every field of the labels type is a column of the schema");
+                let values: Vec<&str> = buckets
+                    .iter()
+                    .map(|bucket| bucket.labels[index].as_str())
+                    .collect();
+                Arc::new(StringViewArray::from(values)) as ArrayRef
+            })
+            .collect();
+        let labels = match fields.is_empty() {
+            true => StructArray::new_empty_fields(buckets.len(), None),
+            false => StructArray::new(fields, columns, None),
+        };
+
         let pairs = StructArray::new(
-            pair_fields(),
-            vec![Arc::new(StringViewArray::from(names)), Arc::new(samples)],
+            pair_fields(&self.schema),
+            vec![Arc::new(labels), Arc::new(samples)],
             None,
         );
-        Ok(one_row(pair_item(), Arc::new(pairs)))
+        Ok(one_row(pair_item(&self.schema), Arc::new(pairs)))
     }
 
+    /// Flat lists throughout: the "many" side is a rectangle of rows by
+    /// steps, and the label sets a rectangle of rows by columns, so a
+    /// partial travels as the same handful of primitive lanes whatever
+    /// the query's label schema is.
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let mut out = Vec::with_capacity(STATE_NAMES.len());
-        for side in [LHS, RHS] {
-            out.push(one_row(
-                state_item(STATE_NAMES[side].counts, DataType::Int64),
-                Arc::new(Int64Array::from(self.counts[side].clone())),
-            ));
-            out.push(one_row(
-                state_item(STATE_NAMES[side].values, DataType::Float64),
-                Arc::new(Float64Array::from(self.values[side].clone())),
-            ));
-            out.push(one_row(
-                state_item(STATE_NAMES[side].metrics, DataType::Utf8),
-                Arc::new(StringArray::from(self.metrics[side].clone())),
-            ));
+        let width = self.schema.len();
+        let mut many_labels: Vec<&str> = Vec::with_capacity(self.many.len() * width);
+        let mut many_counts: Vec<i64> = Vec::with_capacity(self.many.len() * self.grid.len());
+        let mut many_values: Vec<f64> = Vec::with_capacity(many_counts.capacity());
+        for series in &self.many {
+            many_labels.extend(series.labels.iter().map(String::as_str));
+            many_counts.extend_from_slice(&series.counts);
+            many_values.extend_from_slice(&series.values);
         }
-        out.push(ScalarValue::Utf8(self.group.clone()));
-        // The lane spelled out, rather than pool plus indices: the
-        // indices of two partials mean different things, and a string
-        // per step needs no remapping on the way back in. Empty when
-        // no name can reach the result, so the common shapes carry no
-        // lane at all.
-        let lane: Vec<&str> = match self.named {
-            true => self
-                .names
-                .iter()
-                .map(|i| self.pool[*i as usize].as_str())
-                .collect(),
-            false => Vec::new(),
-        };
-        out.push(one_row(
-            state_item(STATE_LHS_NAMES, DataType::Utf8),
-            Arc::new(StringArray::from(lane)),
-        ));
-        Ok(out)
+        let one_pool: Vec<&str> = self
+            .one_pool
+            .iter()
+            .flat_map(|labels| labels.iter().map(String::as_str))
+            .collect();
+
+        Ok(vec![
+            int_lane(STATE_ONE_COUNTS, self.one_counts.clone()),
+            float_lane(STATE_ONE_VALUES, self.one_values.clone()),
+            int_lane(
+                STATE_ONE_ROWS,
+                self.one_rows.iter().map(|row| *row as i64).collect(),
+            ),
+            text_lane(STATE_ONE_POOL, one_pool),
+            text_lane(
+                STATE_ONE_METRICS,
+                self.one_metrics.iter().map(String::as_str).collect(),
+            ),
+            text_lane(STATE_MANY_LABELS, many_labels),
+            int_lane(STATE_MANY_COUNTS, many_counts),
+            float_lane(STATE_MANY_VALUES, many_values),
+            ScalarValue::Utf8(self.group.clone()),
+        ])
     }
 
     /// Lanes added position by position, as in [`crate::aggregate`]. A
@@ -572,79 +843,87 @@ impl Accumulator for Pairing {
     /// one partial saw that sample, so any partial that saw something
     /// carries the value.
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        for side in [LHS, RHS] {
-            let counts = lanes::<Int64Type>(states.get(side * 3), STATE_NAMES[side].counts)?;
-            let values = lanes::<Float64Type>(states.get(side * 3 + 1), STATE_NAMES[side].values)?;
-            if counts.len() != values.len() {
+        let steps = self.grid.len();
+        let width = self.schema.len();
+
+        let one_counts = lanes::<Int64Type>(states.first(), STATE_ONE_COUNTS)?;
+        let one_values = lanes::<Float64Type>(states.get(1), STATE_ONE_VALUES)?;
+        let one_rows = lanes::<Int64Type>(states.get(2), STATE_ONE_ROWS)?;
+        let one_pool = texts(states.get(3), STATE_ONE_POOL)?;
+        for row in 0..one_counts.len() {
+            let counts = one_counts.value(row);
+            let counts = counts.as_primitive::<Int64Type>();
+            let values = one_values.value(row);
+            let values = values.as_primitive::<Float64Type>();
+            let rows = one_rows.value(row);
+            let rows = rows.as_primitive::<Int64Type>();
+            if counts.len() != steps || values.len() != steps || rows.len() != steps {
                 return Err(DataFusionError::Internal(format!(
-                    "{NAME}: partial state has {} count rows and {} value rows",
-                    counts.len(),
-                    values.len()
+                    "{NAME}: partial state is {} steps, not the {steps} of this grid",
+                    counts.len()
                 )));
             }
-            for row in 0..counts.len() {
-                let (count_row, value_row) = (counts.value(row), values.value(row));
-                let c = count_row.as_primitive::<Int64Type>();
-                let v = value_row.as_primitive::<Float64Type>();
-                if c.len() != self.grid.len() || v.len() != self.grid.len() {
-                    return Err(DataFusionError::Internal(format!(
-                        "{NAME}: partial state is {} steps, not the {} of this grid",
-                        c.len(),
-                        self.grid.len()
-                    )));
-                }
-                for step in 0..self.grid.len() {
-                    if c.value(step) > 0 {
-                        self.counts[side][step] += c.value(step);
-                        self.values[side][step] = v.value(step);
-                    }
-                }
+            let pool = rectangle(&one_pool.value(row), width, NO_ROWS)?;
+            let mut seen: Vec<i32> = Vec::with_capacity(pool.len());
+            for labels in &pool {
+                seen.push(self.intern_one(labels));
             }
-            let metrics = states
-                .get(side * 3 + 2)
-                .and_then(|s| s.as_list_opt::<i32>());
-            if let Some(metrics) = metrics {
-                for row in 0..metrics.len() {
-                    let held = metrics.value(row);
-                    let held = held.as_string::<i32>();
-                    for i in 0..held.len() {
-                        if self.metrics[side].len() < 2
-                            && self.metrics[side].first().map(String::as_str) != Some(held.value(i))
-                        {
-                            self.metrics[side].push(held.value(i).to_string());
-                        }
+            for step in 0..steps {
+                if counts.value(step) > 0 {
+                    self.one_counts[step] += counts.value(step);
+                    self.one_values[step] = values.value(step);
+                    let held = rows.value(step);
+                    if held >= 0 {
+                        self.one_rows[step] = *seen
+                            .get(held as usize)
+                            .ok_or_else(|| self.corrupt("a one-side row out of its pool"))?;
                     }
                 }
             }
         }
-        if let Some(group) = states.get(6).and_then(|s| s.as_string_opt::<i32>()) {
+
+        let many_labels = texts(states.get(5), STATE_MANY_LABELS)?;
+        let many_counts = lanes::<Int64Type>(states.get(6), STATE_MANY_COUNTS)?;
+        let many_values = lanes::<Float64Type>(states.get(7), STATE_MANY_VALUES)?;
+        for row in 0..many_counts.len() {
+            let counts = many_counts.value(row);
+            let counts = counts.as_primitive::<Int64Type>();
+            let values = many_values.value(row);
+            let values = values.as_primitive::<Float64Type>();
+            let rows = counts.len() / steps.max(1);
+            if counts.len() != rows * steps || values.len() != counts.len() {
+                return Err(self.corrupt("a many-side rectangle that is not rows by steps"));
+            }
+            let labels = rectangle(&many_labels.value(row), width, rows)?;
+            for (index, labels) in labels.iter().enumerate() {
+                let many = self.intern_many(labels);
+                for step in 0..steps {
+                    let at = index * steps + step;
+                    if counts.value(at) > 0 {
+                        self.many[many].counts[step] += counts.value(at);
+                        self.many[many].values[step] = values.value(at);
+                    }
+                }
+            }
+        }
+
+        if let Some(metrics) = states.get(4).and_then(|s| s.as_list_opt::<i32>()) {
+            for row in 0..metrics.len() {
+                let held = metrics.value(row);
+                let held = held.as_string::<i32>();
+                for i in 0..held.len() {
+                    if self.one_metrics.len() < 2
+                        && self.one_metrics.first().map(String::as_str) != Some(held.value(i))
+                    {
+                        self.one_metrics.push(held.value(i).to_string());
+                    }
+                }
+            }
+        }
+        if let Some(group) = states.get(8).and_then(|s| s.as_string_opt::<i32>()) {
             for row in 0..group.len() {
                 if self.group.is_none() && group.is_valid(row) {
                     self.group = Some(group.value(row).to_string());
-                }
-            }
-        }
-        if let Some(lanes) = states.get(7).and_then(|s| s.as_list_opt::<i32>()) {
-            for row in 0..lanes.len() {
-                let lane = lanes.value(row);
-                let lane = lane.as_string::<i32>();
-                // A partial that carried no name says so by carrying no
-                // lane; anything else is a state from another grid.
-                if lane.is_empty() {
-                    continue;
-                }
-                if lane.len() != self.grid.len() {
-                    return Err(DataFusionError::Internal(format!(
-                        "{NAME}: partial name lane is {} steps, not the {} of this grid",
-                        lane.len(),
-                        self.grid.len()
-                    )));
-                }
-                for step in 0..lane.len() {
-                    if !lane.value(step).is_empty() {
-                        let id = self.intern(lane.value(step));
-                        self.names[step] = id;
-                    }
                 }
             }
         }
@@ -652,48 +931,111 @@ impl Accumulator for Pairing {
     }
 
     fn size(&self) -> usize {
-        let lanes: usize = self
-            .counts
-            .iter()
-            .map(|c| c.capacity() * std::mem::size_of::<i64>())
-            .sum::<usize>()
-            + self
-                .values
-                .iter()
-                .map(|v| v.capacity() * std::mem::size_of::<f64>())
-                .sum::<usize>()
-            + self.names.capacity() * std::mem::size_of::<u32>()
-            + self.pool.iter().map(String::capacity).sum::<usize>();
-        std::mem::size_of::<Self>() + lanes
+        let lane = self.grid.len() * (std::mem::size_of::<i64>() + std::mem::size_of::<f64>());
+        std::mem::size_of::<Self>()
+            + lane
+            + self.grid.len() * std::mem::size_of::<i32>()
+            + self.many.len() * lane
+            + (self.many.len() + self.one_pool.len())
+                * self.schema.len()
+                * std::mem::size_of::<String>()
     }
 }
 
-/// One side's partial-state field names.
-struct StateNames {
-    counts: &'static str,
-    values: &'static str,
-    metrics: &'static str,
+impl Pairing {
+    fn corrupt(&self, what: &str) -> DataFusionError {
+        DataFusionError::Internal(format!("{NAME}: partial state holds {what}"))
+    }
 }
+
+/// Row count of a label rectangle is derived from its length where the
+/// caller does not already know it, which a zero-width schema makes
+/// impossible — so the caller says which case it is.
+const NO_ROWS: usize = usize::MAX;
+
+/// A flat run of label values read back as one label set per row.
+fn rectangle(flat: &ArrayRef, width: usize, rows: usize) -> Result<Vec<Vec<String>>> {
+    let flat = flat.as_string::<i32>();
+    if width == 0 {
+        // Every label set is the empty one, so a pool of them holds
+        // exactly one entry and a rectangle holds as many as the
+        // caller counted.
+        return Ok(vec![Vec::new(); if rows == NO_ROWS { 1 } else { rows }]);
+    }
+    if !flat.len().is_multiple_of(width) {
+        return Err(DataFusionError::Internal(format!(
+            "{NAME}: {} label values are not a multiple of the {width} columns",
+            flat.len()
+        )));
+    }
+    Ok((0..flat.len() / width)
+        .map(|row| {
+            (0..width)
+                .map(|column| flat.value(row * width + column).to_string())
+                .collect()
+        })
+        .collect())
+}
+
+/// One row of a label struct as the vector of values this module works
+/// in, in the schema's order.
+fn read_labels(schema: &[String], labels: &StructArray, row: usize) -> Vec<String> {
+    schema
+        .iter()
+        .map(|name| match labels.column_by_name(name) {
+            Some(column) => match column.data_type() {
+                DataType::Utf8View => column.as_string_view().value(row).to_string(),
+                DataType::Utf8 => column.as_string::<i32>().value(row).to_string(),
+                _ => String::new(),
+            },
+            None => String::new(),
+        })
+        .collect()
+}
+
+/// A label set as Prometheus prints one, keeping the names `wanted`
+/// answers for. An empty value is how the canonical shape spells a
+/// label that is not there, so it prints as nothing at all.
+fn print(schema: &[String], labels: &[String], mut wanted: impl FnMut(&str) -> bool) -> String {
+    let mut out = String::from("{");
+    for (name, value) in schema.iter().zip(labels) {
+        if value.is_empty() || !wanted(name) {
+            continue;
+        }
+        if out.len() > 1 {
+            out.push_str(", ");
+        }
+        out.push_str(name);
+        out.push_str("=\"");
+        out.push_str(value);
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
+const STATE_ONE_COUNTS: &str = "one_counts";
+const STATE_ONE_VALUES: &str = "one_values";
+const STATE_ONE_ROWS: &str = "one_rows";
+const STATE_ONE_POOL: &str = "one_pool";
+const STATE_ONE_METRICS: &str = "one_metrics";
+const STATE_MANY_LABELS: &str = "many_labels";
+const STATE_MANY_COUNTS: &str = "many_counts";
+const STATE_MANY_VALUES: &str = "many_values";
+const STATE_GROUP: &str = "group";
 
 /// Named once so that a rename fails to compile at both ends rather
 /// than mismatching across a partial/final plan boundary.
-const STATE_NAMES: [StateNames; 2] = [
-    StateNames {
-        counts: "lhs_counts",
-        values: "lhs_values",
-        metrics: "lhs_metrics",
-    },
-    StateNames {
-        counts: "rhs_counts",
-        values: "rhs_values",
-        metrics: "rhs_metrics",
-    },
+const STATE_LANES: [(&str, DataType); 8] = [
+    (STATE_ONE_COUNTS, DataType::Int64),
+    (STATE_ONE_VALUES, DataType::Float64),
+    (STATE_ONE_ROWS, DataType::Int64),
+    (STATE_ONE_POOL, DataType::Utf8),
+    (STATE_ONE_METRICS, DataType::Utf8),
+    (STATE_MANY_LABELS, DataType::Utf8),
+    (STATE_MANY_COUNTS, DataType::Int64),
+    (STATE_MANY_VALUES, DataType::Float64),
 ];
-
-const STATE_GROUP: &str = "group";
-
-/// Only the left side has one, so it sits outside [`STATE_NAMES`].
-const STATE_LHS_NAMES: &str = "lhs_names";
 
 fn state_item(name: &str, of: DataType) -> FieldRef {
     Arc::new(Field::new(name, of, false))
@@ -701,6 +1043,27 @@ fn state_item(name: &str, of: DataType) -> FieldRef {
 
 fn state_type(name: &str, of: DataType) -> DataType {
     DataType::List(state_item(name, of))
+}
+
+fn int_lane(name: &str, values: Vec<i64>) -> ScalarValue {
+    one_row(
+        state_item(name, DataType::Int64),
+        Arc::new(Int64Array::from(values)),
+    )
+}
+
+fn float_lane(name: &str, values: Vec<f64>) -> ScalarValue {
+    one_row(
+        state_item(name, DataType::Float64),
+        Arc::new(Float64Array::from(values)),
+    )
+}
+
+fn text_lane(name: &str, values: Vec<&str>) -> ScalarValue {
+    one_row(
+        state_item(name, DataType::Utf8),
+        Arc::new(StringArray::from(values)),
+    )
 }
 
 /// One list value holding `entries` whole: the single row an
@@ -724,17 +1087,12 @@ fn child<'a, T: 'static>(entries: &'a StructArray, name: &str) -> Result<&'a T> 
         })
 }
 
-/// One state column as the list of per-step lanes it must be.
+/// One state column as the list of lanes it must be.
 fn lanes<T: datafusion::arrow::datatypes::ArrowPrimitiveType>(
     state: Option<&ArrayRef>,
     name: &str,
 ) -> Result<ListArray> {
-    let list = state
-        .and_then(|s| s.as_list_opt::<i32>())
-        .ok_or_else(|| {
-            DataFusionError::Internal(format!("{NAME}: partial state column {name} is not a list"))
-        })?
-        .clone();
+    let list = list_state(state, name)?;
     if list.values().as_primitive_opt::<T>().is_none() {
         return Err(DataFusionError::Internal(format!(
             "{NAME}: partial state column {name} holds {}",
@@ -744,51 +1102,24 @@ fn lanes<T: datafusion::arrow::datatypes::ArrowPrimitiveType>(
     Ok(list)
 }
 
-/// One row's `__name__`, or the empty string where the operand has no
-/// such label at all — which is the same thing in the canonical shape.
-fn name_of(labels: &StructArray, row: usize) -> &str {
-    let Some(column) = labels.column_by_name(METRIC_NAME) else {
-        return "";
-    };
-    match column.data_type() {
-        DataType::Utf8View => column.as_string_view().value(row),
-        DataType::Utf8 => column.as_string::<i32>().value(row),
-        _ => "",
+fn texts(state: Option<&ArrayRef>, name: &str) -> Result<ListArray> {
+    let list = list_state(state, name)?;
+    if list.values().as_string_opt::<i32>().is_none() {
+        return Err(DataFusionError::Internal(format!(
+            "{NAME}: partial state column {name} holds {}",
+            list.values().data_type()
+        )));
     }
+    Ok(list)
 }
 
-/// One row of a label struct as Prometheus prints a label set.
-///
-/// `without_name` gives the match group, which is the same label set
-/// with `__name__` taken out — upstream's `MatchLabels(false)` for
-/// default matching. An empty value is how the canonical shape spells a
-/// label that is not there, so it prints as nothing at all rather than
-/// as `l=""`.
-fn render(labels: &StructArray, row: usize, without_name: bool) -> String {
-    let mut out = String::from("{");
-    for (index, name) in labels.column_names().into_iter().enumerate() {
-        if without_name && name == METRIC_NAME {
-            continue;
-        }
-        let column = labels.column(index);
-        let value = match column.data_type() {
-            DataType::Utf8View => column.as_string_view().value(row),
-            DataType::Utf8 => column.as_string::<i32>().value(row),
-            _ => continue,
-        };
-        if value.is_empty() {
-            continue;
-        }
-        if out.len() > 1 {
-            out.push_str(", ");
-        }
-        out.push_str(name);
-        out.push_str("=\"");
-        out.push_str(value);
-        out.push('"');
-    }
-    out.push('}');
-    out
+fn list_state(state: Option<&ArrayRef>, name: &str) -> Result<ListArray> {
+    Ok(state
+        .and_then(|s| s.as_list_opt::<i32>())
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!("{NAME}: partial state column {name} is not a list"))
+        })?
+        .clone())
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -801,7 +1132,7 @@ impl Default for Binary {
         // Not `exact`: the label struct's type is the query's own label
         // set, so only the count of arguments is fixed.
         Self {
-            signature: Signature::any(7, Volatility::Immutable),
+            signature: Signature::any(8, Volatility::Immutable),
         }
     }
 }
@@ -810,13 +1141,13 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(Binary::default())
 }
 
-/// `promql_binary(samples, <side>, labels, '<op>', start, end, step)`.
+/// `promql_binary(samples, <side>, labels, '<op>', '<matching>', …grid)`.
 ///
 /// The grid is an argument for the same reason [`crate::aggregate`]
 /// takes one: it turns a timestamp into a lane index. `labels` is the
 /// *input's* label set, `__name__` included, not the grouping's: the
-/// name a comparison keeps is read off it, and so is the label set a
-/// failure has to quote.
+/// result's labels are built from it, and so is the label set a failure
+/// has to quote.
 #[allow(clippy::too_many_arguments)]
 pub fn call(
     samples: Expr,
@@ -824,6 +1155,7 @@ pub fn call(
     labels: Expr,
     op: Op,
     return_bool: bool,
+    matching: &Matching,
     start_ms: i64,
     end_ms: i64,
     step_ms: i64,
@@ -833,13 +1165,23 @@ pub fn call(
         side,
         labels,
         lit(literal(op, return_bool)),
+        lit(matching.literal()),
         lit(start_ms),
         lit(end_ms),
         lit(step_ms),
     ])
 }
 
-/// The operator and the grid, read back off the planned call.
+/// The label column names of a labels struct, in schema order.
+fn names_of(labels: &DataType) -> Option<Vec<String>> {
+    match labels {
+        DataType::Struct(fields) => Some(fields.iter().map(|f| f.name().clone()).collect()),
+        _ => None,
+    }
+}
+
+/// The operator, the matching and the grid, read back off the planned
+/// call.
 fn from_args(args: &AccumulatorArgs) -> Result<Pairing> {
     let literal = |i: usize| {
         args.exprs
@@ -847,17 +1189,21 @@ fn from_args(args: &AccumulatorArgs) -> Result<Pairing> {
             .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
             .map(Literal::value)
     };
-    let (op, return_bool) = literal(3)
-        .and_then(|v| match v {
-            ScalarValue::Utf8(Some(s)) => parse_literal(s.as_str()),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "{NAME}: fourth argument must be a binary operator as a string literal"
-            ))
-        })?;
-    let grid = |i: usize, what: &str| {
+    let text = |i: usize| match literal(i) {
+        Some(ScalarValue::Utf8(Some(s))) => Some(s.as_str()),
+        _ => None,
+    };
+    let (op, return_bool) = text(3).and_then(parse_literal).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{NAME}: fourth argument must be a binary operator as a string literal"
+        ))
+    })?;
+    let matching = text(4).and_then(Matching::parse).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{NAME}: fifth argument must be the matching modifiers as a string literal"
+        ))
+    })?;
+    let number = |i: usize, what: &str| {
         literal(i)
             .and_then(|v| match v {
                 ScalarValue::Int64(Some(n)) => Some(*n),
@@ -867,8 +1213,24 @@ fn from_args(args: &AccumulatorArgs) -> Result<Pairing> {
                 DataFusionError::Plan(format!("{NAME}: {what} must be an Int64 literal"))
             })
     };
-    let grid = Grid::new(NAME, grid(4, "start")?, grid(5, "end")?, grid(6, "step")?)?;
-    Ok(Pairing::new(op, return_bool, grid))
+    let grid = Grid::new(
+        NAME,
+        number(5, "start")?,
+        number(6, "end")?,
+        number(7, "step")?,
+    )?;
+    let schema = args
+        .exprs
+        .get(2)
+        .ok_or_else(|| DataFusionError::Plan(format!("{NAME}: no labels argument")))?
+        .data_type(args.schema)
+        .ok()
+        .as_ref()
+        .and_then(names_of)
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("{NAME}: third argument must be a label struct"))
+        })?;
+    Ok(Pairing::new(op, return_bool, matching, grid, schema))
 }
 
 impl AggregateUDFImpl for Binary {
@@ -891,10 +1253,10 @@ impl AggregateUDFImpl for Binary {
         if !matches!(arg_types.get(1), Some(DataType::Boolean)) {
             return plan_err!("{NAME}: second argument must say which side a row is on");
         }
-        if !matches!(arg_types.get(2), Some(DataType::Struct(_))) {
+        let Some(names) = arg_types.get(2).and_then(names_of) else {
             return plan_err!("{NAME}: third argument must be a label struct");
-        }
-        Ok(output_type())
+        };
+        Ok(output_type(&names))
     }
 
     /// A match group with nothing to pair answers with an empty list,
@@ -911,33 +1273,20 @@ impl AggregateUDFImpl for Binary {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        let mut fields = Vec::with_capacity(8);
-        for names in &STATE_NAMES {
-            fields.push(Arc::new(Field::new(
-                format_state_name(args.name, names.counts),
-                state_type(names.counts, DataType::Int64),
-                false,
-            )));
-            fields.push(Arc::new(Field::new(
-                format_state_name(args.name, names.values),
-                state_type(names.values, DataType::Float64),
-                false,
-            )));
-            fields.push(Arc::new(Field::new(
-                format_state_name(args.name, names.metrics),
-                state_type(names.metrics, DataType::Utf8),
-                false,
-            )));
-        }
+        let mut fields: Vec<FieldRef> = STATE_LANES
+            .iter()
+            .map(|(name, of)| {
+                Arc::new(Field::new(
+                    format_state_name(args.name, name),
+                    state_type(name, of.clone()),
+                    false,
+                )) as FieldRef
+            })
+            .collect();
         fields.push(Arc::new(Field::new(
             format_state_name(args.name, STATE_GROUP),
             DataType::Utf8,
             true,
-        )));
-        fields.push(Arc::new(Field::new(
-            format_state_name(args.name, STATE_LHS_NAMES),
-            state_type(STATE_LHS_NAMES, DataType::Utf8),
-            false,
         )));
         Ok(fields)
     }
@@ -945,24 +1294,55 @@ impl AggregateUDFImpl for Binary {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::StringViewArray;
-    use datafusion::arrow::datatypes::Fields;
-
     use super::*;
 
-    fn pairing(op: Op) -> Pairing {
-        Pairing::new(op, false, Grid::new(NAME, 0, 30_000, 10_000).unwrap())
+    /// The label schema every pairing below works in, sorted as the
+    /// canonical struct sorts it, so an expected label vector reads in
+    /// the order the output carries.
+    const SCHEMA: [&str; 4] = [METRIC_NAME, "path", "pod", "zone"];
+
+    fn names(of: &[&str]) -> Vec<String> {
+        of.iter().map(|n| n.to_string()).collect()
     }
 
-    /// Every output series of one match group: the name it kept and the
-    /// samples under it, in the order the accumulator promised.
-    fn pairs_of(value: ScalarValue) -> Vec<(String, Vec<(i64, f64)>)> {
+    /// One label set in [`SCHEMA`]'s order; `""` is a label the series
+    /// does not carry.
+    fn lset(name: &str, path: &str, pod: &str, zone: &str) -> Vec<String> {
+        names(&[name, path, pod, zone])
+    }
+
+    fn grid() -> Grid {
+        Grid::new(NAME, 0, 30_000, 10_000).unwrap()
+    }
+
+    fn pairing(op: Op, return_bool: bool, matching: Matching) -> Pairing {
+        Pairing::new(op, return_bool, matching, grid(), names(&SCHEMA))
+    }
+
+    fn plain(op: Op) -> Pairing {
+        pairing(op, false, Matching::default())
+    }
+
+    fn on(labels: &[&str]) -> Matching {
+        Matching {
+            on: true,
+            labels: names(labels),
+            ..Matching::default()
+        }
+    }
+
+    /// One output series as a test reads it: its labels in [`SCHEMA`]'s
+    /// order, then its samples.
+    type Out = (Vec<String>, Vec<(i64, f64)>);
+
+    /// Every output series of one match group.
+    fn pairs_of(value: ScalarValue) -> Vec<Out> {
         let ScalarValue::List(list) = value else {
             panic!("a list of output series")
         };
         let pairs = list.value(0);
         let pairs = pairs.as_struct();
-        let names = pairs.column_by_name(PAIR_NAME).unwrap().as_string_view();
+        let labels = pairs.column_by_name(PAIR_LABELS).unwrap().as_struct();
         let samples = pairs.column_by_name(PAIR_SAMPLES).unwrap().as_list::<i32>();
         (0..pairs.len())
             .map(|row| {
@@ -980,13 +1360,15 @@ mod tests {
                 let samples = (0..entries.len())
                     .map(|i| (timestamps.value(i), values.value(i)))
                     .collect();
-                (names.value(row).to_string(), samples)
+                let labels = (0..labels.num_columns())
+                    .map(|c| labels.column(c).as_string_view().value(row).to_string())
+                    .collect();
+                (labels, samples)
             })
             .collect()
     }
 
-    /// The samples of a group that answers with one series, which is
-    /// every shape but a comparison over two differently named metrics.
+    /// The samples of a group that answers with one series.
     fn samples_of(value: ScalarValue) -> Vec<(i64, f64)> {
         match pairs_of(value).as_slice() {
             [] => Vec::new(),
@@ -1086,17 +1468,67 @@ mod tests {
         assert_eq!(parse_literal("atan2 bool"), None);
     }
 
+    /// The modifiers go into a plan as the query wrote them and come
+    /// back the same.
+    #[test]
+    fn the_matching_modifiers_round_trip_through_promql() {
+        let cases = [
+            (Matching::default(), ""),
+            (on(&["job", "pod"]), "on(job, pod)"),
+            (
+                Matching {
+                    labels: names(&["zone"]),
+                    ..Matching::default()
+                },
+                "ignoring(zone)",
+            ),
+            (
+                Matching {
+                    card: Card::ManyToOne,
+                    on: true,
+                    labels: names(&["job"]),
+                    include: names(&["tier"]),
+                },
+                "on(job) group_left(tier)",
+            ),
+            (
+                Matching {
+                    card: Card::OneToMany,
+                    on: true,
+                    labels: names(&["job"]),
+                    include: Vec::new(),
+                },
+                "on(job) group_right()",
+            ),
+            (
+                Matching {
+                    card: Card::ManyToOne,
+                    ..Matching::default()
+                },
+                "group_left()",
+            ),
+        ];
+        for (matching, spelling) in cases {
+            assert_eq!(matching.literal(), spelling);
+            assert_eq!(Matching::parse(spelling), Some(matching), "{spelling}");
+        }
+        assert_eq!(Matching::parse("on(job"), None);
+        assert_eq!(Matching::parse("group_sideways()"), None);
+    }
+
     /// A step only one side reached is not in the result: upstream's
     /// loop over the left side skips a sample with no match, and a right
     /// sample nothing matched is never looked at.
     #[test]
     fn only_the_steps_both_sides_reached_are_paired() {
-        let mut pairing = pairing(Op::Add);
+        let mut pairing = plain(Op::Add);
+        let left = lset("requests", "", "a", "");
+        let right = lset("errors", "", "a", "");
         pairing
-            .fold(LHS, &[0, 10_000, 20_000], &[1.0, 2.0, 3.0], 0)
+            .absorb(LHS, &left, &[0, 10_000, 20_000], &[1.0, 2.0, 3.0])
             .unwrap();
         pairing
-            .fold(RHS, &[10_000, 30_000], &[10.0, 30.0], 0)
+            .absorb(RHS, &right, &[10_000, 30_000], &[10.0, 30.0])
             .unwrap();
         assert_eq!(samples_of(pairing.evaluate().unwrap()), [(10_000, 12.0)]);
     }
@@ -1106,14 +1538,25 @@ mod tests {
     /// filter upstream's `keep` is, one step at a time.
     #[test]
     fn a_comparison_between_vectors_filters_step_by_step() {
-        let mut filtered = pairing(Op::Gtr);
-        filtered.fold(LHS, &[0, 10_000], &[5.0, 1.0], 0).unwrap();
-        filtered.fold(RHS, &[0, 10_000], &[2.0, 9.0], 0).unwrap();
+        let left = lset("requests", "", "a", "");
+        let right = lset("errors", "", "a", "");
+
+        let mut filtered = pairing(Op::Gtr, false, Matching::default());
+        filtered
+            .absorb(LHS, &left, &[0, 10_000], &[5.0, 1.0])
+            .unwrap();
+        filtered
+            .absorb(RHS, &right, &[0, 10_000], &[2.0, 9.0])
+            .unwrap();
         assert_eq!(samples_of(filtered.evaluate().unwrap()), [(0, 5.0)]);
 
-        let mut scored = Pairing::new(Op::Gtr, true, Grid::new(NAME, 0, 30_000, 10_000).unwrap());
-        scored.fold(LHS, &[0, 10_000], &[5.0, 1.0], 0).unwrap();
-        scored.fold(RHS, &[0, 10_000], &[2.0, 9.0], 0).unwrap();
+        let mut scored = pairing(Op::Gtr, true, Matching::default());
+        scored
+            .absorb(LHS, &left, &[0, 10_000], &[5.0, 1.0])
+            .unwrap();
+        scored
+            .absorb(RHS, &right, &[0, 10_000], &[2.0, 9.0])
+            .unwrap();
         assert_eq!(
             samples_of(scored.evaluate().unwrap()),
             [(0, 1.0), (10_000, 0.0)]
@@ -1124,33 +1567,42 @@ mod tests {
     /// matching errors, and only where their samples meet at a step.
     #[test]
     fn two_series_in_a_match_group_fail_where_they_overlap() {
-        let mut both = pairing(Op::Add);
-        both.fold(LHS, &[0], &[1.0], 0).unwrap();
-        both.fold(LHS, &[0], &[2.0], 0).unwrap();
-        both.fold(RHS, &[0], &[3.0], 0).unwrap();
+        let a = lset("requests", "", "a", "");
+        let b = lset("retries", "", "a", "");
+        let c = lset("errors", "", "a", "");
+
+        let mut both = plain(Op::Add);
+        both.absorb(LHS, &a, &[0], &[1.0]).unwrap();
+        both.absorb(LHS, &b, &[0], &[2.0]).unwrap();
+        both.absorb(RHS, &c, &[0], &[3.0]).unwrap();
         let err = both.evaluate().unwrap_err().to_string();
         assert!(
             err.contains("many-to-one matching must be explicit"),
             "{err}"
         );
 
-        let mut right = pairing(Op::Add);
-        right.fold(LHS, &[0], &[1.0], 0).unwrap();
-        right.fold(RHS, &[0], &[2.0], 0).unwrap();
-        right.fold(RHS, &[0], &[3.0], 0).unwrap();
+        let mut right = plain(Op::Add);
+        right.absorb(LHS, &c, &[0], &[1.0]).unwrap();
+        right.absorb(RHS, &a, &[0], &[2.0]).unwrap();
+        right.absorb(RHS, &b, &[0], &[3.0]).unwrap();
         let err = right.evaluate().unwrap_err().to_string();
         assert!(
-            err.contains("found duplicate series for the match group"),
+            err.contains("found duplicate series for the match group {pod=\"a\"} on the right"),
             "{err}"
         );
-        assert!(err.contains("on the right hand-side"), "{err}");
+        assert!(
+            err.contains(
+                ";many-to-many matching not allowed: matching labels must be unique on one side"
+            ),
+            "{err}"
+        );
 
         // Apart in time is not a duplicate at all: upstream checks the
         // vector at one step, not the series over the range.
-        let mut apart = pairing(Op::Add);
-        apart.fold(LHS, &[0], &[1.0], 0).unwrap();
-        apart.fold(LHS, &[10_000], &[2.0], 0).unwrap();
-        apart.fold(RHS, &[0, 10_000], &[3.0, 4.0], 0).unwrap();
+        let mut apart = plain(Op::Add);
+        apart.absorb(LHS, &a, &[0], &[1.0]).unwrap();
+        apart.absorb(LHS, &b, &[10_000], &[2.0]).unwrap();
+        apart.absorb(RHS, &c, &[0, 10_000], &[3.0, 4.0]).unwrap();
         assert_eq!(
             samples_of(apart.evaluate().unwrap()),
             [(0, 4.0), (10_000, 6.0)]
@@ -1162,83 +1614,253 @@ mod tests {
     /// gives that name back, so the group has to answer with both.
     #[test]
     fn a_kept_name_splits_the_match_group_back_up() {
-        let mut pairing = Pairing::new(Op::Gtr, false, Grid::new(NAME, 0, 30_000, 10_000).unwrap());
-        let b = pairing.intern("b");
-        let a = pairing.intern("a");
-        pairing.fold(LHS, &[0], &[5.0], b).unwrap();
-        pairing.fold(LHS, &[10_000], &[7.0], a).unwrap();
-        pairing.fold(RHS, &[0, 10_000], &[1.0, 1.0], 0).unwrap();
+        let a = lset("a", "", "one", "");
+        let b = lset("b", "", "one", "");
+        let c = lset("c", "", "one", "");
+
+        let mut filtered = pairing(Op::Gtr, false, Matching::default());
+        filtered.absorb(LHS, &b, &[0], &[5.0]).unwrap();
+        filtered.absorb(LHS, &a, &[10_000], &[7.0]).unwrap();
+        filtered.absorb(RHS, &c, &[0, 10_000], &[1.0, 1.0]).unwrap();
         assert_eq!(
-            pairs_of(pairing.evaluate().unwrap()),
+            pairs_of(filtered.evaluate().unwrap()),
             [
-                ("a".to_string(), vec![(10_000, 7.0)]),
-                ("b".to_string(), vec![(0, 5.0)]),
+                (lset("a", "", "one", ""), vec![(10_000, 7.0)]),
+                (lset("b", "", "one", ""), vec![(0, 5.0)]),
             ]
         );
 
         // `bool` takes the name away again, so the same two series are
         // one result — which is what upstream's `resultMetric` does
         // once `changesMetricSchema` holds.
-        let mut scored = Pairing::new(Op::Gtr, true, Grid::new(NAME, 0, 30_000, 10_000).unwrap());
-        assert_eq!(scored.intern("b"), b);
-        scored.fold(LHS, &[0], &[5.0], b).unwrap();
-        scored.fold(LHS, &[10_000], &[7.0], a).unwrap();
-        scored.fold(RHS, &[0, 10_000], &[1.0, 1.0], 0).unwrap();
+        let mut scored = pairing(Op::Gtr, true, Matching::default());
+        scored.absorb(LHS, &b, &[0], &[5.0]).unwrap();
+        scored.absorb(LHS, &a, &[10_000], &[7.0]).unwrap();
+        scored.absorb(RHS, &c, &[0, 10_000], &[1.0, 1.0]).unwrap();
         assert_eq!(
             pairs_of(scored.evaluate().unwrap()),
-            [(String::new(), vec![(0, 1.0), (10_000, 1.0)])]
+            [(lset("", "", "one", ""), vec![(0, 1.0), (10_000, 1.0)])]
         );
     }
 
-    /// Two partitions of one match group reach the same answer as one.
+    /// `on(…)` narrows the result to the labels it names, `ignoring(…)`
+    /// takes only those away — upstream's `Keep` and `Del`.
+    #[test]
+    fn one_to_one_keeps_what_the_modifier_says() {
+        let left = lset("requests", "", "a", "eu");
+        let right = lset("errors", "", "a", "us");
+
+        let mut kept = pairing(Op::Add, false, on(&["pod"]));
+        kept.absorb(LHS, &left, &[0], &[6.0]).unwrap();
+        kept.absorb(RHS, &right, &[0], &[2.0]).unwrap();
+        assert_eq!(
+            pairs_of(kept.evaluate().unwrap()),
+            [(lset("", "", "a", ""), vec![(0, 8.0)])]
+        );
+
+        let mut ignoring = pairing(
+            Op::Add,
+            false,
+            Matching {
+                labels: names(&["zone"]),
+                ..Matching::default()
+            },
+        );
+        ignoring.absorb(LHS, &left, &[0], &[6.0]).unwrap();
+        ignoring.absorb(RHS, &right, &[0], &[2.0]).unwrap();
+        assert_eq!(
+            pairs_of(ignoring.evaluate().unwrap()),
+            [(lset("", "", "a", ""), vec![(0, 8.0)])]
+        );
+    }
+
+    /// `group_left` keeps every label of the many side — no `Keep` and
+    /// no `Del` — and copies the named ones over from the one side, so
+    /// a match group answers with a series per left-hand one.
+    #[test]
+    fn group_left_fans_out_and_carries_the_included_labels() {
+        let mut pairing = pairing(
+            Op::Div,
+            false,
+            Matching {
+                card: Card::ManyToOne,
+                on: true,
+                labels: names(&["pod"]),
+                include: names(&["zone"]),
+            },
+        );
+        pairing
+            .absorb(LHS, &lset("requests", "/a", "a", ""), &[0], &[10.0])
+            .unwrap();
+        pairing
+            .absorb(LHS, &lset("requests", "/b", "a", ""), &[0], &[20.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "", "a", "eu"), &[0], &[2.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(pairing.evaluate().unwrap()),
+            [
+                (lset("", "/a", "a", "eu"), vec![(0, 5.0)]),
+                (lset("", "/b", "a", "eu"), vec![(0, 10.0)]),
+            ]
+        );
+    }
+
+    /// `group_right` is the same match with the sides swapped: the
+    /// right is the many, and the operands keep their written order.
+    #[test]
+    fn group_right_swaps_which_side_may_be_many() {
+        let mut pairing = pairing(
+            Op::Sub,
+            false,
+            Matching {
+                card: Card::OneToMany,
+                on: true,
+                labels: names(&["pod"]),
+                include: Vec::new(),
+            },
+        );
+        pairing
+            .absorb(LHS, &lset("total", "", "a", ""), &[0], &[10.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "/a", "a", ""), &[0], &[2.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "/b", "a", ""), &[0], &[3.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(pairing.evaluate().unwrap()),
+            [
+                (lset("", "/a", "a", ""), vec![(0, 8.0)]),
+                (lset("", "/b", "a", ""), vec![(0, 7.0)]),
+            ]
+        );
+    }
+
+    /// A duplicate on the one side of a `group_right` is quoted as the
+    /// left-hand side, because that is where the one now sits.
+    #[test]
+    fn group_right_names_the_left_hand_side_in_a_duplicate() {
+        let mut pairing = pairing(
+            Op::Add,
+            false,
+            Matching {
+                card: Card::OneToMany,
+                on: true,
+                labels: names(&["pod"]),
+                include: Vec::new(),
+            },
+        );
+        pairing
+            .absorb(LHS, &lset("total", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        pairing
+            .absorb(LHS, &lset("count", "", "a", ""), &[0], &[2.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "", "a", ""), &[0], &[3.0])
+            .unwrap();
+        let err = pairing.evaluate().unwrap_err().to_string();
+        assert!(
+            err.contains("found duplicate series for the match group {pod=\"a\"} on the left"),
+            "{err}"
+        );
+    }
+
+    /// The grouping labels have to leave the result unique: two series
+    /// of the many side reaching the same labels is upstream's other
+    /// matching error.
+    #[test]
+    fn a_fan_out_that_collides_names_the_grouping_labels() {
+        let mut pairing = pairing(
+            Op::Add,
+            false,
+            Matching {
+                card: Card::ManyToOne,
+                on: true,
+                labels: names(&["pod"]),
+                include: Vec::new(),
+            },
+        );
+        // Both left series lose `__name__` to the arithmetic and agree
+        // on everything else, so they are one result label set.
+        pairing
+            .absorb(LHS, &lset("requests", "", "a", "eu"), &[0], &[1.0])
+            .unwrap();
+        pairing
+            .absorb(LHS, &lset("retries", "", "a", "eu"), &[0], &[2.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "", "a", ""), &[0], &[3.0])
+            .unwrap();
+        let err = pairing.evaluate().unwrap_err().to_string();
+        assert!(
+            err.contains("multiple matches for labels: grouping labels must ensure unique matches"),
+            "{err}"
+        );
+    }
+
+    /// An `on` that names `__name__` matches on it and keeps it, save
+    /// where the operator has taken it away first.
+    #[test]
+    fn on_the_metric_name_matches_on_it() {
+        let mut pairing = pairing(Op::Gtr, false, on(&[METRIC_NAME]));
+        pairing
+            .absorb(LHS, &lset("up", "", "a", ""), &[0], &[5.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("up", "", "b", ""), &[0], &[2.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(pairing.evaluate().unwrap()),
+            [(lset("up", "", "", ""), vec![(0, 5.0)])]
+        );
+    }
+
+    /// Two partitions of one match group reach the same answer as one,
+    /// down to the many side's labels and the one side's `group_x`
+    /// values — whose pool indices mean nothing across a partial.
     #[test]
     fn partial_states_merge_to_the_same_pairing() {
-        let mut whole = pairing(Op::Mul);
-        whole.fold(LHS, &[0, 10_000], &[2.0, 3.0], 0).unwrap();
-        whole.fold(RHS, &[0, 10_000], &[5.0, 7.0], 0).unwrap();
+        let matching = Matching {
+            card: Card::ManyToOne,
+            on: true,
+            labels: names(&["pod"]),
+            include: names(&["zone"]),
+        };
+        let of = || pairing(Op::Mul, false, matching.clone());
+        let many_a = lset("requests", "/a", "a", "");
+        let many_b = lset("requests", "/b", "a", "");
+        let one = lset("errors", "", "a", "eu");
 
-        let mut left = pairing(Op::Mul);
-        left.fold(LHS, &[0, 10_000], &[2.0, 3.0], 0).unwrap();
-        let mut right = pairing(Op::Mul);
-        right.fold(RHS, &[0, 10_000], &[5.0, 7.0], 0).unwrap();
+        let mut whole = of();
+        whole
+            .absorb(LHS, &many_a, &[0, 10_000], &[2.0, 3.0])
+            .unwrap();
+        whole.absorb(LHS, &many_b, &[10_000], &[4.0]).unwrap();
+        whole.absorb(RHS, &one, &[0, 10_000], &[5.0, 7.0]).unwrap();
 
-        let mut merged = pairing(Op::Mul);
+        let mut left = of();
+        left.absorb(LHS, &many_a, &[0, 10_000], &[2.0, 3.0])
+            .unwrap();
+        let mut right = of();
+        right.absorb(LHS, &many_b, &[10_000], &[4.0]).unwrap();
+        right.absorb(RHS, &one, &[0, 10_000], &[5.0, 7.0]).unwrap();
+
+        let mut merged = of();
         for mut partial in [left, right] {
             let state = partial.state().unwrap();
             let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
             merged.merge_batch(&arrays).unwrap();
         }
         assert_eq!(merged.evaluate().unwrap(), whole.evaluate().unwrap());
-    }
-
-    /// The name lane survives the same round trip, and the pool indices
-    /// of one partial mean nothing in another — which is why the lane
-    /// travels as the names themselves.
-    #[test]
-    fn partial_states_merge_the_names_they_carried() {
-        let grid = Grid::new(NAME, 0, 30_000, 10_000).unwrap();
-        let mut left = Pairing::new(Op::Gtr, false, grid);
-        let name = left.intern("a");
-        left.fold(LHS, &[0], &[5.0], name).unwrap();
-
-        let mut right = Pairing::new(Op::Gtr, false, grid);
-        // A different pool, so "b" is index 1 here and would collide
-        // with "a" if the index were what crossed over.
-        let name = right.intern("b");
-        right.fold(LHS, &[10_000], &[7.0], name).unwrap();
-        right.fold(RHS, &[0, 10_000], &[1.0, 1.0], 0).unwrap();
-
-        let mut merged = Pairing::new(Op::Gtr, false, grid);
-        for mut partial in [left, right] {
-            let state = partial.state().unwrap();
-            let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
-            merged.merge_batch(&arrays).unwrap();
-        }
         assert_eq!(
             pairs_of(merged.evaluate().unwrap()),
             [
-                ("a".to_string(), vec![(0, 5.0)]),
-                ("b".to_string(), vec![(10_000, 7.0)]),
+                (lset("", "/a", "a", "eu"), vec![(0, 10.0), (10_000, 21.0)]),
+                (lset("", "/b", "a", "eu"), vec![(10_000, 28.0)]),
             ]
         );
     }
@@ -1247,21 +1869,15 @@ mod tests {
     /// shape's empty string read as a label that is not there.
     #[test]
     fn a_label_set_prints_as_prometheus_prints_it() {
-        let fields = Fields::from(vec![
-            Field::new(METRIC_NAME, series::label_type(), false),
-            Field::new("job", series::label_type(), false),
-            Field::new("pod", series::label_type(), false),
-        ]);
-        let labels = StructArray::new(
-            fields,
-            vec![
-                Arc::new(StringViewArray::from(vec!["up"])),
-                Arc::new(StringViewArray::from(vec!["api"])),
-                Arc::new(StringViewArray::from(vec![""])),
-            ],
-            None,
+        let schema = names(&[METRIC_NAME, "job", "pod"]);
+        let labels = names(&["up", "api", ""]);
+        assert_eq!(
+            print(&schema, &labels, |_| true),
+            r#"{__name__="up", job="api"}"#
         );
-        assert_eq!(render(&labels, 0, false), r#"{__name__="up", job="api"}"#);
-        assert_eq!(render(&labels, 0, true), r#"{job="api"}"#);
+        assert_eq!(
+            print(&schema, &labels, |n| n != METRIC_NAME),
+            r#"{job="api"}"#
+        );
     }
 }

@@ -227,21 +227,18 @@ pub fn group_exprs(keys: &[String]) -> Vec<Expr> {
 }
 
 /// The `labels` struct of an aggregation's output, from the group columns
-/// [`group_exprs`] produced, plus any `extra` label the aggregation
-/// carried up beside them — a binary comparison keeps the left side's
-/// `__name__`, which the match signature had to leave out.
+/// [`group_exprs`] produced.
 ///
 /// Built through `Column` directly because `col` parses its argument as a
 /// SQL identifier: it would read a label named `service.name` as relation
 /// `service` column `name`, and fold `Region` to `region`.
-pub fn regroup(keys: &[String], extra: Vec<(String, Expr)>) -> Expr {
+pub fn regroup(keys: &[String]) -> Expr {
     let mut pairs: Vec<(String, Expr)> = keys
         .iter()
         .map(|k| {
             let column = Column::new_unqualified(group_alias(k));
             (k.clone(), Expr::Column(column))
         })
-        .chain(extra)
         .collect();
     // `call` takes its pairs sorted; the keys already are, and an extra
     // name lands wherever it belongs among them.
@@ -308,7 +305,7 @@ mod tests {
         let source = Arc::new(LogicalTableSource::new(series::schema(input)));
         let plan = LogicalPlanBuilder::scan("series", source, None)?
             .aggregate(group_exprs(keys), vec![count(col(SAMPLES)).alias(SAMPLES)])?
-            .project(vec![regroup(keys, Vec::new()).alias(LABELS), col(SAMPLES)])?
+            .project(vec![regroup(keys).alias(LABELS), col(SAMPLES)])?
             .build()?;
         match plan
             .schema()
@@ -360,7 +357,7 @@ mod tests {
         };
         assert_eq!(aliased, "__group__service.name");
 
-        let read = match &regroup(&keys, Vec::new()) {
+        let read = match &regroup(&keys) {
             Expr::ScalarFunction(f) => match &f.args[1] {
                 Expr::Column(c) => c.clone(),
                 other => panic!("expected a column, got {other:?}"),
