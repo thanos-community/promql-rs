@@ -38,7 +38,7 @@ use crate::aggregate::{self, Op};
 use crate::error::EngineError;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
-use crate::params::{step_count, Params};
+use crate::params::{step_count, Params, RangeMode};
 use crate::range::{self, Func};
 use crate::selector;
 use crate::series::{LABELS, SAMPLES};
@@ -197,6 +197,17 @@ impl Planner<'_> {
         vs: &VectorSelector,
         above: Above<'_>,
     ) -> Result<Planned, EngineError> {
+        // `anchored` has no meaning without a window, and upstream's
+        // `getTimeRangesForSelector` widens an instant selector only for
+        // `smoothed`, which reads one lookback *forward* to interpolate.
+        let mode = match vs.smoothed {
+            true => RangeMode::Smoothed,
+            false => RangeMode::Plain,
+        };
+        let extension = match mode {
+            RangeMode::Smoothed => (0, self.query.lookback_ms),
+            _ => (0, 0),
+        };
         let params = Params {
             start_ms: self.query.start_ms,
             end_ms: self.query.end_ms,
@@ -204,6 +215,8 @@ impl Planner<'_> {
             window_ms: self.query.lookback_ms,
             offset_ms: offset_ms(vs),
             at_ms: resolve_at(vs, self.query),
+            mode,
+            extension,
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         let hints = self.hints(params.select_range(), None, above);
@@ -265,6 +278,15 @@ impl Planner<'_> {
             window_ms: (ms.range_secs * 1000.0).round() as i64,
             offset_ms: offset_ms(vs),
             at_ms: resolve_at(vs, self.query),
+            mode: range_mode(vs),
+            // `evalCall`: anchored reaches one lookback before the
+            // window for the sample it anchors on, smoothed one lookback
+            // on each side for the two it interpolates between.
+            extension: match range_mode(vs) {
+                RangeMode::Plain => (0, 0),
+                RangeMode::Anchored => (self.query.lookback_ms, 0),
+                RangeMode::Smoothed => (self.query.lookback_ms, self.query.lookback_ms),
+            },
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         check_time_bound("the range", params.window_ms)?;
@@ -426,15 +448,19 @@ fn check_range_modifiers(call: &Call) -> Result<(), EngineError> {
     )))
 }
 
+fn range_mode(vs: &VectorSelector) -> RangeMode {
+    match (vs.anchored, vs.smoothed) {
+        // The parser rejects both at once, so the order is moot.
+        (true, _) => RangeMode::Anchored,
+        (_, true) => RangeMode::Smoothed,
+        _ => RangeMode::Plain,
+    }
+}
+
 fn reject_unsupported_modifiers(vs: &VectorSelector) -> Result<(), EngineError> {
     if vs.original_offset_expr.is_some() {
         return Err(EngineError::Unsupported(
             "an offset given as a duration expression".into(),
-        ));
-    }
-    if vs.anchored || vs.smoothed {
-        return Err(EngineError::Unsupported(
-            "the anchored and smoothed modifiers".into(),
         ));
     }
     if vs.skip_histogram_buckets {

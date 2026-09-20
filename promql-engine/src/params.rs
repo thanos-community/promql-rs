@@ -6,6 +6,39 @@
 //! so that a change to the grid arithmetic cannot land in one kernel and
 //! miss the other.
 
+/// The `anchored` / `smoothed` modifiers on the selector.
+///
+/// Both widen the samples a step sees beyond its own window, which is
+/// why they belong here and not inside one kernel: the store has to be
+/// asked for the wider span too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RangeMode {
+    #[default]
+    Plain,
+    Anchored,
+    Smoothed,
+}
+
+impl RangeMode {
+    /// Crosses the plan as a literal argument, like the function name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RangeMode::Plain => "plain",
+            RangeMode::Anchored => "anchored",
+            RangeMode::Smoothed => "smoothed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<RangeMode> {
+        Some(match s {
+            "plain" => RangeMode::Plain,
+            "anchored" => RangeMode::Anchored,
+            "smoothed" => RangeMode::Smoothed,
+            _ => return None,
+        })
+    }
+}
+
 /// Everything a per-series kernel needs besides the samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {
@@ -19,6 +52,14 @@ pub struct Params {
     pub offset_ms: i64,
     /// An `@` modifier, already resolved from `start()`/`end()`.
     pub at_ms: Option<i64>,
+    pub mode: RangeMode,
+    /// How far outside its own window a step reads, before the start
+    /// and after the end. Upstream widens `mint`/`maxt` by a lookback
+    /// delta in `evalCall`, `matrixSelector` and `smoothSeries`, and
+    /// the planner sets it here because the amounts differ per kernel:
+    /// an anchored range function reaches backwards only, a smoothed
+    /// one both ways, and a smoothed instant selector forwards only.
+    pub extension: (i64, i64),
 }
 
 impl Params {
@@ -35,10 +76,12 @@ impl Params {
             Some(at) => (at, at),
             None => (self.start_ms, self.end_ms),
         };
+        let (before, after) = self.extension;
         (
             lo.saturating_sub(self.window_ms.saturating_sub(1))
-                .saturating_sub(self.offset_ms),
-            hi.saturating_sub(self.offset_ms),
+                .saturating_sub(self.offset_ms)
+                .saturating_sub(before),
+            hi.saturating_sub(self.offset_ms).saturating_add(after),
         )
     }
 
@@ -81,6 +124,8 @@ mod tests {
             window_ms: 5 * M,
             offset_ms: 30 * S,
             at_ms: None,
+            mode: RangeMode::Plain,
+            extension: (0, 0),
         };
         assert_eq!(p.select_range(), (-(5 * M) + 1 - 30 * S, 10 * M - 30 * S));
     }
@@ -95,6 +140,8 @@ mod tests {
             window_ms: 5 * M,
             offset_ms: 0,
             at_ms: None,
+            mode: RangeMode::Plain,
+            extension: (0, 0),
         };
         let p = Params {
             at_ms: Some(i64::MIN),
@@ -141,6 +188,8 @@ mod tests {
             window_ms: 0,
             offset_ms: 0,
             at_ms: None,
+            mode: RangeMode::Plain,
+            extension: (0, 0),
         };
         assert_eq!(p.steps().collect::<Vec<_>>(), vec![0, 30, 60, 90]);
         assert_eq!(p.steps().count() as i128, step_count(0, 100, 30));

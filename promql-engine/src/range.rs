@@ -1,5 +1,6 @@
 //! Range-vector functions as one DataFusion scalar function:
-//! `promql_range_function(samples, 'rate', start, end, step, range, offset, at)`.
+//! `promql_range_function(samples, 'rate', start, end, step, range,
+//! offset, at, mode, extend_before, extend_after)`.
 //!
 //! A range function is the vector selector's shape with a window instead
 //! of a lookback: one series' slice in, that series' values on the step
@@ -32,7 +33,7 @@ use datafusion::logical_expr::{
 };
 
 use crate::math;
-use crate::params::Params;
+use crate::params::{Params, RangeMode};
 use crate::selector::{int_arg, is_stale};
 use crate::series;
 
@@ -105,12 +106,17 @@ impl Func {
 
 /// One step's window: the samples with `range_start < t <= range_end`,
 /// StaleNaN already removed, plus the bounds the extrapolation needs.
+///
+/// Under [`RangeMode::Anchored`] / [`RangeMode::Smoothed`] the slice
+/// reaches past those bounds by the lookback delta, and `range_start`
+/// and `range_end` stay the logical window the result is reported over.
 pub struct Window<'a> {
     pub ts: &'a [i64],
     pub vs: &'a [f64],
     pub range_start: i64,
     pub range_end: i64,
     pub range_ms: i64,
+    pub mode: RangeMode,
 }
 
 /// Apply `func` to one window. `None` is "no sample at this step".
@@ -118,7 +124,11 @@ pub fn evaluate(func: Func, w: &Window) -> Option<f64> {
     if w.ts.is_empty() {
         return None;
     }
+    let extended = w.mode != RangeMode::Plain;
     match func {
+        Func::Rate if extended => extended_rate(w, true, true),
+        Func::Increase if extended => extended_rate(w, true, false),
+        Func::Delta if extended => extended_rate(w, false, false),
         Func::Rate => extrapolated_rate(w, raw_increase(w.vs, true), true, true),
         Func::Increase => extrapolated_rate(w, raw_increase(w.vs, true), true, false),
         Func::Delta => extrapolated_rate(w, raw_increase(w.vs, false), false, false),
@@ -139,12 +149,40 @@ pub fn evaluate(func: Func, w: &Window) -> Option<f64> {
         Func::LastOverTime => Some(w.vs[w.vs.len() - 1]),
         Func::PresentOverTime => Some(1.0),
         Func::Changes => Some(
-            w.vs.windows(2)
+            w.vs[anchored_first(w)?..]
+                .windows(2)
                 .filter(|p| p[1] != p[0] && !(p[1].is_nan() && p[0].is_nan()))
                 .count() as f64,
         ),
-        Func::Resets => Some(w.vs.windows(2).filter(|p| p[1] < p[0]).count() as f64),
+        Func::Resets => Some(
+            w.vs[anchored_first(w)?..]
+                .windows(2)
+                .filter(|p| p[1] < p[0])
+                .count() as f64,
+        ),
     }
+}
+
+/// `pickFirstSampleIndex`: where a counting function starts reading.
+///
+/// An anchored window reaches back a lookback delta for the sake of the
+/// sample just before its start, and that one sample is all the extra
+/// the count may see — everything earlier is trimmed. `None` when the
+/// window holds nothing at all, which upstream reports as no result
+/// rather than as zero.
+fn anchored_first(w: &Window) -> Option<usize> {
+    if w.mode != RangeMode::Anchored {
+        return Some(0);
+    }
+    let n = w.ts.len();
+    if w.ts[n - 1] <= w.range_start {
+        return None;
+    }
+    Some(
+        w.ts[..n - 1]
+            .partition_point(|t| *t <= w.range_start)
+            .saturating_sub(1),
+    )
 }
 
 /// `result` in `extrapolatedRate`: the span of the window plus, for a
@@ -215,6 +253,108 @@ fn extrapolated_rate(w: &Window, result: f64, is_counter: bool, is_rate: bool) -
         factor /= w.range_ms as f64 / 1000.0;
     }
     Some(result * factor)
+}
+
+/// `extendedRate`: what `rate`/`increase`/`delta` do once the selector
+/// carries `anchored` or `smoothed`.
+///
+/// There is no extrapolation factor here at all. The window's ends are
+/// read from real samples instead of guessed at: `anchored` takes the
+/// last sample at or before the window start as the left value, and
+/// `smoothed` interpolates both ends onto the exact boundaries. That is
+/// why both need samples from outside the window, and why only the
+/// functions that reduce a window to a difference between its ends may
+/// use them.
+fn extended_rate(w: &Window, is_counter: bool, is_rate: bool) -> Option<f64> {
+    let (ts, vs) = (w.ts, w.vs);
+    let smoothed = w.mode == RangeMode::Smoothed;
+    let mut last = ts.len() - 1;
+
+    // Upstream searches `[0, last)`, never the last index itself, so
+    // `first` can land on the sample before the window and `last` can
+    // only move inwards.
+    let first = ts[..last]
+        .partition_point(|t| *t <= w.range_start)
+        .saturating_sub(1);
+    if smoothed {
+        last = ts[..last].partition_point(|t| *t < w.range_end);
+    }
+
+    if ts[last] <= w.range_start {
+        return None;
+    }
+    if smoothed && ts[first] > w.range_end {
+        return None;
+    }
+
+    let left = if smoothed && ts[first] < w.range_start {
+        interpolate(
+            (ts[first], vs[first]),
+            (ts[first + 1], vs[first + 1]),
+            w.range_start,
+            is_counter,
+        )
+    } else {
+        vs[first]
+    };
+    let right = if smoothed && last > 0 && ts[last] > w.range_end {
+        interpolate(
+            (ts[last - 1], vs[last - 1]),
+            (ts[last], vs[last]),
+            w.range_end,
+            is_counter,
+        )
+    } else {
+        vs[last]
+    };
+
+    let mut result = right - left;
+    if is_counter {
+        // Only samples strictly inside the range are swept for resets;
+        // the boundaries are already accounted for in `left`/`right`.
+        let lo = if ts[first] <= w.range_start {
+            first + 1
+        } else {
+            first
+        };
+        let hi = if ts[last] >= w.range_end {
+            last
+        } else {
+            last + 1
+        };
+        let inner = if lo < hi { &vs[lo..hi] } else { &[][..] };
+        result += correct_for_counter_resets(left, right, inner);
+    }
+    if is_rate {
+        result /= w.range_ms as f64 / 1000.0;
+    }
+    Some(result)
+}
+
+/// Linear interpolation onto `t`. A counter reset between the two
+/// points is modelled as the counter having restarted from zero, so the
+/// segment is read from 0 up to the later value.
+pub(crate) fn interpolate(p1: (i64, f64), p2: (i64, f64), t: i64, is_counter: bool) -> f64 {
+    let ((t1, v1), (t2, v2)) = (p1, p2);
+    let y1 = if is_counter && v2 < v1 { 0.0 } else { v1 };
+    y1 + (v2 - y1) * (t - t1) as f64 / (t2 - t1) as f64
+}
+
+/// The value lost at every reset inside the window, with `left` and
+/// `right` as the values just outside it on either side.
+fn correct_for_counter_resets(left: f64, right: f64, vs: &[f64]) -> f64 {
+    let mut correction = 0.0;
+    let mut prev = left;
+    for &v in vs {
+        if v < prev {
+            correction += prev;
+        }
+        prev = v;
+    }
+    if right < prev {
+        correction += prev;
+    }
+    correction
 }
 
 /// `instantValue`: the last two samples.
@@ -394,14 +534,20 @@ pub(crate) fn range_function(
             range_start: range_end - p.window_ms,
             range_end,
             range_ms: p.window_ms,
+            mode: p.mode,
         }
     };
+
+    // How far outside the window the slice reaches. Zero unless the
+    // selector is anchored or smoothed; the edges still advance
+    // monotonically, so the sweep's one-enter-one-leave invariant holds.
+    let (before, after) = p.extension;
 
     // `@` pins the window; evaluate once and repeat across the grid.
     if let Some(at) = p.at_ms {
         let range_end = at - p.offset_ms;
-        let lo = ts.partition_point(|t| *t <= range_end - p.window_ms);
-        let hi = ts.partition_point(|t| *t <= range_end);
+        let lo = ts.partition_point(|t| *t <= range_end - p.window_ms - before);
+        let hi = ts.partition_point(|t| *t <= range_end + after);
         if let Some(v) = evaluate(func, &slice(lo, hi, range_end)) {
             for step in p.steps() {
                 emit(step, v);
@@ -420,11 +566,11 @@ pub(crate) fn range_function(
             for step in p.steps() {
                 let range_end = step - p.offset_ms;
                 let range_start = range_end - p.window_ms;
-                while lo < ts.len() && ts[lo] <= range_start {
+                while lo < ts.len() && ts[lo] <= range_start - before {
                     lo += 1;
                 }
                 hi = hi.max(lo);
-                while hi < ts.len() && ts[hi] <= range_end {
+                while hi < ts.len() && ts[hi] <= range_end + after {
                     hi += 1;
                 }
                 if let Some(v) = evaluate(func, &slice(lo, hi, range_end)) {
@@ -436,7 +582,7 @@ pub(crate) fn range_function(
             for step in p.steps() {
                 let range_end = step - p.offset_ms;
                 let range_start = range_end - p.window_ms;
-                while lo < ts.len() && ts[lo] <= range_start {
+                while lo < ts.len() && ts[lo] <= range_start - before {
                     if lo < hi {
                         sweep.leave(lo);
                     }
@@ -446,7 +592,7 @@ pub(crate) fn range_function(
                 // the samples it skips never entered, and the state is
                 // empty.
                 hi = hi.max(lo);
-                while hi < ts.len() && ts[hi] <= range_end {
+                while hi < ts.len() && ts[hi] <= range_end + after {
                     sweep.enter(hi, lo, vs);
                     hi += 1;
                 }
@@ -467,7 +613,7 @@ pub struct RangeFunction {
 impl Default for RangeFunction {
     fn default() -> Self {
         Self {
-            signature: Signature::any(8, Volatility::Immutable),
+            signature: Signature::any(11, Volatility::Immutable),
         }
     }
 }
@@ -476,7 +622,8 @@ pub fn udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(RangeFunction::default())
 }
 
-/// `promql_range_function(samples, '<func>', start, end, step, range, offset, at)`.
+/// `promql_range_function(samples, '<func>', start, end, step, range,
+/// offset, at, '<mode>', extend_before, extend_after)`.
 pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
     udf().call(vec![
         samples,
@@ -490,6 +637,9 @@ pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
             Some(at) => lit(at),
             None => lit(ScalarValue::Int64(None)),
         },
+        lit(p.mode.as_str()),
+        lit(p.extension.0),
+        lit(p.extension.1),
     ])
 }
 
@@ -513,7 +663,13 @@ impl ScalarUDFImpl for RangeFunction {
         if arg_types.get(1) != Some(&DataType::Utf8) {
             return plan_err!("{NAME}: second argument must be the function name as Utf8");
         }
+        if arg_types.get(8) != Some(&DataType::Utf8) {
+            return plan_err!("{NAME}: argument 8 must be the range mode as Utf8");
+        }
         for (i, t) in arg_types.iter().enumerate().skip(2) {
+            if i == 8 {
+                continue;
+            }
             if !matches!(t, DataType::Int64 | DataType::Null) {
                 return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
             }
@@ -556,6 +712,18 @@ impl ScalarUDFImpl for RangeFunction {
                 DataFusionError::Execution(format!("{NAME}: {what} must not be NULL"))
             })
         };
+        let mode = match &args.args[8] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) => RangeMode::parse(name)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("{NAME}: unknown range mode {name}"))
+                })?,
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "{NAME}: range mode must be a string literal, got {:?}",
+                    other.data_type()
+                )))
+            }
+        };
         let p = Params {
             start_ms: need(2, "start")?,
             end_ms: need(3, "end")?,
@@ -563,6 +731,8 @@ impl ScalarUDFImpl for RangeFunction {
             window_ms: need(5, "range")?,
             offset_ms: need(6, "offset")?,
             at_ms: int_arg(&args, 7, NAME)?,
+            mode,
+            extension: (need(9, "extension before")?, need(10, "extension after")?),
         };
         Ok(ColumnarValue::Array(Arc::new(apply(
             func,
@@ -638,7 +808,14 @@ pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
     let mut out_vs: Vec<f64> = Vec::with_capacity(ts.len());
     let mut out_offsets: Vec<i32> = Vec::with_capacity(samples.len() + 1);
     out_offsets.push(0);
-    let mut sweep = Sweep::new(func);
+    // `Sweep::Counter` replays `raw_increase`, which `extended_rate`
+    // does not use at all, so an anchored or smoothed selector refolds
+    // instead. The windows there are the widest we serve, but also the
+    // rarest.
+    let mut sweep = match p.mode {
+        RangeMode::Plain => Sweep::new(func),
+        _ => None,
+    };
     for row in 0..samples.len() {
         // A null row is an absent series, not an empty one, and its
         // offsets may still span samples.
@@ -726,6 +903,8 @@ mod tests {
             window_ms: 5 * M,
             offset_ms: 0,
             at_ms: None,
+            mode: RangeMode::Plain,
+            extension: (0, 0),
         }
     }
 
@@ -969,6 +1148,7 @@ mod tests {
                 range_start,
                 range_end,
                 range_ms: p.window_ms,
+                mode: p.mode,
             };
             if let Some(v) = evaluate(func, &w) {
                 out.push((step, v));
@@ -987,6 +1167,8 @@ mod tests {
             window_ms: 2 * M,
             offset_ms: 45 * S,
             at_ms: None,
+            mode: RangeMode::Plain,
+            extension: (0, 0),
         };
         for func in ALL {
             let name = func.as_str();
@@ -1045,6 +1227,8 @@ mod tests {
                 window_ms: (1 + next() % 8) as i64 * 30 * S,
                 offset_ms: (next() % 4) as i64 * 15 * S,
                 at_ms: None,
+                mode: RangeMode::Plain,
+                extension: (0, 0),
             };
             for func in ALL {
                 let name = func.as_str();
@@ -1195,6 +1379,9 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::Int64(Some(5 * M))),
             ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
             ColumnarValue::Scalar(ScalarValue::Int64(None)),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("plain".into()))),
+            ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
+            ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
         ];
         let arg_fields = args
             .iter()
@@ -1213,5 +1400,88 @@ mod tests {
             .to_string();
         assert!(err.contains(NAME), "{err}");
         assert!(!err.contains(crate::selector::NAME), "{err}");
+    }
+
+    /// One 60s window as the planner hands it to the kernel: the slice
+    /// already widened by the lookback delta, the bounds still the
+    /// logical range the answer is reported over.
+    fn extended<'a>(ts: &'a [i64], vs: &'a [f64], range_end: i64, mode: RangeMode) -> Window<'a> {
+        Window {
+            ts,
+            vs,
+            range_start: range_end - 60 * S,
+            range_end,
+            range_ms: 60 * S,
+            mode,
+        }
+    }
+
+    /// Samples every ten seconds from `first` to `last` inclusive.
+    fn every_10s(first: i64, vs: &[f64]) -> Vec<i64> {
+        (0..vs.len() as i64).map(|i| first + i * 10 * S).collect()
+    }
+
+    /// Anchored reads the window's left end off the sample at or before
+    /// it instead of extrapolating, so a counter rising by 1 per 10s
+    /// over `(40s, 100s]` increases by exactly 6, not by 6 × 60/50.
+    #[test]
+    fn an_anchored_window_is_read_off_its_boundary_samples() {
+        let vs: Vec<f64> = (2..=10).map(f64::from).collect();
+        let ts = every_10s(20 * S, &vs);
+        let w = extended(&ts, &vs, 100 * S, RangeMode::Anchored);
+        assert_eq!(evaluate(Func::Increase, &w), Some(6.0));
+        assert_eq!(evaluate(Func::Delta, &w), Some(6.0));
+        assert_eq!(evaluate(Func::Rate, &w), Some(0.1));
+    }
+
+    /// Smoothed puts both ends on the boundary by interpolating between
+    /// the straddling samples: 3.5 at 35s and 9.5 at 95s.
+    #[test]
+    fn a_smoothed_window_interpolates_onto_both_boundaries() {
+        let vs: Vec<f64> = (1..=10).map(f64::from).collect();
+        let ts = every_10s(10 * S, &vs);
+        let w = extended(&ts, &vs, 95 * S, RangeMode::Smoothed);
+        assert_eq!(evaluate(Func::Increase, &w), Some(6.0));
+        assert_eq!(evaluate(Func::Delta, &w), Some(6.0));
+        assert_eq!(evaluate(Func::Rate, &w), Some(0.1));
+    }
+
+    /// A reset inside an anchored window: the counter is at 6 on the
+    /// boundary, restarts at 2 and climbs to 7, so it gained 2 across
+    /// the reset and 5 after it.
+    #[test]
+    fn an_anchored_window_adds_back_what_a_reset_lost() {
+        let vs = [4.0, 5.0, 6.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let ts = every_10s(20 * S, &vs);
+        let w = extended(&ts, &vs, 100 * S, RangeMode::Anchored);
+        assert_eq!(evaluate(Func::Increase, &w), Some(7.0));
+        assert_eq!(evaluate(Func::Rate, &w), Some(7.0 / 60.0));
+        // `delta` is not a counter function, so the reset stands.
+        assert_eq!(evaluate(Func::Delta, &w), Some(1.0));
+    }
+
+    /// The same reset with interpolated boundaries: 3.5 at 35s, 4.5 at
+    /// 95s, and the 5 lost at the reset between them.
+    #[test]
+    fn a_smoothed_window_adds_back_what_a_reset_lost() {
+        let vs = [3.0, 4.0, 5.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let ts = every_10s(30 * S, &vs);
+        let w = extended(&ts, &vs, 95 * S, RangeMode::Smoothed);
+        assert_eq!(evaluate(Func::Increase, &w), Some(6.0));
+        assert_eq!(evaluate(Func::Rate, &w), Some(0.1));
+        assert_eq!(evaluate(Func::Delta, &w), Some(1.0));
+    }
+
+    /// `pickFirstSampleIndex`: a counting function may see one sample
+    /// from before the window and no more, and nothing at all when the
+    /// widened slice holds only samples older than the window.
+    #[test]
+    fn an_anchored_count_starts_one_sample_before_the_window() {
+        let vs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let ts = every_10s(20 * S, &vs);
+        let w = extended(&ts, &vs, 100 * S, RangeMode::Anchored);
+        assert_eq!(evaluate(Func::Changes, &w), Some(6.0));
+        let stale = extended(&ts[..2], &vs[..2], 200 * S, RangeMode::Anchored);
+        assert_eq!(evaluate(Func::Changes, &stale), None);
     }
 }

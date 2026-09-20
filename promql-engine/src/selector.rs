@@ -1,9 +1,11 @@
 //! The vector selector as a DataFusion scalar function.
 //!
-//! `promql_vector_selector(samples, start, end, step, lookback, offset, at)`
-//! takes one series' samples and returns that series' values on the step
-//! grid: for every step, the most recent sample no older than `lookback`,
-//! stamped with the step's timestamp.
+//! `promql_vector_selector(samples, start, end, step, lookback, offset,
+//! at, mode, extend_after)` takes one series' samples and returns that
+//! series' values on the step grid: for every step, the most recent
+//! sample no older than `lookback`, stamped with the step's timestamp.
+//! Under `smoothed` it interpolates that value instead, which is why it
+//! also reads `extend_after` milliseconds past the step.
 //!
 //! A scalar function, because a row is a series: DataFusion parallelizes
 //! over rows and pushes projections around it. Keeping the parameters as
@@ -34,7 +36,7 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use crate::params::Params;
+use crate::params::{Params, RangeMode};
 use crate::series;
 
 pub const NAME: &str = "promql_vector_selector";
@@ -66,6 +68,63 @@ fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, window_ms: i64) -> Option<f64> 
     Some(v)
 }
 
+/// `smoothSeries` for one step: the value the series is taken to have at
+/// `data_ts`, read from the samples `ts[lo..hi]`, which the caller has
+/// already narrowed to `(data_ts - lb, data_ts + lb]`.
+///
+/// Staleness markers are not samples, so they are stepped over on both
+/// sides rather than interpolated through; upstream gets this for free
+/// because `matrixIterSlice` has already dropped them.
+fn smoothed(ts: &[i64], vs: &[f64], lo: usize, hi: usize, data_ts: i64) -> Option<f64> {
+    let i = lo + ts[lo..hi].partition_point(|t| *t < data_ts);
+    if i < hi && ts[i] == data_ts && !is_stale(vs[i]) {
+        return Some(vs[i]);
+    }
+    let next = (i..hi).find(|&j| ts[j] > data_ts && !is_stale(vs[j]));
+    let prev = (lo..i).rev().find(|&j| !is_stale(vs[j]));
+    match (prev, next) {
+        (Some(a), Some(b)) => Some(crate::range::interpolate(
+            (ts[a], vs[a]),
+            (ts[b], vs[b]),
+            data_ts,
+            // A smoothed selector has no window to detect a reset in, so
+            // upstream interpolates through one until sample metadata
+            // says the series is a counter.
+            false,
+        )),
+        // Nothing after it yet: the last value carries forward.
+        (Some(a), None) => Some(vs[a]),
+        // Nothing before it: the series has not started.
+        _ => None,
+    }
+}
+
+/// Every step's [`smoothed`] value, sweeping the two window edges
+/// forward with `data_ts` so the series is read once.
+fn eval_smoothed(ts: &[i64], vs: &[f64], p: &Params, emit: &mut impl FnMut(i64, f64)) {
+    let lb = p.window_ms;
+    let mut at_step = |step: i64, data_ts: i64, lo: &mut usize, hi: &mut usize| {
+        while *lo < ts.len() && ts[*lo] <= data_ts - lb {
+            *lo += 1;
+        }
+        *hi = (*hi).max(*lo);
+        while *hi < ts.len() && ts[*hi] <= data_ts + lb {
+            *hi += 1;
+        }
+        if let Some(v) = smoothed(ts, vs, *lo, *hi, data_ts) {
+            emit(step, v);
+        }
+    };
+    let (mut lo, mut hi) = (0usize, 0usize);
+    if let Some(at) = p.at_ms {
+        at_step(at, at - p.offset_ms, &mut lo, &mut hi);
+        return;
+    }
+    for step in p.steps() {
+        at_step(step, step - p.offset_ms, &mut lo, &mut hi);
+    }
+}
+
 /// Evaluate one series on the step grid: the body of upstream's
 /// `evalSeries` loop for one series, with `vectorSelectorSingle` inlined
 /// as a single forward sweep.
@@ -76,6 +135,23 @@ fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, window_ms: i64) -> Option<f64> 
 pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64, f64)) {
     debug_assert_eq!(ts.len(), vs.len());
     if p.step_ms <= 0 || p.end_ms < p.start_ms {
+        return;
+    }
+
+    if p.mode == RangeMode::Smoothed {
+        // `@` still pins one lookup, but the value is then repeated over
+        // the grid, so the pinned case collects it first.
+        if p.at_ms.is_some() {
+            let mut pinned = None;
+            eval_smoothed(ts, vs, p, &mut |_, v| pinned = Some(v));
+            if let Some(v) = pinned {
+                for step in p.steps() {
+                    emit(step, v);
+                }
+            }
+        } else {
+            eval_smoothed(ts, vs, p, &mut emit);
+        }
         return;
     }
 
@@ -119,7 +195,7 @@ pub struct VectorSelector {
 impl Default for VectorSelector {
     fn default() -> Self {
         Self {
-            signature: Signature::any(7, Volatility::Immutable),
+            signature: Signature::any(9, Volatility::Immutable),
         }
     }
 }
@@ -128,7 +204,8 @@ pub fn udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(VectorSelector::default())
 }
 
-/// `promql_vector_selector(samples, start, end, step, lookback, offset, at)`.
+/// `promql_vector_selector(samples, start, end, step, lookback, offset,
+/// at, '<mode>', extend_after)`.
 pub fn call(samples: Expr, p: &Params) -> Expr {
     use datafusion::logical_expr::lit;
     udf().call(vec![
@@ -142,6 +219,10 @@ pub fn call(samples: Expr, p: &Params) -> Expr {
             Some(at) => lit(at),
             None => lit(ScalarValue::Int64(None)),
         },
+        lit(p.mode.as_str()),
+        // An instant selector never reaches back beyond its own
+        // lookback, so only the forward half crosses the plan.
+        lit(p.extension.1),
     ])
 }
 
@@ -164,7 +245,13 @@ impl ScalarUDFImpl for VectorSelector {
                 arg_types.first()
             );
         }
+        if arg_types.get(7) != Some(&DataType::Utf8) {
+            return plan_err!("{NAME}: argument 7 must be the selector mode as Utf8");
+        }
         for (i, t) in arg_types.iter().enumerate().skip(1) {
+            if i == 7 {
+                continue;
+            }
             if !matches!(t, DataType::Int64 | DataType::Null) {
                 return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
             }
@@ -199,6 +286,22 @@ impl ScalarUDFImpl for VectorSelector {
             window_ms: int_arg(&args, 4, NAME)?.ok_or_else(|| missing("lookback"))?,
             offset_ms: int_arg(&args, 5, NAME)?.ok_or_else(|| missing("offset"))?,
             at_ms: int_arg(&args, 6, NAME)?,
+            mode: match &args.args[7] {
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) => RangeMode::parse(name)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!("{NAME}: unknown selector mode {name}"))
+                    })?,
+                other => {
+                    return Err(DataFusionError::Execution(format!(
+                        "{NAME}: selector mode must be a string literal, got {:?}",
+                        other.data_type()
+                    )))
+                }
+            },
+            extension: (
+                0,
+                int_arg(&args, 8, NAME)?.ok_or_else(|| missing("extension"))?,
+            ),
         };
         Ok(ColumnarValue::Array(Arc::new(apply(
             samples.as_list::<i32>(),
@@ -298,6 +401,8 @@ mod tests {
             window_ms: 5 * M,
             offset_ms: 0,
             at_ms: None,
+            mode: RangeMode::Plain,
+            extension: (0, 0),
         }
     }
 
@@ -503,5 +608,55 @@ mod tests {
             .column(1)
             .as_primitive::<Float64Type>();
         assert_eq!(vs.values(), &[1.0, 3.0]);
+    }
+
+    /// `smoothSeries`: the value at a step between two samples is the
+    /// straight line between them, the value before the first sample is
+    /// nothing, and the value after the last one carries forward.
+    #[test]
+    fn a_smoothed_selector_interpolates_between_the_samples() {
+        let p = Params {
+            start_ms: 0,
+            end_ms: 4 * M,
+            step_ms: 30_000,
+            window_ms: M,
+            offset_ms: 0,
+            at_ms: None,
+            mode: RangeMode::Smoothed,
+            extension: (0, M),
+        };
+        let out = run(&[M, 2 * M], &[10.0, 20.0], p);
+        assert_eq!(
+            out,
+            vec![
+                // Steps 0 and 30s see only samples ahead of them, and
+                // the line has no left end there.
+                (M, 10.0),
+                (90_000, 15.0),
+                (2 * M, 20.0),
+                // 150s still has the last sample in its window; from
+                // 180s on the window is empty again.
+                (150_000, 20.0),
+            ]
+        );
+    }
+
+    /// A staleness marker is not a sample, so it is neither returned nor
+    /// interpolated through.
+    #[test]
+    fn a_smoothed_selector_steps_over_a_staleness_marker() {
+        let p = Params {
+            start_ms: 2 * M,
+            end_ms: 2 * M,
+            step_ms: M,
+            window_ms: 2 * M,
+            offset_ms: 0,
+            at_ms: None,
+            mode: RangeMode::Smoothed,
+            extension: (0, 2 * M),
+        };
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let out = run(&[M, 2 * M, 3 * M], &[10.0, stale, 30.0], p);
+        assert_eq!(out, vec![(2 * M, 20.0)]);
     }
 }

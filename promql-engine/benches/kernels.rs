@@ -21,7 +21,7 @@ use datafusion::arrow::array::{ArrayRef, AsArray, BooleanBufferBuilder, ListArra
 use datafusion::logical_expr::{EmitTo, GroupsAccumulator};
 use promql_engine::aggregate::{Grouped, Op};
 use promql_engine::math::{self, FlagLane, Welford};
-use promql_engine::params::Params;
+use promql_engine::params::{Params, RangeMode};
 use promql_engine::range::{self, Func};
 use promql_engine::selector::{self, STALE_NAN_BITS};
 use promql_engine::series::{self, Series};
@@ -77,11 +77,25 @@ fn selector_params(n: usize) -> Params {
         window_ms: FIVE_MINUTES_MS,
         offset_ms: 0,
         at_ms: None,
+        mode: RangeMode::Plain,
+        extension: (0, 0),
     }
 }
 
 fn range_params(n: usize) -> Params {
     selector_params(n)
+}
+
+/// The same grid with `anchored`, whose slice reaches one lookback
+/// delta before each window. That pairing is what the benchmark is
+/// for: anchored windows are the widest we serve and also the ones the
+/// sweep sits out, so every step refolds the wider span from scratch.
+fn anchored_params(n: usize) -> Params {
+    Params {
+        mode: RangeMode::Anchored,
+        extension: (FIVE_MINUTES_MS, 0),
+        ..selector_params(n)
+    }
 }
 
 /// `k` series with a sample on every one of `steps` grid points, the
@@ -276,17 +290,19 @@ fn range_function(c: &mut Criterion) {
         let plain = samples_of(&[(ts.clone(), vs)]);
         let stale = samples_of(&[(ts, stale)]);
         let p = range_params(n);
+        let anchored = anchored_params(n);
         g.throughput(Throughput::Elements(n as u64));
-        for (name, func, column) in [
-            ("rate", Func::Rate, &plain),
-            ("increase", Func::Increase, &plain),
-            ("count_over_time", Func::CountOverTime, &plain),
-            ("max_over_time", Func::MaxOverTime, &plain),
-            ("rate_stale_every_100", Func::Rate, &stale),
+        for (name, func, column, p) in [
+            ("rate", Func::Rate, &plain, &p),
+            ("increase", Func::Increase, &plain, &p),
+            ("count_over_time", Func::CountOverTime, &plain, &p),
+            ("max_over_time", Func::MaxOverTime, &plain, &p),
+            ("rate_stale_every_100", Func::Rate, &stale, &p),
+            ("rate_anchored", Func::Rate, &plain, &anchored),
         ] {
             let column: &ListArray = column.as_list::<i32>();
             g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| range::apply(func, black_box(column), &p))
+                b.iter(|| range::apply(func, black_box(column), p))
             });
         }
     }
