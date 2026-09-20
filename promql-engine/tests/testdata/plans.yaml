@@ -197,6 +197,33 @@ tests:
                   SubqueryAlias: binary_1
                     Projection: selector_1.labels, promql_vector_selector(selector_1.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
                       TableScan: selector_1
+  - name: a set operator matched on one label
+    description: >
+      or is the same union and the same grouping as the arithmetic
+      operators: which samples come out of a match group is the only
+      thing that differs, and that is the accumulator's business, not
+      the plan's. What does change is the projection above the union,
+      which keeps __name__ on both sides -- a set operator hands a
+      sample back as it found it.
+    load:
+      - requests{job="api", pod="api-1"} 0
+      - limit{job="api", zone="eu"} 0
+    query: |
+      requests or on(job) limit
+    plan: |
+      Projection: __pairs__.labels AS labels, __pairs__.samples AS samples
+        Unnest: lists[] structs[__pairs__]
+          Unnest: lists[__pairs__|depth=1] structs[]
+            Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("or"), Utf8("on(job)"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+              Union
+                Projection: promql_labels(Utf8("__name__"), get_field(binary_0.labels, Utf8("__name__")), Utf8("job"), get_field(binary_0.labels, Utf8("job")), Utf8("pod"), get_field(binary_0.labels, Utf8("pod")), Utf8("zone"), Utf8("")) AS labels, binary_0.samples, Boolean(false) AS __rhs
+                  SubqueryAlias: binary_0
+                    Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                      TableScan: selector_0
+                Projection: promql_labels(Utf8("__name__"), get_field(binary_1.labels, Utf8("__name__")), Utf8("job"), get_field(binary_1.labels, Utf8("job")), Utf8("pod"), Utf8(""), Utf8("zone"), get_field(binary_1.labels, Utf8("zone"))) AS labels, binary_1.samples, Boolean(true) AS __rhs
+                  SubqueryAlias: binary_1
+                    Projection: selector_1.labels, promql_vector_selector(selector_1.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                      TableScan: selector_1
   - name: a filtering comparison as an operand
     description: >
       The inner comparison keeps every label, __name__ included, and

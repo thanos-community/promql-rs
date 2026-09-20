@@ -126,9 +126,12 @@ pub async fn plan(
 fn check_expr(expr: &Expr) -> Result<(), EngineError> {
     match expr {
         Expr::Binary(b) => {
-            check_binary(b)?;
+            // Down first: upstream's `checkAST` recurses before it
+            // checks the node it is on, so `(1 > 1) and up` is refused
+            // for the inner comparison and not for the outer operator.
             check_expr(&b.lhs)?;
-            check_expr(&b.rhs)
+            check_expr(&b.rhs)?;
+            check_binary(b)
         }
         Expr::Aggregate(a) => {
             if let Some(param) = &a.param {
@@ -150,7 +153,7 @@ fn check_expr(expr: &Expr) -> Result<(), EngineError> {
 }
 
 /// Upstream's `checkAST` arm for a binary expression
-/// (`promql/parser/parse.go:779-802` at 83962c35), in its order and its
+/// (`promql/parser/parse.go:760-828` at 83962c35), in its order and its
 /// words.
 ///
 /// The `bool` rule is here because the operators need it: a comparison
@@ -160,6 +163,14 @@ fn check_expr(expr: &Expr) -> Result<(), EngineError> {
 /// the merge collapses the two into one.
 fn check_binary(b: &BinaryExpr) -> Result<(), EngineError> {
     let (lhs, rhs) = (value_type(&b.lhs), value_type(&b.rhs));
+    // In `parser/parse.go`'s own order (`:775` onwards at 83962c35), so
+    // that a query breaking two of these is refused for the same one
+    // Prometheus names.
+    if b.return_bool && !is_comparison(b.op) {
+        return Err(EngineError::Query(
+            "bool modifier can only be used on comparison operators".into(),
+        ));
+    }
     // `1 > 1` is not a filter — there is nothing to filter — so upstream
     // makes the author write `bool` and say which of the two they meant.
     if is_comparison(b.op) && !b.return_bool && lhs == ValueType::Scalar && rhs == ValueType::Scalar
@@ -168,12 +179,63 @@ fn check_binary(b: &BinaryExpr) -> Result<(), EngineError> {
             "comparisons between scalars must use BOOL modifier".into(),
         ));
     }
+    if let Some(matching) = &b.vector_matching {
+        // A label cannot both pick the match and be copied across it.
+        if let Some(both) = matching
+            .include
+            .iter()
+            .find(|name| matching.on && matching.matching_labels.contains(name))
+        {
+            return Err(EngineError::Query(format!(
+                "label \"{both}\" must not occur in ON and GROUP clause at once"
+            )));
+        }
+    }
     for side in [lhs, rhs] {
         if !matches!(side, ValueType::Scalar | ValueType::Vector) {
             return Err(EngineError::Query(
                 "binary expression must contain only scalar and instant vector types".into(),
             ));
         }
+    }
+    // One switch upstream (`:805-824`), so the two arms are exclusive:
+    // a modifier is only checked against the operator once both sides
+    // are known to be vectors.
+    let vectors = lhs == ValueType::Vector && rhs == ValueType::Vector;
+    match &b.vector_matching {
+        Some(matching) if !vectors => {
+            // A scalar has no labels to match on. Only the named labels
+            // are refused: upstream quietly throws the whole modifier
+            // away otherwise, `group_left()` on a scalar included.
+            if !matching.matching_labels.is_empty() {
+                return Err(EngineError::Query(
+                    "vector matching only allowed between instant vectors".into(),
+                ));
+            }
+        }
+        // A set operator is many-to-many and nothing else: there is no
+        // "one" side for `group_x` to copy a label off.
+        Some(matching)
+            if is_set(b.op)
+                && matches!(
+                    matching.card,
+                    VectorMatchCardinality::ManyToOne | VectorMatchCardinality::OneToMany
+                ) =>
+        {
+            return Err(EngineError::Query(format!(
+                "no grouping allowed for \"{}\" operation",
+                b.op
+            )));
+        }
+        _ => {}
+    }
+    // A set operator is defined over signatures, and a scalar has no
+    // labels to take one from.
+    if is_set(b.op) && !vectors {
+        return Err(EngineError::Query(format!(
+            "set operator \"{}\" not allowed in binary scalar expression",
+            b.op
+        )));
     }
     Ok(())
 }
@@ -182,6 +244,12 @@ fn check_binary(b: &BinaryExpr) -> Result<(), EngineError> {
 fn is_comparison(op: promql_parser::token::ItemType) -> bool {
     use promql_parser::token::ItemType::*;
     matches!(op, EqlC | Neq | Gtr | Lss | Gte | Lte)
+}
+
+/// The operators upstream's `IsSetOperator` answers for.
+fn is_set(op: promql_parser::token::ItemType) -> bool {
+    use promql_parser::token::ItemType::*;
+    matches!(op, Land | Lor | Lunless)
 }
 
 /// The name both binary shapes give the node they add, so a plan reads
@@ -208,31 +276,21 @@ fn pair_column(field: &str) -> Column {
 /// answers all of it — so each gets its own name: what the differential
 /// suite counts is how many evaluations wait on which feature.
 fn binary_op(b: &BinaryExpr) -> Result<(binary::Op, bool, binary::Matching), EngineError> {
-    use promql_parser::token::ItemType;
-
-    let op = match b.op {
-        ItemType::Land | ItemType::Lor | ItemType::Lunless => {
-            return Err(EngineError::Unsupported(format!(
-                "the {} set operator",
-                b.op
-            )))
-        }
-        op => binary::Op::from_token(op)
-            .ok_or_else(|| EngineError::Unsupported(format!("the {op} operator")))?,
-    };
+    let op = binary::Op::from_token(b.op)
+        .ok_or_else(|| EngineError::Unsupported(format!("the {} operator", b.op)))?;
     let mut out = binary::Matching::default();
     if let Some(matching) = &b.vector_matching {
         out.card = match matching.card {
             VectorMatchCardinality::OneToOne => binary::Card::OneToOne,
             VectorMatchCardinality::ManyToOne => binary::Card::ManyToOne,
             VectorMatchCardinality::OneToMany => binary::Card::OneToMany,
-            // Set operators are the only many-to-many, and they are
-            // already refused above.
-            VectorMatchCardinality::ManyToMany => {
-                return Err(EngineError::Unsupported(
-                    "the many-to-many matching modifier".into(),
-                ))
-            }
+            // Upstream rewrites a set operator's `CardOneToOne` to
+            // `CardManyToMany` while parsing (`parser/parse.go:783` at
+            // 83962c35) and this crate's parser does not, so nothing
+            // reaches here spelling it -- but if it ever does, it means
+            // the same thing `and` already means: every series on both
+            // sides, which is the card a set operator plans with.
+            VectorMatchCardinality::ManyToMany => binary::Card::OneToOne,
         };
         if matching.fill_values.lhs.is_some() || matching.fill_values.rhs.is_some() {
             return Err(EngineError::Unsupported("the fill modifier".into()));
@@ -240,28 +298,6 @@ fn binary_op(b: &BinaryExpr) -> Result<(binary::Op, bool, binary::Matching), Eng
         out.on = matching.on;
         out.labels = sorted(&matching.matching_labels);
         out.include = sorted(&matching.include);
-    }
-    // `bool` is only ever written on a comparison — upstream's parser
-    // says so — so anywhere else it is a parse this engine should not
-    // quietly answer.
-    if b.return_bool && !op.is_comparison() {
-        return Err(EngineError::Query(format!(
-            "bool modifier can only be used on comparison operators, got {}",
-            b.op
-        )));
-    }
-    // Upstream's parser refuses this too, `promql/parser/parse.go:790`
-    // at 83962c35, and only after the `bool` check above (`:775`) —
-    // hence the order here. It lives in the planner because this crate's
-    // parser actions cannot yet carry a message out.
-    if let Some(both) = out
-        .include
-        .iter()
-        .find(|name| out.on && out.labels.contains(name))
-    {
-        return Err(EngineError::Query(format!(
-            "label \"{both}\" must not occur in ON and GROUP clause at once"
-        )));
     }
     Ok((op, b.return_bool, out))
 }
@@ -1116,12 +1152,47 @@ mod tests {
         }
 
         // With the modifier, or with a vector on either side, the
-        // comparison is a query the engine answers; only the matching
-        // modifiers on top of it are still a missing feature.
+        // comparison is a query the engine answers.
         assert!(plan_of("1 > bool 1", range).await.is_ok());
         assert!(plan_of("up > 1", range).await.is_ok());
-        let err = plan_of("up and up", range).await.unwrap_err();
-        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+        assert!(plan_of("up and up", range).await.is_ok());
+    }
+
+    /// The rest of upstream's binary arm, in upstream's words, and in
+    /// the order the walk reaches them.
+    #[tokio::test]
+    async fn the_parse_time_rules_are_upstreams_and_the_inner_one_wins() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        let fails = |query: &'static str| async move {
+            plan_of(query, range).await.unwrap_err().to_string()
+        };
+
+        assert_eq!(
+            fails("up + bool 1").await,
+            "bool modifier can only be used on comparison operators"
+        );
+        // A scalar operand has no labels to match on -- but only the
+        // named ones are refused, as upstream refuses them.
+        assert_eq!(
+            fails("up + on(pod) 1").await,
+            "vector matching only allowed between instant vectors"
+        );
+        assert!(plan_of("up + on() 1", range).await.is_ok());
+        // Both operands are vectors, so this reaches the other arm.
+        assert_eq!(
+            fails("up and on(pod) group_left() up").await,
+            r#"no grouping allowed for "and" operation"#
+        );
+        assert_eq!(
+            fails("up and 1").await,
+            r#"set operator "and" not allowed in binary scalar expression"#
+        );
+        // The walk goes down before it checks the node it is on, so the
+        // comparison inside is what the query is refused for.
+        assert_eq!(
+            fails("(1 > 1) and up").await,
+            "comparisons between scalars must use BOOL modifier"
+        );
     }
 
     /// A string or a range vector as an operand is a query error, not a

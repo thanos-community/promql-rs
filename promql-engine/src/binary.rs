@@ -76,10 +76,11 @@ pub const SIDE: &str = "__rhs";
 const LHS: usize = 0;
 const RHS: usize = 1;
 
-/// The binary operators that take a value on each side.
+/// Every binary operator between two vectors.
 ///
-/// The set operators are not here: `and`, `or` and `unless` never look
-/// at a value, so they are a different operator shape.
+/// The set operators sit here with the rest even though they never read
+/// a value: they match on the same signature, so they are the same
+/// grouping with a different rule for which samples come out of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Add,
@@ -95,7 +96,30 @@ pub enum Op {
     Lss,
     Gte,
     Lte,
+    And,
+    Or,
+    Unless,
 }
+
+/// Every operator, for the round trips that have to name them all.
+const ALL: [Op; 16] = [
+    Op::Add,
+    Op::Sub,
+    Op::Mul,
+    Op::Div,
+    Op::Mod,
+    Op::Pow,
+    Op::Atan2,
+    Op::Eql,
+    Op::Neq,
+    Op::Gtr,
+    Op::Lss,
+    Op::Gte,
+    Op::Lte,
+    Op::And,
+    Op::Or,
+    Op::Unless,
+];
 
 impl Op {
     pub fn from_token(op: ItemType) -> Option<Op> {
@@ -113,6 +137,9 @@ impl Op {
             ItemType::Lss => Op::Lss,
             ItemType::Gte => Op::Gte,
             ItemType::Lte => Op::Lte,
+            ItemType::Land => Op::And,
+            ItemType::Lor => Op::Or,
+            ItemType::Lunless => Op::Unless,
             _ => return None,
         })
     }
@@ -132,7 +159,17 @@ impl Op {
             Op::Lss => "<",
             Op::Gte => ">=",
             Op::Lte => "<=",
+            Op::And => "and",
+            Op::Or => "or",
+            Op::Unless => "unless",
         }
+    }
+
+    /// The operators upstream's `IsSetOperator` answers for. They read
+    /// no value at all: which samples come out is decided by which
+    /// signatures the other side has at that step.
+    pub fn is_set(&self) -> bool {
+        matches!(self, Op::And | Op::Or | Op::Unless)
     }
 
     /// The operators upstream's `IsComparisonOperator` answers for.
@@ -153,7 +190,13 @@ impl Op {
     /// already there. `bool` replaces the value with a 1 or a 0, which
     /// is no longer that metric either, and drops it too.
     pub fn drops_metric_name(&self, return_bool: bool) -> bool {
-        !self.is_comparison() || return_bool
+        match self {
+            // A set operator hands a sample back untouched, so there is
+            // nothing for `changesMetricSchema` to be true of.
+            op if op.is_set() => false,
+            op if op.is_comparison() => return_bool,
+            _ => true,
+        }
     }
 
     /// One pair of floats, upstream's `vectorElemBinop` with the
@@ -167,6 +210,7 @@ impl Op {
     /// `math.Min` did. A NaN compares false to everything, in Go and in
     /// Rust alike, so it is simply filtered away.
     pub fn value(&self, lhs: f64, rhs: f64, return_bool: bool) -> Option<f64> {
+        debug_assert!(!self.is_set(), "a set operator never combines two values");
         if !self.is_comparison() {
             return Some(match self {
                 Op::Add => lhs + rhs,
@@ -176,7 +220,7 @@ impl Op {
                 Op::Mod => lhs % rhs,
                 Op::Pow => lhs.powf(rhs),
                 Op::Atan2 => lhs.atan2(rhs),
-                _ => unreachable!("every comparison is handled below"),
+                _ => unreachable!("every comparison is handled below, every set operator above"),
             });
         }
         let keep = self.compare(lhs, rhs);
@@ -383,23 +427,7 @@ pub fn parse_literal(s: &str) -> Option<(Op, bool)> {
         Some(spelling) => (spelling, true),
         None => (s, false),
     };
-    let op = [
-        Op::Add,
-        Op::Sub,
-        Op::Mul,
-        Op::Div,
-        Op::Mod,
-        Op::Pow,
-        Op::Atan2,
-        Op::Eql,
-        Op::Neq,
-        Op::Gtr,
-        Op::Lss,
-        Op::Gte,
-        Op::Lte,
-    ]
-    .into_iter()
-    .find(|op| op.as_str() == spelling)?;
+    let op = ALL.into_iter().find(|op| op.as_str() == spelling)?;
     // `1 + bool 2` is not a query upstream's parser accepts, so it is
     // not a plan this reads back either.
     if return_bool && !op.is_comparison() {
@@ -408,10 +436,16 @@ pub fn parse_literal(s: &str) -> Option<(Op, bool)> {
     Some((op, return_bool))
 }
 
-/// One series of the "many" side: its labels, and what it put at each
-/// step of the grid.
+/// One series held whole: its labels, and what it put at each step of
+/// the grid.
+///
+/// For the operators that combine two values this is the "many" side
+/// and `side` is always the one the modifier allows to be many. A set
+/// operator has no "one" side at all, so both operands land here and
+/// `side` is what tells them apart.
 #[derive(Debug)]
 struct Many {
+    side: usize,
     labels: Vec<String>,
     counts: Vec<i64>,
     values: Vec<f64>,
@@ -485,11 +519,16 @@ impl Pairing {
         (self.one_pool.len() - 1) as i32
     }
 
-    fn intern_many(&mut self, labels: &[String]) -> usize {
-        if let Some(index) = self.many.iter().position(|held| held.labels == labels) {
+    fn intern_many(&mut self, side: usize, labels: &[String]) -> usize {
+        if let Some(index) = self
+            .many
+            .iter()
+            .position(|held| held.side == side && held.labels == labels)
+        {
             return index;
         }
         self.many.push(Many {
+            side,
             labels: labels.to_vec(),
             counts: vec![0; self.grid.len()],
             values: vec![f64::NAN; self.grid.len()],
@@ -506,7 +545,7 @@ impl Pairing {
         values: &[f64],
     ) -> Result<()> {
         let grid = self.grid;
-        if side == self.matching.one_side() {
+        if !self.op.is_set() && side == self.matching.one_side() {
             self.remember(labels);
             let row = self.intern_one(labels);
             let (counts, lanes, rows) = (
@@ -522,7 +561,7 @@ impl Pairing {
                 rows[index..index + len].fill(row);
             });
         }
-        let many = self.intern_many(labels);
+        let many = self.intern_many(side, labels);
         let series = &mut self.many[many];
         let (counts, lanes) = (&mut series.counts, &mut series.values);
         grid.runs(timestamps, |index, from, len| {
@@ -566,6 +605,13 @@ impl Pairing {
     /// "one" side — or deleted where it has none.
     fn result_labels(&self, many: usize, one: i32) -> Vec<String> {
         let mut out = self.many[many].labels.clone();
+        // A set operator answers with the sample it was handed, so its
+        // labels are the ones it arrived with -- `resultMetric` is not
+        // on that path at all (`promql/engine.go:2888-2961` at
+        // 83962c35).
+        if self.op.is_set() {
+            return out;
+        }
         let m = &self.matching;
         for (index, name) in self.schema.iter().enumerate() {
             // `on` keeps only what it names and `ignoring` drops only
@@ -615,6 +661,62 @@ impl Pairing {
         ))
     }
 
+    /// `and`, `or` and `unless` over the same grid: upstream's
+    /// `VectorAnd` / `VectorOr` / `VectorUnless` (`promql/engine.go:2888`
+    /// at 83962c35), which ask nothing of a sample but whether the other
+    /// side has this signature at this step.
+    ///
+    /// Every sample that survives keeps its own labels and its own
+    /// value, so two of them can only ever land in one output series if
+    /// their label sets are equal -- and equal labels are the same
+    /// signature, which for `or` means the right-hand one was dropped.
+    /// That is why upstream's "vector cannot contain metrics with the
+    /// same labelset" has no way to happen here, and why merging by
+    /// label set is safe.
+    fn sets(&self) -> Vec<Bucket> {
+        let mut buckets: Vec<Bucket> = Vec::new();
+        let mut by_labels: HashMap<&Vec<String>, usize> = HashMap::new();
+
+        for step in 0..self.grid.len() {
+            let present = |side: usize| {
+                self.many
+                    .iter()
+                    .any(|series| series.side == side && series.counts[step] > 0)
+            };
+            let (left, right) = (present(LHS), present(RHS));
+            for series in &self.many {
+                if series.counts[step] == 0 {
+                    continue;
+                }
+                let keep = match self.op {
+                    Op::And => series.side == LHS && right,
+                    Op::Unless => series.side == LHS && !right,
+                    // Everything on the left, and the right only where
+                    // the left put nothing under this signature.
+                    Op::Or => series.side == LHS || !left,
+                    _ => unreachable!("only a set operator walks this grid"),
+                };
+                if !keep {
+                    continue;
+                }
+                let bucket = *by_labels.entry(&series.labels).or_insert_with(|| {
+                    buckets.push(Bucket {
+                        labels: series.labels.clone(),
+                        timestamps: Vec::new(),
+                        values: Vec::new(),
+                        claimed: None,
+                    });
+                    buckets.len() - 1
+                });
+                buckets[bucket].timestamps.push(self.grid.timestamp(step));
+                buckets[bucket].values.push(series.values[step]);
+            }
+        }
+
+        buckets.sort_by(|a, b| a.labels.cmp(&b.labels));
+        buckets
+    }
+
     /// The step grid walked once, in upstream's order: a duplicate on
     /// the "one" side is reported before a "many" side that matched
     /// twice, and both before any value is emitted.
@@ -626,6 +728,9 @@ impl Pairing {
     /// had a sample on the "many" side at that step. Seeing that would
     /// take a second pass over every group.
     fn pairs(&self) -> Result<Vec<Bucket>> {
+        if self.op.is_set() {
+            return Ok(self.sets());
+        }
         let mut buckets: Vec<Bucket> = Vec::new();
         let mut by_labels: HashMap<Vec<String>, usize> = HashMap::new();
         let mut by_pair: HashMap<(usize, i32), usize> = HashMap::new();
@@ -834,6 +939,10 @@ impl Accumulator for Pairing {
             text_lane(STATE_MANY_LABELS, many_labels),
             int_lane(STATE_MANY_COUNTS, many_counts),
             float_lane(STATE_MANY_VALUES, many_values),
+            int_lane(
+                STATE_MANY_SIDES,
+                self.many.iter().map(|s| s.side as i64).collect(),
+            ),
             ScalarValue::Utf8(self.group.clone()),
         ])
     }
@@ -885,18 +994,24 @@ impl Accumulator for Pairing {
         let many_labels = texts(states.get(5), STATE_MANY_LABELS)?;
         let many_counts = lanes::<Int64Type>(states.get(6), STATE_MANY_COUNTS)?;
         let many_values = lanes::<Float64Type>(states.get(7), STATE_MANY_VALUES)?;
+        let many_sides = lanes::<Int64Type>(states.get(8), STATE_MANY_SIDES)?;
         for row in 0..many_counts.len() {
             let counts = many_counts.value(row);
             let counts = counts.as_primitive::<Int64Type>();
             let values = many_values.value(row);
             let values = values.as_primitive::<Float64Type>();
+            let sides = many_sides.value(row);
+            let sides = sides.as_primitive::<Int64Type>();
             let rows = counts.len() / steps.max(1);
             if counts.len() != rows * steps || values.len() != counts.len() {
                 return Err(self.corrupt("a many-side rectangle that is not rows by steps"));
             }
+            if sides.len() != rows {
+                return Err(self.corrupt("a side per series that is not one per series"));
+            }
             let labels = rectangle(&many_labels.value(row), width, rows)?;
             for (index, labels) in labels.iter().enumerate() {
-                let many = self.intern_many(labels);
+                let many = self.intern_many(sides.value(index) as usize, labels);
                 for step in 0..steps {
                     let at = index * steps + step;
                     if counts.value(at) > 0 {
@@ -920,7 +1035,7 @@ impl Accumulator for Pairing {
                 }
             }
         }
-        if let Some(group) = states.get(8).and_then(|s| s.as_string_opt::<i32>()) {
+        if let Some(group) = states.get(9).and_then(|s| s.as_string_opt::<i32>()) {
             for row in 0..group.len() {
                 if self.group.is_none() && group.is_valid(row) {
                     self.group = Some(group.value(row).to_string());
@@ -1022,11 +1137,12 @@ const STATE_ONE_METRICS: &str = "one_metrics";
 const STATE_MANY_LABELS: &str = "many_labels";
 const STATE_MANY_COUNTS: &str = "many_counts";
 const STATE_MANY_VALUES: &str = "many_values";
+const STATE_MANY_SIDES: &str = "many_sides";
 const STATE_GROUP: &str = "group";
 
 /// Named once so that a rename fails to compile at both ends rather
 /// than mismatching across a partial/final plan boundary.
-const STATE_LANES: [(&str, DataType); 8] = [
+const STATE_LANES: [(&str, DataType); 9] = [
     (STATE_ONE_COUNTS, DataType::Int64),
     (STATE_ONE_VALUES, DataType::Float64),
     (STATE_ONE_ROWS, DataType::Int64),
@@ -1035,6 +1151,7 @@ const STATE_LANES: [(&str, DataType); 8] = [
     (STATE_MANY_LABELS, DataType::Utf8),
     (STATE_MANY_COUNTS, DataType::Int64),
     (STATE_MANY_VALUES, DataType::Float64),
+    (STATE_MANY_SIDES, DataType::Int64),
 ];
 
 fn state_item(name: &str, of: DataType) -> FieldRef {
@@ -1433,25 +1550,15 @@ mod tests {
         assert!(Op::Atan2.drops_metric_name(false));
         assert!(!Op::Gtr.drops_metric_name(false));
         assert!(Op::Gtr.drops_metric_name(true));
+        // A set operator hands the sample back as it came, name and all.
+        for op in [Op::And, Op::Or, Op::Unless] {
+            assert!(!op.drops_metric_name(false), "{}", op.as_str());
+        }
     }
 
     #[test]
     fn every_operator_round_trips_through_its_promql_spelling() {
-        for op in [
-            Op::Add,
-            Op::Sub,
-            Op::Mul,
-            Op::Div,
-            Op::Mod,
-            Op::Pow,
-            Op::Atan2,
-            Op::Eql,
-            Op::Neq,
-            Op::Gtr,
-            Op::Lss,
-            Op::Gte,
-            Op::Lte,
-        ] {
+        for op in ALL {
             assert_eq!(parse_literal(literal(op, false)), Some((op, false)));
             if op.is_comparison() {
                 assert_eq!(parse_literal(literal(op, true)), Some((op, true)));
@@ -1460,8 +1567,10 @@ mod tests {
         }
         assert_eq!(Op::from_token(ItemType::Add), Some(Op::Add));
         assert_eq!(Op::from_token(ItemType::Gtr), Some(Op::Gtr));
-        assert_eq!(Op::from_token(ItemType::Land), None);
-        assert_eq!(parse_literal("and"), None);
+        assert_eq!(Op::from_token(ItemType::Land), Some(Op::And));
+        assert_eq!(Op::from_token(ItemType::Lunless), Some(Op::Unless));
+        assert_eq!(parse_literal("and"), Some((Op::And, false)));
+        assert_eq!(parse_literal("and bool"), None);
         // `bool` belongs to a comparison and to nothing else, so a plan
         // that spells it anywhere else is not one this wrote.
         assert_eq!(parse_literal("+ bool"), None);
@@ -1862,6 +1971,107 @@ mod tests {
                 (lset("", "/a", "a", "eu"), vec![(0, 10.0), (10_000, 21.0)]),
                 (lset("", "/b", "a", "eu"), vec![(10_000, 28.0)]),
             ]
+        );
+    }
+
+    /// The three set operators over one match group, step by step: the
+    /// right side is present at the first two steps and gone at the
+    /// third, so each operator changes its mind exactly there.
+    #[test]
+    fn a_set_operator_asks_only_whether_the_other_side_is_there() {
+        let left = lset("requests", "", "a", "");
+        let right = lset("errors", "", "a", "");
+        let of = |op: Op| {
+            let mut pairing = plain(op);
+            pairing
+                .absorb(LHS, &left, &[0, 10_000, 20_000], &[1.0, 2.0, 3.0])
+                .unwrap();
+            pairing
+                .absorb(RHS, &right, &[0, 10_000], &[9.0, 9.0])
+                .unwrap();
+            pairs_of(pairing.evaluate().unwrap())
+        };
+
+        // `and` keeps the left sample, its value and its name.
+        assert_eq!(of(Op::And), [(left.clone(), vec![(0, 1.0), (10_000, 2.0)])]);
+        assert_eq!(of(Op::Unless), [(left.clone(), vec![(20_000, 3.0)])]);
+        // `or` is every left sample plus the right ones the left did
+        // not already answer for, each under its own labels.
+        assert_eq!(
+            of(Op::Or),
+            [(left.clone(), vec![(0, 1.0), (10_000, 2.0), (20_000, 3.0)])]
+        );
+    }
+
+    /// `or` answers with the right-hand series, name and all, at the
+    /// steps the left side left empty — and with nothing of it where
+    /// the left side was there.
+    #[test]
+    fn or_falls_back_to_the_right_hand_series() {
+        let left = lset("requests", "", "a", "");
+        let right = lset("errors", "", "a", "");
+        let mut pairing = plain(Op::Or);
+        pairing.absorb(LHS, &left, &[10_000], &[1.0]).unwrap();
+        pairing
+            .absorb(RHS, &right, &[0, 10_000, 20_000], &[7.0, 8.0, 9.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(pairing.evaluate().unwrap()),
+            [
+                (right, vec![(0, 7.0), (20_000, 9.0)]),
+                (left, vec![(10_000, 1.0)]),
+            ]
+        );
+    }
+
+    /// Two left series in one group are a fan-out error for an
+    /// arithmetic operator and nothing at all for a set one: every
+    /// signature may hold as many series as it likes on both sides.
+    #[test]
+    fn a_set_operator_lets_both_sides_be_many() {
+        let mut pairing = pairing(Op::And, false, on(&["pod"]));
+        let a = lset("requests", "/a", "a", "");
+        let b = lset("requests", "/b", "a", "");
+        pairing.absorb(LHS, &a, &[0], &[1.0]).unwrap();
+        pairing.absorb(LHS, &b, &[0], &[2.0]).unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "", "a", "eu"), &[0], &[9.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "", "a", "us"), &[0], &[9.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(pairing.evaluate().unwrap()),
+            [(a, vec![(0, 1.0)]), (b, vec![(0, 2.0)])]
+        );
+    }
+
+    /// A set operator's partial state carries which side each series was
+    /// on, which is the only thing the merged group cannot work out for
+    /// itself.
+    #[test]
+    fn partial_states_keep_the_side_a_series_was_on() {
+        let left = lset("requests", "", "a", "");
+        let right = lset("errors", "", "a", "");
+        let mut whole = plain(Op::Unless);
+        whole.absorb(LHS, &left, &[0, 10_000], &[1.0, 2.0]).unwrap();
+        whole.absorb(RHS, &right, &[10_000], &[9.0]).unwrap();
+
+        let mut a = plain(Op::Unless);
+        a.absorb(LHS, &left, &[0, 10_000], &[1.0, 2.0]).unwrap();
+        let mut b = plain(Op::Unless);
+        b.absorb(RHS, &right, &[10_000], &[9.0]).unwrap();
+
+        let mut merged = plain(Op::Unless);
+        for mut partial in [a, b] {
+            let state = partial.state().unwrap();
+            let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
+            merged.merge_batch(&arrays).unwrap();
+        }
+        assert_eq!(merged.evaluate().unwrap(), whole.evaluate().unwrap());
+        assert_eq!(
+            pairs_of(merged.evaluate().unwrap()),
+            [(left, vec![(0, 1.0)])]
         );
     }
 

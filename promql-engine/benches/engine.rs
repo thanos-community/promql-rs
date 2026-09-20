@@ -199,6 +199,13 @@ fn binary(c: &mut Criterion) {
             "group_left",
             "http_requests_total / on(route) group_left() sum by (route) (http_requests_total)",
         ),
+        // A set operator holds both sides of every match group whole,
+        // and `or` is the one that then emits both — the widest a group
+        // gets for the least arithmetic.
+        (
+            "or",
+            "http_requests_total or on(route) sum by (route) (http_requests_total)",
+        ),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
             b.iter(|| {
