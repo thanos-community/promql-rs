@@ -144,14 +144,11 @@ impl Engine {
         let expr =
             promql_parser::parse_expr(query).map_err(|e| EngineError::Query(e.to_string()))?;
         let kind = value_type(&expr);
-        if matches!(kind, ValueType::Scalar | ValueType::String) {
-            // A literal, `time()` or `scalar(x)`: none of them is
-            // planned yet, and each would need a plan with no selector
-            // under it rather than a reshape of one.
-            return Err(EngineError::Unsupported(format!(
-                "a {}-typed instant query",
-                kind.as_str()
-            )));
+        // A string is the one type with no evaluation behind it:
+        // upstream returns it before the type switch, straight off the
+        // literal (`promql/engine.go:2350-2352` at 83962c35).
+        if kind == ValueType::String {
+            return Ok(InstantResult::String(string_literal(&expr)?));
         }
 
         let range = instant_range(at_ms);
@@ -168,7 +165,20 @@ impl Engine {
                 &batches,
             )
             .map_err(EngineError::Schema)?])),
-            ValueType::Scalar | ValueType::String => unreachable!("returned above"),
+            // Upstream reads `mat[0].Floats[0].F` (line 843): a scalar
+            // plan is one unlabelled series, and at one step it has one
+            // point, so there is exactly one value to take.
+            ValueType::Scalar => match series::decode(&batches)
+                .map_err(EngineError::Schema)?
+                .as_slice()
+            {
+                [only] if only.values().len() == 1 => Ok(InstantResult::Scalar(only.values()[0])),
+                other => Err(EngineError::Schema(format!(
+                    "a scalar is one series of one point, got {} series",
+                    other.len()
+                ))),
+            },
+            ValueType::String => unreachable!("returned above"),
         }
     }
 
@@ -229,6 +239,19 @@ impl Engine {
 /// The one-step range an instant query at `at_ms` is evaluated over.
 fn instant_range(at_ms: i64) -> RangeQuery {
     RangeQuery::new(at_ms, at_ms, INSTANT_STEP_MS)
+}
+
+/// The string a string-typed expression is. No function returns a
+/// string and no operator combines two, so the only such expression is
+/// the literal itself, under whatever wrappers pass a value along.
+fn string_literal(expr: &promql_parser::ast::Expr) -> Result<String, EngineError> {
+    use promql_parser::ast::Expr;
+    match expr {
+        Expr::StringLiteral(s) => Ok(s.val.clone()),
+        Expr::Paren(p) => string_literal(&p.expr),
+        Expr::StepInvariant(e) => string_literal(e),
+        other => Err(EngineError::Unsupported(crate::plan::describe(other))),
+    }
 }
 
 impl Default for Engine {

@@ -237,12 +237,40 @@ functions = [
     "sum_over_time(metric[3001ms]) @ 4000",
     "sum_over_time(metric[3002ms]) @ 4000",
     "sum_over_time(metric[3003ms]) @ 4000",
+    "time() @ 1",
+    "time() @ 3000000",
 ]
 histograms = [
     'avg (request_duration_seconds_bucket{le="0.1"}) @ 3000000',
     "rate(const_histogram_bucket[5m]) @ 300000",
     "testhistogram3_count @ 3000000",
     "testhistogram3_sum @ 3000000",
+]
+literals = [
+    '" Foo " @ 3000000',
+    '"" @ 3000000',
+    '"Foo" @ 3000000',
+    '("") @ 3000000',
+    '("Foo") @ 3000000',
+    "((1) / (0)) @ 3000000",
+    "+0.2 @ 3000000",
+    "+Inf @ 3000000",
+    "-0.2e-6 @ 3000000",
+    "-1 / 0 @ 3000000",
+    "-inf @ 3000000",
+    ".2 @ 3000000",
+    "0 / 0 @ 3000000",
+    "1 % 0 @ 3000000",
+    "1 - -1 @ 3000000",
+    "1 / 0 @ 3000000",
+    "1+1 @ 3000000",
+    "1-1 @ 3000000",
+    "12.34e+6 @ 3000000",
+    "12.34e-6 @ 3000000",
+    "12.34e6 @ 3000000",
+    "NaN @ 3000000",
+    "inF @ 3000000",
+    "nan @ 3000000",
 ]
 name_label_dropping = [
     'last_over_time(metric_total{env="1"}[10m]) @ 600000',
@@ -253,6 +281,13 @@ name_label_dropping = [
     'sum by (__name__) (rate(metric_total{env="2"}[5m])) @ 600000',
     'sum by (__name__, env) (metric_total{env="1"}) @ 600000',
     'sum(rate({env="1"}[10m])) by (env) @ 600000',
+]
+operators = [
+    "- - - 1 @ 3000000",
+    "0 == bool 1 @ 3000000",
+    "1 == bool 1 @ 3000000",
+    "10 atan2 20 @ 60000",
+    "10 atan2 NaN @ 60000",
 ]
 range_queries = [
     "metric @ 0..120000/60000",
@@ -282,3 +317,4 @@ subquery = [
     "min_over_time(metric_total[10s]) @ 20000",
     "rate(metric_total[1m]) @ 80000",
 ]
+trig_functions = ["pi() @ 0"]
