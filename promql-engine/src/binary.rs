@@ -261,7 +261,7 @@ pub enum Card {
 
 /// The `on`/`ignoring` and `group_left`/`group_right` modifiers, which
 /// together decide the match signature and the result's labels.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Matching {
     pub card: Card,
     /// `on(…)` rather than `ignoring(…)`.
@@ -270,6 +270,18 @@ pub struct Matching {
     pub labels: Vec<String>,
     /// The `group_left(…)` labels, copied from the "one" side.
     pub include: Vec<String>,
+    /// `fill_left(v)` and `fill_right(v)`: the value to stand in for a
+    /// side that has no series under this signature at a step, instead
+    /// of dropping the sample. `fill(v)` writes both.
+    ///
+    /// Left and right here are the operands as the query wrote them and
+    /// *not* the many/one sides: upstream swaps the operands for
+    /// `group_right` and leaves `FillValues` alone
+    /// (`promql/engine.go:2976-2979` at 83962c35), so under
+    /// `group_right` it is `fill_right` that stands in for the left
+    /// operand. Mirrored, quirk and all.
+    pub fill_lhs: Option<f64>,
+    pub fill_rhs: Option<f64>,
 }
 
 impl Matching {
@@ -283,16 +295,32 @@ impl Matching {
             out.push(')');
         }
         let group = match self.card {
-            Card::OneToOne => return out,
-            Card::ManyToOne => "group_left(",
-            Card::OneToMany => "group_right(",
+            Card::OneToOne => None,
+            Card::ManyToOne => Some("group_left("),
+            Card::OneToMany => Some("group_right("),
         };
-        if !out.is_empty() {
-            out.push(' ');
+        if let Some(group) = group {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(group);
+            out.push_str(&self.include.join(", "));
+            out.push(')');
         }
-        out.push_str(group);
-        out.push_str(&self.include.join(", "));
-        out.push(')');
+        for (word, fill) in [
+            ("fill_left(", self.fill_lhs),
+            ("fill_right(", self.fill_rhs),
+        ] {
+            let Some(fill) = fill else { continue };
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+            // `{:?}` and not `{}`: the debug shape of an `f64` is the
+            // shortest text that reads back as the same bits.
+            out.push_str(&format!("{fill:?}"));
+            out.push(')');
+        }
         out
     }
 
@@ -310,24 +338,41 @@ impl Matching {
                 break;
             }
         }
-        if rest.is_empty() {
-            return Some(out);
-        }
         for (prefix, card) in [
             ("group_left(", Card::ManyToOne),
             ("group_right(", Card::OneToMany),
         ] {
             if let Some(tail) = rest.strip_prefix(prefix) {
                 let (names, tail) = tail.split_once(')')?;
-                if !tail.trim().is_empty() {
-                    return None;
-                }
                 out.card = card;
                 out.include = split_names(names);
-                return Some(out);
+                rest = tail.trim_start();
+                break;
             }
         }
-        None
+        for (prefix, side) in [("fill_left(", LHS), ("fill_right(", RHS)] {
+            if let Some(tail) = rest.strip_prefix(prefix) {
+                let (value, tail) = tail.split_once(')')?;
+                let value = value.parse().ok()?;
+                match side {
+                    LHS => out.fill_lhs = Some(value),
+                    _ => out.fill_rhs = Some(value),
+                }
+                rest = tail.trim_start();
+            }
+        }
+        rest.is_empty().then_some(out)
+    }
+
+    /// The value to stand in for the side that holds at most one series
+    /// per match group, and for the side that may hold many. See
+    /// [`Matching::fill_lhs`] for why neither follows the swap.
+    fn fill_one(&self) -> Option<f64> {
+        self.fill_rhs
+    }
+
+    fn fill_many(&self) -> Option<f64> {
+        self.fill_lhs
     }
 
     /// Which side of the union holds at most one series per group.
@@ -585,17 +630,36 @@ impl Pairing {
         }
     }
 
-    /// The match group as upstream's `MatchLabels` renders it: the `on`
-    /// labels, or everything but `__name__` and the `ignoring` ones.
-    fn signature_text(&self, labels: &[String]) -> String {
+    /// Whether a label is part of the match signature, upstream's
+    /// `MatchLabels`: the `on` labels, or everything but `__name__` and
+    /// the `ignoring` ones.
+    fn in_signature(&self, name: &str) -> bool {
         let m = &self.matching;
-        print(&self.schema, labels, |name| {
-            if m.on {
-                m.labels.iter().any(|l| l == name)
-            } else {
-                name != METRIC_NAME && !m.labels.iter().any(|l| l == name)
-            }
-        })
+        if m.on {
+            m.labels.iter().any(|l| l == name)
+        } else {
+            name != METRIC_NAME && !m.labels.iter().any(|l| l == name)
+        }
+    }
+
+    /// The match group as upstream's `MatchLabels` renders it.
+    fn signature_text(&self, labels: &[String]) -> String {
+        print(&self.schema, labels, |name| self.in_signature(name))
+    }
+
+    /// A label set with only the signature left of it -- the whole of
+    /// what upstream gives a filled-in sample (`MatchLabels` at
+    /// `promql/engine.go:3100` and `:3119` at 83962c35), since there is
+    /// no series it could have come from.
+    fn signature_of(&self, labels: &[String]) -> Vec<String> {
+        labels
+            .iter()
+            .zip(&self.schema)
+            .map(|(value, name)| match self.in_signature(name) {
+                true => value.clone(),
+                false => String::new(),
+            })
+            .collect()
     }
 
     /// Upstream's `resultMetric` (`promql/engine.go:3132` at 83962c35),
@@ -603,8 +667,8 @@ impl Pairing {
     /// changed what the metric means, then one-to-one narrows to the
     /// match labels, then the `group_x` labels are copied over from the
     /// "one" side — or deleted where it has none.
-    fn result_labels(&self, many: usize, one: i32) -> Vec<String> {
-        let mut out = self.many[many].labels.clone();
+    fn result_labels(&self, base: &[String], one: &[String]) -> Vec<String> {
+        let mut out = base.to_vec();
         // A set operator answers with the sample it was handed, so its
         // labels are the ones it arrived with -- `resultMetric` is not
         // on that path at all (`promql/engine.go:2888-2961` at
@@ -625,10 +689,7 @@ impl Pairing {
         }
         for name in &m.include {
             if let Some(index) = self.schema.iter().position(|held| held == name) {
-                out[index] = match one {
-                    -1 => String::new(),
-                    one => self.one_pool[one as usize][index].clone(),
-                };
+                out[index] = one[index].clone();
             }
         }
         out
@@ -721,47 +782,84 @@ impl Pairing {
     /// the "one" side is reported before a "many" side that matched
     /// twice, and both before any value is emitted.
     ///
-    /// A step whose "many" side is empty is skipped rather than checked,
-    /// which is where this parts company with upstream: there the
-    /// short-circuit is on the whole vector, so a duplicate in *this*
-    /// match group still fails the query as long as some other group
-    /// had a sample on the "many" side at that step. Seeing that would
-    /// take a second pass over every group.
+    /// A step whose "many" side is empty and has no fill to stand in
+    /// for it is skipped rather than checked, which is where this parts
+    /// company with upstream: there the short-circuit is on the whole
+    /// vector (`promql/engine.go:2968-2971` at 83962c35), so a
+    /// duplicate in *this* match group still fails the query as long as
+    /// some other group had a sample on the "many" side at that step.
+    /// Seeing that would take a second pass over every group. With a
+    /// fill the step is not empty -- the fill is the missing side --
+    /// so it is walked like any other.
     fn pairs(&self) -> Result<Vec<Bucket>> {
         if self.op.is_set() {
             return Ok(self.sets());
         }
         let mut buckets: Vec<Bucket> = Vec::new();
         let mut by_labels: HashMap<Vec<String>, usize> = HashMap::new();
-        let mut by_pair: HashMap<(usize, i32), usize> = HashMap::new();
+        let mut by_pair: HashMap<(Option<usize>, i32), usize> = HashMap::new();
         let one_to_one = self.matching.card == Card::OneToOne;
+        let (fill_one, fill_many) = (self.matching.fill_one(), self.matching.fill_many());
+        let nothing: Vec<String> = vec![String::new(); self.schema.len()];
 
         for step in 0..self.grid.len() {
             let total: i64 = self.many.iter().map(|series| series.counts[step]).sum();
-            if total == 0 {
+            let one_here = self.one_counts[step] > 0;
+            if total == 0 && fill_one.is_none() && fill_many.is_none() {
                 continue;
             }
             if self.one_counts[step] > 1 {
                 return Err(self.duplicate());
             }
-            if self.one_counts[step] == 0 {
+
+            // What pairs at this step: the "many" row, or `None` where
+            // the fill value stands in for a side with no series here.
+            let mut todo: Vec<(Option<usize>, f64, f64)> = Vec::new();
+            if let Some(one_value) = one_here.then(|| self.one_values[step]).or(fill_one) {
+                for many in 0..self.many.len() {
+                    if self.many[many].counts[step] > 0 {
+                        todo.push((Some(many), self.many[many].values[step], one_value));
+                    }
+                }
+            }
+            // Upstream's second pass: a "one" side nothing matched, and
+            // a fill to stand in for the side that would have matched
+            // it (`promql/engine.go:3106-3124` at 83962c35).
+            if todo.is_empty() && one_here {
+                if let Some(fill) = fill_many {
+                    todo.push((None, fill, self.one_values[step]));
+                }
+            }
+            if todo.is_empty() {
                 continue;
             }
             // One to one is the cardinality that says there is nothing
             // to fan out over, so a second series here is the query
             // asking for a fan-out without saying so.
-            if one_to_one && total > 1 {
+            if one_to_one && todo.len() > 1 {
                 return Err(DataFusionError::Execution(MULTIPLE_MATCHES.into()));
             }
-            let one = self.one_rows[step];
-            for many in 0..self.many.len() {
-                if self.many[many].counts[step] == 0 {
-                    continue;
-                }
-                let bucket = match by_pair.get(&(many, one)) {
+
+            let one_row = if one_here { self.one_rows[step] } else { -1 };
+            let one_labels = match one_row {
+                -1 => &nothing,
+                row => &self.one_pool[row as usize],
+            };
+            for (many, many_value, one_value) in todo {
+                let bucket = match by_pair.get(&(many, one_row)) {
                     Some(bucket) => *bucket,
                     None => {
-                        let labels = self.result_labels(many, one);
+                        // A filled-in side carries the signature and
+                        // nothing else, on whichever side it stands in.
+                        let base = match many {
+                            Some(many) => self.many[many].labels.clone(),
+                            None => self.signature_of(one_labels),
+                        };
+                        let one = match many {
+                            Some(_) if !one_here => self.signature_of(&base),
+                            _ => one_labels.clone(),
+                        };
+                        let labels = self.result_labels(&base, &one);
                         let bucket = *by_labels.entry(labels.clone()).or_insert_with(|| {
                             buckets.push(Bucket {
                                 labels,
@@ -771,7 +869,7 @@ impl Pairing {
                             });
                             buckets.len() - 1
                         });
-                        by_pair.insert((many, one), bucket);
+                        by_pair.insert((many, one_row), bucket);
                         bucket
                     }
                 };
@@ -784,8 +882,8 @@ impl Pairing {
                 buckets[bucket].claimed = Some(step);
 
                 let (lhs, rhs) = match self.matching.one_side() {
-                    LHS => (self.one_values[step], self.many[many].values[step]),
-                    _ => (self.many[many].values[step], self.one_values[step]),
+                    LHS => (one_value, many_value),
+                    _ => (many_value, one_value),
                 };
                 if let Some(value) = self.op.value(lhs, rhs, self.return_bool) {
                     buckets[bucket].timestamps.push(self.grid.timestamp(step));
@@ -1597,6 +1695,7 @@ mod tests {
                     on: true,
                     labels: names(&["job"]),
                     include: names(&["tier"]),
+                    ..Matching::default()
                 },
                 "on(job) group_left(tier)",
             ),
@@ -1606,6 +1705,7 @@ mod tests {
                     on: true,
                     labels: names(&["job"]),
                     include: Vec::new(),
+                    ..Matching::default()
                 },
                 "on(job) group_right()",
             ),
@@ -1615,6 +1715,24 @@ mod tests {
                     ..Matching::default()
                 },
                 "group_left()",
+            ),
+            (
+                Matching {
+                    fill_lhs: Some(0.0),
+                    fill_rhs: Some(0.0),
+                    ..Matching::default()
+                },
+                "fill_left(0.0) fill_right(0.0)",
+            ),
+            (
+                Matching {
+                    card: Card::OneToMany,
+                    on: true,
+                    labels: names(&["pod"]),
+                    fill_rhs: Some(-1.5),
+                    ..Matching::default()
+                },
+                "on(pod) group_right() fill_right(-1.5)",
             ),
         ];
         for (matching, spelling) in cases {
@@ -1796,6 +1914,7 @@ mod tests {
                 on: true,
                 labels: names(&["pod"]),
                 include: names(&["zone"]),
+                ..Matching::default()
             },
         );
         pairing
@@ -1828,6 +1947,7 @@ mod tests {
                 on: true,
                 labels: names(&["pod"]),
                 include: Vec::new(),
+                ..Matching::default()
             },
         );
         pairing
@@ -1860,6 +1980,7 @@ mod tests {
                 on: true,
                 labels: names(&["pod"]),
                 include: Vec::new(),
+                ..Matching::default()
             },
         );
         pairing
@@ -1891,6 +2012,7 @@ mod tests {
                 on: true,
                 labels: names(&["pod"]),
                 include: Vec::new(),
+                ..Matching::default()
             },
         );
         // Both left series lose `__name__` to the arithmetic and agree
@@ -1938,6 +2060,7 @@ mod tests {
             on: true,
             labels: names(&["pod"]),
             include: names(&["zone"]),
+            ..Matching::default()
         };
         let of = || pairing(Op::Mul, false, matching.clone());
         let many_a = lset("requests", "/a", "a", "");
@@ -2073,6 +2196,141 @@ mod tests {
             pairs_of(merged.evaluate().unwrap()),
             [(left, vec![(0, 1.0)])]
         );
+    }
+
+    /// A fill value stands in for a side with no series under this
+    /// signature, instead of the step being dropped.
+    #[test]
+    fn a_fill_value_stands_in_for_a_side_that_is_not_there() {
+        let left = lset("requests", "", "a", "");
+        let right = lset("errors", "", "a", "");
+        let of = |matching: Matching, left_steps: &[i64], right_steps: &[i64]| {
+            let mut pairing = pairing(Op::Add, false, matching);
+            let ones = vec![1.0; left_steps.len()];
+            let tens = vec![10.0; right_steps.len()];
+            pairing.absorb(LHS, &left, left_steps, &ones).unwrap();
+            pairing.absorb(RHS, &right, right_steps, &tens).unwrap();
+            pairs_of(pairing.evaluate().unwrap())
+        };
+        let fill = |lhs: Option<f64>, rhs: Option<f64>| Matching {
+            fill_lhs: lhs,
+            fill_rhs: rhs,
+            ..Matching::default()
+        };
+
+        // Without a fill, only the step both sides reached is answered.
+        assert_eq!(
+            of(Matching::default(), &[0, 10_000], &[10_000, 20_000]),
+            [(lset("", "", "a", ""), vec![(10_000, 11.0)])]
+        );
+        // `fill_right(0)` stands in for the right-hand side at 0s, and
+        // says nothing about the right-hand sample at 20s.
+        assert_eq!(
+            of(fill(None, Some(0.0)), &[0, 10_000], &[10_000, 20_000]),
+            [(lset("", "", "a", ""), vec![(0, 1.0), (10_000, 11.0)])]
+        );
+        // `fill_left(100)` is the other way round.
+        assert_eq!(
+            of(fill(Some(100.0), None), &[0, 10_000], &[10_000, 20_000]),
+            [(lset("", "", "a", ""), vec![(10_000, 11.0), (20_000, 110.0)])]
+        );
+        // `fill(0)` writes both, so every step either side reached is
+        // answered.
+        assert_eq!(
+            of(fill(Some(0.0), Some(0.0)), &[0, 10_000], &[10_000, 20_000]),
+            [(
+                lset("", "", "a", ""),
+                vec![(0, 1.0), (10_000, 11.0), (20_000, 10.0)]
+            )]
+        );
+    }
+
+    /// A filled-in side has no series behind it, so what it brings to
+    /// the result labels is the match signature and nothing more --
+    /// which is what the `group_x` labels are copied from.
+    #[test]
+    fn a_filled_in_side_carries_only_the_signature() {
+        let matching = Matching {
+            card: Card::ManyToOne,
+            on: true,
+            labels: names(&["pod"]),
+            include: names(&["zone"]),
+            fill_lhs: Some(7.0),
+            fill_rhs: Some(0.0),
+        };
+        let mut pairing = pairing(Op::Add, false, matching);
+        // The many side at 0s only, the one side at 10s only, so each
+        // step has exactly one real sample and one filled-in one.
+        pairing
+            .absorb(LHS, &lset("requests", "/x", "a", ""), &[0], &[1.0])
+            .unwrap();
+        pairing
+            .absorb(RHS, &lset("errors", "", "a", "eu"), &[10_000], &[2.0])
+            .unwrap();
+        assert_eq!(
+            pairs_of(pairing.evaluate().unwrap()),
+            [
+                // At 10s the "many" side is filled: the base is the
+                // signature alone, plus `zone` off the real one side.
+                (lset("", "", "a", "eu"), vec![(10_000, 9.0)]),
+                // At 0s the "one" side is filled, so `zone` has nothing
+                // to be copied from and the path label survives.
+                (lset("", "/x", "a", ""), vec![(0, 1.0)]),
+            ]
+        );
+    }
+
+    /// A match group the "many" side never reached answers with
+    /// nothing at all, however many series the "one" side put in it --
+    /// the duplicate is upstream's error only once there is a match to
+    /// be made. A fill is that match, so with one the group is walked
+    /// and the duplicate is found.
+    #[test]
+    fn an_unfilled_group_with_no_many_side_is_not_a_duplicate() {
+        let of = |matching: Matching| {
+            let mut pairing = pairing(Op::Add, false, matching);
+            pairing
+                .absorb(RHS, &lset("errors", "/x", "a", ""), &[0], &[1.0])
+                .unwrap();
+            pairing
+                .absorb(RHS, &lset("errors", "/y", "a", ""), &[0], &[2.0])
+                .unwrap();
+            pairing.evaluate()
+        };
+
+        assert!(pairs_of(of(on(&["pod"])).unwrap()).is_empty());
+        let err = of(Matching {
+            fill_lhs: Some(0.0),
+            ..on(&["pod"])
+        })
+        .expect_err("the fill gives the group something to match");
+        assert!(err.to_string().contains(DUPLICATE_SERIES), "{err}");
+    }
+
+    /// A fill does not buy a fan-out its way out of the grouping rule:
+    /// two "many" series whose result labels collide are the same
+    /// error whether the "one" side was there or filled in.
+    #[test]
+    fn a_filled_fan_out_still_has_to_land_on_distinct_labels() {
+        let matching = Matching {
+            card: Card::ManyToOne,
+            on: true,
+            labels: names(&["pod"]),
+            fill_rhs: Some(0.0),
+            ..Matching::default()
+        };
+        let mut pairing = pairing(Op::Add, false, matching);
+        // Two left series differing only in `__name__`, which `+` takes
+        // away, and no right side at all -- so the fill is what they
+        // both pair with.
+        pairing
+            .absorb(LHS, &lset("requests", "", "a", ""), &[0], &[1.0])
+            .unwrap();
+        pairing
+            .absorb(LHS, &lset("retries", "", "a", ""), &[0], &[2.0])
+            .unwrap();
+        let err = pairing.evaluate().expect_err("the two collide");
+        assert!(err.to_string().contains(GROUPING_NOT_UNIQUE), "{err}");
     }
 
     /// The label set as Prometheus prints it, with the canonical

@@ -656,6 +656,104 @@ fn a_set_operator_takes_neither_a_group_modifier_nor_a_scalar() {
     );
 }
 
+/// A fill value answers for a side that has no series in a match
+/// group, where the same query without one drops the step. Over
+/// `zoned()`: pod `c` is on neither side, and `path`/`zone` are only on
+/// one each, so `on(pod)` is the signature that has something to fill.
+#[test]
+fn a_fill_value_answers_for_a_side_with_no_series() {
+    // Without a fill, only the pods both metrics know about answer.
+    assert_eq!(
+        matched(r#"requests{path="/x"} - on(pod) limit"#),
+        [(pod("a"), 8.0), (pod("b"), 27.0)]
+    );
+
+    // `fill_right(0)` stands in for the right operand, so pod `d`'s
+    // request -- which has no limit -- answers with its own value.
+    let source = MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"requests{pod="a", path="/x"} 10"#,
+            r#"requests{pod="d", path="/x"} 40"#,
+            r#"limit{pod="a", zone="eu"} 2"#,
+            r#"limit{pod="e", zone="us"} 5"#,
+        ]),
+        30.0,
+    );
+    let at = |query: &str| vector_of(&source, query, &RangeQuery::new(0, 0, 30_000));
+
+    assert_eq!(at("requests - on(pod) limit"), [(pod("a"), 8.0)]);
+    assert_eq!(
+        at("requests - on(pod) fill_right(0) limit"),
+        [(pod("a"), 8.0), (pod("d"), 40.0)]
+    );
+    // `fill_left(100)` answers for pod `e`, which only `limit` has.
+    assert_eq!(
+        at("requests - on(pod) fill_left(100) limit"),
+        [(pod("a"), 8.0), (pod("e"), 95.0)]
+    );
+    // `fill(0)` is both at once.
+    assert_eq!(
+        at("requests - on(pod) fill(0) limit"),
+        [(pod("a"), 8.0), (pod("d"), 40.0), (pod("e"), -5.0)]
+    );
+    // A filled-in side brings only the signature, so the labels that
+    // are not matched on are gone from the rows it answers for --
+    // `path` is on pod `d`'s request but not on the result.
+    assert!(at("requests - on(pod) fill(0) limit")
+        .iter()
+        .all(|(labels, _)| labels.iter().all(|(k, _)| k == "pod")));
+}
+
+/// A match group only one side ever reached is not a match, so its
+/// duplicates are nobody's error -- until a fill gives it the other
+/// side and it becomes one.
+#[test]
+fn a_group_with_no_left_side_is_empty_until_a_fill_answers_for_it() {
+    let engine = Engine::blocking().unwrap();
+    // Two `limit` series in one `on(pod)` group and no `requests` at
+    // all, which is a duplicate on the right waiting to be noticed.
+    let source = MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"limit{pod="a", zone="eu"} 2"#,
+            r#"limit{pod="a", zone="us"} 3"#,
+        ]),
+        30.0,
+    );
+
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    assert!(vector_of(&source, "requests + on(pod) limit", &at_0).is_empty());
+
+    let err = engine
+        .range_query(&source, "requests + on(pod) fill_left(0) limit", &at_0)
+        .expect_err("the fill makes it a match group");
+    assert!(
+        err.to_string()
+            .contains("found duplicate series for the match group"),
+        "{err}"
+    );
+}
+
+/// Upstream refuses a fill where there is nothing to fill in, and says
+/// so while parsing; this engine has to say it itself.
+#[test]
+fn a_fill_needs_two_vectors_and_a_value_operator() {
+    let engine = Engine::blocking().unwrap();
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    let fails = |query: &str| match engine.range_query(&zoned(), query, &at_0).expect_err(query) {
+        EngineError::Query(message) => message,
+        other => panic!("{query}: expected a query error, got {other:?}"),
+    };
+
+    assert_eq!(
+        fails("requests + fill(0) 1"),
+        "filling in missing series only allowed between instant vectors"
+    );
+    assert_eq!(
+        fails("requests and fill(0) limit"),
+        "filling in missing series not allowed for set operators"
+    );
+}
+
 /// Upstream's parser refuses a label that both picks the match and is
 /// copied across it; ours has to say so itself.
 #[test]

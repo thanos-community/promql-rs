@@ -254,3 +254,30 @@ tests:
                   SubqueryAlias: binary_2
                     Projection: selector_1.labels, promql_vector_selector(selector_1.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
                       TableScan: selector_1
+  - name: a fill value for a side with no series
+    description: >
+      The fill values ride into the aggregation with the rest of the
+      modifiers, spelled as the query spelled them -- fill(0) is both
+      sides at once, so it reads back as the pair it stands for. The
+      plan is the pairing's, unchanged: filling in a missing side is a
+      decision about a match group and there is nothing above the
+      grouping that could make it.
+    load:
+      - requests{job="api", pod="api-1"} 0
+      - limit{job="api", zone="eu"} 0
+    query: |
+      requests / on(job) fill(0) limit
+    plan: |
+      Projection: __pairs__.labels AS labels, __pairs__.samples AS samples
+        Unnest: lists[] structs[__pairs__]
+          Unnest: lists[__pairs__|depth=1] structs[]
+            Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("/"), Utf8("on(job) fill_left(0.0) fill_right(0.0)"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+              Union
+                Projection: promql_labels(Utf8("__name__"), get_field(binary_0.labels, Utf8("__name__")), Utf8("job"), get_field(binary_0.labels, Utf8("job")), Utf8("pod"), get_field(binary_0.labels, Utf8("pod")), Utf8("zone"), Utf8("")) AS labels, binary_0.samples, Boolean(false) AS __rhs
+                  SubqueryAlias: binary_0
+                    Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                      TableScan: selector_0
+                Projection: promql_labels(Utf8("__name__"), get_field(binary_1.labels, Utf8("__name__")), Utf8("job"), get_field(binary_1.labels, Utf8("job")), Utf8("pod"), Utf8(""), Utf8("zone"), get_field(binary_1.labels, Utf8("zone"))) AS labels, binary_1.samples, Boolean(true) AS __rhs
+                  SubqueryAlias: binary_1
+                    Projection: selector_1.labels, promql_vector_selector(selector_1.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                      TableScan: selector_1

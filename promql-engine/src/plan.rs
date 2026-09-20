@@ -212,6 +212,11 @@ fn check_binary(b: &BinaryExpr) -> Result<(), EngineError> {
                     "vector matching only allowed between instant vectors".into(),
                 ));
             }
+            if has_fill(matching) {
+                return Err(EngineError::Query(
+                    "filling in missing series only allowed between instant vectors".into(),
+                ));
+            }
         }
         // A set operator is many-to-many and nothing else: there is no
         // "one" side for `group_x` to copy a label off.
@@ -226,6 +231,13 @@ fn check_binary(b: &BinaryExpr) -> Result<(), EngineError> {
                 "no grouping allowed for \"{}\" operation",
                 b.op
             )));
+        }
+        // Nothing to fill: a set operator never reads a value, so a
+        // stand-in for a missing one has nothing to say.
+        Some(matching) if is_set(b.op) && has_fill(matching) => {
+            return Err(EngineError::Query(
+                "filling in missing series not allowed for set operators".into(),
+            ));
         }
         _ => {}
     }
@@ -244,6 +256,10 @@ fn check_binary(b: &BinaryExpr) -> Result<(), EngineError> {
 fn is_comparison(op: promql_parser::token::ItemType) -> bool {
     use promql_parser::token::ItemType::*;
     matches!(op, EqlC | Neq | Gtr | Lss | Gte | Lte)
+}
+
+fn has_fill(matching: &promql_parser::ast::VectorMatching) -> bool {
+    matching.fill_values.lhs.is_some() || matching.fill_values.rhs.is_some()
 }
 
 /// The operators upstream's `IsSetOperator` answers for.
@@ -292,9 +308,8 @@ fn binary_op(b: &BinaryExpr) -> Result<(binary::Op, bool, binary::Matching), Eng
             // sides, which is the card a set operator plans with.
             VectorMatchCardinality::ManyToMany => binary::Card::OneToOne,
         };
-        if matching.fill_values.lhs.is_some() || matching.fill_values.rhs.is_some() {
-            return Err(EngineError::Unsupported("the fill modifier".into()));
-        }
+        out.fill_lhs = matching.fill_values.lhs;
+        out.fill_rhs = matching.fill_values.rhs;
         out.on = matching.on;
         out.labels = sorted(&matching.matching_labels);
         out.include = sorted(&matching.include);

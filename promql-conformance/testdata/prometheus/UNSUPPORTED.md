@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **443 of 2098 evals pass** (21.1%), and **512** are blocked on the features below.
+Against the vendored corpus: **487 of 2098 evals pass** (23.2%), and **468** are blocked on the features below.
 
 ## Missing features
 
@@ -17,7 +17,6 @@ Against the vendored corpus: **443 of 2098 evals pass** (21.1%), and **512** are
 | 78 | the histogram_quantile function |
 | 57 | a subquery |
 | 56 | the histogram_fraction function |
-| 44 | the fill modifier |
 | 41 | the info function |
 | 21 | the label_replace function |
 | 16 | the absent_over_time function |
@@ -74,6 +73,7 @@ Against the vendored corpus: **443 of 2098 evals pass** (21.1%), and **512** are
 |---|---:|---:|---|
 | staleness | 17 | 17 (100%) | fully green |
 | collision | 2 | 2 (100%) | fully green |
+| fill-modifier | 45 | 44 (98%) |  |
 | trig_functions | 19 | 18 (95%) |  |
 | name_label_dropping | 30 | 16 (53%) |  |
 | range_queries | 18 | 8 (44%) |  |
@@ -89,7 +89,6 @@ Against the vendored corpus: **443 of 2098 evals pass** (21.1%), and **512** are
 | histograms | 185 | 8 (4%) |  |
 | native_histograms | 521 | 0 (0%) |  |
 | type_and_unit | 58 | 0 (0%) |  |
-| fill-modifier | 45 | 0 (0%) |  |
 | info | 42 | 0 (0%) |  |
 | limit | 37 | 0 (0%) | all skipped — native histograms |
 

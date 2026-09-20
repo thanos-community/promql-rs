@@ -206,6 +206,13 @@ fn binary(c: &mut Criterion) {
             "or",
             "http_requests_total or on(route) sum by (route) (http_requests_total)",
         ),
+        // A fill turns the sides that did not match from something to
+        // skip into something to answer for, which is the per-step
+        // bookkeeping at its widest.
+        (
+            "fill",
+            "http_requests_total / on(route) group_left() fill(0) sum by (route) (http_requests_total)",
+        ),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
             b.iter(|| {
