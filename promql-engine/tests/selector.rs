@@ -119,8 +119,8 @@ fn anything_but_a_selector_is_unsupported_by_name() {
     for (query, what) in [
         ("topk(2, http_requests_total)", "the topk aggregation"),
         (
-            "absent_over_time(http_requests_total[5m])",
-            "the absent_over_time function",
+            "quantile_over_time(0.5, http_requests_total[5m])",
+            "the quantile_over_time function",
         ),
         ("http_requests_total + 1", "a binary operator"),
         ("http_requests_total[5m]", "a range selector"),

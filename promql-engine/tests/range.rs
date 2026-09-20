@@ -203,6 +203,25 @@ fn absent_answers_only_where_its_vector_is_empty() {
     assert_eq!(label_set("absent(nonexistent)", at), Some(vec![]));
 }
 
+/// `absent_over_time` is the same answer over a window: 1 where the
+/// window held nothing, and the same invented label set.
+#[test]
+fn absent_over_time_answers_where_the_window_held_nothing() {
+    let at = |ms| RangeQuery::new(ms, ms, 30_000);
+    assert!(query("absent_over_time(http_requests_total[5m])", at(0)).is_empty());
+    assert_eq!(
+        label_set(r#"absent_over_time(nonexistent{pod="mars"}[5m])"#, at(0)),
+        Some(vec![("pod".to_string(), "mars".to_string())])
+    );
+    // The window is what separates the two: the store stops at 540s, so
+    // at 900s a 5m window is empty while a 10m one still reaches back.
+    assert_eq!(
+        query("absent_over_time(http_requests_total[5m])", at(900_000))[0].values(),
+        &[1.0]
+    );
+    assert!(query("absent_over_time(http_requests_total[10m])", at(900_000)).is_empty());
+}
+
 /// `createLabelsForAbsentFunction`: equality matchers only, the first
 /// for a name only, and from a selector only.
 #[test]
@@ -275,10 +294,6 @@ fn a_call_of_the_wrong_shape_is_refused_in_upstreams_words() {
 fn what_is_still_unsupported_is_named() {
     let engine = Engine::blocking().unwrap();
     for (q, what) in [
-        (
-            "absent_over_time(http_requests_total[5m])",
-            "the absent_over_time function",
-        ),
         ("rate(http_requests_total[5m:1m])", "a subquery"),
         ("abs(http_requests_total)", "the abs function"),
         (

@@ -151,6 +151,12 @@ fn reduce(c: &mut Criterion) {
     for (qname, q) in [
         ("scalar_selector", "scalar(http_requests_total)"),
         ("absent_selector", "absent(http_requests_total)"),
+        // `absent` with a window under it, which is what makes the
+        // reduction read every sample rather than every step.
+        (
+            "absent_over_time_5m",
+            "absent_over_time(http_requests_total[5m])",
+        ),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
             b.iter(|| {

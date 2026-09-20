@@ -237,12 +237,25 @@ impl Planner<'_> {
                 },
             )
             .await?;
+        self.groupless(input.plan, arg, func)
+    }
+
+    /// The aggregate with no grouping expressions that every reduction
+    /// is: one row out however many came in, none included, under the
+    /// label set `absent` and `absent_over_time` invent from the
+    /// selector's own equality matchers.
+    fn groupless(
+        &self,
+        input: LogicalPlan,
+        arg: &Expr,
+        func: reduce::Func,
+    ) -> Result<Planned, EngineError> {
         let pairs = match func {
             reduce::Func::Scalar => Vec::new(),
             reduce::Func::Absent => absent_labels(arg),
         };
         let label_names: Vec<String> = pairs.iter().map(|(name, _)| name.clone()).collect();
-        let plan = LogicalPlanBuilder::from(input.plan)
+        let plan = LogicalPlanBuilder::from(input)
             .aggregate(
                 Vec::<datafusion::logical_expr::Expr>::new(),
                 vec![reduce::call(
@@ -262,18 +275,39 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
-    /// A function of one range selector: `rate(x[5m])` and its family.
-    ///
-    /// Takes no `Above`: this call is itself what stands directly over the
-    /// selector, so nothing higher reaches the store.
+    /// Which operator a function call plans as.
     async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
         function::check_call(call)?;
         let name = call.func.name.as_str();
         if let Some(func) = reduce::Func::parse(name) {
             return self.reduce(&call.args[0], func).await;
         }
+        // `absent_over_time` is `absent` over a window rather than over
+        // a step: upstream builds the same one series of 1s at the
+        // steps nothing reached, only after the range selector has been
+        // walked (`promql/engine.go:2233-2271` at 83962c35, with
+        // `funcAbsentOverTime` at `promql/functions.go:1318` doing
+        // nothing but marking the steps that were reached). Marking
+        // them is `present_over_time`, so the two operators this
+        // already has, stacked, are the whole function.
+        if name == "absent_over_time" {
+            let input = self.range_function(call, Func::PresentOverTime).await?;
+            return self.groupless(input.plan, &call.args[0], reduce::Func::Absent);
+        }
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
+        self.range_function(call, func).await
+    }
+
+    /// A function of one range selector: `rate(x[5m])` and its family.
+    ///
+    /// Takes no `Above`: this call is itself what stands directly over the
+    /// selector, so nothing higher reaches the store.
+    ///
+    /// `func` is the kernel to run, which is the call's own function
+    /// everywhere but `absent_over_time` — see [`Planner::call`].
+    async fn range_function(&mut self, call: &Call, func: Func) -> Result<Planned, EngineError> {
+        let name = call.func.name.as_str();
         let (ms, vs) = match call.args.as_slice() {
             [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
                 Expr::VectorSelector(vs) => (ms, vs),
@@ -322,7 +356,10 @@ impl Planner<'_> {
             params.select_range(),
             Some(params.window_ms),
             Above {
-                func: Some(func.as_str()),
+                // The name the query wrote, not the kernel's: the store
+                // is being told what it sits under, and for
+                // `absent_over_time` those differ.
+                func: Some(name),
                 grouping: None,
             },
         );

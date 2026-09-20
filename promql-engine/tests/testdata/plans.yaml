@@ -75,3 +75,19 @@ tests:
         Aggregate: groupBy=[[]], aggr=[[promql_reduce(samples, Utf8("absent"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
           Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
             TableScan: selector_0
+
+  - name: absent_over_time over a range selector
+    description: >
+      The two operators that already exist, stacked: present_over_time
+      marks the steps whose window held something, and the groupless
+      reduce answers 1 at the steps left over. Nothing here is specific
+      to absent_over_time except which kernel the range node runs.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      absent_over_time(temperature{city="oslo"}[5m])
+    plan: |
+      Projection: promql_labels(Utf8("city"), Utf8("oslo")) AS labels, samples
+        Aggregate: groupBy=[[]], aggr=[[promql_reduce(samples, Utf8("absent"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: promql_labels(Utf8("city"), get_field(selector_0.labels, Utf8("city"))) AS labels, promql_range_function(selector_0.samples, Utf8("present_over_time"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+            TableScan: selector_0
