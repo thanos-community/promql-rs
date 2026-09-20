@@ -44,6 +44,33 @@ tests:
       Projection: promql_labels(Utf8("cpu"), get_field(selector_0.labels, Utf8("cpu")), Utf8("instance"), get_field(selector_0.labels, Utf8("instance")), Utf8("mode"), get_field(selector_0.labels, Utf8("mode"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
         TableScan: selector_0
 
+  - name: an elementwise function over a selector
+    description: >
+      One projection per function, each over the last: the operator
+      changes only the value, so the shape it runs on is the shape it
+      hands back. The subquery alias is what keeps the inner `labels`
+      and the rebuilt one apart when the two projections are merged.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      abs(temperature)
+    plan: |
+      Projection: promql_labels(Utf8("city"), get_field(abs_0.labels, Utf8("city"))) AS labels, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL)) AS samples
+        SubqueryAlias: abs_0
+          Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+            TableScan: selector_0
+
+  - name: vector of a scalar
+    description: >
+      vector(s) asks no store: it is the scalar's value under an empty
+      label set, which is the table a scalar plan already is.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      vector(time())
+    plan: |
+      TableScan: scalar_0
+
   - name: grouped aggregation over a range function
     description: >
       by (job) becomes an ordinary DataFusion Aggregate, so grouping and
