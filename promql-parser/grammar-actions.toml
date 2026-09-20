@@ -32,10 +32,10 @@ start_symbol = "start"
 emit_roots = ["start", "step_invariant_expr"]
 
 # Upstream rules to skip entirely, plus anything they pull in. We don't
-# port histogram descriptors, duration expressions (experimental), fill
-# modifiers, or smoothed/anchored modifiers. Series descriptions ARE
-# ported (float sequences only); the histogram alts of `series_item`
-# drop out automatically because they reference skipped rules.
+# port histogram descriptors, duration expressions (experimental) or
+# fill modifiers. Series descriptions ARE ported (float sequences
+# only); the histogram alts of `series_item` drop out automatically
+# because they reference skipped rules.
 skip_rules = [
   "histogram_desc_map",
   "histogram_desc_item",
@@ -43,8 +43,6 @@ skip_rules = [
   "bucket_set",
   "bucket_set_list",
   "counter_reset_hint",
-  "anchored_expr",
-  "smoothed_expr",
 ]
 
 # Upstream terminals no emitted alt may reference. grmtools handles
@@ -150,6 +148,16 @@ uint = "Result<u64, ()>"
 [[actions]]
 rule = "expr"
 alt = "aggregate_expr"
+action = "$1"
+
+[[actions]]
+rule = "expr"
+alt = "anchored_expr"
+action = "$1"
+
+[[actions]]
+rule = "expr"
+alt = "smoothed_expr"
 action = "$1"
 
 [[actions]]
@@ -699,6 +707,18 @@ action = "actions::subquery($lexer, $span, $1, $3.map_err(|_| ())?, Some($5.map_
 rule = "subquery_expr"
 alt = "expr LEFT_BRACKET DURATION COLON RIGHT_BRACKET"
 action = "actions::subquery($lexer, $span, $1, $3.map_err(|_| ())?, None)"
+
+# --- anchored / smoothed range-vector modifiers ---
+
+[[actions]]
+rule = "anchored_expr"
+alt = "expr ANCHORED"
+action = "actions::set_anchored($1)"
+
+[[actions]]
+rule = "smoothed_expr"
+alt = "expr SMOOTHED"
+action = "actions::set_smoothed($1)"
 
 [[actions]]
 rule = "offset_expr"

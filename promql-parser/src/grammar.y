@@ -37,6 +37,8 @@ expr -> Result<Expr, ()>:
   | matrix_selector { $1 }
   | number_duration_literal { $1 }
   | offset_expr { $1 }
+  | anchored_expr { $1 }
+  | smoothed_expr { $1 }
   | paren_expr { $1 }
   | string_literal { $1 }
   | subquery_expr { $1 }
@@ -157,6 +159,14 @@ positive_duration_expr -> Result<Expr, ()>:
 
 offset_expr -> Result<Expr, ()>:
     expr 'OFFSET' offset_duration_expr { actions::offset_from_expr($lexer, $1, $3) }
+  ;
+
+anchored_expr -> Result<Expr, ()>:
+    expr 'ANCHORED' { actions::set_anchored($1) }
+  ;
+
+smoothed_expr -> Result<Expr, ()>:
+    expr 'SMOOTHED' { actions::set_smoothed($1) }
   ;
 
 step_invariant_expr -> Result<Expr, ()>:
