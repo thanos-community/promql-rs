@@ -152,6 +152,11 @@ fn elementwise(c: &mut Criterion) {
         ("abs_selector", "abs(http_requests_total)"),
         ("clamp_selector", "clamp(http_requests_total, 0, 1000)"),
         ("abs_rate_5m", "abs(rate(http_requests_total[5m]))"),
+        // `timestamp` reads the sample's own time rather than its
+        // value, and over a bare selector it does that inside the
+        // selector; the pair prices both paths.
+        ("timestamp_selector", "timestamp(http_requests_total)"),
+        ("timestamp_rate", "timestamp(rate(http_requests_total[5m]))"),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
             b.iter(|| {

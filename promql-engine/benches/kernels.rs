@@ -235,7 +235,7 @@ fn selector_eval_series(c: &mut Criterion) {
             g.bench_function(BenchmarkId::new(name, n), |b| {
                 b.iter(|| {
                     let mut acc = 0.0;
-                    selector::eval_series(black_box(&ts), black_box(vs), p, |_, v| acc += v);
+                    selector::eval_series(black_box(&ts), black_box(vs), p, |_, _, v| acc += v);
                     acc
                 })
             });
@@ -259,7 +259,7 @@ fn selector_apply(c: &mut Criterion) {
     let mut g = c.benchmark_group("selector/apply");
     g.throughput(Throughput::Elements((k * n) as u64));
     g.bench_function(BenchmarkId::from_parameter(format!("{k}x{n}")), |b| {
-        b.iter(|| selector::apply(black_box(&samples), &p))
+        b.iter(|| selector::apply(black_box(&samples), &p, false))
     });
     g.finish();
 }

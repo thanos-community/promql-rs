@@ -47,12 +47,15 @@ pub fn is_stale(v: f64) -> bool {
     v.to_bits() == STALE_NAN_BITS
 }
 
-/// The value the selector yields at one lookup time, if any.
+/// The sample the selector yields at one lookup time, if any.
 ///
 /// The last sample at or before `ref_time`, provided it is younger than
 /// `lookback`: `ref_time - lookback < t <= ref_time`, half-open. A
 /// StaleNaN there means the series was marked stale, so nothing.
-fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, window_ms: i64) -> Option<f64> {
+///
+/// Returns the sample's own timestamp beside its value, which only
+/// `timestamp()` over a bare selector reads — see [`eval_series`].
+fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, window_ms: i64) -> Option<(i64, f64)> {
     // Index of the first sample after ref_time; the candidate is the one
     // before it.
     let i = ts.partition_point(|t| *t <= ref_time);
@@ -63,7 +66,7 @@ fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, window_ms: i64) -> Option<f64> 
     if t <= ref_time - window_ms || is_stale(v) {
         return None;
     }
-    Some(v)
+    Some((t, v))
 }
 
 /// Evaluate one series on the step grid: the body of upstream's
@@ -71,9 +74,13 @@ fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, window_ms: i64) -> Option<f64> 
 /// as a single forward sweep.
 ///
 /// `ts` and `vs` are one series' samples, sorted ascending. `emit` is
-/// called with `(step_timestamp, value)` for every step that has a value,
-/// in step order.
-pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64, f64)) {
+/// called with `(step_timestamp, sample_timestamp, value)` for every
+/// step that has a value, in step order. The two timestamps differ
+/// whenever lookback reached backwards, and only `timestamp()` cares:
+/// every other operator sees the sample restamped to its step, which is
+/// what upstream's `rangeEval` does (`promql/engine.go:833` at
+/// 83962c35) and why upstream special-cases `timestamp()` here.
+pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64, i64, f64)) {
     debug_assert_eq!(ts.len(), vs.len());
     if p.step_ms <= 0 || p.end_ms < p.start_ms {
         return;
@@ -82,9 +89,9 @@ pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64,
     // `@` pins the lookup time, so the answer is the same at every step:
     // one lookup, repeated across the grid at step timestamps.
     if let Some(at) = p.at_ms {
-        if let Some(v) = lookup(ts, vs, at - p.offset_ms, p.window_ms) {
+        if let Some((t, v)) = lookup(ts, vs, at - p.offset_ms, p.window_ms) {
             for step in p.steps() {
-                emit(step, v);
+                emit(step, t, v);
             }
         }
         return;
@@ -106,7 +113,7 @@ pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64,
         if t <= ref_time - p.window_ms || is_stale(v) {
             continue;
         }
-        emit(step, v);
+        emit(step, t, v);
     }
 }
 
@@ -119,7 +126,7 @@ pub struct VectorSelector {
 impl Default for VectorSelector {
     fn default() -> Self {
         Self {
-            signature: Signature::any(7, Volatility::Immutable),
+            signature: Signature::any(8, Volatility::Immutable),
         }
     }
 }
@@ -128,8 +135,14 @@ pub fn udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(VectorSelector::default())
 }
 
-/// `promql_vector_selector(samples, start, end, step, lookback, offset, at)`.
-pub fn call(samples: Expr, p: &Params) -> Expr {
+/// `promql_vector_selector(samples, start, end, step, lookback, offset,
+/// at, stamp)`.
+///
+/// `stamp` makes each step's value the sample's own timestamp in
+/// seconds instead of its value, which is the whole of `timestamp()`
+/// over a bare selector: the sample is still found by lookback, but
+/// what the step reports is when it was taken.
+pub fn call(samples: Expr, p: &Params, stamp: bool) -> Expr {
     use datafusion::logical_expr::lit;
     udf().call(vec![
         samples,
@@ -142,6 +155,7 @@ pub fn call(samples: Expr, p: &Params) -> Expr {
             Some(at) => lit(at),
             None => lit(ScalarValue::Int64(None)),
         },
+        lit(stamp),
     ])
 }
 
@@ -164,10 +178,13 @@ impl ScalarUDFImpl for VectorSelector {
                 arg_types.first()
             );
         }
-        for (i, t) in arg_types.iter().enumerate().skip(1) {
+        for (i, t) in arg_types.iter().enumerate().skip(1).take(6) {
             if !matches!(t, DataType::Int64 | DataType::Null) {
                 return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
             }
+        }
+        if arg_types.get(7) != Some(&DataType::Boolean) {
+            return plan_err!("{NAME}: argument 7 must be Boolean");
         }
         Ok(series::samples_type())
     }
@@ -200,9 +217,19 @@ impl ScalarUDFImpl for VectorSelector {
             offset_ms: int_arg(&args, 5, NAME)?.ok_or_else(|| missing("offset"))?,
             at_ms: int_arg(&args, 6, NAME)?,
         };
+        let stamp = match &args.args[7] {
+            ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => *b,
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "{NAME}: argument 7 must be a Boolean literal, got {:?}",
+                    other.data_type()
+                )))
+            }
+        };
         Ok(ColumnarValue::Array(Arc::new(apply(
             samples.as_list::<i32>(),
             &p,
+            stamp,
         ))))
     }
 }
@@ -226,8 +253,10 @@ pub(crate) fn int_arg(args: &ScalarFunctionArgs, i: usize, caller: &str) -> Resu
     }
 }
 
-/// Run the kernel over every row of a samples column.
-pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
+/// Run the kernel over every row of a samples column. With `stamp`,
+/// each step reports the found sample's timestamp in seconds rather
+/// than its value; see [`call`].
+pub fn apply(samples: &ListArray, p: &Params, stamp: bool) -> ListArray {
     let entries = samples.values().as_struct();
     let ts: &[i64] = entries
         .column_by_name(series::TIMESTAMP)
@@ -251,9 +280,12 @@ pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
         // offsets may still span samples.
         if !samples.is_null(row) {
             let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            eval_series(&ts[a..b], &vs[a..b], p, |t, v| {
-                out_ts.push(t);
-                out_vs.push(v);
+            eval_series(&ts[a..b], &vs[a..b], p, |step, t, v| {
+                out_ts.push(step);
+                out_vs.push(match stamp {
+                    true => t as f64 / 1000.0,
+                    false => v,
+                });
             });
         }
         out_offsets.push(out_ts.len() as i32);
@@ -286,7 +318,7 @@ mod tests {
 
     fn run(ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
         let mut out = Vec::new();
-        eval_series(ts, vs, &p, |t, v| out.push((t, v)));
+        eval_series(ts, vs, &p, |step, _, v| out.push((step, v)));
         out
     }
 
@@ -460,6 +492,7 @@ mod tests {
                 end_ms: M,
                 ..params()
             },
+            false,
         );
         assert_eq!(out.len(), 3);
         assert_eq!(out.offsets().to_vec(), vec![0, 2, 2, 4]);
@@ -491,6 +524,7 @@ mod tests {
                 end_ms: 0,
                 ..params()
             },
+            false,
         );
         assert_eq!(out.len(), 3);
         assert_eq!(out.null_count(), 1);

@@ -246,6 +246,98 @@ fn a_call_prometheus_would_not_parse_is_a_query_error() {
     }
 }
 
+/// The values of `query` at `at_ms`, sorted — for the assertions that
+/// need an instant other than the 150s [`vector`] uses.
+fn values_at(query: &str, at_ms: i64) -> Vec<f64> {
+    let batches = Engine::blocking()
+        .unwrap()
+        .range_query(
+            source().as_ref(),
+            query,
+            &RangeQuery::new(at_ms, at_ms, 30_000),
+        )
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut vs: Vec<f64> = promql_engine::series::decode(&batches)
+        .unwrap()
+        .iter()
+        .map(|s| s.values()[0])
+        .collect();
+    vs.sort_by(f64::total_cmp);
+    vs
+}
+
+/// `timestamp()` over a bare selector reports when the sample was
+/// taken, not when it was asked for — the one place lookback is
+/// visible in a value.
+#[test]
+fn timestamp_over_a_selector_is_the_samples_own_time() {
+    // Samples land every 30s, so at 150s the sample is the step.
+    assert_eq!(values_at("timestamp(temperature)", 150_000), [150.0, 150.0]);
+    // At 160s lookback reaches back to the 150s sample, and that is
+    // the time reported — the step's 160 would be upstream's answer
+    // only if the selector had been stepped first.
+    assert_eq!(values_at("timestamp(temperature)", 160_000), [150.0, 150.0]);
+    // `__name__` goes, as it does for every DropName function.
+    assert_eq!(
+        vector("timestamp(temperature)"),
+        vec![
+            (vec![("city".into(), "lima".into())], 150.0),
+            (vec![("city".into(), "oslo".into())], 150.0),
+        ]
+    );
+}
+
+/// Over anything but a bare selector the samples have already been
+/// restamped to their step, so that is what `timestamp()` reports —
+/// upstream restamps in `rangeEval` for the same reason.
+#[test]
+fn timestamp_over_a_stepped_expression_is_the_step() {
+    assert_eq!(
+        values_at("timestamp(abs(temperature))", 160_000),
+        [160.0, 160.0]
+    );
+    assert_eq!(values_at("timestamp(sum(temperature))", 160_000), [160.0]);
+    // Parentheses are not an expression, so this is still the selector.
+    assert_eq!(
+        values_at("timestamp((temperature))", 160_000),
+        [150.0, 150.0]
+    );
+}
+
+/// With `@` the selector is pinned, so every step reports the pinned
+/// sample's time rather than its own.
+#[test]
+fn timestamp_under_an_at_modifier_is_the_pinned_time() {
+    assert_eq!(
+        values_at("timestamp(temperature @ 60)", 150_000),
+        [60.0, 60.0]
+    );
+    // An offset beside the `@` is discarded rather than stacked with
+    // it: upstream overwrites the offset to reach the pinned instant,
+    // so this reads 60s and not 30s.
+    assert_eq!(
+        values_at("timestamp(temperature @ 60 offset 30s)", 150_000),
+        [60.0, 60.0]
+    );
+    // Without the `@` the offset still counts, which is what makes the
+    // line above a special case rather than the rule.
+    assert_eq!(
+        values_at("timestamp(temperature offset 30s)", 150_000),
+        [120.0, 120.0]
+    );
+}
+
+/// `timestamp` takes an instant vector, so a range selector is the
+/// type error upstream's own signature makes it.
+#[test]
+fn timestamp_of_a_range_selector_is_a_type_error() {
+    let err = error("timestamp(temperature[5m])");
+    assert!(
+        matches!(&err, EngineError::Query(m) if m.contains("expected type instant vector")),
+        "{err}"
+    );
+}
+
 /// What the elementwise operator cannot express is still named as the
 /// feature it is, not as a bad query.
 #[test]
@@ -253,7 +345,6 @@ fn the_functions_that_are_not_elementwise_are_still_unsupported() {
     for (query, what) in [
         ("scalar(temperature)", "the scalar function"),
         ("sort(temperature)", "the sort function"),
-        ("timestamp(temperature)", "the timestamp function"),
         ("year(temperature)", "the year function"),
         ("absent(temperature)", "the absent function"),
     ] {

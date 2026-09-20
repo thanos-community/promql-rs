@@ -27,7 +27,7 @@ tests:
     query: |
       http_requests_total{job="api"}
     plan: |
-      Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+      Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL), Boolean(false)) AS samples
         TableScan: selector_0
 
   - name: range function over a different label set
@@ -57,7 +57,7 @@ tests:
     plan: |
       Projection: promql_labels(Utf8("city"), get_field(abs_0.labels, Utf8("city"))) AS labels, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL)) AS samples
         SubqueryAlias: abs_0
-          Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+          Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL), Boolean(false)) AS samples
             TableScan: selector_0
 
   - name: vector of a scalar
@@ -70,6 +70,38 @@ tests:
       vector(time())
     plan: |
       TableScan: scalar_0
+
+  - name: timestamp over a bare selector
+    description: >
+      No kernel above the selector at all: the last argument tells the
+      selector to report each found sample's own time instead of its
+      value, which is the only way lookback's reach stays visible. The
+      projection above it exists to drop the metric name.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      timestamp(temperature)
+    plan: |
+      Projection: promql_labels(Utf8("city"), get_field(timestamp_0.labels, Utf8("city"))) AS labels, timestamp_0.samples
+        SubqueryAlias: timestamp_0
+          Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL), Boolean(true)) AS samples
+            TableScan: selector_0
+
+  - name: timestamp over an expression
+    description: >
+      Once anything has stepped the samples, their time is the step's,
+      and the ordinary elementwise operator reports it.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      timestamp(abs(temperature))
+    plan: |
+      Projection: promql_labels(Utf8("city"), get_field(timestamp_1.labels, Utf8("city"))) AS labels, promql_elementwise(timestamp_1.samples, Utf8("timestamp"), Float64(NULL), Float64(NULL)) AS samples
+        SubqueryAlias: timestamp_1
+          Projection: promql_labels(Utf8("city"), get_field(abs_0.labels, Utf8("city"))) AS labels, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL)) AS samples
+            SubqueryAlias: abs_0
+              Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL), Boolean(false)) AS samples
+                TableScan: selector_0
 
   - name: grouped aggregation over a range function
     description: >

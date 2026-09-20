@@ -193,7 +193,7 @@ impl Planner<'_> {
     fn expr<'f>(&'f mut self, expr: &'f Expr, above: Above<'f>) -> Planning<'f> {
         Box::pin(async move {
             match expr {
-                Expr::VectorSelector(vs) => self.selector(vs, above).await,
+                Expr::VectorSelector(vs) => self.selector(vs, above, false).await,
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c).await,
@@ -248,18 +248,32 @@ impl Planner<'_> {
         Ok((builder, label_names))
     }
 
+    /// `stamp` asks for each step's value to be the found sample's own
+    /// timestamp; only [`Planner::timestamp`] sets it.
     async fn selector(
         &mut self,
         vs: &VectorSelector,
         above: Above<'_>,
+        stamp: bool,
     ) -> Result<Planned, EngineError> {
+        let at_ms = resolve_at(vs, self.query);
         let params = Params {
             start_ms: self.query.start_ms,
             end_ms: self.query.end_ms,
             step_ms: self.query.step_ms,
             window_ms: self.query.lookback_ms,
-            offset_ms: offset_ms(vs),
-            at_ms: resolve_at(vs, self.query),
+            // On the stamp path an `@` discards the offset rather than
+            // stacking with it: upstream overwrites the selector's own
+            // offset with `enh.Ts - *vs.Timestamp`
+            // (`rangeEvalTimestampFunctionOverVectorSelector`,
+            // `promql/engine.go:2521` at 83962c35), so the lookup lands
+            // on the pinned instant and `metric @ 100 offset 50` reads
+            // 100s, not 50s.
+            offset_ms: match stamp && at_ms.is_some() {
+                true => 0,
+                false => offset_ms(vs),
+            },
+            at_ms,
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         let hints = self.hints(params.select_range(), None, above);
@@ -267,7 +281,7 @@ impl Planner<'_> {
         let plan = builder
             .project(vec![
                 col(LABELS),
-                selector::call(col(SAMPLES), &params).alias(SAMPLES),
+                selector::call(col(SAMPLES), &params, stamp).alias(SAMPLES),
             ])?
             .build()?;
         Ok(Planned { plan, label_names })
@@ -288,10 +302,44 @@ impl Planner<'_> {
                 label_names: Vec::new(),
             });
         }
+        if name == "timestamp" {
+            if let Some(vs) = bare_selector(&call.args[0]) {
+                return self.timestamp(vs).await;
+            }
+        }
         if let Some(func) = elementwise::Func::parse(name) {
             return self.elementwise(call, func).await;
         }
         self.range_function(call).await
+    }
+
+    /// `timestamp(v)` where `v` is a selector and nothing else.
+    ///
+    /// Everywhere else a sample is restamped to the step it was found
+    /// for, which is what `timestamp()` would then report. Upstream
+    /// answers that by reading the selector itself rather than its
+    /// stepped output (`rangeEvalTimestampFunctionOverVectorSelector`,
+    /// `promql/engine.go:2505` at 83962c35), and so does this: the
+    /// selector is told to yield the found sample's own time. With `@`
+    /// that time is the pinned sample's, the same at every step, which
+    /// is upstream's offset trick arriving at the same place.
+    async fn timestamp(&mut self, vs: &VectorSelector) -> Result<Planned, EngineError> {
+        let input = self
+            .selector(
+                vs,
+                Above {
+                    func: Some("timestamp"),
+                    grouping: None,
+                },
+                true,
+            )
+            .await?;
+        let (labels_expr, label_names) = labels::keep(&input.label_names, |n| n != METRIC_NAME);
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(self.stage("timestamp"))?
+            .project(vec![labels_expr.alias(LABELS), col(SAMPLES)])?
+            .build()?;
+        Ok(Planned { plan, label_names })
     }
 
     /// A function applied to one sample at a time: `abs(x)` and its
@@ -497,6 +545,21 @@ impl Planner<'_> {
 
 fn offset_ms(vs: &VectorSelector) -> i64 {
     (vs.original_offset_secs * 1000.0).round() as i64
+}
+
+/// The selector an expression is, through parentheses.
+///
+/// Upstream matches `e.Args[0].(*parser.VectorSelector)` directly
+/// (`promql/engine.go:1968` at 83962c35) and gets the paren case from
+/// the `unwrapParenExpr(&n.Args[i])` its preprocessing pass has already
+/// run over every call argument (`:4350`). `None` for anything else,
+/// which is the ordinary path.
+fn bare_selector(expr: &Expr) -> Option<&VectorSelector> {
+    match expr {
+        Expr::VectorSelector(vs) => Some(vs),
+        Expr::Paren(p) => bare_selector(&p.expr),
+        _ => None,
+    }
 }
 
 /// The widest `@` timestamp, offset or range this engine will plan.

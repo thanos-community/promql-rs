@@ -23,7 +23,9 @@ use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, Float64Array, ListArray, StructArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Float64Type};
+use datafusion::arrow::datatypes::{
+    DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
+};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -65,6 +67,7 @@ pub enum Func {
     Atanh,
     Deg,
     Rad,
+    Timestamp,
 }
 
 impl Func {
@@ -97,6 +100,7 @@ impl Func {
             "atanh" => Func::Atanh,
             "deg" => Func::Deg,
             "rad" => Func::Rad,
+            "timestamp" => Func::Timestamp,
             _ => return None,
         })
     }
@@ -130,6 +134,7 @@ impl Func {
             Func::Atanh => "atanh",
             Func::Deg => "deg",
             Func::Rad => "rad",
+            Func::Timestamp => "timestamp",
         }
     }
 
@@ -150,6 +155,7 @@ impl Func {
             Func::Clamp => Bound::clamp(a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN)),
             Func::ClampMin => Bound::clamp(a.unwrap_or(f64::NAN), f64::INFINITY),
             Func::ClampMax => Bound::clamp(f64::NEG_INFINITY, a.unwrap_or(f64::NAN)),
+            Func::Timestamp => Bound::Timestamp,
             other => Bound::Map(other.map_fn()),
         }
     }
@@ -180,7 +186,7 @@ impl Func {
             Func::Atanh => f64::atanh,
             Func::Deg => |v| v * 180.0 / std::f64::consts::PI,
             Func::Rad => |v| v * std::f64::consts::PI / 180.0,
-            Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
+            Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax | Func::Timestamp => {
                 unreachable!("{} takes its arguments through bind", self.as_str())
             }
         }
@@ -215,6 +221,11 @@ pub enum Bound {
     /// (`clamp`, `promql/functions.go:705-707` at 83962c35), so the
     /// answer is the empty vector however many series came in.
     Nothing,
+    /// The only reading that ignores the value and takes the sample's
+    /// timestamp in seconds. Over anything but a bare selector that
+    /// timestamp is the step's, which is what upstream reports too —
+    /// see [`crate::plan`] for the selector upstream special-cases.
+    Timestamp,
 }
 
 impl Bound {
@@ -238,6 +249,7 @@ impl Bound {
             }
             Bound::Clamp { min, max } => go_max(*min, go_min(*max, v)),
             Bound::Nothing => unreachable!("an empty result has no values"),
+            Bound::Timestamp => unreachable!("timestamp reads the timestamp, not the value"),
         }
     }
 }
@@ -389,7 +401,15 @@ pub fn apply(samples: &ListArray, bound: Bound) -> ListArray {
         return empty_rows(samples.len(), samples.nulls().cloned());
     }
 
-    let mapped: Float64Array = values.values().iter().map(|v| bound.value(*v)).collect();
+    let mapped: Float64Array = match bound {
+        Bound::Timestamp => timestamps
+            .as_primitive::<TimestampMillisecondType>()
+            .values()
+            .iter()
+            .map(|t| *t as f64 / 1000.0)
+            .collect(),
+        _ => values.values().iter().map(|v| bound.value(*v)).collect(),
+    };
     let entries = StructArray::new(
         series::sample_fields(),
         vec![Arc::clone(timestamps), Arc::new(mapped)],
