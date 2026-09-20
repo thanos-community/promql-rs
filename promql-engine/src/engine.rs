@@ -25,7 +25,7 @@ use crate::error::EngineError;
 pub use crate::plan::RangeQuery;
 use crate::series;
 use crate::source::SeriesSource;
-use crate::{aggregate, labels, range, reduce, selector};
+use crate::{aggregate, histogram, labels, range, reduce, selector};
 
 pub struct Engine {
     ctx: SessionContext,
@@ -42,6 +42,7 @@ impl Engine {
         ctx.register_udf(range::udf());
         ctx.register_udaf(reduce::udaf());
         ctx.register_udf(labels::replace_udf());
+        ctx.register_udaf(histogram::udaf());
         Self { ctx, rt: None }
     }
 

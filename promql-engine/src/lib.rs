@@ -32,6 +32,7 @@ pub mod aggregate;
 pub mod engine;
 pub mod error;
 pub mod function;
+pub mod histogram;
 pub mod labels;
 pub mod matcher;
 pub mod math;

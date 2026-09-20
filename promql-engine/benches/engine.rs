@@ -173,6 +173,61 @@ fn reduce(c: &mut Criterion) {
     g.finish();
 }
 
+/// Ten cumulative buckets per histogram, `le` last so that the sort the
+/// kernel does has something to do. The counts climb with the bound, as
+/// a real histogram's do.
+fn histograms(shape: &Shape) -> Arc<dyn SeriesSource> {
+    const BOUNDS: [&str; 10] = [
+        "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "+Inf",
+    ];
+    let all = (0..shape.series)
+        .map(|i| {
+            let pod = format!("nginx-{}", i / BOUNDS.len());
+            let le = BOUNDS[(i + 3) % BOUNDS.len()];
+            let rank = BOUNDS.iter().position(|b| *b == le).unwrap() as f64 + 1.0;
+            let labels = [
+                ("__name__", "rq_seconds_bucket"),
+                ("le", le),
+                ("pod", pod.as_str()),
+            ];
+            let mut v = 0.0;
+            let (ts, vs): (Vec<i64>, Vec<f64>) = (0..shape.samples)
+                .map(|j| {
+                    v += rank * (1.0 + (j % 7) as f64);
+                    (j as i64 * SCRAPE_MS, v)
+                })
+                .unzip();
+            Series::new(&labels, ts, vs).unwrap()
+        })
+        .collect();
+    Arc::new(MemorySeriesSource::try_new(all).unwrap())
+}
+
+/// `histogram_quantile` over a thousand ten-bucket histograms: a group
+/// key per series, then ten lanes folded into one answer per group and
+/// step. Id is `engine/histogram/quantile/<series>x<samples>`.
+fn histogram(c: &mut Criterion) {
+    let engine = Engine::blocking().unwrap();
+    let shape = &SHAPES[2];
+    let source = histograms(shape);
+    let end = shape.end_ms();
+    let range = RangeQuery::new(end - HOUR_MS, end, STEP_MS);
+    let mut g = c.benchmark_group("engine/histogram");
+    g.throughput(Throughput::Elements(shape.elements()));
+    g.bench_function(BenchmarkId::new("quantile", shape.id()), |b| {
+        b.iter(|| {
+            engine
+                .range_query(
+                    source.as_ref(),
+                    black_box("histogram_quantile(0.9, rq_seconds_bucket)"),
+                    &range,
+                )
+                .unwrap()
+        })
+    });
+    g.finish();
+}
+
 /// Parsing and planning alone. The store's `select` runs here, so the gap
 /// to `engine/query` is execution proper.
 fn plan(c: &mut Criterion) {
@@ -208,6 +263,6 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(20);
-    targets = query, reduce, plan
+    targets = query, reduce, histogram, plan
 }
 criterion_main!(benches);

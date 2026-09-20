@@ -110,3 +110,25 @@ tests:
             SubqueryAlias: label_replace_0
               Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
                 TableScan: selector_0
+
+  - name: histogram_quantile over classic buckets
+    description: >
+      Two aggregations. The inner one is the function: one histogram's
+      buckets arrive as separate series, and only a grouped operator
+      sees them all at once, so the grouping is the label set minus
+      `le` and the quantile is a literal folded while planning. The
+      projection over it drops the metric name, which can leave two
+      histograms holding one label set — so the outer aggregation is
+      the label functions' merge, there to refuse exactly that.
+    load:
+      - rq_bucket{path="/a", le="1"} 0
+    query: |
+      histogram_quantile(0.5, rq_bucket)
+    plan: |
+      Projection: promql_labels(Utf8("path"), __group__path) AS labels, samples
+        Aggregate: groupBy=[[get_field(labels, Utf8("path")) AS __group__path]], aggr=[[promql_reduce(samples, Utf8("merge"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: promql_labels(Utf8("path"), __group__path) AS labels, samples
+            Aggregate: groupBy=[[get_field(histogram_quantile_0.labels, Utf8("__name__")) AS __group____name__, get_field(histogram_quantile_0.labels, Utf8("path")) AS __group__path]], aggr=[[promql_histogram_quantile(histogram_quantile_0.samples, get_field(histogram_quantile_0.labels, Utf8("le")), Float64(0.5), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+              SubqueryAlias: histogram_quantile_0
+                Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+                  TableScan: selector_0

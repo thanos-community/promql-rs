@@ -38,11 +38,13 @@ use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, MatchOp, VectorS
 use crate::aggregate::{self, Op};
 use crate::error::EngineError;
 use crate::function;
+use crate::histogram;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::params::{step_count, Params};
 use crate::range::{self, Func};
 use crate::reduce;
+use crate::scalar;
 use crate::selector;
 use crate::series::{LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
@@ -403,6 +405,120 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
+    /// `histogram_quantile(φ, v)` over classic histograms.
+    ///
+    /// A classic histogram is a family of series that differ only in
+    /// `le`, so reading a quantile across it is a grouping: upstream
+    /// gathers the family under the label signature without `le`
+    /// (`resetHistograms`, `promql/engine.go:1322` at 83962c35) and this
+    /// groups on the same labels. `__name__` is not one of them — it
+    /// stays in the key, as upstream keeps it in the signature, and is
+    /// dropped from the output where upstream's `DropName` drops it.
+    ///
+    /// φ is folded while planning, as every scalar argument here is.
+    async fn histogram_quantile(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        let name = call.func.name.as_str();
+        let phi = self.constant(&call.args[0], name)?;
+        let input = self
+            .expr(
+                &call.args[1],
+                Above {
+                    func: Some(name),
+                    grouping: None,
+                },
+            )
+            .await?;
+        let keys: Vec<String> = input
+            .label_names
+            .iter()
+            .filter(|n| n.as_str() != histogram::BUCKET_LABEL)
+            .cloned()
+            .collect();
+        let label_names: Vec<String> = keys
+            .iter()
+            .filter(|n| n.as_str() != METRIC_NAME)
+            .cloned()
+            .collect();
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(self.stage(name))?
+            .aggregate(
+                labels::group_exprs(&keys),
+                vec![histogram::call(
+                    col(SAMPLES),
+                    labels::get(&input.label_names, histogram::BUCKET_LABEL),
+                    phi,
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
+            )?
+            .project(vec![
+                labels::regroup(&label_names).alias(LABELS),
+                col(SAMPLES),
+            ])?;
+
+        // Two metric names over one bucket family are two groups until
+        // the projection above drops `__name__`, and then one label
+        // set — which upstream refuses where both hold a sample at the
+        // same step. That is the label functions' merge exactly, so it
+        // is the same operator, grouped on what is left.
+        //
+        // Only when `__name__` was in the key at all: an input that
+        // already dropped it, as `rate()` does, has groups that are
+        // distinct by the whole of the label set the output carries.
+        if keys.len() == label_names.len() {
+            return Ok(Planned {
+                plan: plan.build()?,
+                label_names,
+            });
+        }
+        let plan = plan
+            .aggregate(
+                labels::group_exprs(&label_names),
+                vec![reduce::call(
+                    col(SAMPLES),
+                    reduce::Func::Merge,
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
+            )?
+            .project(vec![
+                labels::regroup(&label_names).alias(LABELS),
+                col(SAMPLES),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// A scalar argument as the one number the whole plan will use.
+    ///
+    /// Upstream evaluates a function's scalar arguments at every step,
+    /// so `clamp_max(x, time())` narrows as the query walks forward.
+    /// Here they are folded while planning, which only holds for an
+    /// argument that does not move; one that does is named as the gap it
+    /// is rather than silently taken at its first value.
+    fn constant(&self, expr: &Expr, func: &str) -> Result<f64, EngineError> {
+        let mut folded: Option<f64> = None;
+        for ts in grid_of(self.query).steps() {
+            let v = scalar::fold(expr, ts)?;
+            match folded {
+                Some(first) if first.to_bits() != v.to_bits() => {
+                    return Err(EngineError::Unsupported(format!(
+                        "the {func} function with a scalar argument that changes between steps"
+                    )))
+                }
+                _ => folded = Some(v),
+            }
+        }
+        // An empty grid cannot happen: the step check above has already
+        // refused a non-positive step, and start..=end always holds one
+        // step.
+        folded.ok_or_else(|| EngineError::Query("the query has no steps".into()))
+    }
+
     /// A function of one range selector: `rate(x[5m])` and its family.
     ///
     /// Takes no `Above`: this call is itself what stands directly over the
@@ -415,6 +531,9 @@ impl Planner<'_> {
         }
         if name == "label_replace" || name == "label_join" {
             return self.label_function(call).await;
+        }
+        if name == "histogram_quantile" {
+            return self.histogram_quantile(call).await;
         }
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
@@ -530,6 +649,19 @@ impl Planner<'_> {
             plan,
             label_names: keys,
         })
+    }
+}
+
+/// The step grid alone, for the expressions that are a function of the
+/// step and nothing else.
+fn grid_of(query: &RangeQuery) -> Params {
+    Params {
+        start_ms: query.start_ms,
+        end_ms: query.end_ms,
+        step_ms: query.step_ms,
+        window_ms: 0,
+        offset_ms: 0,
+        at_ms: None,
     }
 }
 
