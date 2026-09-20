@@ -30,6 +30,7 @@
 //! store hands over would then be a type mismatch.
 
 pub mod aggregate; // benches/kernels.rs
+pub(crate) mod binary;
 mod buffer;
 pub(crate) mod elementwise;
 pub(crate) mod engine;

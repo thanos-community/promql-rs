@@ -174,12 +174,20 @@ fn count_over_time_across_chunks() {
 }
 
 /// Both sides of the match read the same series across chunk boundaries,
-/// so the carry has to be right twice over. Kept here rather than added
-/// with the operator so that branch turns it on without rediscovering it.
+/// so the carry has to be right twice over.
 #[test]
-#[ignore = "binary operators are not supported yet"]
 fn binary_op_matching_the_selector_with_itself() {
     assert_same_as_unchunked("x + x", RangeQuery::new(300_000, 300_000, 30_000));
+}
+
+/// The offset shifts one side's select, so its blocks' edges fall
+/// elsewhere than the other side's: a pairing keyed by block as well as
+/// by label set would find no partner for most steps.
+#[test]
+fn binary_op_across_blocks_with_different_edges() {
+    for q in ["x + x", "x - x offset 2m", "rate(x[5m]) / x offset 1m"] {
+        assert_same_as_unchunked(q, multi_step());
+    }
 }
 
 /// Four partitions run the selector as one SinglePartitioned aggregate per
