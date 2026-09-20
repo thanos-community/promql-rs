@@ -654,6 +654,49 @@ pub fn at_modifier<'l, 'i: 'l>(
     Ok(e)
 }
 
+// -------- anchored / smoothed --------
+
+/// `anchored_expr : expr ANCHORED` and `smoothed_expr : expr SMOOTHED`.
+/// Both modifiers live on the `VectorSelector`, reached through the
+/// matrix selector when there is one; upstream's `setAnchored` and
+/// `setSmoothed` differ only in which field they set.
+///
+/// Upstream rejects a subquery with `<name> modifier is not supported
+/// for subqueries` and anything else with `<name> modifier not
+/// implemented`. Neither message survives: grmtools fixes actions at
+/// `Result<T, ()>`, so both rejections arrive as a bare `Err(())`.
+fn set_range_modifier(inner: Result<Expr, ()>, anchored: bool) -> Result<Expr, ()> {
+    let mut e = inner?;
+    let vs = match &mut e {
+        Expr::VectorSelector(vs) => vs,
+        Expr::MatrixSelector(ms) => match ms.vector_selector.as_mut() {
+            Expr::VectorSelector(vs) => vs,
+            _ => return Err(()),
+        },
+        _ => return Err(()),
+    };
+    if anchored {
+        vs.anchored = true;
+    } else {
+        vs.smoothed = true;
+    }
+    // Upstream: "anchored and smoothed modifiers cannot be used
+    // together". It sets the flag first and then complains, so the
+    // check is on both being set, not on the one arriving second.
+    if vs.anchored && vs.smoothed {
+        return Err(());
+    }
+    Ok(e)
+}
+
+pub fn set_anchored(inner: Result<Expr, ()>) -> Result<Expr, ()> {
+    set_range_modifier(inner, true)
+}
+
+pub fn set_smoothed(inner: Result<Expr, ()>) -> Result<Expr, ()> {
+    set_range_modifier(inner, false)
+}
+
 /// Variant of [`at_timestamp`] for the upstream-shaped grammar, where
 /// the `@ <number>` arrives as a pre-parsed f64 (from the
 /// `signed_or_unsigned_number → number` rule chain).

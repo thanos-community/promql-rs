@@ -187,3 +187,95 @@ fn metric_selector_api() {
         .any(|m| m.name == "__name__" && m.value == "up"));
     assert!(matchers.iter().any(|m| m.name == "job" && m.value == "api"));
 }
+
+/// Both modifiers sit on the VectorSelector, reached through the
+/// matrix selector: upstream's `setAnchored`/`setSmoothed` walk into it
+/// rather than giving the MatrixSelector its own field.
+#[test]
+fn anchored_and_smoothed_land_on_the_vector_selector() {
+    for (q, anchored, smoothed) in [
+        ("rate(foo[5m] anchored)", true, false),
+        ("rate(foo[5m] smoothed)", false, true),
+    ] {
+        match must_parse(q) {
+            Expr::Call(c) => match &c.args[0] {
+                Expr::MatrixSelector(ms) => match &*ms.vector_selector {
+                    Expr::VectorSelector(vs) => {
+                        assert_eq!(vs.anchored, anchored, "{q}");
+                        assert_eq!(vs.smoothed, smoothed, "{q}");
+                    }
+                    other => panic!("{q}: expected VectorSelector, got {other:?}"),
+                },
+                other => panic!("{q}: expected MatrixSelector, got {other:?}"),
+            },
+            other => panic!("{q}: expected Call, got {other:?}"),
+        }
+    }
+    // A bare instant selector takes them too.
+    match must_parse("foo anchored") {
+        Expr::VectorSelector(vs) => assert!(vs.anchored && !vs.smoothed),
+        other => panic!("expected VectorSelector, got {other:?}"),
+    }
+}
+
+#[test]
+fn anchored_and_smoothed_are_mutually_exclusive() {
+    assert!(parse_expr("rate(foo[5m] anchored smoothed)").is_err());
+    assert!(parse_expr("rate(foo[5m] smoothed anchored)").is_err());
+}
+
+/// Upstream rejects the modifier on a subquery and on anything that is
+/// not a selector at all.
+#[test]
+fn a_misplaced_range_modifier_is_an_error() {
+    assert!(parse_expr("rate(foo[5m])[10m:1m] anchored").is_err());
+    assert!(parse_expr("(foo + bar) anchored").is_err());
+    assert!(parse_expr("sum(foo) smoothed").is_err());
+}
+
+/// `anchored_expr`, `offset_expr` and `at_expr` are all `expr` suffixes
+/// upstream, so the modifier composes with the other two in either
+/// order and every one of them reaches the same VectorSelector.
+#[test]
+fn a_range_modifier_composes_with_offset_and_at() {
+    for (q, offset_secs, timestamp) in [
+        ("rate(foo[5m] anchored offset 1m)", 60.0, None),
+        ("rate(foo[5m] offset 1m anchored)", 60.0, None),
+        ("rate(foo[5m] @ 100 anchored)", 0.0, Some(100_000)),
+    ] {
+        match must_parse(q) {
+            Expr::Call(c) => match &c.args[0] {
+                Expr::MatrixSelector(ms) => match &*ms.vector_selector {
+                    Expr::VectorSelector(vs) => {
+                        assert!(vs.anchored, "{q}");
+                        assert_eq!(vs.original_offset_secs, offset_secs, "{q}");
+                        assert_eq!(vs.timestamp, timestamp, "{q}");
+                    }
+                    other => panic!("{q}: expected VectorSelector, got {other:?}"),
+                },
+                other => panic!("{q}: expected MatrixSelector, got {other:?}"),
+            },
+            other => panic!("{q}: expected Call, got {other:?}"),
+        }
+    }
+}
+
+/// Upstream lists ANCHORED and SMOOTHED in `metric_identifier` and
+/// `maybe_label`, so adding the keywords must not cost anyone a metric,
+/// label or grouping name that parsed before. A keyword as a *label*
+/// name needs the lexer's BRACES start condition, which this branch
+/// does not have; `keywords_are_label_names_inside_braces` covers it
+/// there.
+#[test]
+fn the_new_keywords_are_still_names() {
+    for (q, name) in [("anchored", "anchored"), ("smoothed", "smoothed")] {
+        match must_parse(q) {
+            Expr::VectorSelector(vs) => assert_eq!(vs.name, name, "{q}"),
+            other => panic!("{q}: expected VectorSelector, got {other:?}"),
+        }
+    }
+    match must_parse("sum by (anchored) (x)") {
+        Expr::Aggregate(a) => assert_eq!(a.grouping, ["anchored"]),
+        other => panic!("expected Aggregate, got {other:?}"),
+    }
+}

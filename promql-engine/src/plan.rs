@@ -222,6 +222,9 @@ impl Planner<'_> {
     /// Takes no `Above`: this call is itself what stands directly over the
     /// selector, so nothing higher reaches the store.
     async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        // Before the function is resolved: `deriv(foo[3m] smoothed)` is
+        // an invalid query whether or not this engine has `deriv`.
+        check_range_modifiers(call)?;
         let name = call.func.name.as_str();
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
@@ -382,6 +385,45 @@ fn resolve_at(vs: &VectorSelector, query: &RangeQuery) -> Option<i64> {
         (None, Some(AtModifier::End)) => Some(query.end_ms),
         (None, None) => None,
     }
+}
+
+/// Upstream's `AnchoredSafeFunctions` / `SmoothedSafeFunctions` gate
+/// (engine.go). Both modifiers hand the function samples from outside
+/// the window, so only the functions that reduce a window to a
+/// difference between its ends may see them.
+///
+/// Sorted, because upstream sorts the map keys into the message and the
+/// corpus asserts on the text.
+fn check_range_modifiers(call: &Call) -> Result<(), EngineError> {
+    const ANCHORED_SAFE: [&str; 5] = ["changes", "delta", "increase", "rate", "resets"];
+    const SMOOTHED_SAFE: [&str; 3] = ["delta", "increase", "rate"];
+
+    let Some(vs) = call.args.iter().find_map(|a| match a {
+        Expr::MatrixSelector(ms) => match ms.vector_selector.as_ref() {
+            Expr::VectorSelector(vs) => Some(vs),
+            _ => None,
+        },
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    // Upstream's `switch` tries anchored first; the parser has already
+    // rejected a selector carrying both.
+    let (modifier, safe) = if vs.anchored {
+        ("anchored", &ANCHORED_SAFE[..])
+    } else if vs.smoothed {
+        ("smoothed", &SMOOTHED_SAFE[..])
+    } else {
+        return Ok(());
+    };
+    let name = call.func.name.as_str();
+    if safe.contains(&name) {
+        return Ok(());
+    }
+    Err(EngineError::Query(format!(
+        "{modifier} modifier can only be used with: {} - not with {name}",
+        safe.join(", ")
+    )))
 }
 
 fn reject_unsupported_modifiers(vs: &VectorSelector) -> Result<(), EngineError> {
