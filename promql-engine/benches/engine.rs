@@ -187,6 +187,10 @@ fn binary(c: &mut Criterion) {
     g.throughput(Throughput::Elements(shape.elements()));
     for (qname, q) in [
         ("vector_scalar", "http_requests_total * 2"),
+        // A comparison is the one that rebuilds the row boundaries
+        // rather than only the values, and over this source it keeps
+        // most of them, which is the expensive half of that path.
+        ("vector_scalar_compare", "http_requests_total > 100"),
         ("vector_vector", "http_requests_total + http_requests_total"),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {

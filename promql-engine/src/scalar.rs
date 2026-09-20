@@ -62,26 +62,22 @@ pub fn fold(expr: &Expr, ts_ms: i64) -> Result<f64, EngineError> {
     }
 }
 
-/// Upstream's `scalarBinop`. A comparison yields 1 or 0 — Go's `btos`.
+/// Upstream's `scalarBinop`, which is [`crate::binary::Op`] with the
+/// `bool` its comparisons always carry: between two scalars the modifier
+/// is mandatory, checked by [`crate::plan`] before any of this runs, so
+/// a comparison here is Go's `btos` and never filters.
 ///
-/// The arithmetic is [`crate::binary::Op`], shared with the two shapes
-/// that read series: `scalarBinop` and `vectorElemBinop` agree operator
-/// for operator upstream, and one of them here would drift.
+/// Shared rather than written out again: `scalarBinop` and
+/// `vectorElemBinop` agree operator for operator upstream, and one of
+/// them here would drift.
 fn binop(op: ItemType, lhs: f64, rhs: f64) -> Result<f64, EngineError> {
-    if let Some(arithmetic) = crate::binary::Op::from_token(op) {
-        return Ok(arithmetic.value(lhs, rhs));
-    }
-    let b = |yes: bool| Ok(if yes { 1.0 } else { 0.0 });
-    match op {
-        ItemType::EqlC => b(lhs == rhs),
-        ItemType::Neq => b(lhs != rhs),
-        ItemType::Gtr => b(lhs > rhs),
-        ItemType::Lss => b(lhs < rhs),
-        ItemType::Gte => b(lhs >= rhs),
-        ItemType::Lte => b(lhs <= rhs),
+    match crate::binary::Op::from_token(op) {
+        Some(op) => Ok(op
+            .value(lhs, rhs, true)
+            .expect("bool keeps every comparison")),
         // `and`, `or`, `unless`: upstream's parser rejects them between
         // scalars, so reaching here means our parser was laxer.
-        op => Err(EngineError::Query(format!(
+        None => Err(EngineError::Query(format!(
             "set operator {op} not allowed in binary scalar expression"
         ))),
     }

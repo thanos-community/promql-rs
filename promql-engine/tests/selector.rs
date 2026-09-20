@@ -122,7 +122,10 @@ fn anything_but_a_selector_is_unsupported_by_name() {
             "absent_over_time(http_requests_total[5m])",
             "the absent_over_time function",
         ),
-        ("http_requests_total > 1", "the > comparison operator"),
+        (
+            "http_requests_total and http_requests_total",
+            "the and set operator",
+        ),
         ("http_requests_total[5m]", "a range selector"),
     ] {
         let err = engine
