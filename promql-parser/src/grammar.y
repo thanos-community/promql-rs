@@ -152,7 +152,7 @@ paren_expr -> Result<Expr, ()>:
   ;
 
 positive_duration_expr -> Result<Expr, ()>:
-    duration_expr { $1 }
+    duration_expr { actions::positive_duration($1) }
   ;
 
 offset_expr -> Result<Expr, ()>:
@@ -361,7 +361,7 @@ number_duration_literal -> Result<Expr, ()>:
 
 number -> Result<f64, ()>:
     'NUMBER' { actions::number_value($lexer, $1.map_err(|_| ())?) }
-  | 'DURATION' { Err(()) }
+  | 'DURATION' { actions::duration_value($lexer, $1.map_err(|_| ())?) }
   ;
 
 signed_number -> Result<f64, ()>:
@@ -392,40 +392,40 @@ maybe_grouping_labels -> Result<Vec<String>, ()>:
   ;
 
 offset_duration_expr -> Result<Expr, ()>:
-    number_duration_literal { $1 }
-  | unary_op number_duration_literal { actions::signed_duration($1, $2) }
-  | 'STEP' 'LPAREN' 'RPAREN' { Err(()) }
-  | 'RANGE' 'LPAREN' 'RPAREN' { Err(()) }
-  | unary_op 'STEP' 'LPAREN' 'RPAREN' { Err(()) }
-  | unary_op 'RANGE' 'LPAREN' 'RPAREN' { Err(()) }
-  | min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { Err(()) }
-  | unary_op min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { Err(()) }
-  | unary_op 'LPAREN' duration_expr 'RPAREN' %prec 'MUL' { Err(()) }
+    number_duration_literal { actions::duration_operand($1) }
+  | unary_op number_duration_literal { actions::duration_unary($span, $1, $2) }
+  | 'STEP' 'LPAREN' 'RPAREN' { actions::duration_query_param($span, ItemType::Step) }
+  | 'RANGE' 'LPAREN' 'RPAREN' { actions::duration_query_param($span, ItemType::Range) }
+  | unary_op 'STEP' 'LPAREN' 'RPAREN' { actions::duration_unary_node($span, $1, actions::duration_query_param($span, ItemType::Step)) }
+  | unary_op 'RANGE' 'LPAREN' 'RPAREN' { actions::duration_unary_node($span, $1, actions::duration_query_param($span, ItemType::Range)) }
+  | min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { actions::duration_min_max($span, $1, $3, $5) }
+  | unary_op min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { actions::duration_unary_node($span, $1, actions::duration_min_max($span, $2, $4, $6)) }
+  | unary_op 'LPAREN' duration_expr 'RPAREN' %prec 'MUL' { actions::duration_unary_node($span, $1, $3) }
   | duration_expr { $1 }
   ;
 
 min_max -> Result<ItemType, ()>:
-    'MIN' { Err(()) }
-  | 'MAX' { Err(()) }
+    'MIN' { Ok(ItemType::Min) }
+  | 'MAX' { Ok(ItemType::Max) }
   ;
 
 duration_expr -> Result<Expr, ()>:
-    number_duration_literal { $1 }
-  | unary_op duration_expr %prec 'MUL' { Err(()) }
-  | duration_expr 'ADD' duration_expr { Err(()) }
-  | duration_expr 'SUB' duration_expr { Err(()) }
-  | duration_expr 'MUL' duration_expr { Err(()) }
-  | duration_expr 'DIV' duration_expr { Err(()) }
-  | duration_expr 'MOD' duration_expr { Err(()) }
-  | duration_expr 'POW' duration_expr { Err(()) }
-  | 'STEP' 'LPAREN' 'RPAREN' { Err(()) }
-  | 'RANGE' 'LPAREN' 'RPAREN' { Err(()) }
-  | min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { Err(()) }
-  | paren_duration_expr { Err(()) }
+    number_duration_literal { actions::duration_operand($1) }
+  | unary_op duration_expr %prec 'MUL' { actions::duration_unary($span, $1, $2) }
+  | duration_expr 'ADD' duration_expr { actions::duration_binary($span, ItemType::Add, $1, $3) }
+  | duration_expr 'SUB' duration_expr { actions::duration_binary($span, ItemType::Sub, $1, $3) }
+  | duration_expr 'MUL' duration_expr { actions::duration_binary($span, ItemType::Mul, $1, $3) }
+  | duration_expr 'DIV' duration_expr { actions::duration_binary($span, ItemType::Div, $1, $3) }
+  | duration_expr 'MOD' duration_expr { actions::duration_binary($span, ItemType::Mod, $1, $3) }
+  | duration_expr 'POW' duration_expr { actions::duration_binary($span, ItemType::Pow, $1, $3) }
+  | 'STEP' 'LPAREN' 'RPAREN' { actions::duration_query_param($span, ItemType::Step) }
+  | 'RANGE' 'LPAREN' 'RPAREN' { actions::duration_query_param($span, ItemType::Range) }
+  | min_max 'LPAREN' duration_expr 'COMMA' duration_expr 'RPAREN' { actions::duration_min_max($span, $1, $3, $5) }
+  | paren_duration_expr { $1 }
   ;
 
 paren_duration_expr -> Result<Expr, ()>:
-    'LPAREN' duration_expr 'RPAREN' { Err(()) }
+    'LPAREN' duration_expr 'RPAREN' { actions::duration_paren($2) }
   ;
 
 %%

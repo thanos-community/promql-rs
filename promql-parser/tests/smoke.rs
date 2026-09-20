@@ -203,3 +203,44 @@ fn metric_selector_api() {
         .any(|m| m.name == "__name__" && m.value == "up"));
     assert!(matchers.iter().any(|m| m.name == "job" && m.value == "api"));
 }
+
+/// A duration expression whose operands are all literals still reaches
+/// the engine as a tree, not a number: `step()` may appear anywhere in
+/// one, so the fold belongs on the query side for every shape.
+#[test]
+fn duration_expressions_become_a_tree() {
+    for q in ["foo[30m+0s]", "foo[60*30]", "foo[2m*(10+5)]", "foo[1h/2]"] {
+        match must_parse(q) {
+            Expr::MatrixSelector(ms) => assert!(ms.range_expr.is_some(), "{q}"),
+            other => panic!("expected MatrixSelector for {q}, got {other:?}"),
+        }
+    }
+    match must_parse("foo offset (1h-30m)") {
+        Expr::VectorSelector(vs) => assert!(vs.original_offset_expr.is_some()),
+        other => panic!("expected VectorSelector, got {other:?}"),
+    }
+    // A bare literal keeps the folded-at-parse-time path.
+    match must_parse("foo[5m]") {
+        Expr::MatrixSelector(ms) => {
+            assert_eq!(ms.range_secs, 300.0);
+            assert!(ms.range_expr.is_none());
+        }
+        other => panic!("expected MatrixSelector, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_range_literal_must_be_positive() {
+    assert!(parse_expr("foo[0s]").is_err());
+    assert!(parse_expr("foo[-5m]").is_err());
+    assert!(parse_expr("foo[5m/0]").is_err());
+}
+
+/// `number : DURATION` upstream, so the @ modifier takes one.
+#[test]
+fn at_modifier_takes_a_duration() {
+    match must_parse("foo @ 1m40s") {
+        Expr::VectorSelector(vs) => assert_eq!(vs.timestamp, Some(100_000)),
+        other => panic!("expected VectorSelector, got {other:?}"),
+    }
+}
