@@ -78,13 +78,6 @@ fn vector(query: &str) -> Vec<Row> {
     vector_of(source().as_ref(), query, &at_150s())
 }
 
-fn error(query: &str) -> EngineError {
-    Engine::blocking()
-        .unwrap()
-        .range_query(source().as_ref(), query, &at_150s())
-        .expect_err(query)
-}
-
 fn pod(name: &str) -> Vec<(String, String)> {
     vec![("pod".to_string(), name.to_string())]
 }
@@ -228,9 +221,30 @@ fn named(metric: &str, pod_name: &str) -> Vec<(String, String)> {
 /// and `c`, still called `requests`.
 #[test]
 fn a_filtering_comparison_can_be_an_operand() {
+    let named = |metric: &str, pod_name: &str| {
+        vec![
+            ("__name__".to_string(), metric.to_string()),
+            ("pod".to_string(), pod_name.to_string()),
+        ]
+    };
+
     // Arithmetic on either side: pod `b` is the only one both reach.
     assert_eq!(vector("(requests > 100) + errors"), [(pod("b"), 132.0)]);
     assert_eq!(vector("errors + (requests > 100)"), [(pod("b"), 132.0)]);
+
+    // Set operators, which keep the name the comparison kept.
+    assert_eq!(
+        vector("(requests > 100) or errors"),
+        [
+            (named("errors", "a"), 6.0),
+            (named("requests", "b"), 120.0),
+            (named("requests", "c"), 180.0),
+        ]
+    );
+    assert_eq!(
+        vector("(requests > 100) unless errors"),
+        [(named("requests", "c"), 180.0)]
+    );
 
     // And a function above it, which is the same shape one stage down.
     assert_eq!(
@@ -550,6 +564,98 @@ fn the_matching_errors_are_upstreams() {
     );
 }
 
+/// The set operators over `zoned()`: each of them asks only whether
+/// the other side has this signature at this step, and answers with
+/// the sample it was handed -- labels, `__name__` and value intact.
+#[test]
+fn a_set_operator_filters_by_signature_and_keeps_the_sample() {
+    let requests =
+        |pod: &str, path: &str| labels(&[("__name__", "requests"), ("path", path), ("pod", pod)]);
+
+    // Both pods have a limit, so every request series survives -- and
+    // `ignoring` names the same signature the other way round.
+    for query in [
+        "requests and on(pod) limit",
+        "requests and ignoring(path, zone) limit",
+    ] {
+        assert_eq!(
+            matched(query),
+            [
+                (requests("a", "/x"), 10.0),
+                (requests("b", "/x"), 30.0),
+                (requests("a", "/y"), 20.0),
+            ],
+            "{query}"
+        );
+    }
+    assert!(matched("requests unless on(pod) limit").is_empty());
+
+    // A label one side does not carry is the empty string, which is a
+    // signature of its own: nothing matches on `zone`.
+    assert!(matched("requests and on(zone) limit").is_empty());
+    assert_eq!(matched("requests unless on(zone) limit").len(), 3);
+
+    // Default matching is every label but `__name__`, so this pairs on
+    // `{pod, path}` and only `/y` is left without a partner.
+    assert_eq!(
+        matched(r#"requests unless requests{path="/x"}"#),
+        [(requests("a", "/y"), 20.0)]
+    );
+}
+
+/// `or` is the left side whole plus the right side's series under the
+/// signatures the left side left empty, each keeping its own labels.
+#[test]
+fn or_fills_in_the_signatures_the_left_side_missed() {
+    let limit =
+        |pod: &str, zone: &str| labels(&[("__name__", "limit"), ("pod", pod), ("zone", zone)]);
+    let requests =
+        |pod: &str, path: &str| labels(&[("__name__", "requests"), ("path", path), ("pod", pod)]);
+
+    // Pod `a` is answered by the left side, so only pod `b`'s limit is
+    // filled in -- as `limit`, not as `requests`.
+    assert_eq!(
+        matched(r#"requests{path="/y"} or on(pod) limit"#),
+        [(limit("b", "us"), 3.0), (requests("a", "/y"), 20.0)]
+    );
+    // Every signature the right side has is already on the left.
+    assert_eq!(matched("requests or on(pod) limit").len(), 3);
+    // And with nothing on the left, `or` is the right side.
+    assert_eq!(
+        matched("missing or on(pod) limit"),
+        [(limit("a", "eu"), 2.0), (limit("b", "us"), 3.0)]
+    );
+}
+
+/// Upstream refuses both of these while parsing; this engine has to
+/// say so itself, in the same words.
+#[test]
+fn a_set_operator_takes_neither_a_group_modifier_nor_a_scalar() {
+    let engine = Engine::blocking().unwrap();
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    let fails = |query: &str| match engine.range_query(&zoned(), query, &at_0).expect_err(query) {
+        EngineError::Query(message) => message,
+        other => panic!("{query}: expected a query error, got {other:?}"),
+    };
+
+    assert_eq!(
+        fails("requests and on(pod) group_left() limit"),
+        r#"no grouping allowed for "and" operation"#
+    );
+    assert_eq!(
+        fails("limit or on(pod) group_right(path) requests"),
+        r#"no grouping allowed for "or" operation"#
+    );
+    assert_eq!(
+        fails("requests unless 1"),
+        r#"set operator "unless" not allowed in binary scalar expression"#
+    );
+    assert_eq!(
+        fails("2 and 3"),
+        r#"set operator "and" not allowed in binary scalar expression"#
+    );
+}
+
 /// Upstream's parser refuses a label that both picks the match and is
 /// copied across it; ours has to say so itself.
 #[test]
@@ -567,23 +673,6 @@ fn a_label_cannot_be_matched_on_and_copied_at_once() {
             if q == "label \"pod\" must not occur in ON and GROUP clause at once"),
         "{err}"
     );
-}
-
-/// The operators this commit does not implement are named one by one:
-/// the count per feature is what says which is worth doing next.
-#[test]
-fn the_rest_of_the_operators_are_unsupported_by_name() {
-    for (query, feature) in [
-        ("requests and errors", "the and set operator"),
-        ("requests or errors", "the or set operator"),
-        ("requests unless errors", "the unless set operator"),
-    ] {
-        let err = error(query);
-        assert!(
-            matches!(&err, EngineError::Unsupported(f) if f == feature),
-            "{query}: {err}"
-        );
-    }
 }
 
 /// A scalar operand is folded while planning, so one that moves with
