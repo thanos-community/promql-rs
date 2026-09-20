@@ -71,6 +71,18 @@ tests:
     plan: |
       TableScan: scalar_0
 
+  - name: a date function with no argument
+    description: >
+      Reading the step is not reading a series: with no vector to work
+      on, a date function is the same one-row table a scalar is, and
+      the store is never asked.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      year()
+    plan: |
+      TableScan: scalar_0
+
   - name: grouped aggregation over a range function
     description: >
       by (job) becomes an ordinary DataFusion Aggregate, so grouping and

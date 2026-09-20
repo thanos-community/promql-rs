@@ -246,6 +246,68 @@ fn a_call_prometheus_would_not_parse_is_a_query_error() {
     }
 }
 
+/// A date function reads its argument as a Unix time in seconds, which
+/// is what `timestamp(x)` or a stored epoch gives it. 1500000000 is
+/// 2017-07-14 02:40:00 UTC, a Friday.
+#[test]
+fn a_date_function_reads_the_sample_as_a_unix_time() {
+    for (query, want) in [
+        ("year(vector(1500000000))", 2017.0),
+        ("month(vector(1500000000))", 7.0),
+        ("day_of_month(vector(1500000000))", 14.0),
+        ("day_of_week(vector(1500000000))", 5.0),
+        ("day_of_year(vector(1500000000))", 195.0),
+        ("days_in_month(vector(1500000000))", 31.0),
+        ("hour(vector(1500000000))", 2.0),
+        ("minute(vector(1500000000))", 40.0),
+        // February of a leap year, and of the century that is not one.
+        ("days_in_month(vector(1582934400))", 29.0),
+        ("days_in_month(vector(-2203977600))", 28.0),
+    ] {
+        let got = vector(query);
+        assert_eq!(got.len(), 1, "{query}");
+        assert_eq!(got[0].1, want, "{query}");
+    }
+}
+
+/// With no argument at all a date function answers for the step
+/// itself, as one series with no labels — so it asks no store.
+#[test]
+fn a_date_function_with_no_argument_reads_the_step() {
+    // The one-step queries above run at 150s, which is still 1970.
+    let got = vector("year()");
+    assert_eq!(got.len(), 1);
+    assert!(got[0].0.is_empty(), "no labels: {got:?}");
+    assert_eq!(got[0].1, 1970.0);
+    assert_eq!(vector("minute()")[0].1, 2.0);
+    assert_eq!(vector("day_of_week()")[0].1, 4.0);
+
+    // Over a range it is a value per step, which is the whole point of
+    // it not being a constant.
+    let engine = Engine::blocking().unwrap();
+    let range = RangeQuery::new(0, 7_200_000, 3_600_000);
+    let out = promql_engine::series::decode(
+        &engine
+            .range_query(source().as_ref(), "hour()", &range)
+            .expect("runs"),
+    )
+    .expect("canonical");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].values(), [0.0, 1.0, 2.0]);
+}
+
+/// The metric name goes, as it does for every other function that
+/// emits `DropName: true`, and the rest of the labels stay.
+#[test]
+fn a_date_function_over_a_selector_keeps_the_series() {
+    let got = vector("year(temperature)");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, vec![("city".to_string(), "lima".to_string())]);
+    // Both values are a handful of seconds either side of the epoch.
+    assert_eq!(got[0].1, 1969.0);
+    assert_eq!(got[1].1, 1970.0);
+}
+
 /// What the elementwise operator cannot express is still named as the
 /// feature it is, not as a bad query.
 #[test]
@@ -254,7 +316,6 @@ fn the_functions_that_are_not_elementwise_are_still_unsupported() {
         ("scalar(temperature)", "the scalar function"),
         ("sort(temperature)", "the sort function"),
         ("timestamp(temperature)", "the timestamp function"),
-        ("year(temperature)", "the year function"),
         ("absent(temperature)", "the absent function"),
     ] {
         let err = error(query);

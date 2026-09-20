@@ -152,6 +152,9 @@ fn elementwise(c: &mut Criterion) {
         ("abs_selector", "abs(http_requests_total)"),
         ("clamp_selector", "clamp(http_requests_total, 0, 1000)"),
         ("abs_rate_5m", "abs(rate(http_requests_total[5m]))"),
+        // The calendar arithmetic is the most work any of these does
+        // per value, which is what this case is here to price.
+        ("year_selector", "year(http_requests_total)"),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
             b.iter(|| {

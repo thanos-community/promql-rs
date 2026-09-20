@@ -31,7 +31,7 @@ use datafusion::logical_expr::{
     Signature, Volatility,
 };
 
-use crate::series;
+use crate::{date, series};
 
 pub const NAME: &str = "promql_elementwise";
 
@@ -65,6 +65,14 @@ pub enum Func {
     Atanh,
     Deg,
     Rad,
+    Year,
+    Month,
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    DaysInMonth,
+    Hour,
+    Minute,
 }
 
 impl Func {
@@ -97,6 +105,14 @@ impl Func {
             "atanh" => Func::Atanh,
             "deg" => Func::Deg,
             "rad" => Func::Rad,
+            "year" => Func::Year,
+            "month" => Func::Month,
+            "day_of_month" => Func::DayOfMonth,
+            "day_of_week" => Func::DayOfWeek,
+            "day_of_year" => Func::DayOfYear,
+            "days_in_month" => Func::DaysInMonth,
+            "hour" => Func::Hour,
+            "minute" => Func::Minute,
             _ => return None,
         })
     }
@@ -130,7 +146,32 @@ impl Func {
             Func::Atanh => "atanh",
             Func::Deg => "deg",
             Func::Rad => "rad",
+            Func::Year => "year",
+            Func::Month => "month",
+            Func::DayOfMonth => "day_of_month",
+            Func::DayOfWeek => "day_of_week",
+            Func::DayOfYear => "day_of_year",
+            Func::DaysInMonth => "days_in_month",
+            Func::Hour => "hour",
+            Func::Minute => "minute",
         }
+    }
+
+    /// Whether the function reads a timestamp rather than a
+    /// measurement: upstream's `dateWrapper` family, which may be
+    /// called with no vector at all and then answers for the step.
+    pub fn is_date(&self) -> bool {
+        matches!(
+            self,
+            Func::Year
+                | Func::Month
+                | Func::DayOfMonth
+                | Func::DayOfWeek
+                | Func::DayOfYear
+                | Func::DaysInMonth
+                | Func::Hour
+                | Func::Minute
+        )
     }
 
     /// Every one of these sets `DropName: true` on the sample it emits,
@@ -180,11 +221,34 @@ impl Func {
             Func::Atanh => f64::atanh,
             Func::Deg => |v| v * 180.0 / std::f64::consts::PI,
             Func::Rad => |v| v * std::f64::consts::PI / 180.0,
+            Func::Year => |v| date_field(v, |c| c.year),
+            Func::Month => |v| date_field(v, |c| c.month),
+            Func::DayOfMonth => |v| date_field(v, |c| c.day),
+            Func::DayOfWeek => |v| date_field(v, |c| c.weekday),
+            Func::DayOfYear => |v| date_field(v, |c| c.yearday),
+            Func::DaysInMonth => |v| date_field(v, |c| date::days_in_month(c.year, c.month)),
+            Func::Hour => |v| date_field(v, |c| c.hour),
+            Func::Minute => |v| date_field(v, |c| c.minute),
             Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
                 unreachable!("{} takes its arguments through bind", self.as_str())
             }
         }
     }
+}
+
+/// One field of the UTC calendar, from a sample holding a Unix time in
+/// seconds.
+///
+/// Upstream truncates the float to an `int64` and hands it to
+/// `time.Unix` (`dateWrapper`, `promql/functions.go:2093` at 83962c35).
+/// Go leaves that conversion undefined for a NaN or a value past the
+/// integer range and picks whatever the machine does; Rust's `as`
+/// defines it, so the answers here are the same everywhere even where
+/// upstream's are not: a NaN becomes 0, the epoch, and an infinity
+/// becomes the end of the `i64` range.
+pub fn date_field(secs: f64, field: fn(&date::Civil) -> i64) -> f64 {
+    let civil = date::civil(secs as i64);
+    field(&civil) as f64
 }
 
 /// `funcSgn`: zero and NaN come back as themselves, so the sign of `-0`
@@ -522,6 +586,23 @@ mod tests {
             .bind(Some(f64::NAN), None)
             .value(1.0)
             .is_nan());
+    }
+
+    /// The two samples Go's `int64(v)` leaves to the machine. Rust
+    /// defines both, so these answers are the engine's everywhere:
+    /// a NaN is zero and reads as the epoch, and an infinity saturates
+    /// instead of wrapping into some other year.
+    #[test]
+    fn a_date_function_answers_for_a_nan_and_an_infinity() {
+        let year = |v| date_field(v, |c| c.year);
+        assert_eq!(year(f64::NAN), 1970.0);
+        assert_eq!(date_field(f64::NAN, |c| c.month), 1.0);
+        assert_eq!(date_field(f64::NAN, |c| c.day), 1.0);
+        assert_eq!(date_field(f64::NAN, |c| c.hour), 0.0);
+
+        assert_eq!(year(f64::INFINITY), date::civil(i64::MAX).year as f64);
+        assert_eq!(year(f64::NEG_INFINITY), date::civil(i64::MIN).year as f64);
+        assert!(year(f64::INFINITY) > 1970.0 && year(f64::NEG_INFINITY) < 0.0);
     }
 
     #[test]

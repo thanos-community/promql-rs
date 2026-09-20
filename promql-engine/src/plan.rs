@@ -165,17 +165,26 @@ impl Planner<'_> {
     /// labels.Labels{}, F: …}` (`promql/functions.go:2028-2034` at
     /// 83962c35), the scalar's value with an empty label set.
     ///
-    /// Nothing here reads a series, so the values are folded while
-    /// planning ([`crate::scalar`]) and the plan is the table holding
-    /// them: no store is asked, and no kernel runs. The table is
-    /// numbered because a query can hold more than one of them —
-    /// `vector(1) + vector(2)`, once binary operators land — and two
-    /// scans of the same name in one plan are one scan.
     fn scalar_series(&mut self, expr: &Expr) -> Result<LogicalPlan, EngineError> {
+        self.grid_series(|ts| scalar::fold(expr, ts))
+    }
+
+    /// One unlabelled series over the step grid, `value` at every step.
+    ///
+    /// Nothing here reads a series, so the values are computed while
+    /// planning and the plan is the table holding them: no store is
+    /// asked, and no kernel runs. The table is numbered because a
+    /// query can hold more than one of them — `vector(1) + vector(2)`,
+    /// once binary operators land — and two scans of the same name in
+    /// one plan are one scan.
+    fn grid_series(
+        &mut self,
+        mut value: impl FnMut(i64) -> Result<f64, EngineError>,
+    ) -> Result<LogicalPlan, EngineError> {
         let mut timestamps = Vec::new();
         let mut values = Vec::new();
         for ts in grid_of(self.query).steps() {
-            values.push(scalar::fold(expr, ts)?);
+            values.push(value(ts)?);
             timestamps.push(ts);
         }
 
@@ -289,6 +298,18 @@ impl Planner<'_> {
             });
         }
         if let Some(func) = elementwise::Func::parse(name) {
+            // A date function with no argument reads the step itself:
+            // upstream's `dateWrapper` answers one sample with an empty
+            // label set from `enh.Ts` (`promql/functions.go:2080-2086`
+            // at 83962c35), which is the same one-series grid a scalar
+            // is, only vector-typed.
+            if func.is_date() && call.args.is_empty() {
+                let bound = func.bind(None, None);
+                return Ok(Planned {
+                    plan: self.grid_series(|ts_ms| Ok(bound.value(ts_ms as f64 / 1000.0)))?,
+                    label_names: Vec::new(),
+                });
+            }
             return self.elementwise(call, func).await;
         }
         self.range_function(call).await
