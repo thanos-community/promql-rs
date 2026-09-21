@@ -111,7 +111,7 @@ labels   Struct<{name}: Utf8View, …>    one field per label name, sorted
 samples  List<Struct<timestamp: Timestamp(ms), value: Float64>>
 ```
 
-One row is one series. Nothing is nullable.
+One row is one series. Nothing is nullable. For a worked example of one query flowing through the engine, see [engine-trace.md](engine-trace.md).
 
 A series is identified by its label set: one value per label name, and
 the set never changes for the life of the series. Three series that
