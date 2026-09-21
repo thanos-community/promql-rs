@@ -2075,9 +2075,20 @@ mod tests {
             SessionConfig::new().with_target_partitions(partitions),
         );
         ctx.register_udaf(udaf());
+        // One partition per batch so DataFusion's Final phase actually
+        // receives more than one partial state per group: a single
+        // MemTable partition only ever exercises `Lanes::copy_run`. The
+        // `partitions == 1` case stays one MemTable partition, since
+        // that's the serial reference the many-partitions run is
+        // compared against.
+        let table_partitions = if partitions > 1 {
+            batches.iter().cloned().map(|b| vec![b]).collect()
+        } else {
+            vec![batches]
+        };
         ctx.register_table(
             "t",
-            Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+            Arc::new(MemTable::try_new(schema, table_partitions).unwrap()),
         )
         .unwrap();
         let sql = format!(
@@ -2120,7 +2131,13 @@ mod tests {
     /// The partial/final split DataFusion runs across partitions must
     /// not change a single bit, for any operator: the partial states
     /// leaving one partition and the merge in the final one are the same
-    /// arithmetic as one accumulator seeing every row.
+    /// arithmetic as one accumulator seeing every row. Stddev and stdvar
+    /// are the exception: Chan's parallel Welford merge used by
+    /// `Lanes::merge_run` is not bit-identical to the serial fold, so
+    /// those two are compared with a relative tolerance instead (this
+    /// fixture's values run into the hundreds, where the absolute 1e-12
+    /// `partial_states_round_trip_and_merge` uses is too tight). The
+    /// Kahan-based operators stay exact.
     #[tokio::test]
     async fn many_partitions_aggregate_to_the_same_bits_as_one() {
         for op in OPS {
@@ -2128,7 +2145,21 @@ mod tests {
             let many = grouped_sql(op, 4).await;
             assert_eq!(one.len(), 8, "{op:?}");
             assert!(one.iter().all(|(_, s)| !s.is_empty()), "{op:?}");
-            assert_eq!(one, many, "{op:?}");
+            if matches!(op, Op::Stddev | Op::Stdvar) {
+                assert_eq!(one.len(), many.len(), "{op:?}");
+                for ((job1, s1), (job2, s2)) in one.iter().zip(&many) {
+                    assert_eq!(job1, job2, "{op:?}");
+                    assert_eq!(s1.len(), s2.len(), "{op:?}");
+                    for ((t1, a), (t2, b)) in s1.iter().zip(s2) {
+                        assert_eq!(t1, t2, "{op:?}");
+                        let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+                        let tol = 1e-9 * a.abs().max(b.abs()).max(1.0);
+                        assert!((a - b).abs() < tol, "{op:?}: {a} vs {b}");
+                    }
+                }
+            } else {
+                assert_eq!(one, many, "{op:?}");
+            }
         }
     }
 
