@@ -2153,7 +2153,7 @@ mod tests {
                     for ((t1, a), (t2, b)) in s1.iter().zip(s2) {
                         assert_eq!(t1, t2, "{op:?}");
                         let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
-                        let tol = 1e-9 * a.abs().max(b.abs()).max(1.0);
+                        let tol = 1e-11 * a.abs().max(b.abs()).max(1.0);
                         assert!((a - b).abs() < tol, "{op:?}: {a} vs {b}");
                     }
                 }
