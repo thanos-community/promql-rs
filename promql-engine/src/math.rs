@@ -146,7 +146,12 @@ impl Mean {
         self.count += 1.0;
         if !self.incremental {
             let (v, c) = kahan_inc(f, self.value, self.c);
-            if !v.is_infinite() {
+            // The first sample seeds the group the way Prometheus's
+            // `groupedAggregation` literal does (`floatValue: f`), so an
+            // infinite first sample must not trip the overflow switch
+            // below: doing so would divide 0.0 by `count - 1.0` (0.0)
+            // and poison the mean with NaN instead of keeping the ±Inf.
+            if !v.is_infinite() || self.count == 1.0 {
                 self.value = v;
                 self.c = c;
                 return;
@@ -162,9 +167,11 @@ impl Mean {
         self.c = c;
     }
 
-    /// Combine two partial means. Exact when either side is empty, which is
-    /// the common case (a state merged into a fresh accumulator); otherwise
-    /// a count-weighted combination.
+    /// Combine two partial means. Exact when either side is empty (a
+    /// state merged into a fresh accumulator, the common case) or when
+    /// both sides still hold a direct sum and their Kahan-merged total
+    /// stays finite; otherwise falls back to a count-weighted combination
+    /// of each side's `result()`.
     #[inline]
     pub fn merge(&mut self, other: &Mean) {
         if other.count == 0.0 {
@@ -598,6 +605,83 @@ mod tests {
         assert_eq!(m.result(), f64::MAX);
         m.add(0.0);
         assert!((m.result() - f64::MAX / 1.5).abs() <= f64::MAX * 1e-15);
+    }
+
+    /// An infinite first sample seeds the group directly, the way
+    /// Prometheus's `groupedAggregation` literal does, instead of
+    /// dividing zero by zero in the overflow switch.
+    #[test]
+    fn an_infinite_first_sample_does_not_poison_the_mean() {
+        let mut m = Mean::default();
+        m.add(f64::INFINITY);
+        m.add(2.0);
+        assert_eq!(m.result(), f64::INFINITY);
+
+        let mut m = Mean::default();
+        m.add(f64::NEG_INFINITY);
+        m.add(2.0);
+        assert_eq!(m.result(), f64::NEG_INFINITY);
+
+        // Two infinities of opposite sign is a legitimate NaN, same as
+        // Prometheus: this is not the bug, it is Inf + -Inf.
+        let mut m = Mean::default();
+        m.add(f64::INFINITY);
+        m.add(f64::NEG_INFINITY);
+        assert!(m.result().is_nan());
+
+        let mut m = Mean::default();
+        m.add(f64::NAN);
+        m.add(1.0);
+        assert!(m.result().is_nan());
+    }
+
+    /// The same four sequences through the lane kernel `mean_add_each`,
+    /// which is what the grouped accumulator actually calls: the fix
+    /// lives in [`Mean::add`], which `mean_add_each` calls per position,
+    /// so this is the same guard reached through the other entry point.
+    #[test]
+    fn mean_add_each_keeps_an_infinite_first_sample_out_of_the_overflow_switch() {
+        let run = |values: &[f64]| -> f64 {
+            let mut acc = [0.0];
+            let mut comps = [0.0];
+            let mut counts = [0.0];
+            let mut flags = BooleanBufferBuilder::new(1);
+            flags.append(false);
+            for v in values {
+                mean_add_each(
+                    &mut acc,
+                    &mut comps,
+                    &mut counts,
+                    FlagLane::new(&mut flags, 0, 1),
+                    std::slice::from_ref(v),
+                );
+            }
+            Mean {
+                value: acc[0],
+                c: comps[0],
+                count: counts[0],
+                incremental: flags.get_bit(0),
+            }
+            .result()
+        };
+        assert_eq!(run(&[f64::INFINITY, 2.0]), f64::INFINITY);
+        assert_eq!(run(&[f64::NEG_INFINITY, 2.0]), f64::NEG_INFINITY);
+        assert!(run(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
+        assert!(run(&[f64::NAN, 1.0]).is_nan());
+    }
+
+    /// A partial state seeded from a lone `+Inf` merged into a partial
+    /// state seeded from a plain value must stay `+Inf`, not poison to
+    /// NaN: the two-phase path hits the same first-sample seeding as the
+    /// single-accumulator path.
+    #[test]
+    fn merging_an_infinite_partial_state_stays_infinite() {
+        let mut inf = Mean::default();
+        inf.add(f64::INFINITY);
+        let mut two = Mean::default();
+        two.add(2.0);
+        inf.merge(&two);
+        assert_eq!(inf.result(), f64::INFINITY);
     }
 
     #[test]

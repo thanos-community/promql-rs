@@ -136,6 +136,36 @@ fn by_can_keep_the_metric_name() {
     assert_eq!(out[0].values(), [3.0]);
 }
 
+/// `avg`'s overflow switch must not trip on a group's very first sample:
+/// a lone `+Inf` averaged with a plain value must stay `+Inf`, not fold
+/// to NaN. Own fixture, since [`source`] has no infinite series.
+#[test]
+fn avg_of_a_group_with_an_infinite_series_stays_infinite() {
+    let source = Arc::new(MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"pos_inf{group="a", pod="p1"} +Inf +Inf +Inf"#,
+            r#"pos_inf{group="a", pod="p2"} 2+0x2"#,
+        ]),
+        30.0,
+    ));
+    let batches = Engine::blocking()
+        .unwrap()
+        .range_query(
+            source.as_ref(),
+            "avg by (group) (pos_inf)",
+            &RangeQuery::new(0, 60_000, 30_000),
+        )
+        .unwrap();
+    let out = promql_engine::series::decode(&batches).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].timestamps(), [0, 30_000, 60_000]);
+    assert!(
+        out[0].values().iter().all(|v| *v == f64::INFINITY),
+        "{:?}",
+        out[0].values()
+    );
+}
+
 #[test]
 fn an_aggregation_over_nothing_is_nothing() {
     let out = query("sum(no_such_metric)", RangeQuery::new(0, 60_000, 30_000));
