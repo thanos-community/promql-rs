@@ -50,6 +50,10 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Compiled but not run: benches that do not build rot silently.
+      - name: Build benchmarks
+        run: cargo build --workspace --benches
+
       - name: Check vendored upstream files
         run: cargo run -p promql-sync -- check
 
