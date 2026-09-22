@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use datafusion::prelude::SessionContext;
 use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery, Series};
 use promql_parser::SeriesDescription;
 
@@ -191,4 +192,121 @@ async fn the_plan_is_a_projection_with_the_function_as_a_literal() {
         "{rendered}"
     );
     assert!(rendered.contains("TableScan: selector_0"), "{rendered}");
+}
+
+/// Two metrics with one label set but the name, plus a third pod so the
+/// queries that are allowed still have rows.
+fn two_metrics() -> Arc<MemorySeriesSource> {
+    Arc::new(MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"http_requests_total{pod="envoy-1"} 1+1x15"#,
+            r#"http_errors_total{pod="envoy-1"} 1+1x15"#,
+            r#"http_requests_total{pod="envoy-2"} 1+2x18"#,
+        ]),
+        30.0,
+    ))
+}
+
+#[test]
+fn dropping_the_metric_name_may_not_leave_one_label_set_twice() {
+    let engine = Engine::blocking().unwrap();
+    let source = two_metrics();
+    let at = RangeQuery::new(300_000, 300_000, 30_000);
+    let run = |q: &str| engine.range_query(source.as_ref(), q, &at);
+
+    // Both series lose `__name__` and become `{pod="envoy-1"}`.
+    for q in [
+        r#"rate({pod="envoy-1"}[1m])"#,
+        // The check sits below the aggregation, so it still fires.
+        r#"sum(rate({pod="envoy-1"}[1m]))"#,
+        r#"sum by (pod)(rate({pod="envoy-1"}[1m]))"#,
+    ] {
+        let err = run(q).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "vector cannot contain metrics with the same labelset",
+            "{q}"
+        );
+    }
+
+    // A pinned name leaves one row, and a function that keeps the name
+    // leaves two rows that are still distinct.
+    assert!(run(r#"rate(http_requests_total{pod="envoy-1"}[1m])"#).is_ok());
+    assert!(run(r#"last_over_time({pod="envoy-1"}[1m])"#).is_ok());
+}
+
+#[tokio::test]
+async fn the_check_carries_the_projection_the_aggregation_needs() {
+    let engine = Engine::new();
+    let source = two_metrics();
+    let range = RangeQuery::new(0, 600_000, 30_000);
+    // The optimized plan, not the planner's: the rule this pins down runs
+    // during optimization and leaves the raw plan alone.
+    let plan = async |q: &str| {
+        let plan = engine.plan_async(source.as_ref(), q, &range).await.unwrap();
+        SessionContext::new()
+            .state()
+            .optimize(&plan)
+            .unwrap()
+            .display_indent()
+            .to_string()
+    };
+
+    let rendered = plan(r#"sum by (pod)(rate({pod="envoy-1"}[1m]))"#).await;
+    let check = rendered
+        .find("ContainsSameLabelset")
+        .unwrap_or_else(|| panic!("the check is in the plan: {rendered}"));
+    // DataFusion extracts the aggregation's group key, `get_field(labels,
+    // 'pod')`, into a projection of its own and sinks it towards the leaf
+    // through every node that would pass the extracted column back up.
+    // Were the check node to report its input's schema rather than its
+    // own, it would be such a node, and the operator would end up hashing
+    // whatever the store's rows became rather than the labels the call
+    // actually emits.
+    assert!(
+        !rendered[check..].contains("__datafusion_extracted"),
+        "nothing extracted below the check: {rendered}"
+    );
+
+    let rendered = plan("rate(http_requests_total[5m])").await;
+    assert!(!rendered.contains("ContainsSameLabelset"), "{rendered}");
+}
+
+#[test]
+fn dropping_the_metric_name_rejects_duplicate_label_sets() {
+    let source = MemorySeriesSource::from_descriptions(&load(&["foo 1", "bar 2"]), 30.0);
+    let engine = Engine::blocking().unwrap();
+
+    // Both series contribute at t=0. Dropping their only distinguishing
+    // label would produce two samples with the same empty label set.
+    let err = engine
+        .range_query(
+            &source,
+            r#"count_over_time({__name__=~"foo|bar"}[1m])"#,
+            &RangeQuery::new(0, 0, 30_000),
+        )
+        .expect_err("overlapping series with the same output labels must be rejected");
+    assert!(err.to_string().contains("same labelset"), "{err}");
+}
+
+#[test]
+fn a_series_with_no_output_points_cannot_collide() {
+    // Both series share `pod` and lose `__name__` under rate(). foo has
+    // enough samples for rate to produce a slope at t=300s; bar has only
+    // one sample ever, so rate over it never has two points to compare
+    // and the row it contributes has no output points at any step.
+    let source = MemorySeriesSource::from_descriptions(
+        &load(&[r#"foo{pod="envoy-1"} 1+1x15"#, r#"bar{pod="envoy-1"} 5"#]),
+        30.0,
+    );
+    let engine = Engine::blocking().unwrap();
+    let out = engine
+        .range_query(
+            &source,
+            r#"rate({pod="envoy-1"}[1m])"#,
+            &RangeQuery::new(300_000, 300_000, 30_000),
+        )
+        .expect("bar's empty row must not be counted as a collision with foo's");
+    let series = promql_engine::series::decode(&out).unwrap();
+    assert_eq!(series.len(), 1, "{series:?}");
 }
