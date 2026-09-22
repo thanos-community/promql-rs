@@ -15,13 +15,21 @@
 //! back is [`series::drop_empty`] — see its doc for why that can't live
 //! in the plan.
 
+use std::fmt;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
+use datafusion::error::DataFusionError;
+use datafusion::execution::context::QueryPlanner;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::error::EngineError;
+use crate::labelset::ContainsSameLabelsetPlanner;
 pub use crate::plan::RangeQuery;
 use crate::series;
 use crate::source::SeriesSource;
@@ -35,7 +43,17 @@ pub struct Engine {
 impl Engine {
     /// An engine for async callers. Use the `*_async` methods.
     pub fn new() -> Self {
-        let ctx = SessionContext::new_with_config(SessionConfig::new());
+        // `SessionContext::new_with_config` is this without the planner,
+        // and DataFusion turns an extension node into an operator through
+        // no other route.
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new())
+            .with_default_features()
+            .with_query_planner(Arc::new(ExtensionQueryPlanner {
+                planners: vec![Arc::new(ContainsSameLabelsetPlanner)],
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(selector::udf());
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
@@ -79,7 +97,7 @@ impl Engine {
     ) -> Result<Vec<RecordBatch>, EngineError> {
         let plan = self.plan_async(source, query, range).await?;
         let df = self.ctx.execute_logical_plan(plan).await?;
-        let batches = df.collect().await?;
+        let batches = df.collect().await.map_err(promql_error)?;
         // One `collect()` shares a single output schema across all its
         // batches, so validating it once and comparing later batches by
         // pointer skips the redundant re-walk of the label fields.
@@ -115,6 +133,46 @@ impl Engine {
             )
         })
     }
+}
+
+/// DataFusion's default physical planner plus the engine's own extension
+/// planners; the session's `QueryPlanner`.
+struct ExtensionQueryPlanner {
+    planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+}
+
+impl fmt::Debug for ExtensionQueryPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtensionQueryPlanner")
+            .field("planners", &self.planners.len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl QueryPlanner for ExtensionQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        plan: &LogicalPlan,
+        state: &SessionState,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        DefaultPhysicalPlanner::with_extension_planners(self.planners.clone())
+            .create_physical_plan(plan, state)
+            .await
+    }
+}
+
+/// An operator's own [`EngineError`] back out of the `External` DataFusion
+/// wrapped it in. Prometheus's wording is the answer to some queries, and
+/// a `datafusion: External error:` prefix in front of it would be a
+/// different answer.
+fn promql_error(e: DataFusionError) -> EngineError {
+    if let DataFusionError::External(inner) = e.find_root() {
+        if let Some(EngineError::Query(msg)) = inner.downcast_ref::<EngineError>() {
+            return EngineError::Query(msg.clone());
+        }
+    }
+    EngineError::DataFusion(e)
 }
 
 impl Default for Engine {

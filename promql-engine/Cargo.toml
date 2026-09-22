@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+futures = { workspace = true }
 promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }
