@@ -44,10 +44,12 @@ impl Params {
 
     /// The grid this evaluates on, whose length is [`step_count`].
     pub(crate) fn steps(&self) -> impl Iterator<Item = i64> {
-        let (start, end, step) = (self.start_ms, self.end_ms, self.step_ms);
-        (0..)
-            .map(move |i| start + i * step)
-            .take_while(move |ts| *ts <= end)
+        let (start, step) = (i128::from(self.start_ms), i128::from(self.step_ms));
+        // The count is derived up front, the way `Grid` derives its length,
+        // so the last position is <= end by construction: no per-step bound
+        // check, and so no probe one step past the end that could overflow.
+        let count = step_count(self.start_ms, self.end_ms, self.step_ms);
+        (0..count).map(move |i| (start + i * step) as i64)
     }
 }
 
@@ -144,5 +146,24 @@ mod tests {
         };
         assert_eq!(p.steps().collect::<Vec<_>>(), vec![0, 30, 60, 90]);
         assert_eq!(p.steps().count() as i128, step_count(0, 100, 30));
+    }
+
+    #[test]
+    fn the_step_grid_stops_at_the_end_of_time() {
+        let p = Params {
+            start_ms: i64::MAX,
+            end_ms: i64::MAX,
+            step_ms: 1,
+            window_ms: 0,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        assert_eq!(step_count(p.start_ms, p.end_ms, p.step_ms), 1);
+
+        // Ask for the end explicitly: collecting an unbounded iterator
+        // could hang if overflow wraps instead of panicking in release.
+        let mut steps = p.steps();
+        assert_eq!(steps.next(), Some(i64::MAX));
+        assert_eq!(steps.next(), None);
     }
 }
