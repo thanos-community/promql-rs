@@ -20,10 +20,6 @@
 //!       TableScan: selector_0          ← SelectorTable over SeriesSource::select
 //! ```
 //!
-//! A selector that does not pin `__name__` gets one more node,
-//! [`labelset::contains_same_labelset`], directly above that projection:
-//! dropping the name there can leave two rows with one label set.
-//!
 //! The `__group__` prefix on a group key keeps a label named `labels`
 //! or `samples` from colliding with the engine's own columns; see
 //! [`labels::group_exprs`]. [`labels::regroup`] restores the bare name.
@@ -36,12 +32,11 @@ use std::time::Duration;
 use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
-use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, MatchOp, VectorSelector};
+use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
 
 use crate::aggregate::{self, Op};
 use crate::error::EngineError;
 use crate::labels;
-use crate::labelset;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::params::{step_count, Params};
 use crate::range::{self, Func};
@@ -283,7 +278,6 @@ impl Planner<'_> {
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
-        let check_labelset = func.drops_metric_name() && !pins_metric_name(vs, &input_names);
         let (labels_expr, label_names) = if func.drops_metric_name() {
             labels::keep(&input_names, |n| n != METRIC_NAME)
         } else {
@@ -295,13 +289,6 @@ impl Planner<'_> {
                 range::call(col(SAMPLES), func, &params).alias(SAMPLES),
             ])?
             .build()?;
-        // Upstream checks `ContainsSameLabelset` on this result rather
-        // than merging the rows the dropped name made equal.
-        let plan = if check_labelset {
-            labelset::contains_same_labelset(plan)
-        } else {
-            plan
-        };
         Ok(Planned { plan, label_names })
     }
 
@@ -395,16 +382,6 @@ fn resolve_at(vs: &VectorSelector, query: &RangeQuery) -> Option<i64> {
         (None, Some(AtModifier::End)) => Some(query.end_ms),
         (None, None) => None,
     }
-}
-
-/// Whether dropping `__name__` from this selector's rows cannot make two
-/// of them equal: the scan carries no name at all, or one equality
-/// matcher already leaves every row the same name.
-fn pins_metric_name(vs: &VectorSelector, input_names: &[String]) -> bool {
-    !input_names.iter().any(|n| n == METRIC_NAME)
-        || effective_matchers(vs)
-            .iter()
-            .any(|m| m.name == METRIC_NAME && m.op == MatchOp::Equal)
 }
 
 fn reject_unsupported_modifiers(vs: &VectorSelector) -> Result<(), EngineError> {

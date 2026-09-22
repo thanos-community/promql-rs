@@ -1,347 +1,187 @@
-//! `Matrix.ContainsSameLabelset` as a DataFusion plan node and its operator.
+//! `cleanupMetricLabels` on the query's result: two series that ended up
+//! with one label set.
 //!
-//! Prometheus checks this once, on the result of a call over a range
-//! selector (`promql/engine.go`, the `rangeEval` of a `Call` over a
-//! `MatrixSelector`): dropping `__name__` from a selector that matched
-//! several metric names leaves two rows with one label set, and rather
-//! than merge them it errors. A plain projection would leave them side by
-//! side, so the plan carries this node above the projection instead.
+//! Prometheus runs with delayed `__name__` removal (`promql/engine.go`,
+//! `evaluator.cleanupMetricLabels`, and `EnableDelayedNameRemoval: true`
+//! in `promql/promqltest`), so dropping the name never errors where it
+//! happens. The name stays on the series for the whole evaluation and is
+//! removed once, on the way out; only then does upstream look for a label
+//! set twice. Every check inside the evaluation — above a call, above a
+//! binary operator, in `rangeEval` — is behind `!enableDelayedNameRemoval`
+//! and dead. Checking earlier would answer with an error where upstream
+//! answers with a number: `sum(rate({env="1"}[10m])) by (env)` adds two
+//! rows that lost their names into one series and is not a duplicate at
+//! all.
 //!
-//! It relies on the store's obligation to put one row per series in a
-//! batch ([`crate::source`]); a store that split one series across two
-//! batches would trip the check, which is the same thing that already
-//! breaks every operator above it.
+//! Upstream errors only when two such series share a timestamp, and
+//! merges them into one series when they do not. Two metrics alike in
+//! every label but the name, sampled over windows that do not overlap,
+//! are exactly that under a name-dropping call, so it is reachable here
+//! and the merge is a known gap: the result then carries both rows where
+//! upstream carries one series. Closing it needs an Arrow concat pass
+//! over the colliding rows' points, so only the error is mirrored.
 
-use std::collections::HashSet;
-use std::fmt;
-use std::sync::Arc;
+use std::collections::HashMap;
 
-use async_trait::async_trait;
-use datafusion::arrow::array::AsArray;
+use datafusion::arrow::array::{AsArray, RecordBatch};
+use datafusion::arrow::datatypes::TimestampMillisecondType;
+use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::row::{RowConverter, SortField};
-use datafusion::common::{internal_err, DFSchemaRef};
-use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::session_state::SessionState;
-use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{
-    Expr, Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
-};
-use datafusion::physical_expr::{Distribution, Partitioning};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    SendableRecordBatchStream,
-};
-use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use futures::StreamExt;
+use datafusion::error::DataFusionError;
 
 use crate::error::EngineError;
-use crate::series::{LABELS, SAMPLES};
-
-const NAME: &str = "ContainsSameLabelset";
+use crate::series::{LABELS, SAMPLES, TIMESTAMP};
 
 /// Prometheus's own sentence, word for word: the conformance suite
 /// compares error text, not error kinds.
 pub const SAME_LABELSET: &str = "vector cannot contain metrics with the same labelset";
 
-/// Fail the query if `plan` ever emits two rows with one label set.
-pub fn contains_same_labelset(plan: LogicalPlan) -> LogicalPlan {
-    LogicalPlan::Extension(Extension {
-        node: Arc::new(ContainsSameLabelset::new(plan)),
-    })
-}
-
-/// The plan node. Rows pass through untouched; only the error is new.
+/// Reject a result that carries one label set on two series.
 ///
-/// The schema is pinned when the node is made rather than read off the
-/// input, and carried through `with_exprs_and_inputs`. DataFusion pushes
-/// struct field accesses such as `get_field(labels, 'pod')` towards the
-/// leaves through any single-input node whose rebuilt output schema shows
-/// the extracted column, and `sum by (pod) (rate({…}[5m]))` has exactly
-/// such an access above this node. Owning the schema means the rebuild
-/// never shows it, so the projection stays above and the operator still
-/// gets the `labels` struct it hashes rather than loose scalars.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ContainsSameLabelset {
-    input: LogicalPlan,
-    schema: DFSchemaRef,
-}
-
-impl ContainsSameLabelset {
-    fn new(input: LogicalPlan) -> Self {
-        Self {
-            schema: Arc::clone(input.schema()),
-            input,
+/// Called on the final batches, with empty rows already dropped: a series
+/// that produced no points is not in upstream's result matrix and cannot
+/// collide with anything in it.
+pub fn reject_same_labelset(batches: &[RecordBatch]) -> Result<(), EngineError> {
+    let Some(first) = batches.first() else {
+        return Ok(());
+    };
+    let labels = first
+        .schema()
+        .field_with_name(LABELS)
+        .map_err(|e| EngineError::Schema(e.to_string()))?
+        .data_type()
+        .clone();
+    // Row format rather than a hash: `create_hashes` would report a
+    // collision as a duplicate label set, and this error is an answer the
+    // user sees, not a heuristic.
+    let converter = RowConverter::new(vec![SortField::new(labels)]).map_err(arrow_error)?;
+    // Label sets first, and timestamps only for a label set that turned
+    // up twice: upstream reaches for the timestamps from behind a
+    // `ContainsSameLabelset` guard as well, and a result whose rows are
+    // all distinct is every query that answers with a number.
+    let mut seen: HashMap<Vec<u8>, Vec<Location>> = HashMap::new();
+    for (batch, b) in batches.iter().enumerate() {
+        let column = b
+            .column_by_name(LABELS)
+            .ok_or_else(|| EngineError::Schema(format!("no {LABELS} column")))?;
+        let rows = converter
+            .convert_columns(std::slice::from_ref(column))
+            .map_err(arrow_error)?;
+        for (row, bytes) in rows.iter().enumerate() {
+            seen.entry(bytes.as_ref().to_vec())
+                .or_default()
+                .push(Location { batch, row });
         }
     }
-}
 
-/// `DFSchema` has no order; the schema follows from the input anyway.
-impl PartialOrd for ContainsSameLabelset {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.input.partial_cmp(&other.input)
-    }
-}
-
-impl UserDefinedLogicalNodeCore for ContainsSameLabelset {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.input]
-    }
-
-    fn schema(&self) -> &DFSchemaRef {
-        &self.schema
-    }
-
-    fn expressions(&self) -> Vec<Expr> {
-        Vec::new()
-    }
-
-    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{NAME}")
-    }
-
-    // `necessary_children_exprs` and `prevent_predicate_push_down_columns`
-    // stay at their defaults, which report "cannot say" and "no predicate
-    // may pass": the check has to see every row the projection above it
-    // would emit, so nothing below it may drop or filter rows.
-
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        mut inputs: Vec<LogicalPlan>,
-    ) -> Result<Self> {
-        if !exprs.is_empty() || inputs.len() != 1 {
-            return internal_err!(
-                "{NAME} takes one input and no expressions, got {} and {}",
-                inputs.len(),
-                exprs.len()
-            );
+    for rows in seen.values().filter(|rows| rows.len() > 1) {
+        let mut timestamps = Vec::new();
+        for at in rows {
+            timestamps.extend(timestamps_of(&batches[at.batch], at.row)?);
         }
-        Ok(Self {
-            input: inputs.swap_remove(0),
-            ..self.clone()
-        })
-    }
-}
-
-/// Plans a [`ContainsSameLabelset`] as a [`ContainsSameLabelsetExec`].
-#[derive(Debug, Default)]
-pub struct ContainsSameLabelsetPlanner;
-
-#[async_trait]
-impl ExtensionPlanner for ContainsSameLabelsetPlanner {
-    async fn plan_extension(
-        &self,
-        _planner: &dyn PhysicalPlanner,
-        node: &dyn UserDefinedLogicalNode,
-        _logical_inputs: &[&LogicalPlan],
-        physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if node
-            .as_any()
-            .downcast_ref::<ContainsSameLabelset>()
-            .is_none()
-        {
-            return Ok(None);
+        timestamps.sort_unstable();
+        if timestamps.windows(2).any(|w| w[0] == w[1]) {
+            return Err(EngineError::Query(SAME_LABELSET.into()));
         }
-        let [input] = physical_inputs else {
-            return internal_err!("{NAME} takes one input, got {}", physical_inputs.len());
-        };
-        Ok(Some(Arc::new(ContainsSameLabelsetExec::new(Arc::clone(
-            input,
-        )))))
     }
+    Ok(())
 }
 
-/// The operator: pass every batch through, and fail on the first label
-/// set seen twice.
-#[derive(Debug)]
-pub struct ContainsSameLabelsetExec {
-    input: Arc<dyn ExecutionPlan>,
-    properties: Arc<PlanProperties>,
+/// Where one row of the result sits, so the second pass can go back to it.
+struct Location {
+    batch: usize,
+    row: usize,
 }
 
-impl ContainsSameLabelsetExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        // Unlike `CoalescePartitionsExec`, this node never merges more
-        // than one input partition, so unlike that node it keeps the
-        // input's orderings rather than clearing them.
-        let properties = Arc::new(PlanProperties::new(
-            input.equivalence_properties().clone(),
-            Partitioning::UnknownPartitioning(1),
-            input.pipeline_behavior(),
-            input.boundedness(),
-        ));
-        Self { input, properties }
-    }
+/// The timestamps of one row's points.
+fn timestamps_of(batch: &RecordBatch, row: usize) -> Result<Vec<i64>, EngineError> {
+    let points = batch
+        .column_by_name(SAMPLES)
+        .ok_or_else(|| EngineError::Schema(format!("no {SAMPLES} column")))?
+        .as_list::<i32>()
+        .value(row);
+    Ok(points
+        .as_struct()
+        .column_by_name(TIMESTAMP)
+        .ok_or_else(|| EngineError::Schema(format!("no {TIMESTAMP} field")))?
+        .as_primitive::<TimestampMillisecondType>()
+        .values()
+        .to_vec())
 }
 
-impl DisplayAs for ContainsSameLabelsetExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{NAME}")
-    }
-}
-
-impl ExecutionPlan for ContainsSameLabelsetExec {
-    fn name(&self) -> &str {
-        NAME
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    /// One partition, so one set sees every row: two rows with the same
-    /// label set are a duplicate wherever the store put them.
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let [input] = children.as_slice() else {
-            return internal_err!("{NAME} takes one input, got {}", children.len());
-        };
-        Ok(Arc::new(Self::new(Arc::clone(input))))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return internal_err!("{NAME} has one partition, partition {partition} was asked for");
-        }
-        // `required_input_distribution` asks `EnforceDistribution` for a
-        // coalesce below this node; without it rows in partitions >= 1
-        // would vanish from both the check and the output.
-        if self.input.output_partitioning().partition_count() != 1 {
-            return internal_err!("{NAME} requires a single input partition");
-        }
-        let schema = self.schema();
-        let labels = schema
-            .field_with_name(LABELS)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        // Row format rather than a hash: `create_hashes` would report a
-        // collision as a duplicate label set, and this error is an answer
-        // the user sees, not a heuristic.
-        let converter = RowConverter::new(vec![SortField::new(labels.data_type().clone())])?;
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        let input = self.input.execute(0, context)?;
-        let stream = input.map(move |batch| {
-            let batch = batch?;
-            let column = batch
-                .column_by_name(LABELS)
-                .ok_or_else(|| DataFusionError::Internal(format!("{NAME}: no {LABELS} column")))?;
-            let samples = batch
-                .column_by_name(SAMPLES)
-                .ok_or_else(|| DataFusionError::Internal(format!("{NAME}: no {SAMPLES} column")))?
-                .as_list::<i32>();
-            let rows = converter.convert_columns(std::slice::from_ref(column))?;
-            for (i, row) in rows.iter().enumerate() {
-                // A series with no points is not in Prometheus's output
-                // matrix, so it cannot collide with anything in it. This
-                // predicate must match `series::drop_empty` exactly, or a
-                // row skipped here but kept there lets a real duplicate
-                // through unchecked.
-                if samples.value_length(i) == 0 {
-                    continue;
-                }
-                if !seen.insert(row.as_ref().to_vec()) {
-                    return Err(DataFusionError::External(Box::new(EngineError::Query(
-                        SAME_LABELSET.into(),
-                    ))));
-                }
-            }
-            Ok(batch)
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
+fn arrow_error(e: ArrowError) -> EngineError {
+    EngineError::DataFusion(DataFusionError::ArrowError(Box::new(e), None))
 }
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::RecordBatch;
-    use datafusion::arrow::compute::concat_batches;
-    use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::physical_plan::collect;
-    use datafusion::prelude::SessionContext;
-
     use super::*;
     use crate::series::{encode, label_names_of, Series};
 
-    fn row(pod: &str, name: &str) -> Series {
-        Series::new(&[("__name__", name), ("pod", pod)], vec![0], vec![1.0]).unwrap()
+    fn row(pod: &str, name: &str, timestamps: Vec<i64>) -> Series {
+        let values = vec![1.0; timestamps.len()];
+        Series::new(&[("__name__", name), ("pod", pod)], timestamps, values).unwrap()
     }
 
-    /// Run `batches`, each its own batch of one partition, through the
-    /// operator.
+    /// Encode `batches`, one batch per inner vec, and check them.
     ///
     /// Rows are encoded one at a time and concatenated: [`encode`]
     /// refuses a duplicate label set, which is the very input under test
-    /// here — a store that hands one over is what the operator catches.
-    async fn check(batches: Vec<Vec<Series>>) -> Result<Vec<RecordBatch>> {
+    /// here — a plan that emits one is what this catches.
+    fn check(batches: Vec<Vec<Series>>) -> Result<(), EngineError> {
         let names = label_names_of(&batches.concat());
         let one = |row| encode(&names, std::slice::from_ref(row)).unwrap();
         let schema = one(&batches[0][0]).schema();
         let batches: Vec<RecordBatch> = batches
             .iter()
-            .map(|rows| concat_batches(&schema, rows.iter().map(one).collect::<Vec<_>>().iter()))
-            .collect::<std::result::Result<_, _>>()?;
-        let input = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
-        let exec = Arc::new(ContainsSameLabelsetExec::new(input));
-        collect(exec, SessionContext::new().task_ctx()).await
+            .map(|rows| {
+                datafusion::arrow::compute::concat_batches(
+                    &schema,
+                    rows.iter().map(one).collect::<Vec<_>>().iter(),
+                )
+                .unwrap()
+            })
+            .collect();
+        reject_same_labelset(&batches)
     }
 
-    #[tokio::test]
-    async fn a_label_set_repeated_across_batches_is_an_error() {
+    #[test]
+    fn a_label_set_repeated_across_batches_is_an_error() {
         let err = check(vec![
-            vec![row("envoy-1", "a"), row("envoy-2", "a")],
-            vec![row("envoy-3", "a"), row("envoy-1", "a")],
+            vec![row("envoy-1", "a", vec![0]), row("envoy-2", "a", vec![0])],
+            vec![row("envoy-3", "a", vec![0]), row("envoy-1", "a", vec![0])],
         ])
-        .await
         .unwrap_err();
         assert!(err.to_string().contains(SAME_LABELSET), "{err}");
     }
 
-    #[tokio::test]
-    async fn a_label_set_repeated_within_one_batch_is_an_error() {
-        let err = check(vec![vec![row("envoy-1", "a"), row("envoy-1", "a")]])
-            .await
-            .unwrap_err();
+    #[test]
+    fn a_label_set_repeated_within_one_batch_is_an_error() {
+        let err = check(vec![vec![
+            row("envoy-1", "a", vec![0]),
+            row("envoy-1", "a", vec![0]),
+        ]])
+        .unwrap_err();
         assert!(err.to_string().contains(SAME_LABELSET), "{err}");
     }
 
-    #[tokio::test]
-    async fn distinct_label_sets_pass_through_unchanged() {
-        let batches = check(vec![
-            vec![row("envoy-1", "a"), row("envoy-2", "a")],
-            vec![row("envoy-3", "a")],
+    #[test]
+    fn distinct_label_sets_are_fine() {
+        check(vec![
+            vec![row("envoy-1", "a", vec![0]), row("envoy-2", "a", vec![0])],
+            vec![row("envoy-3", "a", vec![0])],
         ])
-        .await
         .unwrap();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].num_rows(), 2);
-        assert_eq!(batches[1].num_rows(), 1);
+    }
+
+    /// Upstream merges these rather than erroring; the error is what is
+    /// mirrored, so at least it must not fire.
+    #[test]
+    fn one_label_set_on_rows_that_share_no_timestamp_is_not_an_error() {
+        check(vec![vec![
+            row("envoy-1", "a", vec![0, 30_000]),
+            row("envoy-1", "a", vec![60_000]),
+        ]])
+        .unwrap();
     }
 }

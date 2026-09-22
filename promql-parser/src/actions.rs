@@ -989,7 +989,13 @@ fn parse_number_literal(raw: &str) -> Result<f64, ()> {
     s.parse::<f64>().map_err(|_| ())
 }
 
-fn parse_duration_seconds(raw: &str) -> Result<f64, ()> {
+/// Parse a PromQL duration literal (`30s`, `1h30m`, `500ms`) into
+/// seconds. Mirrors upstream's `model.ParseDuration`.
+///
+/// Public because promqltest scripts carry durations of their own, in
+/// `load <interval>` directives and in eval ranges, and those are the
+/// same literals. A second implementation would drift.
+pub fn parse_duration_seconds(raw: &str) -> Result<f64, ()> {
     let mut total = 0f64;
     let mut chars = raw.chars().peekable();
     let mut had_any = false;
