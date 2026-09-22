@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
 use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery, Series};
 use promql_parser::SeriesDescription;
 
@@ -215,61 +214,28 @@ fn dropping_the_metric_name_may_not_leave_one_label_set_twice() {
     let run = |q: &str| engine.range_query(source.as_ref(), q, &at);
 
     // Both series lose `__name__` and become `{pod="envoy-1"}`.
+    let err = run(r#"rate({pod="envoy-1"}[1m])"#).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "vector cannot contain metrics with the same labelset"
+    );
+
+    // An aggregation over the same rows is not a duplicate: upstream
+    // removes the name after evaluating, so the check only ever sees the
+    // one series the sum produced.
     for q in [
-        r#"rate({pod="envoy-1"}[1m])"#,
-        // The check sits below the aggregation, so it still fires.
         r#"sum(rate({pod="envoy-1"}[1m]))"#,
         r#"sum by (pod)(rate({pod="envoy-1"}[1m]))"#,
     ] {
-        let err = run(q).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "vector cannot contain metrics with the same labelset",
-            "{q}"
-        );
+        let out = run(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let series = promql_engine::series::decode(&out).unwrap();
+        assert_eq!(series.len(), 1, "{q}: {series:?}");
     }
 
     // A pinned name leaves one row, and a function that keeps the name
     // leaves two rows that are still distinct.
     assert!(run(r#"rate(http_requests_total{pod="envoy-1"}[1m])"#).is_ok());
     assert!(run(r#"last_over_time({pod="envoy-1"}[1m])"#).is_ok());
-}
-
-#[tokio::test]
-async fn the_check_carries_the_projection_the_aggregation_needs() {
-    let engine = Engine::new();
-    let source = two_metrics();
-    let range = RangeQuery::new(0, 600_000, 30_000);
-    // The optimized plan, not the planner's: the rule this pins down runs
-    // during optimization and leaves the raw plan alone.
-    let plan = async |q: &str| {
-        let plan = engine.plan_async(source.as_ref(), q, &range).await.unwrap();
-        SessionContext::new()
-            .state()
-            .optimize(&plan)
-            .unwrap()
-            .display_indent()
-            .to_string()
-    };
-
-    let rendered = plan(r#"sum by (pod)(rate({pod="envoy-1"}[1m]))"#).await;
-    let check = rendered
-        .find("ContainsSameLabelset")
-        .unwrap_or_else(|| panic!("the check is in the plan: {rendered}"));
-    // DataFusion extracts the aggregation's group key, `get_field(labels,
-    // 'pod')`, into a projection of its own and sinks it towards the leaf
-    // through every node that would pass the extracted column back up.
-    // Were the check node to report its input's schema rather than its
-    // own, it would be such a node, and the operator would end up hashing
-    // whatever the store's rows became rather than the labels the call
-    // actually emits.
-    assert!(
-        !rendered[check..].contains("__datafusion_extracted"),
-        "nothing extracted below the check: {rendered}"
-    );
-
-    let rendered = plan("rate(http_requests_total[5m])").await;
-    assert!(!rendered.contains("ContainsSameLabelset"), "{rendered}");
 }
 
 #[test]

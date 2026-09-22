@@ -185,6 +185,7 @@ functions = [
     "changes(http_requests[6m]) @ 3000000",
     "changes(nonexistent_metric[50m]) @ 3000000",
     "changes(x[20m]) @ 900000",
+    "changes({__name__=~'testmetric1|testmetric2'}[5m]) @ 0",
     "delta(http_requests[20m]) @ 1200000",
     "idelta(http_requests[20m]) @ 1200000",
     "idelta(http_requests_nan[15m1s]) @ 0..1200000/300000",

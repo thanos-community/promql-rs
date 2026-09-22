@@ -2702,7 +2702,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "datafusion",
- "futures",
  "promql-parser",
  "regex",
  "thiserror",
