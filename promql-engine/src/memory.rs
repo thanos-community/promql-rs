@@ -25,8 +25,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{AsArray, RecordBatch};
+use datafusion::arrow::array::{ArrayRef, AsArray, ListArray, RecordBatch};
+use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::datatypes::{SchemaRef, TimestampMillisecondType};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result};
@@ -36,12 +38,19 @@ use promql_parser::ast::{LabelMatcher, SeriesDescription};
 use crate::matcher::{mask_all, CompiledMatcher};
 #[cfg(test)]
 use crate::series::decode;
-use crate::series::{clip, drop_unused_labels, encode, label_names_of, Series, LABELS};
+use crate::series::{
+    clip, drop_unused_labels, encode, label_names_of, sample_item, Series, LABELS, SAMPLES,
+    TIMESTAMP,
+};
 use crate::source::{SelectHints, SeriesSource};
 
 #[derive(Debug)]
 pub struct MemorySeriesSource {
     batch: RecordBatch,
+    /// Reproduction knob, not a real store's behavior: when set, `select`
+    /// hands the engine each series as several consecutive rows instead of
+    /// one, to exercise what breaks downstream. See the module doc.
+    chunk_ms: Option<i64>,
 }
 
 impl Default for MemorySeriesSource {
@@ -59,7 +68,18 @@ impl MemorySeriesSource {
     pub fn try_new(series: Vec<Series>) -> std::result::Result<Self, String> {
         Ok(Self {
             batch: encode(&label_names_of(&series), &series)?,
+            chunk_ms: None,
         })
+    }
+
+    /// Split every series `select` returns into consecutive rows of at
+    /// most `chunk_ms` span, each its own single-row `RecordBatch`, still
+    /// one partition, series order then time order preserved. A
+    /// reproduction knob for what a chunked `SeriesSource` hands the
+    /// engine, not a real store's behavior; see the module doc.
+    pub fn chunked(mut self, chunk_ms: i64) -> Self {
+        self.chunk_ms = Some(chunk_ms);
+        self
     }
 
     /// The same, for callers that already merged by label set. They key
@@ -158,12 +178,81 @@ impl SeriesSource for MemorySeriesSource {
         // stored batch already holds one row per series with its samples
         // ascending, and neither step here reorders anything.
         let schema = selected.schema();
+        let batches = match self.chunk_ms {
+            Some(chunk_ms) => split_into_chunks(&selected, chunk_ms).map_err(DataFusionError::Execution)?,
+            None => vec![selected],
+        };
         Ok(MemorySourceConfig::try_new_exec(
-            &[vec![selected]],
+            &[batches],
             schema,
             None,
         )?)
     }
+}
+
+/// Reproduction-only: turn one canonical batch (one row per series) into
+/// several, each holding one series' samples split into consecutive
+/// chunks of at most `chunk_ms` span. Series order is preserved, and
+/// within a series so is time order, so the result is what a chunked
+/// `SeriesSource` would hand over for the same selection.
+fn split_into_chunks(batch: &RecordBatch, chunk_ms: i64) -> std::result::Result<Vec<RecordBatch>, String> {
+    let schema: SchemaRef = batch.schema();
+    let labels = batch.column_by_name(LABELS).expect("canonical").as_struct();
+    let samples = batch
+        .column_by_name(SAMPLES)
+        .expect("canonical")
+        .as_list::<i32>();
+
+    let mut out = Vec::new();
+    for row in 0..batch.num_rows() {
+        let label_row: ArrayRef = Arc::new(labels.slice(row, 1));
+        let row_samples: ArrayRef = samples.value(row);
+        let timestamps: Vec<i64> = row_samples
+            .as_struct()
+            .column_by_name(TIMESTAMP)
+            .expect("canonical")
+            .as_primitive::<TimestampMillisecondType>()
+            .values()
+            .to_vec();
+
+        if timestamps.is_empty() {
+            out.push(chunk_batch(&schema, label_row, row_samples.slice(0, 0))?);
+            continue;
+        }
+
+        let mut start = 0usize;
+        while start < timestamps.len() {
+            let mut end = start + 1;
+            while end < timestamps.len() && timestamps[end] - timestamps[start] <= chunk_ms {
+                end += 1;
+            }
+            out.push(chunk_batch(
+                &schema,
+                label_row.clone(),
+                row_samples.slice(start, end - start),
+            )?);
+            start = end;
+        }
+    }
+    Ok(out)
+}
+
+/// One single-row batch: `label_row` and `chunk_samples` (already the
+/// list's child slice) wrapped back into the canonical list-of-structs
+/// column.
+fn chunk_batch(
+    schema: &SchemaRef,
+    label_row: ArrayRef,
+    chunk_samples: ArrayRef,
+) -> std::result::Result<RecordBatch, String> {
+    let len = i32::try_from(chunk_samples.len()).map_err(|_| "chunk longer than i32::MAX")?;
+    let list = ListArray::new(
+        sample_item(),
+        OffsetBuffer::new(vec![0i32, len].into()),
+        chunk_samples,
+        None,
+    );
+    RecordBatch::try_new(schema.clone(), vec![label_row, Arc::new(list)]).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
