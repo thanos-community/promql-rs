@@ -28,10 +28,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, AsArray, ListArray, RecordBatch, UInt32Array};
+use datafusion::arrow::array::{Array, AsArray, ListArray, RecordBatch, UInt32Array};
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::{filter_record_batch, take_record_batch};
-use datafusion::arrow::datatypes::{SchemaRef, TimestampMillisecondType};
+use datafusion::arrow::compute::{filter_record_batch, take, take_record_batch};
+use datafusion::arrow::datatypes::TimestampMillisecondType;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -57,7 +57,13 @@ pub struct MemorySeriesSource {
     chunk_ms: Option<i64>,
     /// Test mode: see [`Self::partitions`].
     partitions: usize,
+    /// See [`Self::rows_per_batch`].
+    rows_per_batch: usize,
 }
+
+/// DataFusion's default `execution.batch_size`, the size a store scanning
+/// through DataFusion hands over.
+const ROWS_PER_BATCH: usize = 8192;
 
 impl Default for MemorySeriesSource {
     fn default() -> Self {
@@ -77,15 +83,28 @@ impl MemorySeriesSource {
             batch: sort_by_labels(&batch).map_err(|e| e.to_string())?,
             chunk_ms: None,
             partitions: 1,
+            rows_per_batch: ROWS_PER_BATCH,
         })
     }
 
     /// Test mode: hand every selected series over as consecutive rows of
-    /// at most `chunk_ms` span, each its own single-row `RecordBatch`, the
-    /// way a chunked store does. Series order and time order are kept.
-    /// `0` gives one sample per row.
+    /// at most `chunk_ms` span, the way a chunked store does. Series order
+    /// and time order are kept. `0` gives one sample per row.
     pub fn chunked(mut self, chunk_ms: i64) -> Self {
         self.chunk_ms = Some(chunk_ms);
+        self
+    }
+
+    /// Hand rows over at most `n` to a `RecordBatch`, chunk rows or whole
+    /// series, a series free to straddle two batches. The default is
+    /// DataFusion's batch size, what a store fills; `1` makes every row
+    /// cross a batch boundary, which is what a test of carrying a series
+    /// across batches wants. A bench at one row per batch measures
+    /// DataFusion's per-batch cost, about half of a chunked 30-day query,
+    /// not the engine.
+    pub fn rows_per_batch(mut self, n: usize) -> Self {
+        assert!(n > 0, "a batch holds at least one row");
+        self.rows_per_batch = n;
         self
     }
 
@@ -199,10 +218,8 @@ impl SeriesSource for MemorySeriesSource {
         let partitions = partition_by_labels(&selected, self.partitions)?
             .iter()
             .map(|part| match self.chunk_ms {
-                Some(chunk_ms) => {
-                    split_into_chunks(part, chunk_ms).map_err(DataFusionError::Execution)
-                }
-                None => Ok(vec![part.clone()]),
+                Some(chunk_ms) => split_into_chunks(part, chunk_ms, self.rows_per_batch),
+                None => Ok(slice_rows(part, self.rows_per_batch)),
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
@@ -243,72 +260,83 @@ fn partition_by_labels(batch: &RecordBatch, n: usize) -> Result<Vec<RecordBatch>
         .collect()
 }
 
-/// Test mode: turn one canonical batch (one row per series) into
-/// several, each holding one series' samples split into consecutive
-/// chunks of at most `chunk_ms` span. Series order is preserved, and
-/// within a series so is time order, so the result is what a chunked
-/// `SeriesSource` would hand over for the same selection.
+/// `batch` in slices of at most `n` rows. A partition with no series is
+/// still one batch, an empty one.
+fn slice_rows(batch: &RecordBatch, n: usize) -> Vec<RecordBatch> {
+    let rows = batch.num_rows();
+    (0..rows.max(1))
+        .step_by(n)
+        .map(|k| batch.slice(k, n.min(rows - k)))
+        .collect()
+}
+
+/// Test mode: turn one canonical batch (one row per series) into chunk
+/// rows of at most `chunk_ms` span, packed at most `rows_per_batch` to a
+/// batch. Series order is preserved, and within a series so is time order,
+/// so the result is what a chunked `SeriesSource` would hand over for the
+/// same selection.
+///
+/// A series' chunks are consecutive ranges of the samples child, and the
+/// series are too, so a batch of chunk rows is one slice of that child
+/// under new offsets: the samples are never copied, only the label rows.
 fn split_into_chunks(
     batch: &RecordBatch,
     chunk_ms: i64,
-) -> std::result::Result<Vec<RecordBatch>, String> {
-    let schema: SchemaRef = batch.schema();
-    let labels = batch.column_by_name(LABELS).expect("canonical").as_struct();
+    rows_per_batch: usize,
+) -> Result<Vec<RecordBatch>> {
+    let labels = batch.column_by_name(LABELS).expect("canonical");
     let samples = batch
         .column_by_name(SAMPLES)
         .expect("canonical")
         .as_list::<i32>();
+    let offsets = samples.value_offsets();
+    let timestamps = samples
+        .values()
+        .as_struct()
+        .column_by_name(TIMESTAMP)
+        .expect("canonical")
+        .as_primitive::<TimestampMillisecondType>()
+        .values();
 
-    let mut out = Vec::new();
+    // Chunk `c` is series `rows[c]`'s samples `bounds[c]..bounds[c + 1]`.
+    let mut rows: Vec<u32> = Vec::new();
+    let mut bounds: Vec<i32> = vec![offsets[0]];
     for row in 0..batch.num_rows() {
-        let label_row: ArrayRef = Arc::new(labels.slice(row, 1));
-        let row_samples: ArrayRef = samples.value(row);
-        let timestamps: Vec<i64> = row_samples
-            .as_struct()
-            .column_by_name(TIMESTAMP)
-            .expect("canonical")
-            .as_primitive::<TimestampMillisecondType>()
-            .values()
-            .to_vec();
-
-        if timestamps.is_empty() {
-            out.push(chunk_batch(&schema, label_row, row_samples.slice(0, 0))?);
-            continue;
+        let (mut start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        if start == end {
+            rows.push(row as u32);
+            bounds.push(end as i32);
         }
-
-        let mut start = 0usize;
-        while start < timestamps.len() {
-            let mut end = start + 1;
-            while end < timestamps.len() && timestamps[end] - timestamps[start] <= chunk_ms {
-                end += 1;
+        while start < end {
+            let mut next = start + 1;
+            while next < end && timestamps[next] - timestamps[start] <= chunk_ms {
+                next += 1;
             }
-            out.push(chunk_batch(
-                &schema,
-                label_row.clone(),
-                row_samples.slice(start, end - start),
-            )?);
-            start = end;
+            rows.push(row as u32);
+            bounds.push(next as i32);
+            start = next;
         }
     }
-    Ok(out)
-}
 
-/// One single-row batch: `label_row` and `chunk_samples` (already the
-/// list's child slice) wrapped back into the canonical list-of-structs
-/// column.
-fn chunk_batch(
-    schema: &SchemaRef,
-    label_row: ArrayRef,
-    chunk_samples: ArrayRef,
-) -> std::result::Result<RecordBatch, String> {
-    let len = i32::try_from(chunk_samples.len()).map_err(|_| "chunk longer than i32::MAX")?;
-    let list = ListArray::new(
-        sample_item(),
-        OffsetBuffer::new(vec![0i32, len].into()),
-        chunk_samples,
-        None,
-    );
-    RecordBatch::try_new(schema.clone(), vec![label_row, Arc::new(list)]).map_err(|e| e.to_string())
+    let mut out = Vec::new();
+    for (k, rows) in rows.chunks(rows_per_batch).enumerate() {
+        let bounds = &bounds[k * rows_per_batch..=k * rows_per_batch + rows.len()];
+        let first = bounds[0];
+        let list = ListArray::new(
+            sample_item(),
+            OffsetBuffer::new(bounds.iter().map(|b| b - first).collect::<Vec<_>>().into()),
+            samples
+                .values()
+                .slice(first as usize, (bounds[rows.len()] - first) as usize),
+            None,
+        );
+        let label_rows = take(labels, &UInt32Array::from(rows.to_vec()), None)?;
+        out.push(RecordBatch::try_new(
+            batch.schema(),
+            vec![label_rows, Arc::new(list)],
+        )?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -595,6 +623,53 @@ mod tests {
         }
         seen.sort();
         assert_eq!(seen, pods(&collect(whole, ctx.task_ctx()).await.unwrap()));
+    }
+
+    /// A store fills its batches: rows pack up to the batch size whether
+    /// or not they are chunks, and a series may straddle two batches.
+    #[tokio::test]
+    async fn rows_pack_into_batches_of_the_batch_size() {
+        let many: Vec<Series> = (0..16)
+            .map(|i| {
+                counter(
+                    &[("__name__", "x"), ("pod", &format!("p{i:02}"))],
+                    0.0,
+                    1.0,
+                    10,
+                )
+            })
+            .collect();
+        let ctx = SessionContext::new();
+        let batches = |src: MemorySeriesSource| {
+            let ctx = &ctx;
+            async move {
+                collect(select_all(&src).await, ctx.task_ctx())
+                    .await
+                    .unwrap()
+            }
+        };
+        let sizes = |b: &[RecordBatch]| b.iter().map(RecordBatch::num_rows).collect::<Vec<_>>();
+        let samples = |b: &[RecordBatch]| {
+            crate::series::decode(b)
+                .unwrap()
+                .iter()
+                .map(|s| (s.label("pod").to_string(), s.timestamps().to_vec()))
+                .collect::<Vec<_>>()
+        };
+        let stored = || MemorySeriesSource::try_new(many.clone()).unwrap();
+
+        // 30s apart, a 60s span is three samples: four chunks per series.
+        let one = batches(stored().chunked(60_000).rows_per_batch(1)).await;
+        assert_eq!(sizes(&one), vec![1; 64]);
+        let packed = batches(stored().chunked(60_000).rows_per_batch(5)).await;
+        assert_eq!(sizes(&packed), [vec![5; 12], vec![4]].concat());
+        assert_eq!(pods(&packed), pods(&one));
+        assert_eq!(samples(&packed), samples(&one));
+        assert_eq!(sizes(&batches(stored().chunked(60_000)).await), [64]);
+
+        let whole = batches(stored().rows_per_batch(5)).await;
+        assert_eq!(sizes(&whole), [5, 5, 5, 1]);
+        assert_eq!(samples(&whole), samples(&batches(stored()).await));
     }
 
     #[tokio::test]

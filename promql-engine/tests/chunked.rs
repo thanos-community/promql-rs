@@ -37,8 +37,14 @@ fn plain() -> Arc<MemorySeriesSource> {
     Arc::new(MemorySeriesSource::from_descriptions(&descriptions(), 30.0))
 }
 
+/// One chunk row per batch, so every chunk boundary is a batch boundary
+/// too, the harder case for carrying a series.
 fn chunked() -> Arc<MemorySeriesSource> {
-    Arc::new(MemorySeriesSource::from_descriptions(&descriptions(), 30.0).chunked(CHUNK_MS))
+    Arc::new(
+        MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
+            .chunked(CHUNK_MS)
+            .rows_per_batch(1),
+    )
 }
 
 fn query(source: &MemorySeriesSource, q: &str, range: RangeQuery) -> Vec<Series> {
@@ -135,6 +141,7 @@ fn binary_op_matching_the_selector_with_itself() {
 fn chunks_over_four_partitions() {
     let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
         .chunked(CHUNK_MS)
+        .rows_per_batch(1)
         .partitions(4);
     for q in ["x", "rate(x[5m])", "sum(x)", "count_over_time(x[10m])"] {
         assert_same_on(&source, q, RangeQuery::new(300_000, 600_000, 30_000));
@@ -189,7 +196,9 @@ fn every_query_over_many_steps() {
 /// `chunked(0)`: one sample per row, so every window crosses rows.
 #[test]
 fn one_sample_per_row() {
-    let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0).chunked(0);
+    let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
+        .chunked(0)
+        .rows_per_batch(1);
     for q in [
         "x",
         "rate(x[5m])",
@@ -203,16 +212,25 @@ fn one_sample_per_row() {
 }
 
 /// Partition counts below, at and above the number of series, alone and
-/// under chunking: a series lands whole in one partition either way.
+/// under chunking: a series lands whole in one partition either way. Rows
+/// one to a batch, three, which puts a batch boundary inside a series and
+/// two series in one batch, and packed as a store packs them.
 #[test]
 fn partitions_match_unpartitioned() {
     for n in [1, 2, 4, 7] {
-        for chunk_ms in [None, Some(0), Some(CHUNK_MS)] {
+        for (chunk_ms, rows) in [
+            (None, 8192),
+            (Some(0), 1),
+            (Some(0), 3),
+            (Some(CHUNK_MS), 1),
+            (Some(CHUNK_MS), 3),
+            (Some(CHUNK_MS), 8192),
+        ] {
             let mut source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0);
             if let Some(ms) = chunk_ms {
                 source = source.chunked(ms);
             }
-            let source = source.partitions(n);
+            let source = source.rows_per_batch(rows).partitions(n);
             for q in [
                 "x",
                 "rate(x[5m])",
