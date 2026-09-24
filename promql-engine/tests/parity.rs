@@ -171,14 +171,20 @@ fn replay_against_chunked() {
     }
 }
 
-/// `partitions(4)` doesn't exist yet: step 3 is what repartitions a
-/// `SeriesSource`'s output across several DataFusion partitions.
-/// TODO(step 3): implement a partitioned variant of `MemorySeriesSource`
-/// (or an equivalent test double) and un-ignore this once it lands.
+/// `partitions(4)`: a series never straddles partitions, so each one's
+/// answer must not depend on which partition it came from or what else
+/// shared it.
 #[test]
-#[ignore = "partitions(4) mode doesn't exist yet; needs step 3"]
 fn replay_against_partitions() {
-    unimplemented!("needs a partitioned MemorySeriesSource from step 3")
+    let corpus = load_corpus();
+    let source = Arc::new(
+        MemorySeriesSource::from_descriptions(&descriptions(&corpus.series), corpus.interval_secs)
+            .partitions(4),
+    );
+    for case in &corpus.cases {
+        let actual = run(&source, case);
+        assert_matches_recorded(case, actual);
+    }
 }
 
 /// Records `tests/testdata/parity.json` from *today's* engine. Not a
