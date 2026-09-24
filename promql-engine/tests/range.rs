@@ -172,7 +172,7 @@ fn what_is_still_unsupported_is_named() {
 }
 
 #[tokio::test]
-async fn the_plan_is_a_projection_with_the_function_as_a_literal() {
+async fn the_plan_is_an_aggregate_with_the_function_as_a_literal() {
     let engine = Engine::new();
     let source = source();
     let plan = engine
@@ -186,7 +186,7 @@ async fn the_plan_is_a_projection_with_the_function_as_a_literal() {
     let rendered = plan.display_indent().to_string();
     assert!(
         rendered.starts_with(
-            "Projection: promql_labels(Utf8(\"pod\"), get_field(selector_0.labels, Utf8(\"pod\"))) AS labels, promql_range_function(selector_0.samples, Utf8(\"rate\"), Int64(0), Int64(600000), Int64(30000), Int64(300000), Int64(60000), Int64(NULL)) AS samples"
+            "Projection: promql_labels(Utf8(\"pod\"), get_field(selector_0.labels, Utf8(\"pod\"))) AS labels, samples\n  Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8(\"rate\"), Int64(0), Int64(600000), Int64(30000), Int64(300000), Int64(60000), Int64(NULL)) AS samples]]"
         ),
         "{rendered}"
     );
