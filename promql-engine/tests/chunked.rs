@@ -329,3 +329,42 @@ fn a_group_spanning_every_partition_matches_unpartitioned() {
         }
     }
 }
+
+/// Prometheus sorts a range query's matrix by label set before returning
+/// it, and partitions finish in no particular order. `app` and `zone`
+/// sort around the `i` series by name, but around them the other way in
+/// the struct's field-by-field order, where an absent label is `""`.
+#[test]
+fn series_come_back_in_label_set_order() {
+    let mut lines: Vec<String> = (0..40)
+        .map(|i| {
+            format!(
+                r#"x{{pod="{}", i="{i}"}} 1+{}x19"#,
+                ["a", "b", "c"][i % 3],
+                i % 5 + 1
+            )
+        })
+        .collect();
+    lines.push(r#"x{zone="z"} 1+1x19"#.into());
+    lines.push(r#"x{app="q"} 1+1x19"#.into());
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let descriptions = load(&lines);
+    let label_sets = |series: &[Series]| -> Vec<Vec<(String, String)>> {
+        series
+            .iter()
+            .map(|s| s.labels().map(|(n, v)| (n.into(), v.into())).collect())
+            .collect()
+    };
+    let unpartitioned = MemorySeriesSource::from_descriptions(&descriptions, 30.0);
+    for q in ["x", "rate(x[5m])", "sum by (pod) (rate(x[5m]))"] {
+        let want = label_sets(&query(&unpartitioned, q, multi_step()));
+        assert!(want.is_sorted(), "{q}: {want:?}");
+        for n in [4, 7] {
+            let source = MemorySeriesSource::from_descriptions(&descriptions, 30.0)
+                .chunked(CHUNK_MS)
+                .partitions(n);
+            let got = label_sets(&query(&source, q, multi_step()));
+            assert_eq!(got, want, "{q} over {n} partitions");
+        }
+    }
+}

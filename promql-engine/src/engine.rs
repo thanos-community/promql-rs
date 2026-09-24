@@ -55,9 +55,8 @@ impl Engine {
         // Hash(labels) DataFusion only places it above the selector, over
         // finished series, but nothing but that requirement keeps it there.
         // Hash repartitioning for aggregations is what lets the selector run
-        // SinglePartitioned per store partition. The price: the plan ends in
-        // several partitions and series come back in arrival order, which
-        // nothing in the plan can re-sort, since Arrow has no struct sort.
+        // SinglePartitioned per store partition. The plan then ends in
+        // several partitions, and `range_query_async` restores the order.
         let mut config = SessionConfig::new()
             .with_round_robin_repartition(false)
             .with_repartition_file_scans(false)
