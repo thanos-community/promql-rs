@@ -663,12 +663,25 @@ impl SamplesBuilder {
     /// The head keeps the vectors' allocations and becomes the Arrow
     /// buffers; what is copied is the tail, the rows after `n` plus the
     /// open one, which in Sorted mode is a single series.
+    ///
+    /// `split_off` leaves the head's capacity exactly as it was before the
+    /// split: `reserve`'s room for the still-open series behind it, which
+    /// an emit hands to Arrow uncounted otherwise. Only shrunk past a 2x
+    /// slack, so the one head that is genuinely most of the buffer (an
+    /// `EmitTo::All` with nothing left open) skips a copy of the whole
+    /// thing for a percent-scale reservation remainder.
     pub(crate) fn take_first(&mut self, n: usize) -> ListArray {
         let end = self.offsets[n];
         let ts = self.ts.split_off(end as usize);
         let vs = self.vs.split_off(end as usize);
-        let ts = std::mem::replace(&mut self.ts, ts);
-        let vs = std::mem::replace(&mut self.vs, vs);
+        let mut ts = std::mem::replace(&mut self.ts, ts);
+        let mut vs = std::mem::replace(&mut self.vs, vs);
+        if ts.capacity() > ts.len().saturating_mul(2) {
+            ts.shrink_to_fit();
+        }
+        if vs.capacity() > vs.len().saturating_mul(2) {
+            vs.shrink_to_fit();
+        }
         let rest: Vec<i32> = self.offsets[n..].iter().map(|o| o - end).collect();
         let mut offsets = std::mem::replace(&mut self.offsets, rest);
         offsets.truncate(n + 1);
@@ -974,5 +987,30 @@ mod tests {
             vec![vec![(10, 2.0), (20, 3.0)], vec![(30, 4.0)]]
         );
         assert_eq!(b.take_all().len(), 0);
+    }
+
+    /// The head split off by `take_first` must not carry the open series'
+    /// reservation: an emit that hands a small row to Arrow while a large
+    /// grid is still reserved behind it must not report the grid's size.
+    #[test]
+    fn take_first_does_not_emit_the_open_series_reservation() {
+        let mut b = SamplesBuilder::default();
+        b.reserve(100_000);
+        b.push(0, 1.0);
+        b.finish_row();
+        b.push(10, 2.0); // the open row, still being grown
+
+        let first = b.take_first(1);
+        let row = first.value(0);
+        let (ts, vs) = sample_slices(row.as_struct());
+        assert_eq!(ts.len(), 1);
+        assert_eq!(vs.len(), 1);
+        assert!(
+            first.get_array_memory_size() < 4096,
+            "emitted row of {} sample(s) reports {} bytes, still counting the open \
+             series' reservation",
+            ts.len(),
+            first.get_array_memory_size()
+        );
     }
 }

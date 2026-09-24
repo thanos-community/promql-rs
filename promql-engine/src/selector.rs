@@ -767,6 +767,35 @@ mod tests {
         assert!(reserved(&acc) >= 1000, "{} reserved", reserved(&acc));
     }
 
+    /// Sorted mode emits a batch's closed groups as soon as the next one
+    /// opens. With a grid near `MAX_STEPS` and sparse series, a flushed row
+    /// must report only its own samples, not the reservation the freshly
+    /// opened series behind it still needs.
+    #[test]
+    fn per_batch_emit_does_not_carry_the_next_series_reservation() {
+        let grid = Params {
+            end_ms: (crate::aggregate::MAX_STEPS as i64 - 1) * M,
+            ..params()
+        };
+        let mut acc = EvalSeries::new(Kernel::Selector, grid);
+        let at = |i: i64| column(&[&[(i * M, i as f64)]]);
+        for i in 0..20i64 {
+            acc.update_batch(&[at(i)], &[i as usize], None, i as usize + 1)
+                .unwrap();
+            if i > 0 {
+                let list = acc.evaluate(EmitTo::First(1)).unwrap();
+                let list = list.as_list::<i32>();
+                assert_eq!(list.len(), 1);
+                assert!(
+                    list.get_array_memory_size() < 4096,
+                    "batch {i}: {} bytes for one sparse row, still counting the next \
+                     series' MAX_STEPS-sized reservation",
+                    list.get_array_memory_size()
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_group_with_nothing_to_select_is_an_empty_row() {
         let mut acc = accumulator();
