@@ -25,6 +25,7 @@ criterion = { version = "0.7", features = ["html_reports"] }
 # direct `arrow` dependency: a consumer that patches DataFusion to a fork
 # would otherwise end up with two Arrows and a type mismatch at the seam.
 datafusion = "54"
+futures = "0.3"
 insta = { version = "1", features = ["filters"] }
 lrlex = "0.13"
 lrpar = "0.13"

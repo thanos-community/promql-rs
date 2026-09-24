@@ -134,7 +134,12 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
         // functions, so nothing needs registering.
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
         let exec = rt
-            .block_on(async { ctx.execute_logical_plan(plan).await?.create_physical_plan().await })
+            .block_on(async {
+                ctx.execute_logical_plan(plan)
+                    .await?
+                    .create_physical_plan()
+                    .await
+            })
             .expect("the plan lowers");
         // The renderer borrows the plan, so it cannot be the tail expression.
         let rendered = displayable(exec.as_ref()).indent(true).to_string();

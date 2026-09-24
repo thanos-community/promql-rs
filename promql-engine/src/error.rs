@@ -25,14 +25,43 @@ pub enum EngineError {
     #[error("series source schema: {0}")]
     Schema(String),
 
+    /// A store broke the order it promised: rows of a series not
+    /// consecutive, series not label-sorted, or a series' first sample
+    /// timestamps going backwards. Found while executing, so it reaches
+    /// the caller through DataFusion, and is unwrapped from it again.
+    #[error("series source order: {0}")]
+    Source(String),
+
     /// DataFusion refused or failed the plan.
     #[error("datafusion: {0}")]
-    DataFusion(#[from] DataFusionError),
+    DataFusion(DataFusionError),
 
     /// A blocking call on an engine without a runtime, or a runtime that
     /// could not be built.
     #[error("runtime: {0}")]
     Runtime(String),
+}
+
+impl From<DataFusionError> for EngineError {
+    /// An operator can only fail with a `DataFusionError`, so an engine
+    /// error raised inside one travels as `External` and is taken back out
+    /// here; otherwise every such error would reach callers as an opaque
+    /// `DataFusion` string.
+    fn from(e: DataFusionError) -> Self {
+        match e {
+            DataFusionError::External(inner) => match inner.downcast::<EngineError>() {
+                Ok(engine) => *engine,
+                Err(inner) => EngineError::DataFusion(DataFusionError::External(inner)),
+            },
+            DataFusionError::Context(ctx, inner) => match EngineError::from(*inner) {
+                EngineError::DataFusion(inner) => {
+                    EngineError::DataFusion(DataFusionError::Context(ctx, Box::new(inner)))
+                }
+                engine => engine,
+            },
+            e => EngineError::DataFusion(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -44,14 +73,22 @@ mod tests {
     /// able to match on the variant.
     #[test]
     fn a_source_error_survives_the_trip_through_datafusion() {
-        let wrapped = DataFusionError::External(Box::new(EngineError::Source("out of order".into())));
-        assert!(matches!(EngineError::from(wrapped), EngineError::Source(m) if m == "out of order"));
+        let wrapped =
+            DataFusionError::External(Box::new(EngineError::Source("out of order".into())));
+        assert!(
+            matches!(EngineError::from(wrapped), EngineError::Source(m) if m == "out of order")
+        );
 
         let in_context = DataFusionError::Context(
             "while collecting".into(),
-            Box::new(DataFusionError::External(Box::new(EngineError::Source("x".into())))),
+            Box::new(DataFusionError::External(Box::new(EngineError::Source(
+                "x".into(),
+            )))),
         );
-        assert!(matches!(EngineError::from(in_context), EngineError::Source(_)));
+        assert!(matches!(
+            EngineError::from(in_context),
+            EngineError::Source(_)
+        ));
     }
 
     #[test]

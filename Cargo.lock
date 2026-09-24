@@ -2837,6 +2837,7 @@ dependencies = [
  "async-trait",
  "criterion",
  "datafusion",
+ "futures",
  "promql-parser",
  "regex",
  "serde",
