@@ -30,10 +30,7 @@ fn load(lines: &[&str]) -> Vec<SeriesDescription> {
 /// chunked and unchunked runs comes from chunking rather than from the
 /// data itself.
 fn descriptions() -> Vec<SeriesDescription> {
-    load(&[
-        r#"x{pod="a"} 1+1x19"#,
-        r#"x{pod="b"} 2+3x19"#,
-    ])
+    load(&[r#"x{pod="a"} 1+1x19"#, r#"x{pod="b"} 2+3x19"#])
 }
 
 fn plain() -> Arc<MemorySeriesSource> {

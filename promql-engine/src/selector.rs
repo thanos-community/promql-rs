@@ -967,6 +967,8 @@ mod tests {
         let mut last = accumulator();
         last.merge_batch(&state, &[0, 1], None, 2).unwrap();
         let err = last.merge_batch(&state, &[1, 2], None, 3).unwrap_err();
-        assert!(matches!(EngineError::from(err), EngineError::Source(m) if m.contains("partition")));
+        assert!(
+            matches!(EngineError::from(err), EngineError::Source(m) if m.contains("partition"))
+        );
     }
 }

@@ -57,7 +57,10 @@ fn key(labels: &BTreeMap<String, String>) -> String {
 }
 
 fn series_key(s: &Series) -> String {
-    key(&s.labels().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    key(&s
+        .labels()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect())
 }
 
 fn load_corpus() -> Corpus {
@@ -161,8 +164,11 @@ fn replay_against_chunked() {
     let interval_ms = (corpus.interval_secs * 1000.0).round() as i64;
     for chunk_ms in [0, interval_ms, 150_000, 3_600_000] {
         let source = Arc::new(
-            MemorySeriesSource::from_descriptions(&descriptions(&corpus.series), corpus.interval_secs)
-                .chunked(chunk_ms),
+            MemorySeriesSource::from_descriptions(
+                &descriptions(&corpus.series),
+                corpus.interval_secs,
+            )
+            .chunked(chunk_ms),
         );
         for case in &corpus.cases {
             let actual = run(&source, case);
@@ -397,10 +403,7 @@ mod generate {
         for metric in ["counter_metric", "gauge_metric"] {
             out.push((format!("plain_selector_{metric}"), metric.to_string()));
             for func in RANGE_FUNCS {
-                out.push((
-                    format!("{func}_{metric}"),
-                    format!("{func}({metric}[5m])"),
-                ));
+                out.push((format!("{func}_{metric}"), format!("{func}({metric}[5m])")));
             }
         }
         out.push((
@@ -447,7 +450,10 @@ mod generate {
                     .unwrap()
                     .iter()
                     .map(|s| ExpectedSeries {
-                        labels: s.labels().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                        labels: s
+                            .labels()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
                         timestamps: s.timestamps().to_vec(),
                         values: s.values().to_vec(),
                     })
