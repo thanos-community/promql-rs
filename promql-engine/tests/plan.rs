@@ -8,9 +8,8 @@
 //! diff instead.
 //!
 //! The expectations are descriptive, not normative: a deliberate planner
-//! change updates the YAML, and that diff is the review. Three queries
-//! with three shapes is the whole corpus today; it is meant to grow one
-//! query at a time as shapes are added.
+//! change updates the YAML, and that diff is the review. The corpus is
+//! meant to grow one query at a time as shapes are added.
 //!
 //! # Adding a case
 //!

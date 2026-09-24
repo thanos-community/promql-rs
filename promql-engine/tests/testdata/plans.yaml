@@ -53,17 +53,21 @@ tests:
 
   - name: range function over a different label set
     description: >
-      rate drops __name__, so the labels are rebuilt field by field. The
-      fields named here are this case's own, which is what shows that the
-      projection follows the data rather than a fixed schema.
+      The range function is an aggregate grouped by the whole labels
+      struct, like the selector. rate drops __name__, so the labels are
+      rebuilt field by field above it: dropped below, two series differing
+      only in their name would fold into one group. The fields named here
+      are this case's own, which is what shows that the projection follows
+      the data rather than a fixed schema.
     load:
       - node_cpu_seconds_total{cpu="0", instance="a", mode="idle"} 0
       - node_cpu_seconds_total{cpu="1", instance="a", mode="user"} 0
     query: |
       rate(node_cpu_seconds_total[5m])
     plan: |
-      Projection: promql_labels(Utf8("cpu"), get_field(selector_0.labels, Utf8("cpu")), Utf8("instance"), get_field(selector_0.labels, Utf8("instance")), Utf8("mode"), get_field(selector_0.labels, Utf8("mode"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
-        TableScan: selector_0
+      Projection: promql_labels(Utf8("cpu"), get_field(labels, Utf8("cpu")), Utf8("instance"), get_field(labels, Utf8("instance")), Utf8("mode"), get_field(labels, Utf8("mode"))) AS labels, samples
+        Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+          TableScan: selector_0
 
   - name: grouped aggregation over a range function
     description: >
@@ -78,5 +82,35 @@ tests:
     plan: |
       Projection: promql_labels(Utf8("job"), __group__job) AS labels, samples
         Aggregate: groupBy=[[get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
-          Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
-            TableScan: selector_0
+          Projection: promql_labels(Utf8("job"), get_field(labels, Utf8("job")), Utf8("pod"), get_field(labels, Utf8("pod"))) AS labels, samples
+            Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+              TableScan: selector_0
+
+  - name: count over time
+    description: >
+      A counting function takes the same aggregate as rate; only the
+      function-name literal differs, so one registration serves the whole
+      family.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      count_over_time(http_requests_total[10m])
+    plan: |
+      Projection: promql_labels(Utf8("job"), get_field(labels, Utf8("job")), Utf8("pod"), get_field(labels, Utf8("pod"))) AS labels, samples
+        Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("count_over_time"), Int64(600000), Int64(1200000), Int64(30000), Int64(600000), Int64(0), Int64(NULL)) AS samples]]
+          TableScan: selector_0
+
+  - name: range function with an offset
+    description: >
+      The offset is a literal argument of the aggregate, in the slot an @
+      fills too, so the shape does not change with either modifier.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      rate(http_requests_total[5m] offset 5m)
+    plan: |
+      Projection: promql_labels(Utf8("job"), get_field(labels, Utf8("job")), Utf8("pod"), get_field(labels, Utf8("pod"))) AS labels, samples
+        Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(300000), Int64(NULL)) AS samples]]
+          TableScan: selector_0
