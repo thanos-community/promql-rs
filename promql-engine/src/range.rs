@@ -14,13 +14,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, ListArray, StructArray, TimestampMillisecondArray,
-};
-use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::datatypes::{
-    DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
-};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, ListArray};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -30,9 +25,9 @@ use datafusion::logical_expr::{
 
 use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::math;
-use crate::params::Params;
-use crate::selector::{int_arg, is_stale};
-use crate::series;
+use crate::params::{step_count, Params};
+use crate::selector::int_arg;
+use crate::series::{self, SamplesBuilder};
 
 pub const NAME: &str = "promql_range_function";
 
@@ -398,8 +393,8 @@ pub(crate) fn advance_range(
         ..
     } = it;
     debug_assert_eq!(ts.len(), vs.len());
-    let end = i128::from(p.end_ms);
-    if p.step_ms <= 0 || p.end_ms < p.start_ms || p.window_ms <= 0 || *next_step > end {
+    let steps = step_count(p.start_ms, p.end_ms, p.step_ms);
+    if p.window_ms <= 0 || *next_step >= steps {
         return;
     }
     // A window ending after this may still gain a sample.
@@ -434,7 +429,7 @@ pub(crate) fn advance_range(
                 emit(step, v);
             }
         }
-        *next_step = end + 1;
+        *next_step = steps;
         return;
     }
 
@@ -446,8 +441,8 @@ pub(crate) fn advance_range(
     let step_ms = i128::from(p.step_ms);
     match sweep {
         None => {
-            while *next_step <= end {
-                let step = *next_step as i64;
+            while *next_step < steps {
+                let step = (i128::from(p.start_ms) + *next_step * step_ms) as i64;
                 let range_end = step - p.offset_ms;
                 if range_end > ready {
                     return;
@@ -463,12 +458,12 @@ pub(crate) fn advance_range(
                 if let Some(v) = evaluate(func, &slice(*lo, *hi, range_end)) {
                     emit(step, v);
                 }
-                *next_step += step_ms;
+                *next_step += 1;
             }
         }
         Some(sweep) => {
-            while *next_step <= end {
-                let step = *next_step as i64;
+            while *next_step < steps {
+                let step = (i128::from(p.start_ms) + *next_step * step_ms) as i64;
                 let range_end = step - p.offset_ms;
                 if range_end > ready {
                     return;
@@ -491,7 +486,7 @@ pub(crate) fn advance_range(
                 if let Some(v) = sweep.value(&slice(*lo, *hi, range_end), *lo) {
                     emit(step, v);
                 }
-                *next_step += step_ms;
+                *next_step += 1;
             }
         }
     }
@@ -616,31 +611,14 @@ impl ScalarUDFImpl for RangeFunction {
 ///
 /// This is the cursor fed one chunk per series, kept only until the
 /// range function is an aggregate that feeds it chunk rows itself.
-/// Staleness markers are not samples (`matrixIterSlice` skips them); they
-/// are dropped while copying into the cursor's buffer, which the cursor
-/// pays for anyway.
 pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
     // Offsets index the child as it is, so a sliced `ListArray`, whose
     // offsets need not start at zero and whose child may still hold the
     // dropped rows' samples, needs no rebasing.
     let offsets = samples.offsets();
-    let child = samples.values().as_struct();
-    let ts: &[i64] = child
-        .column_by_name(series::TIMESTAMP)
-        .expect("validated by return_type")
-        .as_primitive::<TimestampMillisecondType>()
-        .values();
-    let vs: &[f64] = child
-        .column_by_name(series::VALUE)
-        .expect("validated by return_type")
-        .as_primitive::<Float64Type>()
-        .values();
+    let (ts, vs) = series::sample_slices(samples.values().as_struct());
 
-    // A starting size, not a ceiling: one window can serve many steps.
-    let mut out_ts: Vec<i64> = Vec::with_capacity(ts.len());
-    let mut out_vs: Vec<f64> = Vec::with_capacity(ts.len());
-    let mut out_offsets: Vec<i32> = Vec::with_capacity(samples.len() + 1);
-    out_offsets.push(0);
+    let mut out = SamplesBuilder::default();
     // One cursor for the column, so the buffers and the sweep's queues
     // keep their capacity from series to series.
     let mut it = BufferedSeriesIterator::new(Kernel::Range(func), *p);
@@ -649,51 +627,24 @@ pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
         // offsets may still span samples.
         if !samples.is_null(row) {
             let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            it.ts.clear();
-            it.vs.clear();
-            for (t, v) in ts[a..b].iter().zip(&vs[a..b]) {
-                if !is_stale(*v) {
-                    it.ts.push(*t);
-                    it.vs.push(*v);
-                }
-            }
-            (it.base, it.lo, it.hi) = (0, 0, 0);
-            it.next_step = i128::from(p.start_ms);
-            it.last_t = ts[a..b].last().copied();
-            if let Some(sweep) = it.sweep.as_mut() {
-                sweep.reset();
-            }
-            advance_range(&mut it, func, true, |t, v| {
-                out_ts.push(t);
-                out_vs.push(v);
-            });
+            it.push(&ts[a..b], &vs[a..b], &mut out);
         }
-        out_offsets.push(out_ts.len() as i32);
+        it.close(&mut out);
     }
 
-    let entries = StructArray::new(
-        series::sample_fields(),
-        vec![
-            Arc::new(TimestampMillisecondArray::from(out_ts)),
-            Arc::new(Float64Array::from(out_vs)),
-        ],
-        None,
-    );
-    ListArray::new(
-        series::sample_item(),
-        OffsetBuffer::new(out_offsets.into()),
-        Arc::new(entries),
-        // One output row per input row, in order, so the input's
-        // validity is the output's.
-        samples.nulls().cloned(),
-    )
+    let (field, offsets, values, _) = out.take_all().into_parts();
+    // One output row per input row, in order, so the input's validity is
+    // the output's.
+    ListArray::new(field, offsets, values, samples.nulls().cloned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::selector::STALE_NAN_BITS;
-    use datafusion::arrow::buffer::NullBuffer;
+    use crate::selector::{is_stale, STALE_NAN_BITS};
+    use datafusion::arrow::array::{Float64Array, StructArray, TimestampMillisecondArray};
+    use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
+    use datafusion::arrow::datatypes::{Float64Type, TimestampMillisecondType};
     use datafusion::common::config::ConfigOptions;
 
     const S: i64 = 1000;

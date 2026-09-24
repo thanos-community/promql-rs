@@ -14,21 +14,17 @@
 //! window. The output row is still only visible once the series closes.
 
 use crate::params::{step_count, Params};
-use crate::range::{Func, Sweep};
+use crate::range::{advance_range, Func, Sweep};
 use crate::selector::{advance_selector, is_stale};
 use crate::series::SamplesBuilder;
 
 pub(crate) enum Kernel {
     Selector,
-    // Built once the range functions run in `EvalSeries`.
-    #[allow(dead_code)]
     Range(Func),
 }
 
 pub(crate) struct BufferedSeriesIterator {
     pub(crate) kernel: Kernel,
-    // Read by the range arm's step walk.
-    #[allow(dead_code)]
     pub(crate) sweep: Option<Sweep>,
     pub(crate) params: Params,
     pub(crate) ts: Vec<i64>,
@@ -47,10 +43,13 @@ pub(crate) struct BufferedSeriesIterator {
 
 impl BufferedSeriesIterator {
     pub(crate) fn new(kernel: Kernel, params: Params) -> Self {
+        let sweep = match kernel {
+            Kernel::Range(func) => Sweep::new(func),
+            Kernel::Selector => None,
+        };
         Self {
             kernel,
-            // The range arm builds its sweep.
-            sweep: None,
+            sweep,
             params,
             ts: Vec::new(),
             vs: Vec::new(),
@@ -78,7 +77,7 @@ impl BufferedSeriesIterator {
             return;
         }
         self.append(ts, vs);
-        self.advance(out);
+        self.advance(false, out);
         self.reduce_delta();
     }
 
@@ -89,7 +88,7 @@ impl BufferedSeriesIterator {
         if !self.ts.is_empty() {
             // Every sample is in: no window can change any more.
             self.last_t = Some(i64::MAX);
-            self.advance(out);
+            self.advance(true, out);
         }
         out.finish_row();
         self.ts.clear();
@@ -99,6 +98,9 @@ impl BufferedSeriesIterator {
         self.hi = 0;
         self.next_step = 0;
         self.last_t = None;
+        if let Some(sweep) = self.sweep.as_mut() {
+            sweep.reset();
+        }
     }
 
     pub(crate) fn size(&self) -> usize {
@@ -117,10 +119,10 @@ impl BufferedSeriesIterator {
         (i128::from(self.params.start_ms) + i * i128::from(self.params.step_ms)) as i64
     }
 
-    fn advance(&mut self, out: &mut SamplesBuilder) {
+    fn advance(&mut self, done: bool, out: &mut SamplesBuilder) {
         match self.kernel {
             Kernel::Selector => advance_selector(self, out),
-            Kernel::Range(_) => unimplemented!("the range kernel walks in range::advance_range"),
+            Kernel::Range(func) => advance_range(self, func, done, |t, v| out.push(t, v)),
         }
     }
 

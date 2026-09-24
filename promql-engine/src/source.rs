@@ -407,7 +407,7 @@ impl RecordBatchStream for SeriesSetStream {
     }
 }
 
-fn source_error(msg: String) -> DataFusionError {
+pub(crate) fn source_error(msg: String) -> DataFusionError {
     DataFusionError::External(Box::new(EngineError::Source(msg)))
 }
 

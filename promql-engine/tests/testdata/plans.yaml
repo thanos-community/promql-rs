@@ -32,7 +32,7 @@ tests:
       Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
         TableScan: selector_0
     physical: |
-      ProjectionExec: expr=[labels@0 as labels, promql_vector_selector(samples@1, 600000, 1200000, 30000, 300000, 0, NULL) as samples]
+      AggregateExec: mode=Single, gby=[labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
         SeriesSetExec
           DataSourceExec: partitions=1, partition_sizes=[1]
 

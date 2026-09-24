@@ -129,10 +129,18 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     let logical = plan.display_indent().to_string();
     let physical = case.physical.as_ref().map(|_| {
         // Target partitions are fixed because DataFusion defaults them to
-        // the core count, which would put the machine into the text. The
-        // context is otherwise stock: the logical plan already carries its
-        // functions, so nothing needs registering.
-        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        // the core count, which would put the machine into the text; four
+        // rather than one, so it is the flags that keep the selector in one
+        // aggregate. The flags copy `Engine::new`'s because the engine's
+        // context is private; once the engine hands out its own physical
+        // plan this context goes and the expected text stays. The logical
+        // plan already carries its functions, so nothing needs registering.
+        let config = SessionConfig::new()
+            .with_target_partitions(4)
+            .with_round_robin_repartition(false)
+            .with_repartition_file_scans(false)
+            .with_repartition_aggregations(false);
+        let ctx = SessionContext::new_with_config(config);
         let exec = rt
             .block_on(async {
                 ctx.execute_logical_plan(plan)

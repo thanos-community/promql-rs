@@ -41,6 +41,7 @@ use datafusion::logical_expr::{
 use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::params::Params;
 use crate::series::{self, SamplesBuilder};
+use crate::source::source_error;
 
 pub const NAME: &str = "promql_vector_selector";
 
@@ -267,8 +268,11 @@ impl GroupsAccumulator for EvalSeries {
                 continue;
             }
             if self.open != Some(g) {
+                // The group key never reaches an accumulator, so unlike
+                // `SeriesSetExec` this cannot name the series. It is the
+                // backstop for a plan that reorders rows above that check.
                 if g < self.finished {
-                    return Err(DataFusionError::Execution(format!(
+                    return Err(source_error(format!(
                         "{NAME}: rows of a series are not consecutive: group {g} came back \
                          after group {} opened",
                         self.finished
@@ -311,7 +315,7 @@ impl GroupsAccumulator for EvalSeries {
                 continue;
             }
             if g < self.finished || self.open.is_some() {
-                return Err(DataFusionError::Execution(format!(
+                return Err(source_error(format!(
                     "{NAME}: a series arrived from more than one partition (group {g})"
                 )));
             }
@@ -504,6 +508,7 @@ pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::EngineError;
     use datafusion::arrow::buffer::NullBuffer;
     use datafusion::logical_expr::EmitTo;
 
@@ -909,7 +914,9 @@ mod tests {
         let mut acc = accumulator();
         let rows = column(&[&[(0, 1.0)], &[(0, 2.0)], &[(M, 3.0)]]);
         let err = acc.update_batch(&[rows], &[0, 1, 0], None, 2).unwrap_err();
-        assert!(err.to_string().contains("not consecutive"), "{err}");
+        assert!(
+            matches!(EngineError::from(err), EngineError::Source(m) if m.contains("not consecutive"))
+        );
     }
 
     #[test]
@@ -960,6 +967,6 @@ mod tests {
         let mut last = accumulator();
         last.merge_batch(&state, &[0, 1], None, 2).unwrap();
         let err = last.merge_batch(&state, &[1, 2], None, 3).unwrap_err();
-        assert!(err.to_string().contains("partition"), "{err}");
+        assert!(matches!(EngineError::from(err), EngineError::Source(m) if m.contains("partition")));
     }
 }
