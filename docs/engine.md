@@ -90,9 +90,10 @@ per open series is **one window buffer**, `BufferedSeriesIterator`
 What a later step still reads of a pushed chunk row is copied into the
 buffer, not held as a slice of its batch: a retained slice pins the batch's
 child buffers, other series' samples included, and every kernel indexes one
-contiguous slice. A row that arrives with the buffer empty, which is every
-row of a store that does not chunk, is walked in place and only its tail is
-copied, so a one-row series is not copied whole to be read once. A step is
+contiguous slice. A row that arrives with the buffer empty is walked in
+place and only its tail is copied, unless it needs `@`'s pinned window
+trimmed or carries a stale marker a range function must not see in place —
+either copies the row whole into the buffer instead. A step is
 evaluated the moment its window can no longer change, when its end is at
 or before the last timestamp pushed, rather than at series close. The
 buffer then drops what no later window reaches, once that is at least half

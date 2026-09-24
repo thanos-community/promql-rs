@@ -7,9 +7,10 @@
 //! pin the whole batch's child buffers, other series' samples included, and
 //! every kernel indexes one contiguous slice; the copy replaces the
 //! staleness filter the range kernel pays anyway. A row that arrives with
-//! the buffer empty, every row of a store that does not chunk, is walked
-//! where it lies and only its tail is copied: copying it first would copy
-//! the whole series.
+//! the buffer empty is walked where it lies and only its tail is copied,
+//! unless it needs `@`'s pinned window trimmed or a range kernel would
+//! otherwise see a stale marker — either sends it through the buffer
+//! instead, copying it whole.
 //!
 //! Steps are evaluated as soon as their window can no longer change, not at
 //! series close. Otherwise the buffer would hold the whole series, which is

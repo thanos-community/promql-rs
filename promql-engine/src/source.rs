@@ -331,7 +331,6 @@ struct SeriesSetStream {
     /// One converter for the whole stream, so the first row of a batch
     /// compares with the last of the batch before.
     converter: RowConverter,
-    /// The last row's labels, `None` until a row has been seen.
     prev: Option<OwnedRow>,
     /// The last non-empty row's first sample timestamp within the current
     /// series, `None` until one has been seen.
