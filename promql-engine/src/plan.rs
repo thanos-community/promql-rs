@@ -208,11 +208,13 @@ impl Planner<'_> {
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         let hints = self.hints(params.select_range(), None, above);
         let (builder, label_names) = self.scan(vs, hints).await?;
+        // Grouped by the whole label set, so every chunk row of a series
+        // folds into one group.
         let plan = builder
-            .project(vec![
-                col(LABELS),
-                selector::call(col(SAMPLES), &params).alias(SAMPLES),
-            ])?
+            .aggregate(
+                vec![col(LABELS)],
+                vec![selector::call(col(SAMPLES), &params).alias(SAMPLES)],
+            )?
             .build()?;
         Ok(Planned { plan, label_names })
     }

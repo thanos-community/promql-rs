@@ -1,22 +1,23 @@
-//! The vector selector as a DataFusion scalar function.
+//! The vector selector as a DataFusion grouped aggregate function.
 //!
 //! `promql_vector_selector(samples, start, end, step, lookback, offset, at)`
-//! takes one series' samples and returns that series' values on the step
-//! grid: for every step, the most recent sample no older than `lookback`,
-//! stamped with the step's timestamp.
+//! grouped by `labels` folds one series' chunk rows, in arrival order, into
+//! that series' values on the step grid: for every step, the most recent
+//! sample no older than `lookback`, stamped with the step's timestamp.
 //!
-//! A scalar function, because a row is a series: DataFusion parallelizes
-//! over rows and pushes projections around it. Keeping the parameters as
-//! literal arguments rather than state on the function means the plan
-//! serializes with no custom codec and two selectors with different
+//! An aggregate, because a row is a chunk, not a series: only an aggregate
+//! sees a group's rows in sequence and keeps state between them. Keeping the
+//! parameters as literal arguments rather than state on the function means
+//! the plan serializes with no custom codec and two selectors with different
 //! parameters are never taken for one.
 //!
 //! The names follow Prometheus's `promql/engine.go`, where a
 //! `VectorSelector` expands the series set and runs `evalSeries` over
 //! `vectorSelectorSingle`: the expansion is [`crate::source::SelectorTable`],
-//! [`eval_series`] is one series' walk across the grid, and [`apply`] runs
-//! it over a batch. The tests below are the boundary cases
-//! `vectorSelectorSingle`'s `if`s encode.
+//! [`EvalSeries`] is the accumulator both the selector and the range
+//! functions run in, and [`advance_selector`] is one series' walk across the
+//! grid. [`eval_series`] and [`apply`] are the one-row walk it replaced, kept
+//! as the oracle the tests below pin it against.
 
 use std::sync::Arc;
 
@@ -30,9 +31,11 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    ColumnarValue, EmitTo, Expr, GroupsAccumulator, ReturnFieldArgs, ScalarFunctionArgs,
-    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    lit, Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, EmitTo, Expr,
+    GroupsAccumulator, ScalarFunctionArgs, Signature, Volatility,
 };
 
 use crate::buffer::{BufferedSeriesIterator, Kernel};
@@ -112,28 +115,138 @@ pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64,
     }
 }
 
-/// The selector's step walk over the buffered samples.
+/// `vectorSelectorSingle` for every step the buffered samples can answer
+/// for good: those whose lookup time is at or before `last_t`, since a
+/// later sample is later than that.
+///
+/// Stale markers stay in the buffer: one that is the latest sample hides
+/// the series, which dropping it would undo.
 pub(crate) fn advance_selector(it: &mut BufferedSeriesIterator, out: &mut SamplesBuilder) {
-    todo!()
+    let Some(last_t) = it.last_t else {
+        return;
+    };
+    let p = it.params;
+    let steps = it.steps();
+
+    // `@` pins the lookup, so the answer is one value repeated across the
+    // grid. The buffer holds only the pinned window's latest sample.
+    if let Some(at) = p.at_ms {
+        if it.next_step >= steps || at - p.offset_ms > last_t {
+            return;
+        }
+        if let Some(&v) = it.vs.last() {
+            if !is_stale(v) {
+                for step in p.steps() {
+                    out.push(step, v);
+                }
+            }
+        }
+        it.next_step = steps;
+        return;
+    }
+
+    let end = it.base + it.ts.len();
+    while it.next_step < steps {
+        let step = it.step_at(it.next_step);
+        let ref_time = step - p.offset_ms;
+        if ref_time > last_t {
+            break;
+        }
+        while it.hi < end && it.ts[it.hi - it.base] <= ref_time {
+            it.hi += 1;
+        }
+        if it.hi > it.base {
+            let i = it.hi - 1 - it.base;
+            let (t, v) = (it.ts[i], it.vs[i]);
+            if t > ref_time - p.window_ms && !is_stale(v) {
+                out.push(step, v);
+            }
+        }
+        it.next_step += 1;
+    }
+    // The candidate for the next step is the last sample read, or a later one.
+    it.lo = it.hi.saturating_sub(1).max(it.base);
 }
 
+/// `evalSeries` as a DataFusion accumulator, one per selector or range
+/// function per partition, grouped by the whole `labels` struct.
+///
+/// It relies on a series' rows arriving consecutively: that is what lets one
+/// [`BufferedSeriesIterator`] serve every group, and it is what DataFusion's
+/// Sorted mode, one open group at a time, needs to bound memory. A group
+/// seen again after a later one opened is an error, not a second fold,
+/// because folding it would answer from half a series.
 pub(crate) struct EvalSeries {
     series: BufferedSeriesIterator,
     out: SamplesBuilder,
+    /// Group index of the open series, always `finished` when set.
     open: Option<usize>,
+    /// Rows finished in `out`, all before `open`.
     finished: usize,
+    /// The groups DataFusion has handed out, so an emit can give trailing
+    /// groups that only had null or filtered rows their empty row.
+    groups: usize,
 }
 
 impl EvalSeries {
     pub(crate) fn new(kernel: Kernel, params: Params) -> Self {
-        todo!()
+        Self {
+            series: BufferedSeriesIterator::new(kernel, params),
+            out: SamplesBuilder::default(),
+            open: None,
+            finished: 0,
+            groups: 0,
+        }
+    }
+
+    /// Finishes every row before group `g`: the open series, then an empty
+    /// row for each group whose rows were all null, filtered or empty.
+    fn close_until(&mut self, g: usize) {
+        if self.open.take().is_some() {
+            self.series.close(&mut self.out);
+            self.finished += 1;
+        }
+        while self.finished < g {
+            self.out.finish_row();
+            self.finished += 1;
+        }
+    }
+
+    /// In Sorted mode `First(n)` never reaches the open group. In any other
+    /// mode it may, and the group is closed with what it has; a row for it
+    /// afterwards is a new group DataFusion cannot tell apart.
+    fn emit(&mut self, emit_to: EmitTo) -> ListArray {
+        let n = match emit_to {
+            EmitTo::All => self
+                .groups
+                .max(self.finished + usize::from(self.open.is_some())),
+            EmitTo::First(n) => n,
+        };
+        if self.open.is_none_or(|o| o < n) {
+            self.close_until(n);
+        }
+        let list = self.out.take_first(n);
+        self.finished -= n;
+        self.open = self.open.map(|o| o - n);
+        self.groups = self.groups.saturating_sub(n);
+        list
     }
 }
 
 impl std::fmt::Debug for EvalSeries {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EvalSeries").finish_non_exhaustive()
+        f.debug_struct("EvalSeries")
+            .field("open", &self.open)
+            .field("finished", &self.finished)
+            .field("groups", &self.groups)
+            .finish_non_exhaustive()
     }
+}
+
+/// Rows a `FILTER` clause dropped, and rows with no series at all,
+/// contribute nothing to their group.
+fn skipped(list: &ListArray, filter: Option<&BooleanArray>, row: usize) -> bool {
+    list.is_null(row) || filter.is_some_and(|f| f.is_null(row) || !f.value(row))
 }
 
 impl GroupsAccumulator for EvalSeries {
@@ -144,17 +257,44 @@ impl GroupsAccumulator for EvalSeries {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        todo!()
+        self.groups = self.groups.max(total_num_groups);
+        let list = values[0].as_list::<i32>();
+        let (ts, vs) = series::sample_slices(list.values().as_struct());
+        let offsets = list.offsets();
+        for (row, &g) in group_indices.iter().enumerate() {
+            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
+            if a == b || skipped(list, opt_filter, row) {
+                continue;
+            }
+            if self.open != Some(g) {
+                if g < self.finished {
+                    return Err(DataFusionError::Execution(format!(
+                        "{NAME}: rows of a series are not consecutive: group {g} came back \
+                         after group {} opened",
+                        self.finished
+                    )));
+                }
+                self.close_until(g);
+                self.open = Some(g);
+            }
+            self.series.push(&ts[a..b], &vs[a..b], &mut self.out);
+        }
+        Ok(())
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        todo!()
+        Ok(Arc::new(self.emit(emit_to)))
     }
 
+    /// The finished series itself: a partial holding a whole series has
+    /// nothing left to combine, so the final side only has to pass it on.
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
-        todo!()
+        Ok(vec![Arc::new(self.emit(emit_to))])
     }
 
+    /// Group indices are handed out in first-seen order, so a state for a
+    /// group at or before the last one merged is that series' second state,
+    /// from a second partition, and no bitset is needed to see it.
     fn merge_batch(
         &mut self,
         values: &[ArrayRef],
@@ -162,11 +302,31 @@ impl GroupsAccumulator for EvalSeries {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        todo!()
+        self.groups = self.groups.max(total_num_groups);
+        let list = values[0].as_list::<i32>();
+        let (ts, vs) = series::sample_slices(list.values().as_struct());
+        let offsets = list.offsets();
+        for (row, &g) in group_indices.iter().enumerate() {
+            if skipped(list, opt_filter, row) {
+                continue;
+            }
+            if g < self.finished || self.open.is_some() {
+                return Err(DataFusionError::Execution(format!(
+                    "{NAME}: a series arrived from more than one partition (group {g})"
+                )));
+            }
+            self.close_until(g);
+            for i in offsets[row] as usize..offsets[row + 1] as usize {
+                self.out.push(ts[i], vs[i]);
+            }
+            self.out.finish_row();
+            self.finished += 1;
+        }
+        Ok(())
     }
 
     fn size(&self) -> usize {
-        todo!()
+        self.series.size() + self.out.size()
     }
 }
 
@@ -178,34 +338,39 @@ pub struct VectorSelector {
 
 impl Default for VectorSelector {
     fn default() -> Self {
+        let mut args = vec![series::samples_type()];
+        args.extend(std::iter::repeat_n(DataType::Int64, 6));
         Self {
-            signature: Signature::any(7, Volatility::Immutable),
+            signature: Signature::exact(args, Volatility::Immutable),
         }
     }
 }
 
-pub fn udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(VectorSelector::default())
+pub fn udaf() -> AggregateUDF {
+    AggregateUDF::new_from_impl(VectorSelector::default())
 }
 
 /// `promql_vector_selector(samples, start, end, step, lookback, offset, at)`.
 pub fn call(samples: Expr, p: &Params) -> Expr {
-    use datafusion::logical_expr::lit;
-    udf().call(vec![
+    udaf().call(vec![
         samples,
         lit(p.start_ms),
         lit(p.end_ms),
         lit(p.step_ms),
         lit(p.window_ms),
         lit(p.offset_ms),
-        match p.at_ms {
-            Some(at) => lit(at),
-            None => lit(ScalarValue::Int64(None)),
-        },
+        lit(ScalarValue::Int64(p.at_ms)),
     ])
 }
 
-impl ScalarUDFImpl for VectorSelector {
+/// What a group with no rows yields: no samples.
+fn empty_samples() -> ScalarValue {
+    let mut b = SamplesBuilder::default();
+    b.finish_row();
+    ScalarValue::List(Arc::new(b.take_all()))
+}
+
+impl AggregateUDFImpl for VectorSelector {
     fn name(&self) -> &str {
         NAME
     }
@@ -224,51 +389,50 @@ impl ScalarUDFImpl for VectorSelector {
                 arg_types.first()
             );
         }
-        for (i, t) in arg_types.iter().enumerate().skip(1) {
-            if !matches!(t, DataType::Int64 | DataType::Null) {
-                return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
-            }
-        }
         Ok(series::samples_type())
     }
 
-    /// Every row gets a list, possibly empty. DataFusion's default marks a
-    /// function's output nullable, which would make the result no longer
-    /// the canonical shape it came in as.
-    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        let types: Vec<DataType> = args
-            .arg_fields
-            .iter()
-            .map(|f| f.data_type().clone())
-            .collect();
-        let data_type = self.return_type(&types)?;
-        // A null row maps to a null row, so nullability mirrors the input.
-        let nullable = args.arg_fields[0].is_nullable();
-        Ok(Arc::new(Field::new(NAME, data_type, nullable)))
+    /// Every series yields a list, possibly empty; never NULL, so the
+    /// output is the canonical shape it came in as.
+    fn is_nullable(&self) -> bool {
+        false
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let samples: ArrayRef = match &args.args[0] {
-            ColumnarValue::Array(a) => Arc::clone(a),
-            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
-        };
-        let p = Params {
-            start_ms: int_arg(&args, 1, NAME)?.ok_or_else(|| missing("start"))?,
-            end_ms: int_arg(&args, 2, NAME)?.ok_or_else(|| missing("end"))?,
-            step_ms: int_arg(&args, 3, NAME)?.ok_or_else(|| missing("step"))?,
-            window_ms: int_arg(&args, 4, NAME)?.ok_or_else(|| missing("lookback"))?,
-            offset_ms: int_arg(&args, 5, NAME)?.ok_or_else(|| missing("offset"))?,
-            at_ms: int_arg(&args, 6, NAME)?,
-        };
-        Ok(ColumnarValue::Array(Arc::new(apply(
-            samples.as_list::<i32>(),
-            &p,
-        ))))
+    /// Without a group key there is no series to fold rows into.
+    fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        plan_err!("{NAME} must be grouped by labels")
     }
-}
 
-fn missing(what: &str) -> DataFusionError {
-    DataFusionError::Execution(format!("{NAME}: {what} must not be NULL"))
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        Ok(vec![Arc::new(Field::new(
+            format_state_name(args.name, "samples"),
+            series::samples_type(),
+            false,
+        ))])
+    }
+
+    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+        true
+    }
+
+    /// `DISTINCT` would deduplicate chunk rows, which is the overlap rule's
+    /// job; answering without it would be silently different.
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.is_distinct {
+            return plan_err!("{NAME}: DISTINCT is not supported");
+        }
+        Ok(Box::new(EvalSeries::new(
+            Kernel::Selector,
+            Params::from_literals(args.exprs, 1)?,
+        )))
+    }
+
+    fn default_value(&self, _data_type: &DataType) -> Result<ScalarValue> {
+        Ok(empty_samples())
+    }
 }
 
 /// Read literal argument `i` as an `Int64`, `None` for SQL NULL.
@@ -627,15 +791,43 @@ mod tests {
         };
         vec![
             base,
-            Params { step_ms: 7_000, ..base },
-            Params { start_ms: 16 * M, ..base },
-            Params { offset_ms: 90_000, ..base },
-            Params { offset_ms: -M, ..base },
-            Params { window_ms: 5 * M, ..base },
-            Params { at_ms: Some(150_000), ..base },
-            Params { at_ms: Some(160_000), offset_ms: -M, ..base },
-            Params { at_ms: Some(185_000), ..base },
-            Params { at_ms: Some(20 * M), ..base },
+            Params {
+                step_ms: 7_000,
+                ..base
+            },
+            Params {
+                start_ms: 16 * M,
+                ..base
+            },
+            Params {
+                offset_ms: 90_000,
+                ..base
+            },
+            Params {
+                offset_ms: -M,
+                ..base
+            },
+            Params {
+                window_ms: 5 * M,
+                ..base
+            },
+            Params {
+                at_ms: Some(150_000),
+                ..base
+            },
+            Params {
+                at_ms: Some(160_000),
+                offset_ms: -M,
+                ..base
+            },
+            Params {
+                at_ms: Some(185_000),
+                ..base
+            },
+            Params {
+                at_ms: Some(20 * M),
+                ..base
+            },
         ]
     }
 
@@ -726,19 +918,17 @@ mod tests {
         acc.update_batch(&[column(&[&[(0, 1.0)], &[(0, 5.0)]])], &[0, 1], None, 2)
             .unwrap();
         // Group 1 is open; only group 0 is closed.
-        assert_eq!(emitted(acc.evaluate(EmitTo::First(1)).unwrap()), vec![vec![
-            (0, 1.0),
-            (M, 1.0),
-            (2 * M, 1.0)
-        ]]);
+        assert_eq!(
+            emitted(acc.evaluate(EmitTo::First(1)).unwrap()),
+            vec![vec![(0, 1.0), (M, 1.0), (2 * M, 1.0)]]
+        );
         // The open series is now group 0.
         acc.update_batch(&[column(&[&[(M, 6.0)]])], &[0], None, 1)
             .unwrap();
-        assert_eq!(emitted(acc.evaluate(EmitTo::All).unwrap()), vec![vec![
-            (0, 5.0),
-            (M, 6.0),
-            (2 * M, 6.0)
-        ]]);
+        assert_eq!(
+            emitted(acc.evaluate(EmitTo::All).unwrap()),
+            vec![vec![(0, 5.0), (M, 6.0), (2 * M, 6.0)]]
+        );
     }
 
     #[test]

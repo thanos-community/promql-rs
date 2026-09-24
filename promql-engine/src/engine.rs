@@ -37,8 +37,18 @@ pub struct Engine {
 impl Engine {
     /// An engine for async callers. Use the `*_async` methods.
     pub fn new() -> Self {
-        let ctx = SessionContext::new_with_config(SessionConfig::new());
-        ctx.register_udf(selector::udf());
+        // Each would let one series' chunk rows reach the selector aggregate
+        // from more than one partition, which then folds half a series in
+        // each: round-robin repartitioning inserts itself under a partial
+        // aggregate, and a scan split by byte range cuts through a series.
+        // Hash repartitioning for aggregations stays off until a plan check
+        // proves the selector still runs Sorted above it.
+        let config = SessionConfig::new()
+            .with_round_robin_repartition(false)
+            .with_repartition_file_scans(false)
+            .with_repartition_aggregations(false);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_udaf(selector::udaf());
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
         ctx.register_udf(range::udf());

@@ -596,40 +596,102 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     .map_err(|e| e.to_string())
 }
 
-/// The timestamp and value children of a samples list's entries.
+/// The timestamp and value children of a samples list's entries. Callers
+/// hold a column whose type the signature or [`validate`] already checked.
 pub(crate) fn sample_slices(s: &StructArray) -> (&[i64], &[f64]) {
-    todo!("{s:?}")
+    let ts = s
+        .column_by_name(TIMESTAMP)
+        .expect("a canonical samples entry")
+        .as_primitive::<TimestampMillisecondType>()
+        .values();
+    let vs = s
+        .column_by_name(VALUE)
+        .expect("a canonical samples entry")
+        .as_primitive::<Float64Type>()
+        .values();
+    (ts, vs)
 }
 
 /// Rows of a samples column under construction. Arrow in, Arrow out: the
-/// buffers are those of the canonical samples column.
-#[derive(Debug, Default)]
+/// buffers are those of the canonical samples column, handed over without
+/// a copy, so a kernel writes its output once.
+///
+/// The row after the last finished one is open: samples pushed since, not
+/// yet visible to [`take_first`](Self::take_first).
+#[derive(Debug)]
 pub(crate) struct SamplesBuilder {
     ts: Vec<i64>,
     vs: Vec<f64>,
     offsets: Vec<i32>,
 }
 
+impl Default for SamplesBuilder {
+    fn default() -> Self {
+        Self {
+            ts: Vec::new(),
+            vs: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+}
+
 impl SamplesBuilder {
     pub(crate) fn push(&mut self, t: i64, v: f64) {
-        todo!("{t} {v}")
+        self.ts.push(t);
+        self.vs.push(v);
     }
 
+    /// Past `i32::MAX` samples the offsets cannot say where a row ends, and
+    /// a wrapped offset would hand DataFusion a corrupt list.
     pub(crate) fn finish_row(&mut self) {
-        todo!()
+        let end = i32::try_from(self.ts.len()).expect("more than i32::MAX samples in one column");
+        self.offsets.push(end);
+    }
+
+    /// Rows finished and not yet taken.
+    pub(crate) fn rows(&self) -> usize {
+        self.offsets.len() - 1
     }
 
     /// Splits the first n finished rows off as the canonical samples ListArray.
+    ///
+    /// The head keeps the vectors' allocations and becomes the Arrow
+    /// buffers; what is copied is the tail, the rows after `n` plus the
+    /// open one, which in Sorted mode is a single series.
     pub(crate) fn take_first(&mut self, n: usize) -> ListArray {
-        todo!("{n}")
+        let end = self.offsets[n];
+        let ts = self.ts.split_off(end as usize);
+        let vs = self.vs.split_off(end as usize);
+        let ts = std::mem::replace(&mut self.ts, ts);
+        let vs = std::mem::replace(&mut self.vs, vs);
+        let rest: Vec<i32> = self.offsets[n..].iter().map(|o| o - end).collect();
+        let mut offsets = std::mem::replace(&mut self.offsets, rest);
+        offsets.truncate(n + 1);
+        ListArray::new(
+            sample_item(),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(StructArray::new(
+                sample_fields(),
+                vec![
+                    Arc::new(TimestampMillisecondArray::from(ts)),
+                    Arc::new(Float64Array::from(vs)),
+                ],
+                None,
+            )),
+            None,
+        )
     }
 
+    /// Every finished row. An open row stays behind.
     pub(crate) fn take_all(&mut self) -> ListArray {
-        todo!()
+        self.take_first(self.rows())
     }
 
     pub(crate) fn size(&self) -> usize {
-        todo!()
+        std::mem::size_of::<Self>()
+            + self.ts.capacity() * std::mem::size_of::<i64>()
+            + self.vs.capacity() * std::mem::size_of::<f64>()
+            + self.offsets.capacity() * std::mem::size_of::<i32>()
     }
 }
 
