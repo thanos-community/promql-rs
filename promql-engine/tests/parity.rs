@@ -174,6 +174,26 @@ fn replay_against_chunked() {
     }
 }
 
+/// One row per batch, on top of `chunked(0)`'s one sample per row: every
+/// step lands in its own batch. Packing to `ROWS_PER_BATCH` (8192) leaves
+/// the whole corpus in one batch at 150s and 1h chunks, so without this
+/// the per-batch emit, the re-reserve of the still-open series and
+/// `SeriesSetExec`'s cross-batch `RowConverter` path would only be
+/// exercised by `tests/chunked.rs`, not by the recorded corpus.
+#[test]
+fn replay_against_chunked_one_row_per_batch() {
+    let corpus = load_corpus();
+    let source = Arc::new(
+        MemorySeriesSource::from_descriptions(&descriptions(&corpus.series), corpus.interval_secs)
+            .chunked(0)
+            .rows_per_batch(1),
+    );
+    for case in &corpus.cases {
+        let actual = run(&source, case);
+        assert_matches_recorded(case, actual);
+    }
+}
+
 /// `partitions(4)`: a series never straddles partitions, so each one's
 /// answer must not depend on which partition it came from or what else
 /// shared it.
