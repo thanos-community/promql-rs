@@ -33,7 +33,7 @@ tests:
       Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
         TableScan: selector_0
     physical: |
-      AggregateExec: mode=Single, gby=[labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+      AggregateExec: mode=SinglePartitioned, gby=[labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
         SeriesSetExec
           DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -133,16 +133,17 @@ tests:
       Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
         TableScan: selector_0
     physical: |
-      AggregateExec: mode=Single, gby=[labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+      AggregateExec: mode=SinglePartitioned, gby=[labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
         SeriesSetExec
           DataSourceExec: partitions=1, partition_sizes=[4]
 
   - name: range function over chunk rows in four partitions
     description: >
       Four store partitions, each series whole in one of them and chunked
-      within it. Each partition's Partial folds its own series Sorted and
-      emits them finished; a merge on labels hands them in order to one
-      Final, which stays Sorted too.
+      within it. SeriesSetExec declares that as Hash(labels), so the
+      aggregate grouped by labels needs no shuffle: one SinglePartitioned
+      aggregate per partition folds its own series Sorted and emits them
+      finished, with no merge and no Final.
     chunked_ms: 150000
     partitions: 4
     load:
@@ -156,8 +157,107 @@ tests:
           TableScan: selector_0
     physical: |
       ProjectionExec: expr=[promql_labels(pod, get_field(labels@0, pod)) as labels, samples@1 as samples]
-        AggregateExec: mode=Final, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
-          SortPreservingMergeExec: [labels@0 ASC]
-            AggregateExec: mode=Partial, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
-              SeriesSetExec
-                DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
+        AggregateExec: mode=SinglePartitioned, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+          SeriesSetExec
+            DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
+
+  - name: grouped aggregation over chunk rows in four partitions
+    description: >
+      The rate aggregate runs SinglePartitioned per store partition. The
+      projection above it computes the group key as a new expression, so
+      Hash(labels) does not carry through it and the upper aggregate
+      splits into a Partial per partition, a hash shuffle on the group key
+      and a FinalPartitioned. The shuffle's width is the session's
+      target_partitions, which the harness prints as a name.
+    chunked_ms: 150000
+    partitions: 4
+    load:
+      - x{pod="a"} 1+1x19
+      - x{pod="b"} 2+3x19
+    query: |
+      sum by (pod) (rate(x[5m]))
+    plan: |
+      Projection: promql_labels(Utf8("pod"), __group__pod) AS labels, samples
+        Aggregate: groupBy=[[get_field(labels, Utf8("pod")) AS __group__pod]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: promql_labels(Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples
+            Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+              TableScan: selector_0
+    physical: |
+      ProjectionExec: expr=[promql_labels(pod, __group__pod@0) as labels, samples@1 as samples]
+        AggregateExec: mode=FinalPartitioned, gby=[__group__pod@0 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples]
+          RepartitionExec: partitioning=Hash([__group__pod@0], target_partitions), input_partitions=4
+            AggregateExec: mode=Partial, gby=[__datafusion_extracted_1@1 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples]
+              ProjectionExec: expr=[samples@1 as samples, get_field(promql_labels(pod, get_field(labels@0, pod)), pod) as __datafusion_extracted_1]
+                AggregateExec: mode=SinglePartitioned, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+                  SeriesSetExec
+                    DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
+
+  - name: grouped aggregation with every group in every partition
+    description: >
+      Sixteen series, eight per pod, spread so that both groups occur in
+      every store partition: the shape is the same as with one series per
+      pod, which is the point. Each Partial emits a partial sum per group
+      it saw, and the shuffle brings a group's partials together.
+    chunked_ms: 150000
+    partitions: 4
+    load:
+      - x{pod="a", i="0"} 1+1x19
+      - x{pod="a", i="1"} 1+1x19
+      - x{pod="a", i="2"} 1+1x19
+      - x{pod="a", i="3"} 1+1x19
+      - x{pod="a", i="4"} 1+1x19
+      - x{pod="a", i="5"} 1+1x19
+      - x{pod="a", i="6"} 1+1x19
+      - x{pod="a", i="7"} 1+1x19
+      - x{pod="b", i="0"} 2+3x19
+      - x{pod="b", i="1"} 2+3x19
+      - x{pod="b", i="2"} 2+3x19
+      - x{pod="b", i="3"} 2+3x19
+      - x{pod="b", i="4"} 2+3x19
+      - x{pod="b", i="5"} 2+3x19
+      - x{pod="b", i="6"} 2+3x19
+      - x{pod="b", i="7"} 2+3x19
+    query: |
+      sum by (pod) (rate(x[5m]))
+    plan: |
+      Projection: promql_labels(Utf8("pod"), __group__pod) AS labels, samples
+        Aggregate: groupBy=[[get_field(labels, Utf8("pod")) AS __group__pod]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: promql_labels(Utf8("i"), get_field(selector_0.labels, Utf8("i")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples
+            Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+              TableScan: selector_0
+    physical: |
+      ProjectionExec: expr=[promql_labels(pod, __group__pod@0) as labels, samples@1 as samples]
+        AggregateExec: mode=FinalPartitioned, gby=[__group__pod@0 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples]
+          RepartitionExec: partitioning=Hash([__group__pod@0], target_partitions), input_partitions=4
+            AggregateExec: mode=Partial, gby=[__datafusion_extracted_1@1 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples]
+              ProjectionExec: expr=[samples@1 as samples, get_field(promql_labels(i, get_field(labels@0, i), pod, get_field(labels@0, pod)), pod) as __datafusion_extracted_1]
+                AggregateExec: mode=SinglePartitioned, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+                  SeriesSetExec
+                    DataSourceExec: partitions=4, partition_sizes=[6, 12, 8, 6]
+
+  - name: ungrouped aggregation over chunk rows in four partitions
+    description: >
+      With no group key there is nothing to shuffle on: a Partial per
+      partition, a coalesce, one Final.
+    chunked_ms: 150000
+    partitions: 4
+    load:
+      - x{pod="a"} 1+1x19
+      - x{pod="b"} 2+3x19
+    query: |
+      sum(rate(x[5m]))
+    plan: |
+      Projection: promql_labels() AS labels, samples
+        Aggregate: groupBy=[[]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Projection: promql_labels(Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples
+            Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+              TableScan: selector_0
+    physical: |
+      ProjectionExec: expr=[{} as labels, samples@0 as samples]
+        AggregateExec: mode=Final, gby=[], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples]
+          CoalescePartitionsExec
+            AggregateExec: mode=Partial, gby=[], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples]
+              ProjectionExec: expr=[samples@1 as samples]
+                AggregateExec: mode=SinglePartitioned, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+                  SeriesSetExec
+                    DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]

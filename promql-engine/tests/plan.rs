@@ -66,9 +66,10 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::expressions::{Column, UnKnownColumn};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
@@ -163,16 +164,20 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     // The renderer borrows the plan, so it cannot be the tail expression.
     let logical = plan.display_indent().to_string();
     // The engine's own physical plan, not one lowered here, so the text is
-    // what the engine runs. It does not depend on the core count: the
-    // engine's flags keep DataFusion from repartitioning below the
-    // selector, which is the only place target partitions would show.
+    // what the engine runs.
     let physical = case.physical.as_ref().map(|_| {
         let exec = rt
             .block_on(engine.physical_plan_async(&source, query, range))
             .expect("the plan lowers");
         // The renderer borrows the plan, so it cannot be the tail expression.
         let rendered = displayable(exec.as_ref()).indent(true).to_string();
-        rendered
+        // A shuffle above the selector is as wide as the session's
+        // target_partitions, DataFusion's default of one per core.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        rendered.replace(
+            &format!("], {cores}), input_partitions="),
+            "], target_partitions), input_partitions=",
+        )
     });
     (logical, physical)
 }
@@ -409,4 +414,49 @@ fn prometheus_ordered_input_is_rejected() {
         Err(EngineError::Source(_)) => {}
         other => panic!("expected a source order error, got {other:?}"),
     }
+}
+
+/// Hash(labels) from SeriesSetExec must not survive the projection that
+/// computes the group key above the range function: the key is a new
+/// expression, and an upper aggregate that believed its input already
+/// hash-partitioned by it would skip the shuffle and answer a group once
+/// per store partition.
+#[test]
+fn the_label_projection_drops_the_hash_partitioning() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
+        .chunked(150_000)
+        .partitions(4);
+    let plan = physical_plan(&source, "sum by (pod) (rate(x[5m]))");
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    // The ProjectionExec that feeds the upper Partial, right above the
+    // range function's aggregate.
+    let mut node = &plan;
+    while !node.children()[0]
+        .downcast_ref::<AggregateExec>()
+        .is_some_and(|agg| {
+            agg.aggr_expr()
+                .iter()
+                .any(|e| e.fun().name() == range::NAME)
+        })
+    {
+        node = node.children()[0];
+    }
+    let projection = node;
+    assert!(projection.is::<ProjectionExec>(), "{shown}");
+    assert_eq!(
+        projection.children()[0]
+            .properties()
+            .partitioning
+            .to_string(),
+        "Hash([labels@0], 4)",
+        "{shown}"
+    );
+    // It still prints as Hash([labels@0], 4): Partitioning::project turns an
+    // expression the projection does not carry into an UnKnownColumn named
+    // after it. That placeholder equals nothing, itself included, so nothing
+    // above can find a requirement satisfied by it.
+    let Partitioning::Hash(exprs, 4) = &projection.properties().partitioning else {
+        panic!("{shown}");
+    };
+    assert!(exprs[0].is::<UnKnownColumn>(), "{exprs:?}\n{shown}");
 }
