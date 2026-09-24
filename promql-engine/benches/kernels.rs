@@ -26,6 +26,11 @@ use promql_engine::range::{self, Func};
 use promql_engine::selector::{self, STALE_NAN_BITS};
 use promql_engine::series::{self, Series};
 
+#[path = "support/pprof.rs"]
+mod profiler;
+
+use profiler::PProfProfiler;
+
 /// Scrape interval of every synthetic series.
 const SCRAPE_MS: i64 = 15_000;
 /// Step of every synthetic query grid.
@@ -408,6 +413,7 @@ fn series_encode_decode(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default()
+        .with_profiler(PProfProfiler::new(100))
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(2))
         .sample_size(50);

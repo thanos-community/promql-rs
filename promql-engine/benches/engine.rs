@@ -21,6 +21,11 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series, SeriesSource};
 
+#[path = "support/pprof.rs"]
+mod profiler;
+
+use profiler::PProfProfiler;
+
 const SCRAPE_MS: i64 = 15_000;
 const STEP_MS: i64 = 30_000;
 const HOUR_MS: i64 = 60 * 60_000;
@@ -165,6 +170,7 @@ fn plan(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default()
+        .with_profiler(PProfProfiler::new(100))
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3))
         .sample_size(20);
