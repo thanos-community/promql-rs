@@ -507,6 +507,7 @@ mod tests {
 
     const A: &[(&str, &str)] = &[("pod", "a")];
     const B: &[(&str, &str)] = &[("pod", "b")];
+    const C: &[(&str, &str)] = &[("pod", "c")];
 
     #[tokio::test]
     async fn descending_labels_are_refused() {
@@ -546,17 +547,38 @@ mod tests {
         assert_eq!(out, input);
     }
 
-    /// An empty row has no first timestamp to check, and carries nothing
-    /// an operator could fold, so neither its position nor its labels
-    /// can make a result wrong.
+    /// An empty row has no first timestamp to check, so a run of empty
+    /// rows inside one series never trips the "ascend by first sample
+    /// timestamp" check.
     #[tokio::test]
-    async fn empty_rows_are_not_checked() {
-        run(vec![vec![
-            batch(&["pod"], &[(A, &[100, 200]), (A, &[]), (A, &[300])]),
-            batch(&["pod"], &[(B, &[1]), (A, &[]), (B, &[2])]),
-        ]])
+    async fn empty_rows_skip_only_the_timestamp_check() {
+        run(vec![vec![batch(
+            &["pod"],
+            &[(A, &[100, 200]), (A, &[]), (A, &[300])],
+        )]])
         .await
         .unwrap();
+    }
+
+    /// An empty row still carries a label set and still closes the series
+    /// before it: `c{}` closes `b`, so `b` reappearing in the next batch is
+    /// a closed series reappearing, same as if `c{}` had samples.
+    #[tokio::test]
+    async fn an_empty_row_closes_the_series_before_it() {
+        let msg = refused(vec![vec![
+            batch(&["pod"], &[(B, &[0, 30_000]), (C, &[])]),
+            batch(&["pod"], &[(B, &[60_000, 90_000])]),
+        ]])
+        .await;
+        assert!(msg.contains(r#"pod="b""#), "{msg}");
+    }
+
+    /// The doc promises samples ascend within a row is checked, not just
+    /// assumed; a row whose samples go backwards must be refused.
+    #[tokio::test]
+    async fn samples_out_of_order_within_a_row_are_refused() {
+        let msg = refused(vec![vec![batch(&["pod"], &[(A, &[200, 100])])]]).await;
+        assert!(msg.contains(r#"pod="a""#), "{msg}");
     }
 
     /// `labels ASC` is DataFusion's struct order: fields by name, compared
