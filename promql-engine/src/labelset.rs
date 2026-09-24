@@ -21,9 +21,11 @@
 //! upstream carries one series. Closing it needs an Arrow concat pass
 //! over the colliding rows' points, so only the error is mirrored.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use datafusion::arrow::array::{AsArray, RecordBatch};
+use datafusion::arrow::array::{AsArray, RecordBatch, StringViewArray};
+use datafusion::arrow::compute::interleave_record_batch;
 use datafusion::arrow::datatypes::TimestampMillisecondType;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::row::{RowConverter, SortField};
@@ -85,6 +87,88 @@ pub fn reject_same_labelset(batches: &[RecordBatch]) -> Result<(), EngineError> 
         }
     }
     Ok(())
+}
+
+/// The result's rows in the order Prometheus returns a range query's
+/// matrix: `sort.Sort(mat)` in `promql/engine.go`, which compares label
+/// sets pair by pair, `labels.Compare`. The plan ends in as many
+/// partitions as the store has and they finish in any order, so without
+/// this the order would change from run to run.
+///
+/// The `labels` struct's own order, which `SeriesSetExec` declares, is
+/// not that order: it compares field by field with `""` for an absent
+/// label, so `{app="q"}` sorts after `{i="0"}` there and before it here.
+pub fn sort_by_labelset(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, EngineError> {
+    let mut columns = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let labels = batch
+            .column_by_name(LABELS)
+            .ok_or_else(|| EngineError::Schema(format!("no {LABELS} column")))?
+            .as_struct();
+        // `compare` pairs fields by position across batches.
+        if columns.is_empty() || batch.schema_ref() == batches[0].schema_ref() {
+            columns.push(
+                labels
+                    .columns()
+                    .iter()
+                    .map(|c| c.as_string_view())
+                    .collect(),
+            );
+        } else {
+            return Err(EngineError::Schema(
+                "result batches differ in schema".into(),
+            ));
+        }
+    }
+    let mut order: Vec<(usize, usize)> = batches
+        .iter()
+        .enumerate()
+        .flat_map(|(b, batch)| (0..batch.num_rows()).map(move |row| (b, row)))
+        .collect();
+    let cmp = |x: &(usize, usize), y: &(usize, usize)| compare(&columns, *x, *y);
+    // A single store partition, and label sets that all carry the same
+    // names, come out of the plan in this order already.
+    if order.is_sorted_by(|x, y| cmp(x, y) != Ordering::Greater) {
+        return Ok(batches.to_vec());
+    }
+    order.sort_unstable_by(cmp);
+    let batches: Vec<&RecordBatch> = batches.iter().collect();
+    // One batch per input batch's worth of rows keeps each within the
+    // sizes the plan already produced, so no list offsets overflow.
+    let per_batch = batches
+        .iter()
+        .map(|b| b.num_rows())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    order
+        .chunks(per_batch)
+        .map(|at| interleave_record_batch(&batches, at).map_err(arrow_error))
+        .collect()
+}
+
+/// `labels.Compare` of two rows, read off the columns without collecting
+/// either label set. Where the rows first differ and one has the label and
+/// the other not, the one without it continues with a later name, or ends.
+fn compare(columns: &[Vec<&StringViewArray>], x: (usize, usize), y: (usize, usize)) -> Ordering {
+    let (a, b) = (&columns[x.0], &columns[y.0]);
+    let has_more = |c: &[&StringViewArray], row: usize, from: usize| {
+        c[from..].iter().any(|v| !v.value(row).is_empty())
+    };
+    for f in 0..a.len() {
+        let (va, vb) = (a[f].value(x.1), b[f].value(y.1));
+        if va == vb {
+            continue;
+        }
+        return match (va.is_empty(), vb.is_empty()) {
+            (false, true) if has_more(b, y.1, f + 1) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (true, false) if has_more(a, x.1, f + 1) => Ordering::Greater,
+            (true, false) => Ordering::Less,
+            _ => va.cmp(vb),
+        };
+    }
+    Ordering::Equal
 }
 
 /// Where one row of the result sits, so the second pass can go back to it.
@@ -183,5 +267,38 @@ mod tests {
             row("envoy-1", "a", vec![60_000]),
         ]])
         .unwrap();
+    }
+
+    /// Every ordering of label sets that differ in which names they carry,
+    /// split over two batches, against `labels.Compare` written the obvious
+    /// way: pair lists compared lexicographically.
+    #[test]
+    fn sort_by_labelset_is_labels_compare() {
+        let sets: Vec<Vec<(&str, &str)>> = vec![
+            vec![("a", "1")],
+            vec![("a", "1"), ("b", "1")],
+            vec![("a", "1"), ("c", "1")],
+            vec![("a", "2")],
+            vec![("b", "1")],
+            vec![("b", "2"), ("c", "1")],
+            vec![("c", "1")],
+            vec![],
+        ];
+        let series: Vec<Series> = sets
+            .iter()
+            .rev()
+            .map(|l| Series::new(l, vec![0], vec![1.0]).unwrap())
+            .collect();
+        let names = label_names_of(&series);
+        let (front, back) = series.split_at(4);
+        let batches = [
+            encode(&names, front).unwrap(),
+            encode(&names, back).unwrap(),
+        ];
+        let sorted = crate::series::decode(&sort_by_labelset(&batches).unwrap()).unwrap();
+        let got: Vec<Vec<(&str, &str)>> = sorted.iter().map(|s| s.labels().collect()).collect();
+        let mut want = sets.clone();
+        want.sort();
+        assert_eq!(got, want);
     }
 }
