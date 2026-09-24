@@ -13,8 +13,13 @@
 //! `RecordBatch` end to end instead of paying to materialize Rust values
 //! it may only re-encode. The two things applied before the batches come
 //! back are [`series::drop_empty`] — see its doc for why that can't live
-//! in the plan — and [`labelset::reject_same_labelset`], which is
+//! in the plan — and `labelset::reject_same_labelset`, which is
 //! Prometheus's own post-evaluation pass.
+//!
+//! Between planning and execution the physical plan goes through
+//! [`check_selector_plans`]. The selector and range aggregates bound memory
+//! only in DataFusion's Sorted mode, and DataFusion drops to Linear mode
+//! without an error; the check turns that into a refused query.
 
 use std::sync::Arc;
 
@@ -49,8 +54,9 @@ impl Engine {
         // from more than one partition, which then folds half a series in
         // each: round-robin repartitioning inserts itself under a partial
         // aggregate, and a scan split by byte range cuts through a series.
-        // Hash repartitioning for aggregations stays off until a plan check
-        // proves the selector still runs Sorted above it.
+        // Hash repartitioning for aggregations keeps the selector Sorted, but
+        // the plan then ends in several partitions and series come back out
+        // of order, which nothing can re-sort: Arrow has no struct sort.
         let config = SessionConfig::new()
             .with_round_robin_repartition(false)
             .with_repartition_file_scans(false)

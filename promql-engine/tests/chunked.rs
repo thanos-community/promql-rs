@@ -1,13 +1,13 @@
-//! Reproduction only: what happens when a `SeriesSource` hands the engine
-//! one series as several rows (one per time chunk) instead of one.
+//! A `SeriesSource` that hands the engine one series as several rows, one
+//! per time chunk, must get the same answer as one that hands it one row.
 //!
-//! `MemorySeriesSource::chunked` is a test-only knob (see its doc in
+//! `MemorySeriesSource::chunked` is the test mode (see its doc in
 //! `memory.rs`) that splits each selected series' samples into consecutive
-//! rows of at most `CHUNK_MS` span before handing them to the plan, still
-//! one partition, series order then time order preserved. Every test here
-//! runs the same query against a chunked and an unchunked source built from
-//! the same descriptions, and compares the two: any difference is a bug
-//! this repository does not yet claim to fix.
+//! rows of at most `CHUNK_MS` span before handing them to the plan, series
+//! order then time order preserved. Every test here runs the same query
+//! against a chunked and an unchunked source built from the same
+//! descriptions, and compares the two: any difference is a bug in how the
+//! selector and range aggregates carry a series across rows.
 
 use std::sync::Arc;
 

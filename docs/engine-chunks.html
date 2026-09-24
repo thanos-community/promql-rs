@@ -340,7 +340,7 @@ table.lanes td.out{color:var(--accent); font-weight:600;}
   <code>rate(x[5m])</code> &nbsp;&middot;&nbsp; step 30&thinsp;s &nbsp;&middot;&nbsp; 420&thinsp;s &rarr; 600&thinsp;s &nbsp;&middot;&nbsp; two batches, three rows, two series
 </div>
 
-<p><b>They are not aligned.</b> The two chunk rows of <code>x</code> are ranges in two different <code>RecordBatch</code>es, read in arrival order, and the last value of the first is already in per-step <b>lane state</b> when the second is read. Alignment is only a question if the operator works on whole series. A grouped aggregate does not.</p>
+<p><b>They are not aligned.</b> The two chunk rows of <code>x</code> are ranges in two different <code>RecordBatch</code>es, read in arrival order, and the samples of the first that a later window still reaches are already copied into the series' <b>window buffer</b> when the second is read. Alignment is only a question if the operator works on whole series. A grouped aggregate does not.</p>
 
 <section id="fold" class="anim">
   <div class="anim-bar">
@@ -419,22 +419,22 @@ row  labels.__name__  samples                  first / last sample timestamp, de
 <h2 id="batches"><span class="num">2</span>Batches carry no meaning</h2>
 
 <div class="stage-card">
-<p><b>A store may split a series' chunk rows across any number of <code>RecordBatch</code>es.</b> A series may end mid-batch or span several; <code>x</code> here does both. The engine never gathers a series' chunks for <code>rate</code>: it folds rows in arrival order into per-step lane state, closes a series when a row with another label set arrives or the stream ends, and carries across a batch boundary only the lane state of the one open series per partition.</p>
+<p><b>A store may split a series' chunk rows across any number of <code>RecordBatch</code>es.</b> A series may end mid-batch or span several; <code>x</code> here does both. The engine never gathers a series' chunks for <code>rate</code>: it folds rows in arrival order into one window buffer, closes a series when a row with another label set arrives or the stream ends, and carries across a batch boundary only the window buffer of the one open series per partition.</p>
 </div>
 
-<p>What crosses from A.0 to B.0 is lane state, never a reference into batch A's buffers, and the batch boundary is not an event the fold notices. Why the engine never joins chunk rows into one is in <a href="engine.md#memory">docs/engine.md</a>.</p>
+<p>What crosses from A.0 to B.0 is a copy of the samples a later window reaches, never a reference into batch A's buffers, and the batch boundary is not an event the fold notices. Why the engine never joins chunk rows into one is in <a href="engine.md#memory">docs/engine.md</a>.</p>
 
 <p>That B.1 closes <code>x</code> holds only because the store keeps a series' rows consecutive and label-sorted, a contract in <a href="engine.md#ordering-integrity">docs/engine.md</a>. The engine checks it on every row at one comparison each, labels non-decreasing between adjacent rows and first sample timestamp non-decreasing within a series, and turns a violation into a query error rather than a silently wrong result.</p>
 
 <h2 id="fold-sec"><span class="num">3</span>The fold</h2>
 
-<p><code>rate(x[5m])</code> from t&nbsp;=&nbsp;420&thinsp;s to t&nbsp;=&nbsp;600&thinsp;s at step 30&thinsp;s. Seven steps, so seven lanes per series. A lane holds only what <code>extrapolatedRate</code> needs, so a sample can be forgotten once folded: the first and last sample, the count, and <code>reset_sum</code>, the values lost to counter resets.</p>
+<p><code>rate(x[5m])</code> from t&nbsp;=&nbsp;420&thinsp;s to t&nbsp;=&nbsp;600&thinsp;s at step 30&thinsp;s. Seven steps, and each step's answer is a function of its <b>lane</b>, the samples in its window <code>(t_step &minus; 300&thinsp;s, t_step]</code>. The lanes are the semantics, not the data structure: the engine keeps no state per step. It copies each chunk row into one buffer per open series, <code>BufferedSeriesIterator</code> after Prometheus's <code>storage/buffer.go</code>, answers a step as soon as its window can no longer change, and trims from the front what no later window reaches (<a href="engine.md#kernel-state">docs/engine.md</a>). A state per step would pay every sample once per window it falls in, ten times here, twenty for <code>[5m]</code> at 15&thinsp;s.</p>
 
-<p>A sample folds into every lane whose window <code>(t_step &minus; 300&thinsp;s, t_step]</code> holds it: set <code>first</code> if unset, add the old <code>last</code> to <code>reset_sum</code> if the new value is below it, overwrite <code>last</code>, bump <code>count</code>.</p>
+<p>What <code>extrapolatedRate</code> needs from a lane is small: its first and last sample, the count, and <code>reset_sum</code>, the values lost to counter resets. The engine reads the endpoints and the count off the lane's slice of the buffer, and carries the reset positions from step to step in <code>Sweep::Counter</code> so a step costs the samples entering and leaving the window. The tables below are those numbers per lane.</p>
 
-<p>A.0 first. Six lanes take all five of its samples. The lane at t&nbsp;=&nbsp;600&thinsp;s takes four: its window is half-open, so the sample exactly on 300&thinsp;s is outside it.</p>
+<p>A.0 first. When it is pushed the last timestamp seen is 420&thinsp;s, so the lane at t&nbsp;=&nbsp;420&thinsp;s is complete and answered at once; no later sample can land in <code>(120&thinsp;s, 420&thinsp;s]</code>. The other six stay open, and all five samples stay in the buffer because the next window, <code>(150&thinsp;s, 450&thinsp;s]</code>, still reaches 300&thinsp;s. The lane at t&nbsp;=&nbsp;600&thinsp;s holds four of them: its window is half-open, so the sample exactly on 300&thinsp;s is outside it.</p>
 
-<p>B.0 folds into the same lanes; nothing of A.0 is held except those numbers. Its first sample is the first thing read from batch B, and lane state is all that connects it to A.0. After it:</p>
+<p>B.0 is copied into the same buffer, after A.0's five samples; nothing of batch A is referenced. Its first sample is the first thing read from batch B, and the buffer is all that connects it to A.0. Its last timestamp is 600&thinsp;s, so all six open lanes are complete and answered during the push:</p>
 
 <div class="tablewrap">
 <table class="wide">
@@ -451,11 +451,11 @@ row  labels.__name__  samples                  first / last sample timestamp, de
 </table>
 </div>
 
-<p>The lane at t&nbsp;=&nbsp;600&thinsp;s holds <code>first = 11</code> from A.0 in batch A and <code>last = 6</code> from B.0 in batch B, and nothing ever built a range spanning the two.</p>
+<p>The lane at t&nbsp;=&nbsp;600&thinsp;s holds <code>first = 11</code> from A.0 in batch A and <code>last = 6</code> from B.0 in batch B, and the only thing spanning the two is a buffer of eleven copied samples, bounded by the window rather than the series.</p>
 
 <h2 id="finalise"><span class="num">4</span>Finalising</h2>
 <div class="stage-card">
-<p>B.1 belongs to series <code>y</code>, so series <code>x</code> is complete and each of its lanes goes through Prometheus's <code>extrapolatedRate</code>. For the lane at t&nbsp;=&nbsp;600&thinsp;s, spelled out once:</p>
+<p>Each lane went through Prometheus's <code>extrapolatedRate</code> when it was answered: t&nbsp;=&nbsp;420&thinsp;s during A.0's push, the rest during B.0's. B.1 belongs to series <code>y</code>, so it only closes <code>x</code>'s output row, which DataFusion sees from then on. For the lane at t&nbsp;=&nbsp;600&thinsp;s, spelled out once:</p>
 
 <pre class="codeblock"><code>result             = last_v - first_v + reset_sum = 6 - 11 + 16 = 11
 sampled_interval   = 600 - 330                                  = 270 s
@@ -490,14 +490,14 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
 <h2 id="overlap"><span class="num">5</span>Overlapping chunks</h2>
 
-<p>Adjacent chunk rows of a series may overlap in time, after compaction for example. The engine remembers the last timestamp it folded for each series and skips any sample at or before it, so the first row wins, as in Thanos's <code>chunkSeriesIterator</code>; whether to take Prometheus's union instead is <a href="engine.md#ordering-integrity">open</a>. The skip matters even for an exact duplicate, which moves neither endpoint and fakes no reset but would raise <code>count</code>, shortening the average interval, which can push <code>duration_to_start</code> through a clamp it would otherwise miss.</p>
+<p>Adjacent chunk rows of a series may overlap in time, after compaction for example. The engine remembers the last timestamp it copied for each series and skips any sample at or before it, so the first row wins, as in Thanos's <code>chunkSeriesIterator</code>; Prometheus's union differs only for interleaved timestamps (<a href="engine.md#ordering-integrity">docs/engine.md</a>). A stale marker claims its timestamp too, before <code>rate</code> filters it out of the buffer, so a marker in the first row is not replaced by a sample at the same timestamp in the second. The skip matters even for an exact duplicate, which moves neither endpoint and fakes no reset but would raise <code>count</code>, shortening the average interval, which can push <code>duration_to_start</code> through a clamp it would otherwise miss.</p>
 
 <h2 id="ring"><span class="num">6</span>Functions that need every sample in the window</h2>
 
-<p><code>quantile_over_time</code> and its kind cannot be folded into a few numbers, because they need the set. They keep a buffer of each series' samples, bounded by the window rather than the series, in place of running lane state; see <a href="engine.md#kernel-state">docs/engine.md</a>.</p>
+<p><code>quantile_over_time</code> and its kind cannot be reduced to a few numbers, because they need the set. They need no other structure either: each step refolds its lane's slice of the same buffer, which is already bounded by the window and sorted by time; see <a href="engine.md#kernel-state">docs/engine.md</a>.</p>
 
 <div class="footnote" id="notes">
-<p><b>Notes on the numbers.</b> The fold and <code>extrapolatedRate</code> run in this page, following Prometheus's <code>promql/functions.go</code> term for term, with the guards in the order that file runs them: threshold clamp, then counter zero clip. None of it is read back from the engine, whose kernel is still being written. When it lands, pin this fixture: three rows in two batches, the series boundary and the batch boundary in different places, a reset inside the second chunk, and one lane that closes before the second chunk opens.</p>
+<p><b>Notes on the numbers.</b> The fold and <code>extrapolatedRate</code> run in this page, following Prometheus's <code>promql/functions.go</code> term for term, with the guards in the order that file runs them: threshold clamp, then counter zero clip. None of it is read back from the engine; the engine checks itself against it instead. <code>the_engine_chunks_fixture</code> in <code>buffer.rs</code> pushes A.0 and B.0, asserts the lane at 420&thinsp;s is answered before B.0 is pushed, and matches all seven rates to 1e-10.</p>
 </div>
 
 </main>

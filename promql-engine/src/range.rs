@@ -3,8 +3,8 @@
 //! grouped by `labels`.
 //!
 //! A range function is the vector selector's shape with a window instead
-//! of a lookback, so it runs in the selector's accumulator, [`EvalSeries`],
-//! with [`advance_range`] as the walk: one series' chunk rows in, that
+//! of a lookback, so it runs in the selector's accumulator, `EvalSeries`,
+//! with `advance_range` as the walk: one series' chunk rows in, that
 //! series' values on the step grid out. The function name is a literal
 //! argument, like every parameter, so one registration serves all of them
 //! and the plan says which it is.

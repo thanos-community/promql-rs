@@ -72,38 +72,50 @@ such a plan.
 **Batch boundaries mean nothing.** A store may split a series' chunk rows
 across any number of RecordBatches, ending it mid-batch or spreading it over
 several. The engine never gathers or looks up the chunks a `rate` window
-needs: it folds rows into the open series' lane state in arrival order, and
-closes the series at the first row with another label set or at the end of
-the stream. There is no lookup, no join and no buffered batch. A whole-series
+needs: it folds rows into the open series' window buffer in arrival order,
+and closes the series at the first row with another label set or at the end
+of the stream. There is no lookup, no join and no buffered batch. A whole-series
 store sending one row per series is the one-chunk case.
 
 ## Kernel state
 
-Folding a chunk into step lanes is not the same problem for every function,
-and the engine splits them on whether the fold can forget.
+Semantically each step is a lane: the samples in `(t − range, t]`, reduced
+by the function. Keeping a lane per step as the data structure would pay
+every sample once per window it falls in, twenty times for `[5m]` at 15 s,
+which is the refold the sweep in `range.rs` exists to remove. So the state
+per open series is **one window buffer**, `BufferedSeriesIterator`
+(`buffer.rs`), after Prometheus's `storage.BufferedSeriesIterator`
+(`storage/buffer.go:26-36`), and it serves every function alike.
 
-**Streamable.** `rate`, `increase`, `delta`, `idelta`, `count_over_time`,
-`sum_over_time`, `min_over_time`, `max_over_time`, `avg_over_time`,
-`last_over_time` and `present_over_time` need per-lane accumulators and the
-few samples at the window edges. They keep that state across rows and drop
-each sample once folded.
+A pushed chunk row is copied into the buffer, not held as a slice of its
+batch: a retained slice pins the batch's child buffers, other series'
+samples included, and every kernel indexes one contiguous slice. A step is
+evaluated the moment its window can no longer change, when its end is at
+or before the last timestamp pushed, rather than at series close. The
+buffer then drops what no later window reaches, once that is at least half
+of it, as `ReduceDelta` (`storage/buffer.go:67-70`) shrinks Prometheus's.
+Without the eager step a 30-day range at 15 s would buffer 172,800 samples
+per series before answering the first one.
 
-**Buffered.** `quantile_over_time`, `stddev_over_time`, `stdvar_over_time`,
-`changes`, `resets`, `deriv`, `predict_linear`, `double_exponential_smoothing` and
-`mad_over_time` need the window's samples as a set or in order, so the
-aggregate keeps a carry-over buffer trimmed to the window as steps advance.
-It is Prometheus's ring buffer under another name, with
-`BufferedSeriesIterator.ReduceDelta` (`storage/buffer.go:67-70`) as the model
-for shrinking it as the window moves. The bound is the same: window, not
-series.
+Over the buffer, `rate`, `increase`, `min_over_time` and `max_over_time`
+carry a `Sweep` from step to step, the resets or the extremum candidates as
+absolute sample ordinals, so a step costs the samples that entered and left
+its window and trimming the front never rewrites them. Every other function
+refolds its window through `range::evaluate`; a sliding variant measured
+no faster for `changes`/`resets` and a no-op one slowed the whole family.
+Order-dependent functions (`quantile_over_time`, `deriv`, `changes`, …)
+need nothing more than a buffer already sorted by time.
 
 The instant selector is the degenerate case. For each step it wants the last
-sample at or before the step within the lookback delta, with stale markers
-dropped rather than returned. `offset` and `@` shift the window before
+sample at or before the step within the lookback delta, and a stale marker
+that is that sample hides the series, so the selector keeps markers the
+range functions filter on copy. `offset` and `@` shift the window before
 clipping, which is why the first step of a fold can still be looking for a
-sample that lives in an earlier row. That, and overlap between adjacent
-chunks, is why rows must be folded in the order they arrive and can never be
-folded independently and combined.
+sample that lives in an earlier row. Under `@` the window is pinned: what
+falls outside it is dropped on copy and the one answer is repeated across
+the grid. That, and overlap between adjacent chunks, is why rows must be
+folded in the order they arrive and can never be folded independently and
+combined.
 
 ## Memory
 
@@ -111,14 +123,14 @@ The bound is **O(series in flight × window)**, and series in flight is one
 per partition under sorted mode. Nothing in the engine is proportional to a
 series' length, its number of chunks, or how its rows fall across batches: at
 a batch boundary the previous RecordBatch is released entirely and only the
-open series' lane state survives.
+open series' window buffer survives.
 
-Zero copy holds where Arrow lets it. Consecutive rows in one batch are
-slices of the same list values buffer, so folding them costs offsets
-arithmetic. Across a batch boundary they are not, and `arrow::compute::concat`
-copies list arrays, so the engine carries the few samples it still needs
-rather than joining the rows. A carry-over of a window is cheap; a concat of
-a series is the cost we just refused to push into the store.
+The engine copies samples, but only a window's worth: each row's samples
+enter the buffer once and leave it when no step reads them. That is the
+price of releasing batches, and it replaces the pass the range kernels pay
+anyway to drop stale markers. What it avoids is `arrow::compute::concat`
+over a series' rows, which copies the series; a copy of a window is cheap,
+a concat of a series is the cost we just refused to push into the store.
 
 The offsets pay for themselves here. Samples ascend within a row, so its
 first sample timestamp is `timestamp[offsets[i]]` and its last sample
@@ -128,8 +140,7 @@ is skipped without walking its samples, where Prometheus decodes through the
 chunk to find out (`tsdb/querier.go:779-791`). The one row to guard is an
 empty one, `offsets[i] == offsets[i+1]`, where both reads land outside the
 row. The contract forbids it; the engine skips one anyway, since it has
-nothing to fold. The sample count comes from the same offsets, so a buffer
-is sized once instead of grown.
+nothing to fold.
 
 ## Ordering integrity
 
@@ -162,16 +173,32 @@ catches a closed series reappearing, and first sample timestamp
 non-decreasing within a series. A violation is a query error.
 `reject_same_labelset` sees final output only, so it misses
 `sum(rate(x[5m]))` over a split series. The engine also refuses a plan that
-loses the declared `(labels, first sample timestamp)` ordering or the hash
-partitioning on `labels`, which `CoalescePartitionsExec` and `RepartitionExec`
+loses the declared `labels` ordering or keeps a series from staying whole
+in one partition, which `CoalescePartitionsExec` and `RepartitionExec`
 without `preserve_order` do between scan and selector.
 
-**Overlap.** The engine skips samples at or before the last timestamp seen for the series, so the first
-row wins, as Thanos's `chunkSeriesIterator` does (thanos
-`pkg/query/iter.go:277-281`). Prometheus's block merge keeps the union and
-drops only duplicate timestamps (prom `storage/merge.go:653-656`), so the
-two differ when overlapping chunks carry different timestamps. *Open for
-Matthias: which rule the engine follows.*
+**Session flags.** The engine turns off the three DataFusion rewrites that
+deal one series' rows to several partitions: round-robin repartitioning
+(inserted under a partial aggregate,
+`datafusion-physical-optimizer-54.1.0/src/enforce_distribution.rs:1309-1314`),
+file-scan repartitioning, and hash repartitioning of aggregations.
+`check_selector_plans` (`engine.rs`) then refuses, per plan, a selector
+aggregate that is not Sorted over `SeriesSetExec`. Parallelism comes from
+store partitions and `SelectHints.shard` instead. Hash repartitioning with
+`prefer_existing_sort` would regain it for the upper aggregates, and keeps
+both selector aggregates Sorted, but it is deferred: the plan then ends in
+`target_partitions` partitions, series come back in arrival order, and
+struct columns have no sort kernel to restore it.
+
+**Overlap.** The first row wins: the engine skips samples at or before the
+last timestamp seen for the series, as Thanos's `chunkSeriesIterator` does
+(thanos `pkg/query/iter.go:277-281`). Prometheus's block merge keeps the
+union and drops only duplicate timestamps (prom `storage/merge.go:653-656`).
+The two agree on exact duplicates and differ only for interleaved
+timestamps. A stale marker claims its timestamp
+like any sample, before the range functions filter it out, because a
+store's merge dedups before PromQL sees staleness: a marker in the first row
+must not let a real sample at the same timestamp through from the second.
 
 ## The correctness net
 

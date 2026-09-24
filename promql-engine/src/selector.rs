@@ -14,8 +14,8 @@
 //! The names follow Prometheus's `promql/engine.go`, where a
 //! `VectorSelector` expands the series set and runs `evalSeries` over
 //! `vectorSelectorSingle`: the expansion is [`crate::source::SelectorTable`],
-//! [`EvalSeries`] is the accumulator both the selector and the range
-//! functions run in, and [`advance_selector`] is one series' walk across the
+//! `EvalSeries` is the accumulator both the selector and the range
+//! functions run in, and `advance_selector` is one series' walk across the
 //! grid.
 
 use std::sync::Arc;

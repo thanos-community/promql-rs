@@ -11,7 +11,8 @@
 //! `docs/series-source.md` is the design note for the trait and the shape.
 //! Above them, [`plan`] turns a parsed expression into a `LogicalPlan`
 //! over the store's plan, with [`selector`], [`aggregate`] and [`range`]
-//! as DataFusion functions over the samples list, and [`engine`] runs it.
+//! as DataFusion aggregate functions over the samples list, and [`engine`]
+//! runs it.
 //!
 //! ```text
 //! PromQL text ─► parser ─► Expr ─► plan::plan ─► LogicalPlan ─► DataFusion
