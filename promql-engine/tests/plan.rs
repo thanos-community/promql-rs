@@ -70,10 +70,12 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_expr::expressions::{Column, UnKnownColumn};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
 use promql_engine::engine::check_selector_plans;
 use promql_engine::series::{encode, label_names_of};
@@ -507,4 +509,44 @@ fn a_partitioned_join_over_the_store_partitioning_is_refused() {
         Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![labels], 4)).unwrap())
     });
     check_selector_plans(&rehashed).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// `x or x` partition by partition: DataFusion turns a `UnionExec` into an
+/// `InterleaveExec` whenever every child declares the same partitioning
+/// (`enforce_distribution.rs:1458-1485`, `union.rs:664-676`), and two
+/// selectors over the same store both declare `Hash([labels], n)`. The
+/// interleave would then zip partition i of one scan with partition i of
+/// the other, handing a Sorted consumer above it the same label set twice.
+#[test]
+fn an_interleave_over_the_store_partitioning_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let inputs = vec![physical_plan(&source, "x"), physical_plan(&source, "x")];
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(inputs).unwrap());
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    match check_selector_plans(&plan) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
+    }
+}
+
+/// A plain `UnionExec` does not pair partitions by index — each child keeps
+/// contributing its own partitions — so coalescing both children first,
+/// which DataFusion cannot interleave because it no longer sees a shared
+/// Hash partitioning, must stay accepted.
+#[test]
+fn a_union_over_coalesced_children_is_accepted() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let inputs = vec![
+        Arc::new(CoalescePartitionsExec::new(physical_plan(&source, "x")))
+            as Arc<dyn ExecutionPlan>,
+        Arc::new(CoalescePartitionsExec::new(physical_plan(&source, "x")))
+            as Arc<dyn ExecutionPlan>,
+    ];
+    let plan = UnionExec::try_new(inputs).unwrap();
+    assert!(
+        plan.is::<UnionExec>(),
+        "{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+    check_selector_plans(&plan).unwrap_or_else(|e| panic!("{e}"));
 }
