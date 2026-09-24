@@ -3,7 +3,8 @@
 `kernels` times the engine's kernels without DataFusion, `engine` whole
 queries through DataFusion, and `memory` measures peak heap of single
 queries instead of time. The doc comment at the top of each file says
-how to compare two states of the code.
+how to compare two states of the code. `PROMQL_BENCH_PARTS=<n>` spreads
+`engine`'s synthetic series over n store partitions.
 
 ## Profiling
 
