@@ -596,6 +596,43 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     .map_err(|e| e.to_string())
 }
 
+/// The timestamp and value children of a samples list's entries.
+pub(crate) fn sample_slices(s: &StructArray) -> (&[i64], &[f64]) {
+    todo!("{s:?}")
+}
+
+/// Rows of a samples column under construction. Arrow in, Arrow out: the
+/// buffers are those of the canonical samples column.
+#[derive(Debug, Default)]
+pub(crate) struct SamplesBuilder {
+    ts: Vec<i64>,
+    vs: Vec<f64>,
+    offsets: Vec<i32>,
+}
+
+impl SamplesBuilder {
+    pub(crate) fn push(&mut self, t: i64, v: f64) {
+        todo!("{t} {v}")
+    }
+
+    pub(crate) fn finish_row(&mut self) {
+        todo!()
+    }
+
+    /// Splits the first n finished rows off as the canonical samples ListArray.
+    pub(crate) fn take_first(&mut self, n: usize) -> ListArray {
+        todo!("{n}")
+    }
+
+    pub(crate) fn take_all(&mut self) -> ListArray {
+        todo!()
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,5 +874,38 @@ mod tests {
             Field::new("x", DataType::Int64, false),
         ]);
         assert!(validate(&extra).unwrap_err().contains("exactly"));
+    }
+
+    fn builder_rows(list: &ListArray) -> Vec<Vec<(i64, f64)>> {
+        (0..list.len())
+            .map(|r| {
+                let row = list.value(r);
+                let (ts, vs) = sample_slices(row.as_struct());
+                ts.iter().copied().zip(vs.iter().copied()).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn take_first_leaves_later_rows_and_the_open_one() {
+        let mut b = SamplesBuilder::default();
+        b.push(0, 1.0);
+        b.finish_row();
+        b.finish_row();
+        b.push(10, 2.0);
+        b.push(20, 3.0);
+        b.finish_row();
+        b.push(30, 4.0);
+
+        let first = b.take_first(2);
+        assert_eq!(first.data_type(), &samples_type());
+        assert_eq!(builder_rows(&first), vec![vec![(0, 1.0)], vec![]]);
+
+        b.finish_row();
+        assert_eq!(
+            builder_rows(&b.take_all()),
+            vec![vec![(10, 2.0), (20, 3.0)], vec![(30, 4.0)]]
+        );
+        assert_eq!(b.take_all().len(), 0);
     }
 }

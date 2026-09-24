@@ -19,16 +19,33 @@ defaults:
 tests:
   - name: instant selector
     description: >
-      The labels pass through untouched as one struct: an instant
-      selector keeps every label it was given, __name__ included.
+      The selector is an aggregate grouped by the whole labels struct, so
+      a series split over several chunk rows is one group. The labels pass
+      through untouched: an instant selector keeps every label it was
+      given, __name__ included.
     load:
       - http_requests_total{job="api", pod="api-1"} 0
       - http_requests_total{job="api", pod="api-2"} 0
     query: |
       http_requests_total{job="api"}
     plan: |
-      Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
+      Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
         TableScan: selector_0
+
+  - name: aggregation over an instant selector
+    description: >
+      An ungrouped sum stacks on the selector aggregate: two aggregates,
+      the lower grouped by series, the upper by nothing.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      sum(http_requests_total)
+    plan: |
+      Projection: promql_labels() AS labels, samples
+        Aggregate: groupBy=[[]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
+          Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+            TableScan: selector_0
 
   - name: range function over a different label set
     description: >

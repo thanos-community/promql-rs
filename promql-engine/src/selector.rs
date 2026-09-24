@@ -21,7 +21,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, ListArray, StructArray, TimestampMillisecondArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, ListArray, StructArray,
+    TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{
@@ -30,12 +31,13 @@ use datafusion::arrow::datatypes::{
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    Volatility,
+    ColumnarValue, EmitTo, Expr, GroupsAccumulator, ReturnFieldArgs, ScalarFunctionArgs,
+    ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
+use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::params::Params;
-use crate::series;
+use crate::series::{self, SamplesBuilder};
 
 pub const NAME: &str = "promql_vector_selector";
 
@@ -107,6 +109,64 @@ pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64,
             continue;
         }
         emit(step, v);
+    }
+}
+
+/// The selector's step walk over the buffered samples.
+pub(crate) fn advance_selector(it: &mut BufferedSeriesIterator, out: &mut SamplesBuilder) {
+    todo!()
+}
+
+pub(crate) struct EvalSeries {
+    series: BufferedSeriesIterator,
+    out: SamplesBuilder,
+    open: Option<usize>,
+    finished: usize,
+}
+
+impl EvalSeries {
+    pub(crate) fn new(kernel: Kernel, params: Params) -> Self {
+        todo!()
+    }
+}
+
+impl std::fmt::Debug for EvalSeries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalSeries").finish_non_exhaustive()
+    }
+}
+
+impl GroupsAccumulator for EvalSeries {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        todo!()
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        todo!()
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    fn size(&self) -> usize {
+        todo!()
     }
 }
 
@@ -281,10 +341,38 @@ pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
 mod tests {
     use super::*;
     use datafusion::arrow::buffer::NullBuffer;
+    use datafusion::logical_expr::EmitTo;
 
     const M: i64 = 60_000;
 
     fn run(ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
+        select(&[(ts, vs)], p)
+    }
+
+    /// One series pushed as `chunks`, then closed.
+    fn select(chunks: &[(&[i64], &[f64])], p: Params) -> Vec<(i64, f64)> {
+        let mut it = BufferedSeriesIterator::new(Kernel::Selector, p);
+        let mut out = SamplesBuilder::default();
+        for (ts, vs) in chunks {
+            it.push(ts, vs, &mut out);
+        }
+        it.close(&mut out);
+        let mut rows = rows(&out.take_all());
+        assert_eq!(rows.len(), 1);
+        rows.pop().unwrap()
+    }
+
+    fn rows(list: &ListArray) -> Vec<Vec<(i64, f64)>> {
+        (0..list.len())
+            .map(|r| {
+                let row = list.value(r);
+                let (ts, vs) = series::sample_slices(row.as_struct());
+                ts.iter().copied().zip(vs.iter().copied()).collect()
+            })
+            .collect()
+    }
+
+    fn oracle(ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
         let mut out = Vec::new();
         eval_series(ts, vs, &p, |t, v| out.push((t, v)));
         out
@@ -503,5 +591,185 @@ mod tests {
             .column(1)
             .as_primitive::<Float64Type>();
         assert_eq!(vs.values(), &[1.0, 3.0]);
+    }
+
+    /// Gaps longer than the lookback, a stale marker, a NaN and repeated
+    /// values: every branch `eval_series` has, across the grids below.
+    fn a_rough_series() -> (Vec<i64>, Vec<f64>) {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        [
+            (0, 1.0),
+            (30_000, 2.0),
+            (90_000, 2.0),
+            (120_000, f64::NAN),
+            (150_000, 5.0),
+            (180_000, stale),
+            (240_000, 4.0),
+            (270_000, -0.0),
+            (300_000, 9.0),
+            (900_000, 3.0),
+            (930_000, stale),
+            (960_000, 3.0),
+            (1_020_000, 2.0),
+        ]
+        .into_iter()
+        .unzip()
+    }
+
+    fn grids() -> Vec<Params> {
+        let base = Params {
+            start_ms: 0,
+            end_ms: 20 * M,
+            step_ms: 30_000,
+            window_ms: 2 * M,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        vec![
+            base,
+            Params { step_ms: 7_000, ..base },
+            Params { start_ms: 16 * M, ..base },
+            Params { offset_ms: 90_000, ..base },
+            Params { offset_ms: -M, ..base },
+            Params { window_ms: 5 * M, ..base },
+            Params { at_ms: Some(150_000), ..base },
+            Params { at_ms: Some(160_000), offset_ms: -M, ..base },
+            Params { at_ms: Some(185_000), ..base },
+            Params { at_ms: Some(20 * M), ..base },
+        ]
+    }
+
+    fn close_enough(a: &[(i64, f64)], b: &[(i64, f64)]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| x.0 == y.0 && x.1.to_bits() == y.1.to_bits())
+    }
+
+    #[test]
+    fn chunk_splits_select_what_one_row_selects() {
+        let (ts, vs) = a_rough_series();
+        for p in grids() {
+            let expected = oracle(&ts, &vs, p);
+            for k in 1..=ts.len() {
+                let chunks: Vec<(&[i64], &[f64])> = ts.chunks(k).zip(vs.chunks(k)).collect();
+                let got = select(&chunks, p);
+                assert!(
+                    close_enough(&got, &expected),
+                    "{p:?}, chunks of {k}: {got:?} != {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_repeating_the_previous_tail_select_the_same() {
+        let (ts, vs) = a_rough_series();
+        for p in grids() {
+            let expected = oracle(&ts, &vs, p);
+            for k in 2..=ts.len() {
+                // Each chunk starts one sample back, a duplicate of the
+                // previous chunk's last one.
+                let chunks: Vec<(&[i64], &[f64])> = (0..ts.len())
+                    .step_by(k - 1)
+                    .map(|a| {
+                        let b = (a + k).min(ts.len());
+                        (&ts[a..b], &vs[a..b])
+                    })
+                    .collect();
+                let got = select(&chunks, p);
+                assert!(
+                    close_enough(&got, &expected),
+                    "{p:?}, overlapping chunks of {k}: {got:?} != {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// A samples column, one row per entry.
+    fn column(rows: &[&[(i64, f64)]]) -> ArrayRef {
+        let mut b = SamplesBuilder::default();
+        for row in rows {
+            for &(t, v) in *row {
+                b.push(t, v);
+            }
+            b.finish_row();
+        }
+        Arc::new(b.take_all())
+    }
+
+    fn accumulator() -> EvalSeries {
+        EvalSeries::new(
+            Kernel::Selector,
+            Params {
+                end_ms: 2 * M,
+                ..params()
+            },
+        )
+    }
+
+    fn emitted(a: ArrayRef) -> Vec<Vec<(i64, f64)>> {
+        rows(a.as_list::<i32>())
+    }
+
+    #[test]
+    fn a_series_whose_rows_are_not_consecutive_is_an_error() {
+        let mut acc = accumulator();
+        let rows = column(&[&[(0, 1.0)], &[(0, 2.0)], &[(M, 3.0)]]);
+        let err = acc.update_batch(&[rows], &[0, 1, 0], None, 2).unwrap_err();
+        assert!(err.to_string().contains("not consecutive"), "{err}");
+    }
+
+    #[test]
+    fn a_series_carries_across_batches_and_emits_once_closed() {
+        let mut acc = accumulator();
+        acc.update_batch(&[column(&[&[(0, 1.0)], &[(0, 5.0)]])], &[0, 1], None, 2)
+            .unwrap();
+        // Group 1 is open; only group 0 is closed.
+        assert_eq!(emitted(acc.evaluate(EmitTo::First(1)).unwrap()), vec![vec![
+            (0, 1.0),
+            (M, 1.0),
+            (2 * M, 1.0)
+        ]]);
+        // The open series is now group 0.
+        acc.update_batch(&[column(&[&[(M, 6.0)]])], &[0], None, 1)
+            .unwrap();
+        assert_eq!(emitted(acc.evaluate(EmitTo::All).unwrap()), vec![vec![
+            (0, 5.0),
+            (M, 6.0),
+            (2 * M, 6.0)
+        ]]);
+    }
+
+    #[test]
+    fn a_group_with_nothing_to_select_is_an_empty_row() {
+        let mut acc = accumulator();
+        let rows = column(&[&[(0, 1.0)], &[(0, 2.0)], &[], &[(0, 4.0)]]);
+        let skip = BooleanArray::from(vec![true, false, true, true]);
+        acc.update_batch(&[rows], &[0, 1, 2, 3], Some(&skip), 5)
+            .unwrap();
+        let out = emitted(acc.evaluate(EmitTo::All).unwrap());
+        assert_eq!(out.len(), 5);
+        assert!(out[1].is_empty() && out[2].is_empty() && out[4].is_empty());
+        assert_eq!(out[3].len(), 3);
+    }
+
+    #[test]
+    fn the_state_is_the_finished_series() {
+        let mut acc = accumulator();
+        acc.update_batch(&[column(&[&[(0, 1.0)], &[(0, 2.0)]])], &[0, 1], None, 2)
+            .unwrap();
+        let state = acc.state(EmitTo::All).unwrap();
+        assert_eq!(state.len(), 1);
+
+        let mut last = accumulator();
+        last.merge_batch(&state, &[0, 1], None, 2).unwrap();
+        assert_eq!(emitted(last.evaluate(EmitTo::All).unwrap()).len(), 2);
+
+        // A second state for one series means it crossed partitions.
+        let mut last = accumulator();
+        last.merge_batch(&state, &[0, 1], None, 2).unwrap();
+        let err = last.merge_batch(&state, &[1, 2], None, 3).unwrap_err();
+        assert!(err.to_string().contains("partition"), "{err}");
     }
 }
