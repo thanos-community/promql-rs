@@ -54,10 +54,25 @@
 //! their matchers render the same text.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use datafusion::physical_plan::displayable;
-use datafusion::prelude::{SessionConfig, SessionContext};
-use promql_engine::{Engine, MemorySeriesSource, RangeQuery};
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
+use promql_engine::engine::check_selector_plans;
+use promql_engine::series::{encode, label_names_of};
+use promql_engine::{
+    range, selector, Engine, EngineError, MemorySeriesSource, RangeQuery, SelectHints, Series,
+    SeriesSource,
+};
+use promql_parser::ast::LabelMatcher;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -121,32 +136,19 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     // Both `query` and `plan` are `|` block scalars, so both shed the
     // newline it appends; a query wrapped over several lines keeps its
     // own newlines, which PromQL treats as whitespace.
+    let query = case.query.trim_end();
     let plan = rt
-        .block_on(engine.plan_async(&source, case.query.trim_end(), range))
+        .block_on(engine.plan_async(&source, query, range))
         .expect("the query plans");
     // The renderer borrows the plan, so it cannot be the tail expression.
     let logical = plan.display_indent().to_string();
+    // The engine's own physical plan, not one lowered here, so the text is
+    // what the engine runs. It does not depend on the core count: the
+    // engine's flags keep DataFusion from repartitioning below the
+    // selector, which is the only place target partitions would show.
     let physical = case.physical.as_ref().map(|_| {
-        // Target partitions are fixed because DataFusion defaults them to
-        // the core count, which would put the machine into the text; four
-        // rather than one, so it is the flags that keep the selector in one
-        // aggregate. The flags copy `Engine::new`'s because the engine's
-        // context is private; once the engine hands out its own physical
-        // plan this context goes and the expected text stays. The logical
-        // plan already carries its functions, so nothing needs registering.
-        let config = SessionConfig::new()
-            .with_target_partitions(4)
-            .with_round_robin_repartition(false)
-            .with_repartition_file_scans(false)
-            .with_repartition_aggregations(false);
-        let ctx = SessionContext::new_with_config(config);
         let exec = rt
-            .block_on(async {
-                ctx.execute_logical_plan(plan)
-                    .await?
-                    .create_physical_plan()
-                    .await
-            })
+            .block_on(engine.physical_plan_async(&source, query, range))
             .expect("the plan lowers");
         // The renderer borrows the plan, so it cannot be the tail expression.
         let rendered = displayable(exec.as_ref()).indent(true).to_string();
@@ -203,4 +205,187 @@ fn every_case_plans_to_its_expected_shape() {
         path.display(),
         failures.join("\n\n"),
     );
+}
+
+// The physical plan decides what the logical plan cannot: whether the
+// selector aggregate holds one open series per partition (Sorted) or every
+// series of the scan (Linear). The rest of this file checks that choice
+// directly rather than as text, because partition counts and the upper
+// aggregate's split make the larger plans too fragile to pin.
+
+/// Every selector and range-function aggregate in `plan`, Partial and Final
+/// alike.
+fn selector_aggregates(plan: &Arc<dyn ExecutionPlan>) -> Vec<&AggregateExec> {
+    let mut found = Vec::new();
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        if let Some(agg) = node.downcast_ref::<AggregateExec>() {
+            if agg
+                .aggr_expr()
+                .iter()
+                .any(|e| [selector::NAME, range::NAME].contains(&e.fun().name()))
+            {
+                found.push(agg);
+            }
+        }
+        stack.extend(node.children());
+    }
+    found
+}
+
+fn two_counters() -> Vec<promql_parser::SeriesDescription> {
+    [r#"x{pod="a"} 1+1x19"#, r#"x{pod="b"} 2+3x19"#]
+        .iter()
+        .map(|l| promql_parser::parse_series_desc(l).expect("series line parses"))
+        .collect()
+}
+
+fn physical_plan(source: &dyn SeriesSource, query: &str) -> Arc<dyn ExecutionPlan> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(Engine::new().physical_plan_async(
+        source,
+        query,
+        &RangeQuery::new(300_000, 600_000, 30_000),
+    ))
+    .unwrap_or_else(|e| panic!("{query}: {e}"))
+}
+
+#[test]
+fn the_selector_aggregate_runs_sorted_at_one_and_four_partitions() {
+    for n in [1, 4] {
+        let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
+            .chunked(150_000)
+            .partitions(n);
+        for query in ["x", "rate(x[5m])", "sum by (pod) (rate(x[5m]))"] {
+            let plan = physical_plan(&source, query);
+            let shown = displayable(plan.as_ref()).indent(true).to_string();
+            let aggregates = selector_aggregates(&plan);
+            assert!(
+                !aggregates.is_empty(),
+                "{query} at {n} partitions has no selector aggregate:\n{shown}"
+            );
+            for agg in aggregates {
+                assert_eq!(
+                    agg.input_order_mode(),
+                    &InputOrderMode::Sorted,
+                    "{query} at {n} partitions, {:?} aggregate:\n{shown}",
+                    agg.mode(),
+                );
+            }
+        }
+    }
+}
+
+/// `plan` with `wrap` applied to the input of every selector aggregate,
+/// the aggregate rebuilt over it so it re-derives its input order.
+fn under_the_selector(
+    plan: Arc<dyn ExecutionPlan>,
+    wrap: impl Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    plan.transform_up(|node| {
+        let is_selector = node
+
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|agg| {
+                agg.aggr_expr()
+                    .iter()
+                    .any(|e| e.fun().name() == selector::NAME)
+            });
+        if !is_selector {
+            return Ok(Transformed::no(node));
+        }
+        let input = wrap(Arc::clone(node.children()[0]));
+        Ok(Transformed::yes(node.with_new_children(vec![input])?))
+    })
+    .expect("the plan rebuilds")
+    .data
+}
+
+#[test]
+fn the_engine_accepts_its_own_plans() {
+    for n in [1, 4] {
+        let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(n);
+        for query in ["x", "rate(x[5m])", "sum(x)"] {
+            let plan = physical_plan(&source, query);
+            check_selector_plans(&plan).unwrap_or_else(|e| {
+                panic!(
+                    "{query} at {n} partitions: {e}\n{}",
+                    displayable(plan.as_ref()).indent(true)
+                )
+            });
+        }
+    }
+}
+
+#[test]
+fn a_repartition_under_the_selector_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0);
+    let plan = under_the_selector(physical_plan(&source, "x"), |input| {
+        Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(4)).unwrap())
+    });
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    match check_selector_plans(&plan) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
+    }
+}
+
+/// `sort_to_indices` has no Struct arm, so this plan would fail inside
+/// Arrow at execution; refusing it names the cause instead.
+#[test]
+fn a_sort_on_labels_under_the_selector_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0);
+    let plan = under_the_selector(physical_plan(&source, "x"), |input| {
+        let labels = Column::new_with_schema("labels", &input.schema()).unwrap();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(labels))]).unwrap();
+        Arc::new(SortExec::new(ordering, input))
+    });
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    match check_selector_plans(&plan) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
+    }
+}
+
+/// A store emitting Prometheus's `labels.Compare` order rather than struct
+/// order: `{a="1"}` before `{b="1"}`, where struct order compares the `a`
+/// column first and puts `("", "1")` ahead of `("1", "")`.
+#[derive(Debug)]
+struct PrometheusOrdered;
+
+#[async_trait]
+impl SeriesSource for PrometheusOrdered {
+    async fn select(
+        &self,
+        _state: &dyn Session,
+        _matchers: &[LabelMatcher],
+        _hints: SelectHints,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let series = vec![
+            Series::new(&[("__name__", "x"), ("a", "1")], vec![300_000], vec![1.0]).unwrap(),
+            Series::new(&[("__name__", "x"), ("b", "1")], vec![300_000], vec![2.0]).unwrap(),
+        ];
+        let batch = encode(&label_names_of(&series), &series).unwrap();
+        let schema = batch.schema();
+        Ok(MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?)
+    }
+}
+
+#[test]
+fn prometheus_ordered_input_is_rejected() {
+    let engine = Engine::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let result = rt.block_on(engine.range_query_async(
+        &PrometheusOrdered,
+        "x",
+        &RangeQuery::new(300_000, 300_000, 30_000),
+    ));
+    match result {
+        Err(EngineError::Source(_)) => {}
+        other => panic!("expected a source order error, got {other:?}"),
+    }
 }

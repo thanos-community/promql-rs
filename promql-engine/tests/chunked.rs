@@ -59,8 +59,13 @@ fn key(s: &Series) -> String {
 /// Compare a chunked run against the same query on the unchunked source:
 /// same series (by label set), same timestamps, same values.
 fn assert_same_as_unchunked(q: &str, range: RangeQuery) {
+    assert_same_on(chunked().as_ref(), q, range);
+}
+
+/// [`assert_same_as_unchunked`] for any source built from [`descriptions`].
+fn assert_same_on(source: &MemorySeriesSource, q: &str, range: RangeQuery) {
     let mut expected = query(plain().as_ref(), q, range);
-    let mut actual = query(chunked().as_ref(), q, range);
+    let mut actual = query(source, q, range);
     expected.sort_by_key(key);
     actual.sort_by_key(key);
 
@@ -122,4 +127,16 @@ fn count_over_time_across_chunks() {
 #[test]
 fn binary_op_matching_the_selector_with_itself() {
     assert_same_as_unchunked("x + x", RangeQuery::new(300_000, 300_000, 30_000));
+}
+
+/// Four partitions put the selector under a Partial and a Final aggregate
+/// with a merge between them, a shape one partition never plans.
+#[test]
+fn chunks_over_four_partitions() {
+    let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
+        .chunked(CHUNK_MS)
+        .partitions(4);
+    for q in ["x", "rate(x[5m])", "sum(x)", "count_over_time(x[10m])"] {
+        assert_same_on(&source, q, RangeQuery::new(300_000, 600_000, 30_000));
+    }
 }
