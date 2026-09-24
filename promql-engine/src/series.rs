@@ -636,6 +636,11 @@ impl Default for SamplesBuilder {
 }
 
 impl SamplesBuilder {
+    pub(crate) fn reserve(&mut self, samples: usize) {
+        self.ts.reserve(samples);
+        self.vs.reserve(samples);
+    }
+
     pub(crate) fn push(&mut self, t: i64, v: f64) {
         self.ts.push(t);
         self.vs.push(v);

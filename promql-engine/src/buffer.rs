@@ -16,6 +16,7 @@
 //! 172,800 samples for a 30-day range at 15 s; evaluated eagerly it holds a
 //! window. The output row is still only visible once the series closes.
 
+use crate::aggregate::MAX_STEPS;
 use crate::params::{step_count, Params};
 use crate::range::{advance_range, Func, Sweep};
 use crate::selector::{advance_selector, is_stale};
@@ -119,6 +120,13 @@ impl BufferedSeriesIterator {
     pub(crate) fn steps(&self) -> i128 {
         let p = &self.params;
         step_count(p.start_ms, p.end_ms, p.step_ms)
+    }
+
+    /// An upper bound on what the open series still emits: one sample per
+    /// step not yet evaluated. Capped because the functions are reachable
+    /// from SQL, past the planner's grid check.
+    pub(crate) fn steps_left(&self) -> usize {
+        (self.steps() - self.next_step).clamp(0, MAX_STEPS as i128) as usize
     }
 
     /// The timestamp of step `i` on the grid.

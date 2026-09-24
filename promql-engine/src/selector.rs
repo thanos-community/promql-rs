@@ -173,6 +173,11 @@ impl EvalSeries {
         let list = self.out.take_first(n);
         self.finished -= n;
         self.open = self.open.map(|o| o - n);
+        // The reservation left with the head; in Sorted mode this runs on
+        // every batch, so without it the open series regrows each time.
+        if self.open.is_some() {
+            self.out.reserve(self.series.steps_left());
+        }
         self.groups = self.groups.saturating_sub(n);
         list
     }
@@ -224,6 +229,9 @@ impl GroupsAccumulator for EvalSeries {
                 }
                 self.close_until(g);
                 self.open = Some(g);
+                // Grown by doubling instead, a 30-day row is copied a dozen
+                // times on its way to the size the grid gives up front.
+                self.out.reserve(self.series.steps_left());
             }
             self.series.push(&ts[a..b], &vs[a..b], &mut self.out);
         }
@@ -726,6 +734,37 @@ mod tests {
             emitted(acc.evaluate(EmitTo::All).unwrap()),
             vec![vec![(0, 5.0), (M, 6.0), (2 * M, 6.0)]]
         );
+    }
+
+    /// A series answers each step at most once, so the grid bounds its row
+    /// before the first sample, and what an emit hands away with the
+    /// finished rows has to be reserved again for the open one.
+    #[test]
+    fn the_open_series_is_reserved_the_steps_it_has_left() {
+        let mut acc = EvalSeries::new(
+            Kernel::Selector,
+            Params {
+                end_ms: 999 * M,
+                ..params()
+            },
+        );
+        let at = |i: i64| column(&[&[(i * M, i as f64)]]);
+        let reserved = |acc: &EvalSeries| acc.out.size() / 16;
+        acc.update_batch(&[at(0)], &[0], None, 1).unwrap();
+        assert!(reserved(&acc) >= 1000, "{} reserved", reserved(&acc));
+        for i in 1..500 {
+            acc.update_batch(&[at(i)], &[0], None, 1).unwrap();
+        }
+        for i in 0..300 {
+            acc.update_batch(&[at(i)], &[1], None, 2).unwrap();
+        }
+        // Series 0: its 500 samples and four steps of lookback after.
+        assert_eq!(
+            emitted(acc.evaluate(EmitTo::First(1)).unwrap())[0].len(),
+            504
+        );
+        // Series 1 holds 299 answered steps and has 701 to go.
+        assert!(reserved(&acc) >= 1000, "{} reserved", reserved(&acc));
     }
 
     #[test]
