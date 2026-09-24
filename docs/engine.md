@@ -208,8 +208,10 @@ and they finish in any order. Prometheus sorts a range query's matrix
 before returning it (prom `promql/engine.go`, `sort.Sort(mat)`), and so
 does `range_query_async`, once, over finished rows: O(series log
 series) comparisons, then one copy of the samples into the new order,
-which a single store partition skips, since its rows arrive in it. The
-order is `labels.Compare` over the
+which a single store partition skips only when every series carries the
+same label names, so struct order and `labels.Compare` agree; a single
+partition whose series differ in label names still pays for the copy.
+The order is `labels.Compare` over the
 labels a series has. The `labels` struct's own order is not it: it
 compares field by field and an absent label is `""`, so two series with
 different label names can sort the other way. A `SortPreservingMergeExec`
@@ -222,11 +224,17 @@ nor the count (`datafusion-physical-expr-54.1.0/src/partitioning.rs:219-222`).
 Aggregates and windows only need each key in one partition, never which
 one. A partitioned join matches partition i with partition i and would
 line a store's bucket up against DataFusion's, or another store's, and
-drop matches silently. `check_selector_plans` therefore refuses a
-partitioned join with an input that still carries the declaration.
-Vector matching will join on a rebuilt label key, which sheds it:
-`Partitioning::project` turns a key the projection does not carry into
-an `UnKnownColumn`, which equals nothing, itself included.
+drop matches silently; an `InterleaveExec`, which DataFusion builds from
+a `UnionExec` whose children all declare the same partitioning, does the
+same by zipping partition i of one child with partition i of another.
+`check_selector_plans` therefore refuses a partitioned join or an
+interleave with an input that still carries the declaration, looking
+through `FilterExec`, `GlobalLimitExec`, `LocalLimitExec` and
+`CoalesceBatchesExec` on the way down, since DataFusion reports each of
+those as leaving its child's partitioning unchanged. Vector matching
+will join on a rebuilt label key, which sheds it: `Partitioning::project`
+turns a key the projection does not carry into an `UnKnownColumn`, which
+equals nothing, itself included.
 
 **Overlap.** The first row wins: the engine skips samples at or before the
 last timestamp seen for the series, as Thanos's `chunkSeriesIterator` does
