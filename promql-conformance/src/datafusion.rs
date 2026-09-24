@@ -17,13 +17,88 @@ use crate::result::{Engine, EngineError, LoadedSeries, Point, QueryResult, Serie
 
 pub struct DataFusionEngine {
     inner: promql_engine::Engine,
+    source: SourceMode,
+}
+
+/// How the store hands each case's series to the engine. The answers must
+/// not depend on it: the chunked and partitioned modes replay the whole
+/// corpus through the shapes a real store produces, which the corpus's
+/// own series, one row each, never reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    /// One row per series, one partition.
+    Plain,
+    /// [`MemorySeriesSource::chunked`].
+    Chunked(i64),
+    /// [`MemorySeriesSource::partitions`].
+    Partitions(usize),
+}
+
+impl SourceMode {
+    /// The variable [`DataFusionEngine::new`] reads the mode from.
+    pub const VAR: &'static str = "PROMQL_CONFORMANCE_SOURCE";
+
+    /// `plain`, `chunked[=<ms>]` or `partitions[=<n>]`. Bare `chunked` is
+    /// one sample per row, so every window of the corpus crosses rows;
+    /// bare `partitions` is four.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (mode, arg) = match s.split_once('=') {
+            Some((mode, arg)) => (mode, Some(arg)),
+            None => (s, None),
+        };
+        let bad = || {
+            format!(
+                "{}={s:?}: expected plain, chunked[=<ms>] or partitions[=<n>]",
+                Self::VAR
+            )
+        };
+        match (mode, arg) {
+            ("plain", None) => Ok(Self::Plain),
+            ("chunked", None) => Ok(Self::Chunked(0)),
+            ("chunked", Some(ms)) => ms
+                .parse()
+                .ok()
+                .filter(|ms| *ms >= 0)
+                .map(Self::Chunked)
+                .ok_or_else(bad),
+            ("partitions", None) => Ok(Self::Partitions(4)),
+            ("partitions", Some(n)) => n
+                .parse()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Self::Partitions)
+                .ok_or_else(bad),
+            _ => Err(bad()),
+        }
+    }
+
+    fn apply(self, source: MemorySeriesSource) -> MemorySeriesSource {
+        match self {
+            Self::Plain => source,
+            Self::Chunked(ms) => source.chunked(ms),
+            Self::Partitions(n) => source.partitions(n),
+        }
+    }
 }
 
 impl DataFusionEngine {
+    /// The source mode comes from [`SourceMode::VAR`], so the promqltest
+    /// binary can replay the corpus in every mode without a flag of its
+    /// own; unset is [`SourceMode::Plain`].
     pub fn new() -> Result<Self, EngineError> {
+        let source = match std::env::var(SourceMode::VAR) {
+            Ok(v) => SourceMode::parse(&v).map_err(EngineError::Other)?,
+            Err(std::env::VarError::NotPresent) => SourceMode::Plain,
+            Err(e) => return Err(EngineError::Other(format!("{}: {e}", SourceMode::VAR))),
+        };
+        Self::with_source(source)
+    }
+
+    pub fn with_source(source: SourceMode) -> Result<Self, EngineError> {
         Ok(Self {
             inner: promql_engine::Engine::blocking()
                 .map_err(|e| EngineError::Other(e.to_string()))?,
+            source,
         })
     }
 }
@@ -99,6 +174,7 @@ impl Engine for DataFusionEngine {
         // on the query, so it stays an Other rather than an answer.
         let source = MemorySeriesSource::try_new(merge(load))
             .map_err(|e| EngineError::Other(format!("seeding the store: {e}")))?;
+        let source = self.source.apply(source);
         let range = RangeQuery::new(start_ms, end_ms, step_ms);
         match self.inner.range_query(&source, query, &range) {
             Ok(batches) => {
@@ -210,5 +286,65 @@ mod tests {
     #[test]
     fn no_blocks_is_an_empty_store() {
         assert!(merge(&[]).is_empty());
+    }
+
+    #[test]
+    fn source_modes_parse() {
+        assert_eq!(SourceMode::parse("plain"), Ok(SourceMode::Plain));
+        assert_eq!(SourceMode::parse("chunked"), Ok(SourceMode::Chunked(0)));
+        assert_eq!(
+            SourceMode::parse("chunked=150000"),
+            Ok(SourceMode::Chunked(150_000))
+        );
+        assert_eq!(
+            SourceMode::parse("partitions"),
+            Ok(SourceMode::Partitions(4))
+        );
+        assert_eq!(
+            SourceMode::parse("partitions=7"),
+            Ok(SourceMode::Partitions(7))
+        );
+        for bad in [
+            "",
+            "chunky",
+            "plain=1",
+            "chunked=-1",
+            "partitions=0",
+            "partitions=x",
+        ] {
+            assert!(SourceMode::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Every mode answers a query over several series and blocks the way
+    /// the plain store does.
+    #[test]
+    fn every_source_mode_answers_alike() {
+        let a = vec![desc(r#"x{pod="a"} 1+1x19"#), desc(r#"x{pod="b"} 2+3x19"#)];
+        let b = vec![desc(r#"x{pod="c"} 0+5x9"#)];
+        let load = [
+            LoadedSeries {
+                series: &a,
+                interval_secs: 30.0,
+            },
+            LoadedSeries {
+                series: &b,
+                interval_secs: 60.0,
+            },
+        ];
+        let run = |mode| {
+            DataFusionEngine::with_source(mode)
+                .unwrap()
+                .range_query(&load, "rate(x[5m])", 0, 600_000, 30_000)
+                .unwrap()
+        };
+        let plain = run(SourceMode::Plain);
+        for mode in [
+            SourceMode::Chunked(0),
+            SourceMode::Chunked(150_000),
+            SourceMode::Partitions(4),
+        ] {
+            assert_eq!(run(mode), plain, "{mode:?}");
+        }
     }
 }

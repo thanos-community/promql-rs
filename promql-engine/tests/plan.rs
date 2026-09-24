@@ -26,6 +26,10 @@
 //! `ExecutionPlan`. Only small cases can carry one: partition counts and
 //! repartitioning make larger physical plans too fragile to hold as text.
 //!
+//! `chunked_ms` and `partitions` run a case over
+//! [`MemorySeriesSource::chunked`] and [`MemorySeriesSource::partitions`],
+//! the store shapes the Sorted selector exists for.
+//!
 //! # Why the series are per case
 //!
 //! A projection over the source names the label fields one by one, and
@@ -34,7 +38,9 @@
 //! would pin someone else's schema. Only the label set reaches the
 //! planner, so one sample per series is enough and a second adds
 //! nothing; the loader rejects any series carrying more, so the corpus
-//! cannot drift into looking like a data-driven evaluation suite.
+//! cannot drift into looking like a data-driven evaluation suite. A
+//! chunked case is the exception: there the samples decide how many
+//! batches the store hands over, which the physical plan shows.
 //!
 //! # Conventions borrowed
 //!
@@ -62,7 +68,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
@@ -155,17 +161,16 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     // The renderer borrows the plan, so it cannot be the tail expression.
     let logical = plan.display_indent().to_string();
     // The engine's own physical plan, not one lowered here, so the text is
-    // what the engine runs. The core count shows only as the width of a
-    // hash repartition, which DataFusion sizes to its target partitions;
-    // that one number is written `$target_partitions` so a case pins the
-    // shape on every machine.
+    // what the engine runs. It does not depend on the core count: the
+    // engine's flags keep DataFusion from repartitioning below the
+    // selector, which is the only place target partitions would show.
     let physical = case.physical.as_ref().map(|_| {
         let exec = rt
             .block_on(engine.physical_plan_async(&source, query, range))
             .expect("the plan lowers");
+        // The renderer borrows the plan, so it cannot be the tail expression.
         let rendered = displayable(exec.as_ref()).indent(true).to_string();
-        let target = datafusion::common::utils::get_available_parallelism();
-        rendered.replace(&format!("], {target}), input_partitions="), "], $target_partitions), input_partitions=")
+        rendered
     });
     (logical, physical)
 }
@@ -401,48 +406,5 @@ fn prometheus_ordered_input_is_rejected() {
     match result {
         Err(EngineError::Source(_)) => {}
         other => panic!("expected a source order error, got {other:?}"),
-    }
-}
-
-
-/// Stage 2 of the session flags: hash repartitioning for aggregations is on,
-/// with existing sorts preferred. The selector's state is its finished
-/// series, so a hash split on `labels` between its Partial and its Final
-/// moves one state per series, and with order preserved the Final still
-/// holds one open series per partition. What is above then runs hash
-/// parallel. If DataFusion ever plans that split without keeping the order,
-/// the Final turns Linear, and this is where it shows.
-#[test]
-fn a_hash_split_between_partial_and_final_keeps_both_sorted() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
-        .chunked(150_000)
-        .partitions(4);
-    for query in ["x", "rate(x[5m])", "sum by (pod) (rate(x[5m]))"] {
-        let plan = physical_plan(&source, query);
-        let shown = displayable(plan.as_ref()).indent(true).to_string();
-        let aggregates = selector_aggregates(&plan);
-        let of = |mode: AggregateMode| {
-            aggregates
-                .iter()
-                .find(|a| *a.mode() == mode)
-                .unwrap_or_else(|| panic!("{query}: no {mode:?} selector aggregate:\n{shown}"))
-        };
-        let (partial, last) = (of(AggregateMode::Partial), of(AggregateMode::FinalPartitioned));
-        for agg in [partial, last] {
-            assert_eq!(
-                agg.input_order_mode(),
-                &InputOrderMode::Sorted,
-                "{query}, {:?} aggregate:\n{shown}",
-                agg.mode(),
-            );
-        }
-        let split = last
-            .input()
-            .downcast_ref::<RepartitionExec>()
-            .unwrap_or_else(|| panic!("{query}: the Final is not over a repartition:\n{shown}"));
-        assert!(
-            split.preserve_order() && matches!(split.partitioning(), Partitioning::Hash(..)),
-            "{query}: the split between Partial and Final is not an order-preserving hash:\n{shown}"
-        );
     }
 }

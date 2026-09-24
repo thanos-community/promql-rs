@@ -59,8 +59,35 @@ impl From<DataFusionError> for EngineError {
                 }
                 engine => engine,
             },
+            // A repartition hands one input error to every output partition,
+            // so it arrives shared and usually cannot be moved out.
+            DataFusionError::Shared(shared) => match std::sync::Arc::try_unwrap(shared) {
+                Ok(e) => EngineError::from(e),
+                Err(shared) => match shared.as_ref() {
+                    DataFusionError::External(inner) => inner
+                        .downcast_ref::<EngineError>()
+                        .and_then(EngineError::copied)
+                        .unwrap_or(EngineError::DataFusion(DataFusionError::Shared(shared))),
+                    _ => EngineError::DataFusion(DataFusionError::Shared(shared)),
+                },
+            },
             e => EngineError::DataFusion(e),
         }
+    }
+}
+
+impl EngineError {
+    /// `DataFusionError` is not `Clone`, so an engine error wrapping one
+    /// cannot be copied out of a shared reference; every other can.
+    fn copied(&self) -> Option<EngineError> {
+        Some(match self {
+            EngineError::Unsupported(m) => EngineError::Unsupported(m.clone()),
+            EngineError::Query(m) => EngineError::Query(m.clone()),
+            EngineError::Schema(m) => EngineError::Schema(m.clone()),
+            EngineError::Source(m) => EngineError::Source(m.clone()),
+            EngineError::Runtime(m) => EngineError::Runtime(m.clone()),
+            EngineError::DataFusion(_) => return None,
+        })
     }
 }
 
@@ -89,6 +116,22 @@ mod tests {
             EngineError::from(in_context),
             EngineError::Source(_)
         ));
+    }
+
+    #[test]
+    fn a_source_error_survives_a_repartition_sharing_it() {
+        let external =
+            || DataFusionError::External(Box::new(EngineError::Source("out of order".into())));
+        let alone = DataFusionError::Shared(std::sync::Arc::new(external()));
+        assert!(matches!(EngineError::from(alone), EngineError::Source(_)));
+
+        let held = std::sync::Arc::new(external());
+        let other_partition = std::sync::Arc::clone(&held);
+        assert!(matches!(
+            EngineError::from(DataFusionError::Shared(held)),
+            EngineError::Source(m) if m == "out of order"
+        ));
+        drop(other_partition);
     }
 
     #[test]

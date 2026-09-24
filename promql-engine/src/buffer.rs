@@ -437,7 +437,11 @@ mod tests {
     /// changes the answer, and `1e-9` would not see it.
     fn assert_bits(got: &[(i64, f64)], want: &[(i64, f64)], ctx: &dyn std::fmt::Display) {
         let bits = |s: &[(i64, f64)]| s.iter().map(|(t, v)| (*t, v.to_bits())).collect::<Vec<_>>();
-        assert_eq!(bits(got), bits(want), "{ctx}\n got: {got:?}\nwant: {want:?}");
+        assert_eq!(
+            bits(got),
+            bits(want),
+            "{ctx}\n got: {got:?}\nwant: {want:?}"
+        );
     }
 
     /// Counter resets, NaN runs, a staleness marker, signed zeros and a gap
@@ -603,11 +607,7 @@ mod tests {
             let whole = eval(Some(func), p, &[(&ts, &vs)]);
             // The reset is the first sample of the second chunk, so the
             // value it compares against lives only in the first.
-            let got = eval(
-                Some(func),
-                p,
-                &[(&ts[..6], &vs[..6]), (&ts[6..], &vs[6..])],
-            );
+            let got = eval(Some(func), p, &[(&ts[..6], &vs[..6]), (&ts[6..], &vs[6..])]);
             assert_bits(&got, &whole, &func.as_str());
         }
         assert_eq!(
@@ -809,7 +809,10 @@ mod tests {
             for (i, (cts, cvs)) in split(&ts, &vs, chunk).into_iter().enumerate() {
                 let steps = it.next_step;
                 it.push(cts, cvs, &mut out);
-                assert!(it.next_step > steps, "chunk {chunk}: no step finalised at {i}");
+                assert!(
+                    it.next_step > steps,
+                    "chunk {chunk}: no step finalised at {i}"
+                );
                 // Every finalised step but the first, whose window holds one
                 // sample, has a rate, and `size` counts at least the samples
                 // held: they are in `out` before the row is finished.

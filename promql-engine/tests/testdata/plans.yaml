@@ -10,7 +10,8 @@
 # source's label names, sorted and deduplicated: the label set is part of
 # what is being pinned. One sample per series is enough because nothing
 # but the label set reaches the planner, and a second adds nothing; the
-# loader rejects a series carrying more.
+# loader rejects a series carrying more unless the case sets `chunked_ms`,
+# where the samples decide how many batches the store hands over.
 defaults:
   start_ms: 600000
   end_ms: 1200000
@@ -129,14 +130,19 @@ tests:
     query: |
       x
     plan: |
+      Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+        TableScan: selector_0
     physical: |
+      AggregateExec: mode=Single, gby=[labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+        SeriesSetExec
+          DataSourceExec: partitions=1, partition_sizes=[4]
 
   - name: range function over chunk rows in four partitions
     description: >
       Four store partitions, each series whole in one of them and chunked
-      within it. Each partition's Partial folds its own series Sorted; an
-      order-preserving hash split on labels hands each finished series to
-      one Final, which stays Sorted too.
+      within it. Each partition's Partial folds its own series Sorted and
+      emits them finished; a merge on labels hands them in order to one
+      Final, which stays Sorted too.
     chunked_ms: 150000
     partitions: 4
     load:
@@ -145,4 +151,13 @@ tests:
     query: |
       rate(x[5m])
     plan: |
+      Projection: promql_labels(Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples
+        Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+          TableScan: selector_0
     physical: |
+      ProjectionExec: expr=[promql_labels(pod, get_field(labels@0, pod)) as labels, samples@1 as samples]
+        AggregateExec: mode=Final, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+          SortPreservingMergeExec: [labels@0 ASC]
+            AggregateExec: mode=Partial, gby=[labels@0 as labels], aggr=[promql_range_function(selector_0.samples, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+              SeriesSetExec
+                DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
