@@ -20,21 +20,15 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, ListArray, StructArray,
-    TimestampMillisecondArray,
-};
-use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::datatypes::{
-    DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
-};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, ListArray};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    lit, Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, EmitTo, Expr,
-    GroupsAccumulator, ScalarFunctionArgs, Signature, Volatility,
+    lit, Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, GroupsAccumulator, Signature,
+    Volatility,
 };
 
 use crate::buffer::{BufferedSeriesIterator, Kernel};
@@ -379,7 +373,6 @@ impl AggregateUDFImpl for VectorSelector {
 mod tests {
     use super::*;
     use crate::error::EngineError;
-    use datafusion::arrow::buffer::NullBuffer;
     use datafusion::logical_expr::EmitTo;
 
     const M: i64 = 60_000;
@@ -543,87 +536,6 @@ mod tests {
             },
         );
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn the_select_range_reflects_the_strict_lower_bound() {
-        let p = Params {
-            offset_ms: 30_000,
-            ..params()
-        };
-        assert_eq!(p.select_range(), (-(5 * M) + 1 - 30_000, 10 * M - 30_000));
-        let p = Params {
-            at_ms: Some(M),
-            ..params()
-        };
-        assert_eq!(p.select_range(), (M - 5 * M + 1, M));
-    }
-
-    #[test]
-    fn apply_runs_the_kernel_row_by_row() {
-        // Three series, so three distinct label sets.
-        let batch = series::encode(
-            &["s".to_string()],
-            &[
-                series::Series::new(&[("s", "a")], vec![0], vec![1.0]).unwrap(),
-                series::Series::new(&[("s", "b")], vec![], vec![]).unwrap(),
-                series::Series::new(&[("s", "c")], vec![0, M], vec![1.0, 2.0]).unwrap(),
-            ],
-        )
-        .unwrap();
-        let samples = batch
-            .column_by_name(series::SAMPLES)
-            .unwrap()
-            .as_list::<i32>();
-        let out = apply(
-            samples,
-            &Params {
-                end_ms: M,
-                ..params()
-            },
-        );
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.offsets().to_vec(), vec![0, 2, 2, 4]);
-    }
-
-    /// Three one-sample rows; the middle is null but still spans a sample.
-    fn with_a_null_row() -> ListArray {
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![0, 0, 0])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-            None,
-        );
-        ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, 1, 2, 3].into()),
-            Arc::new(entries),
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-    }
-
-    #[test]
-    fn a_null_row_yields_a_null_row() {
-        let out = apply(
-            &with_a_null_row(),
-            &Params {
-                end_ms: 0,
-                ..params()
-            },
-        );
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.null_count(), 1);
-        assert!(!out.is_null(0) && out.is_null(1) && !out.is_null(2));
-        // The sample the null row spans stays out of the output.
-        assert_eq!(out.offsets().to_vec(), vec![0, 1, 1, 2]);
-        let vs = out
-            .values()
-            .as_struct()
-            .column(1)
-            .as_primitive::<Float64Type>();
-        assert_eq!(vs.values(), &[1.0, 3.0]);
     }
 
     /// Gaps longer than the lookback, a stale marker, a NaN and repeated

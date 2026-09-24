@@ -17,7 +17,6 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, AsArray, ListArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::Result;
@@ -34,7 +33,7 @@ use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::math;
 use crate::params::{step_count, Params};
 use crate::selector::{empty_samples, EvalSeries};
-use crate::series::{self, SamplesBuilder};
+use crate::series;
 
 pub const NAME: &str = "promql_range_function";
 
@@ -622,9 +621,8 @@ impl AggregateUDFImpl for RangeFunction {
 mod tests {
     use super::*;
     use crate::selector::{is_stale, STALE_NAN_BITS};
-    use datafusion::arrow::array::{Float64Array, StructArray, TimestampMillisecondArray};
-    use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
-    use datafusion::arrow::datatypes::{Float64Type, TimestampMillisecondType};
+    use crate::series::SamplesBuilder;
+    use datafusion::arrow::array::AsArray;
 
     const S: i64 = 1000;
     const M: i64 = 60 * S;
@@ -1024,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_range_matches_apply_across_a_base_shift() {
+    fn advance_range_matches_one_chunk_across_a_base_shift() {
         let (ts, vs) = a_rough_series();
         let plain = Params {
             start_ms: 0,
@@ -1076,122 +1074,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Three one-sample rows; the middle is null but still spans a sample.
-    fn with_a_null_row() -> ListArray {
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![0, 0, 0])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-            None,
-        );
-        ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, 1, 2, 3].into()),
-            Arc::new(entries),
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-    }
-
-    #[test]
-    fn a_null_row_yields_a_null_row() {
-        let out = apply(
-            Func::CountOverTime,
-            &with_a_null_row(),
-            &Params {
-                start_ms: 0,
-                end_ms: 0,
-                ..at_5m()
-            },
-        );
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.null_count(), 1);
-        assert!(!out.is_null(0) && out.is_null(1) && !out.is_null(2));
-        // The sample the null row spans stays out of the output.
-        assert_eq!(out.offsets().to_vec(), vec![0, 1, 1, 2]);
-    }
-
-    /// A sliced `ListArray` shares its child and offsets verbatim with
-    /// the original: the first offset is not zero, and the child still
-    /// holds the dropped row's samples, including a stale one. The mask
-    /// and the recomputed offsets must line up against that shared
-    /// child, not against a zero-based view of it.
-    #[test]
-    fn a_stale_marker_in_a_dropped_row_does_not_shift_a_sliced_rows_offsets() {
-        let stale = f64::from_bits(STALE_NAN_BITS);
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![0, 0, 30 * S])),
-                Arc::new(Float64Array::from(vec![stale, 1.0, 2.0])),
-            ],
-            None,
-        );
-        // Row 0: one stale sample. Row 1: two clean samples.
-        let two_rows = ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, 1, 3].into()),
-            Arc::new(entries),
-            None,
-        );
-        let sliced = two_rows.slice(1, 1);
-
-        let p = Params {
-            start_ms: 30 * S,
-            end_ms: 30 * S,
-            window_ms: M,
-            ..at_5m()
-        };
-        let from_sliced = apply(Func::CountOverTime, &sliced, &p);
-
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![0, 30 * S])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0])),
-            ],
-            None,
-        );
-        let one_row = ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, 2].into()),
-            Arc::new(entries),
-            None,
-        );
-        let from_unsliced = apply(Func::CountOverTime, &one_row, &p);
-
-        assert_eq!(
-            from_sliced.offsets().to_vec(),
-            from_unsliced.offsets().to_vec()
-        );
-        let sliced_values = from_sliced.values().as_struct();
-        let unsliced_values = from_unsliced.values().as_struct();
-        assert_eq!(
-            sliced_values
-                .column_by_name(series::VALUE)
-                .unwrap()
-                .as_primitive::<Float64Type>()
-                .values(),
-            unsliced_values
-                .column_by_name(series::VALUE)
-                .unwrap()
-                .as_primitive::<Float64Type>()
-                .values()
-        );
-        // Both count the window's two samples.
-        assert_eq!(
-            from_unsliced
-                .values()
-                .as_struct()
-                .column_by_name(series::VALUE)
-                .unwrap()
-                .as_primitive::<Float64Type>()
-                .value(0),
-            2.0
-        );
     }
 
     /// The grid literals are read by a helper shared with the vector
