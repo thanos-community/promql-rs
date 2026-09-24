@@ -170,8 +170,8 @@ Without the third the overlap rule drops an earlier row's samples. A store
 adapted from the Store API sorts each series' chunk metas before emitting
 rows, as the proxy does, touching metas, not samples.
 
-**Checks.** The engine never sorts or buffers to repair order; that is the
-concatenation problem again. It always checks, one comparison per row:
+**Checks.** The engine never sorts or buffers rows to repair order; that
+is the concatenation problem again. It always checks, one comparison per row:
 labels non-decreasing between adjacent rows of a partition, which also
 catches a closed series reappearing, and first sample timestamp
 non-decreasing within a series. A violation is a query error.
@@ -181,18 +181,52 @@ loses the declared `labels` ordering or keeps a series from staying whole
 in one partition, which `CoalescePartitionsExec` and `RepartitionExec`
 without `preserve_order` do between scan and selector.
 
-**Session flags.** The engine turns off the three DataFusion rewrites that
-deal one series' rows to several partitions: round-robin repartitioning
-(inserted under a partial aggregate,
-`datafusion-physical-optimizer-54.1.0/src/enforce_distribution.rs:1309-1314`),
-file-scan repartitioning, and hash repartitioning of aggregations.
-`check_selector_plans` (`engine.rs`) then refuses, per plan, a selector
-aggregate that is not Sorted over `SeriesSetExec`. Parallelism comes from
-store partitions and `SelectHints.shard` instead. Hash repartitioning with
-`prefer_existing_sort` would regain it for the upper aggregates, and keeps
-both selector aggregates Sorted, but it is deferred: the plan then ends in
-`target_partitions` partitions, series come back in arrival order, and
-struct columns have no sort kernel to restore it.
+**Session flags.** `SeriesSetExec` declares `Hash([labels], n)` over the
+store's n partitions. That is what DataFusion means by the contract's
+"never crossing a partition", and it is exactly what the selector
+aggregate needs. With `repartition_aggregations` on, DataFusion finds
+that requirement already met and plans the selector and range aggregates
+`SinglePartitioned`, Sorted, one per store partition, with no merge and
+no Final. Partitions meet only at the shuffle an upper `sum by (…)`
+needs for its own key, which moves one partial state per group and
+partition, not samples. It takes `subset_repartition_threshold = 1` as
+well: below its default of four input partitions `add_hash_on_top`
+(`datafusion-physical-optimizer-54.1.0/src/enforce_distribution.rs:897-902`)
+re-hashes a satisfied input just to reach `target_partitions`, splitting
+the selector back into Partial and FinalPartitioned. Round-robin and
+file-scan repartitioning stay off. A byte-range scan split cuts through
+a series. Round-robin is inserted under a partial aggregate
+(`enforce_distribution.rs:1309-1314`); today the Hash requirement keeps
+it above the selector, over finished series, but that requirement is the
+only thing that does. `check_selector_plans` (`engine.rs`) refuses, per
+plan, a selector aggregate that is not Sorted over `SeriesSetExec`.
+Parallelism below the selector is the store's partition count and
+`SelectHints.shard`, never `target_partitions`.
+
+**Output order.** The plan ends in as many partitions as the store has,
+and they finish in any order. Prometheus sorts a range query's matrix
+before returning it (prom `promql/engine.go`, `sort.Sort(mat)`), and so
+does `range_query_async`, once, over finished rows: O(series log
+series) comparisons, then one copy of the samples into the new order,
+which a single store partition skips, since its rows arrive in it. The
+order is `labels.Compare` over the
+labels a series has. The `labels` struct's own order is not it: it
+compares field by field and an absent label is `""`, so two series with
+different label names can sort the other way. A `SortPreservingMergeExec`
+at the root would be that wrong order, and would not survive the label
+rebuild above an aggregate anyway.
+
+**Co-partitioning.** The declared hash is the store's bucketing, not
+DataFusion's hash function, and DataFusion checks neither the function
+nor the count (`datafusion-physical-expr-54.1.0/src/partitioning.rs:219-222`).
+Aggregates and windows only need each key in one partition, never which
+one. A partitioned join matches partition i with partition i and would
+line a store's bucket up against DataFusion's, or another store's, and
+drop matches silently. `check_selector_plans` therefore refuses a
+partitioned join with an input that still carries the declaration.
+Vector matching will join on a rebuilt label key, which sheds it:
+`Partitioning::project` turns a key the projection does not carry into
+an `UnKnownColumn`, which equals nothing, itself included.
 
 **Overlap.** The first row wins: the engine skips samples at or before the
 last timestamp seen for the series, as Thanos's `chunkSeriesIterator` does

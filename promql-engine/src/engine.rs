@@ -11,10 +11,10 @@
 //! ([`crate::series`]), not decoded [`Series`](crate::Series): this is a
 //! DataFusion engine, and Arrow in, Arrow out lets a caller stay on
 //! `RecordBatch` end to end instead of paying to materialize Rust values
-//! it may only re-encode. The two things applied before the batches come
-//! back are [`series::drop_empty`] — see its doc for why that can't live
-//! in the plan — and `labelset::reject_same_labelset`, which is
-//! Prometheus's own post-evaluation pass.
+//! it may only re-encode. Applied before the batches come back are
+//! [`series::drop_empty`] — see its doc for why that can't live in the
+//! plan — and `labelset::reject_same_labelset` and
+//! `labelset::sort_by_labelset`, Prometheus's own post-evaluation passes.
 //!
 //! Between planning and execution the physical plan goes through
 //! [`check_selector_plans`]. The selector and range aggregates bound memory
