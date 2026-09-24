@@ -1,32 +1,39 @@
-//! Range-vector functions as one DataFusion scalar function:
-//! `promql_range_function(samples, 'rate', start, end, step, range, offset, at)`.
+//! Range-vector functions as one DataFusion grouped aggregate function:
+//! `promql_range_function(samples, 'rate', start, end, step, range, offset, at)`
+//! grouped by `labels`.
 //!
 //! A range function is the vector selector's shape with a window instead
-//! of a lookback: one series' slice in, that series' values on the step
-//! grid out, DataFusion parallel over rows. The function name is a
-//! literal argument, like every parameter, so one registration serves all
-//! of them and the plan says which it is.
+//! of a lookback, so it runs in the selector's accumulator, [`EvalSeries`],
+//! with [`advance_range`] as the walk: one series' chunk rows in, that
+//! series' values on the step grid out. The function name is a literal
+//! argument, like every parameter, so one registration serves all of them
+//! and the plan says which it is.
 //!
 //! Semantics are `matrixIterSlice`, `extrapolatedRate`, `instantValue`
 //! and the `*_over_time` functions in Prometheus's `promql/functions.go`
 //! and `engine.go`. Floats only; native histograms are a later slice.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, ListArray};
+use datafusion::arrow::array::{Array, AsArray, ListArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
+use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    lit, ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility,
+    lit, Accumulator, AggregateUDF, AggregateUDFImpl, Expr, GroupsAccumulator, Signature,
+    Volatility,
 };
+use datafusion::physical_expr::expressions::Literal;
+use datafusion::physical_expr::PhysicalExpr;
 
 use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::math;
 use crate::params::{step_count, Params};
-use crate::selector::int_arg;
+use crate::selector::{empty_samples, EvalSeries};
 use crate::series::{self, SamplesBuilder};
 
 pub const NAME: &str = "promql_range_function";
@@ -500,19 +507,21 @@ pub struct RangeFunction {
 
 impl Default for RangeFunction {
     fn default() -> Self {
+        let mut args = vec![series::samples_type(), DataType::Utf8];
+        args.extend(std::iter::repeat_n(DataType::Int64, 6));
         Self {
-            signature: Signature::any(8, Volatility::Immutable),
+            signature: Signature::exact(args, Volatility::Immutable),
         }
     }
 }
 
-pub fn udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(RangeFunction::default())
+pub fn udaf() -> AggregateUDF {
+    AggregateUDF::new_from_impl(RangeFunction::default())
 }
 
 /// `promql_range_function(samples, '<func>', start, end, step, range, offset, at)`.
 pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
-    udf().call(vec![
+    udaf().call(vec![
         samples,
         lit(func.as_str()),
         lit(p.start_ms),
@@ -520,14 +529,33 @@ pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
         lit(p.step_ms),
         lit(p.window_ms),
         lit(p.offset_ms),
-        match p.at_ms {
-            Some(at) => lit(at),
-            None => lit(ScalarValue::Int64(None)),
-        },
+        lit(ScalarValue::Int64(p.at_ms)),
     ])
 }
 
-impl ScalarUDFImpl for RangeFunction {
+/// The function name and the grid, read off a planned call's literals.
+/// Every error names this function: the grid literals are read by a
+/// helper shared with the selector, whose own message cannot say which
+/// of the two it was reading for.
+fn read_args(exprs: &[Arc<dyn PhysicalExpr>]) -> Result<(Func, Params)> {
+    let name = exprs
+        .get(1)
+        .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
+        .map(Literal::value);
+    let func = match name {
+        Some(ScalarValue::Utf8(Some(name))) => match Func::parse(name) {
+            Some(func) => func,
+            None => return plan_err!("{NAME}: unknown function {name}"),
+        },
+        other => {
+            return plan_err!("{NAME}: the function name must be a Utf8 literal, got {other:?}")
+        }
+    };
+    let params = Params::from_literals(exprs, 2).map_err(|e| e.context(NAME))?;
+    Ok((func, params))
+}
+
+impl AggregateUDFImpl for RangeFunction {
     fn name(&self) -> &str {
         NAME
     }
@@ -536,6 +564,8 @@ impl ScalarUDFImpl for RangeFunction {
         &self.signature
     }
 
+    /// Same shape out as in. The check here is what makes a mistyped
+    /// samples column a plan error rather than a downcast panic.
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         if arg_types.first() != Some(&series::samples_type()) {
             return plan_err!(
@@ -544,73 +574,55 @@ impl ScalarUDFImpl for RangeFunction {
                 arg_types.first()
             );
         }
-        if arg_types.get(1) != Some(&DataType::Utf8) {
-            return plan_err!("{NAME}: second argument must be the function name as Utf8");
-        }
-        for (i, t) in arg_types.iter().enumerate().skip(2) {
-            if !matches!(t, DataType::Int64 | DataType::Null) {
-                return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
-            }
-        }
         Ok(series::samples_type())
     }
 
-    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        let types: Vec<DataType> = args
-            .arg_fields
-            .iter()
-            .map(|f| f.data_type().clone())
-            .collect();
-        let data_type = self.return_type(&types)?;
-        // A null row maps to a null row, so nullability mirrors the input.
-        let nullable = args.arg_fields[0].is_nullable();
-        Ok(Arc::new(Field::new(NAME, data_type, nullable)))
+    /// Every series yields a list, possibly empty; never NULL, so the
+    /// output is the canonical shape it came in as.
+    fn is_nullable(&self) -> bool {
+        false
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let samples: ArrayRef = match &args.args[0] {
-            ColumnarValue::Array(a) => Arc::clone(a),
-            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
-        };
-        let func = match &args.args[1] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) => {
-                Func::parse(name).ok_or_else(|| {
-                    DataFusionError::Execution(format!("{NAME}: unknown function {name}"))
-                })?
-            }
-            other => {
-                return Err(DataFusionError::Execution(format!(
-                    "{NAME}: function name must be a string literal, got {:?}",
-                    other.data_type()
-                )))
-            }
-        };
-        let need = |i: usize, what: &str| -> Result<i64> {
-            int_arg(&args, i, NAME)?.ok_or_else(|| {
-                DataFusionError::Execution(format!("{NAME}: {what} must not be NULL"))
-            })
-        };
-        let p = Params {
-            start_ms: need(2, "start")?,
-            end_ms: need(3, "end")?,
-            step_ms: need(4, "step")?,
-            window_ms: need(5, "range")?,
-            offset_ms: need(6, "offset")?,
-            at_ms: int_arg(&args, 7, NAME)?,
-        };
-        Ok(ColumnarValue::Array(Arc::new(apply(
-            func,
-            samples.as_list::<i32>(),
-            &p,
-        ))))
+    /// Without a group key there is no series to fold rows into.
+    fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        plan_err!("{NAME} must be grouped by labels")
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        Ok(vec![Arc::new(Field::new(
+            format_state_name(args.name, "samples"),
+            series::samples_type(),
+            false,
+        ))])
+    }
+
+    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+        true
+    }
+
+    /// `DISTINCT` would deduplicate chunk rows, which is the overlap rule's
+    /// job; answering without it would be silently different.
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.is_distinct {
+            return plan_err!("{NAME}: DISTINCT is not supported");
+        }
+        let (func, params) = read_args(args.exprs)?;
+        Ok(Box::new(EvalSeries::new(Kernel::Range(func), params)))
+    }
+
+    fn default_value(&self, _data_type: &DataType) -> Result<ScalarValue> {
+        Ok(empty_samples())
     }
 }
 
 /// Run the kernel over every row of a samples column, each row being a
 /// whole series in one chunk.
 ///
-/// This is the cursor fed one chunk per series, kept only until the
-/// range function is an aggregate that feeds it chunk rows itself.
+/// This is the cursor fed one chunk per series: no plan calls it any more,
+/// it stays as the one-row oracle until the scalar path is deleted.
 pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
     // Offsets index the child as it is, so a sliced `ListArray`, whose
     // offsets need not start at zero and whose child may still hold the
@@ -645,7 +657,6 @@ mod tests {
     use datafusion::arrow::array::{Float64Array, StructArray, TimestampMillisecondArray};
     use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
     use datafusion::arrow::datatypes::{Float64Type, TimestampMillisecondType};
-    use datafusion::common::config::ConfigOptions;
 
     const S: i64 = 1000;
     const M: i64 = 60 * S;
@@ -1238,36 +1249,30 @@ mod tests {
         );
     }
 
-    /// `int_arg` is shared with the vector selector.
+    /// The grid literals are read by a helper shared with the vector
+    /// selector, so the name has to be added on the way out.
     #[test]
     fn an_argument_error_names_the_range_function() {
-        let args = vec![
-            ColumnarValue::Array(Arc::new(with_a_null_row())),
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some("rate".into()))),
+        let lit = |v: ScalarValue| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>;
+        let exprs = vec![
+            lit(ScalarValue::Null),
+            lit(ScalarValue::Utf8(Some("rate".into()))),
             // `start`, which is not an Int64 literal.
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some("noon".into()))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(30 * S))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(5 * M))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
-            ColumnarValue::Scalar(ScalarValue::Int64(None)),
+            lit(ScalarValue::Utf8(Some("noon".into()))),
+            lit(ScalarValue::Int64(Some(0))),
+            lit(ScalarValue::Int64(Some(30 * S))),
+            lit(ScalarValue::Int64(Some(5 * M))),
+            lit(ScalarValue::Int64(Some(0))),
+            lit(ScalarValue::Int64(None)),
         ];
-        let arg_fields = args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| Arc::new(Field::new(format!("arg{i}"), a.data_type(), true)) as FieldRef)
-            .collect();
-        let err = RangeFunction::default()
-            .invoke_with_args(ScalarFunctionArgs {
-                args,
-                arg_fields,
-                number_rows: 3,
-                return_field: Arc::new(Field::new(NAME, series::samples_type(), false)),
-                config_options: Arc::new(ConfigOptions::default()),
-            })
-            .unwrap_err()
-            .to_string();
+        let err = read_args(&exprs).unwrap_err().to_string();
         assert!(err.contains(NAME), "{err}");
         assert!(!err.contains(crate::selector::NAME), "{err}");
+
+        let mut unknown = exprs;
+        unknown[1] = lit(ScalarValue::Utf8(Some("rote".into())));
+        unknown[2] = lit(ScalarValue::Int64(Some(0)));
+        let err = read_args(&unknown).unwrap_err().to_string();
+        assert!(err.contains(NAME) && err.contains("rote"), "{err}");
     }
 }

@@ -51,7 +51,7 @@ impl Engine {
         ctx.register_udaf(selector::udaf());
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
-        ctx.register_udf(range::udf());
+        ctx.register_udaf(range::udaf());
         Self { ctx, rt: None }
     }
 

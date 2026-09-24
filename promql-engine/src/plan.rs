@@ -15,9 +15,10 @@
 //! Projection: promql_labels('pod', __group__pod) AS labels, samples
 //!   Aggregate: groupBy=[get_field(labels, 'pod') AS __group__pod],
 //!              aggr=[promql_aggregate(samples, 'sum') AS samples]
-//!     Projection: promql_labels(…without __name__) AS labels,
-//!                 promql_range_function(samples, 'rate', …) AS samples
-//!       TableScan: selector_0          ← SelectorTable over SeriesSource::select
+//!     Projection: promql_labels(…without __name__) AS labels, samples
+//!       Aggregate: groupBy=[labels],
+//!                  aggr=[promql_range_function(samples, 'rate', …) AS samples]
+//!         TableScan: selector_0        ← SelectorTable over SeriesSource::select
 //! ```
 //!
 //! The `__group__` prefix on a group key keeps a label named `labels`
@@ -280,16 +281,21 @@ impl Planner<'_> {
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
-        let (labels_expr, label_names) = if func.drops_metric_name() {
-            labels::keep(&input_names, |n| n != METRIC_NAME)
-        } else {
-            (col(LABELS), input_names)
-        };
+        let builder = builder.aggregate(
+            vec![col(LABELS)],
+            vec![range::call(col(SAMPLES), func, &params).alias(SAMPLES)],
+        )?;
+        // `__name__` is dropped above the grouping, not below it: below, two
+        // series differing only in their name would fold into one group.
+        if !func.drops_metric_name() {
+            return Ok(Planned {
+                plan: builder.build()?,
+                label_names: input_names,
+            });
+        }
+        let (labels_expr, label_names) = labels::keep(&input_names, |n| n != METRIC_NAME);
         let plan = builder
-            .project(vec![
-                labels_expr.alias(LABELS),
-                range::call(col(SAMPLES), func, &params).alias(SAMPLES),
-            ])?
+            .project(vec![labels_expr.alias(LABELS), col(SAMPLES)])?
             .build()?;
         Ok(Planned { plan, label_names })
     }

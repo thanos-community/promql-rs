@@ -368,7 +368,7 @@ pub fn call(samples: Expr, p: &Params) -> Expr {
 }
 
 /// What a group with no rows yields: no samples.
-fn empty_samples() -> ScalarValue {
+pub(crate) fn empty_samples() -> ScalarValue {
     let mut b = SamplesBuilder::default();
     b.finish_row();
     ScalarValue::List(Arc::new(b.take_all()))

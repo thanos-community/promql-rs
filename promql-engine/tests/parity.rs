@@ -153,12 +153,9 @@ fn replay_against_unchunked() {
 }
 
 /// `chunked(k)` for `k` in `{0, one interval, 150s, 1h}`, against the
-/// same recorded corpus. Ignored: chunking a series into several rows is
-/// what steps 1 and 2 make correct (`BufferedSeriesIterator`,
-/// `advance_selector`/`advance_range`); today it still breaks the same
-/// way `tests/chunked.rs` demonstrates. Un-ignore once those land.
+/// same recorded corpus. `0` is one sample per row, so every window
+/// crosses a row boundary.
 #[test]
-#[ignore = "chunked SeriesSource rows aren't handled correctly until steps 1-2 land"]
 fn replay_against_chunked() {
     let corpus = load_corpus();
     let interval_ms = (corpus.interval_secs * 1000.0).round() as i64;
