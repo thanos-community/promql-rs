@@ -23,6 +23,10 @@
 //! edit. Read it before pasting — the point is to notice a shape you did
 //! not expect, not to record one.
 //!
+//! A `physical: |` block, added the same way, also pins the
+//! `ExecutionPlan`. Only small cases can carry one: partition counts and
+//! repartitioning make larger physical plans too fragile to hold as text.
+//!
 //! # Why the series are per case
 //!
 //! A projection over the source names the label fields one by one, and
@@ -52,6 +56,8 @@
 
 use std::path::{Path, PathBuf};
 
+use datafusion::physical_plan::displayable;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery};
 use serde::Deserialize;
 
@@ -76,13 +82,18 @@ struct Case {
     load: Vec<String>,
     query: String,
     plan: String,
+    /// The `ExecutionPlan`, for shapes the logical plan cannot show: the
+    /// store-order wrapper and the physical operators DataFusion picks.
+    /// Pinned only where the text does not depend on the machine.
+    physical: Option<String>,
 }
 
 fn plans_file() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/plans.yaml")
 }
 
-fn plan_of(case: &Case, range: &RangeQuery) -> String {
+/// The logical plan's text, and the physical plan's when `case` pins one.
+fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     let series: Vec<_> = case
         .load
         .iter()
@@ -115,8 +126,21 @@ fn plan_of(case: &Case, range: &RangeQuery) -> String {
         .block_on(engine.plan_async(&source, case.query.trim_end(), range))
         .expect("the query plans");
     // The renderer borrows the plan, so it cannot be the tail expression.
-    let rendered = plan.display_indent().to_string();
-    rendered
+    let logical = plan.display_indent().to_string();
+    let physical = case.physical.as_ref().map(|_| {
+        // Target partitions are fixed because DataFusion defaults them to
+        // the core count, which would put the machine into the text. The
+        // context is otherwise stock: the logical plan already carries its
+        // functions, so nothing needs registering.
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        let exec = rt
+            .block_on(async { ctx.execute_logical_plan(plan).await?.create_physical_plan().await })
+            .expect("the plan lowers");
+        // The renderer borrows the plan, so it cannot be the tail expression.
+        let rendered = displayable(exec.as_ref()).indent(true).to_string();
+        rendered
+    });
+    (logical, physical)
 }
 
 #[test]
@@ -137,16 +161,26 @@ fn every_case_plans_to_its_expected_shape() {
     // the update a single reviewable edit.
     let mut failures = Vec::new();
     for case in &suite.tests {
-        let expected = case.plan.trim_end();
-        let actual = plan_of(case, &range);
-        if actual != expected {
-            failures.push(format!(
-                "case {:?}\n  query:    {}\n  expected: {}\n  actual:   {}",
-                case.name,
-                case.query.trim_end(),
-                expected.replace('\n', "\n            "),
-                actual.replace('\n', "\n            "),
-            ));
+        let (logical, physical) = plan_of(case, &range);
+        let pairs = [
+            ("plan", Some(case.plan.as_str()), Some(logical)),
+            ("physical", case.physical.as_deref(), physical),
+        ];
+        for (block, expected, actual) in pairs {
+            let (Some(expected), Some(actual)) = (expected, actual) else {
+                continue;
+            };
+            let expected = expected.trim_end();
+            let actual = actual.trim_end();
+            if actual != expected {
+                failures.push(format!(
+                    "case {:?}, {block}:\n  query:    {}\n  expected: {}\n  actual:   {}",
+                    case.name,
+                    case.query.trim_end(),
+                    expected.replace('\n', "\n            "),
+                    actual.replace('\n', "\n            "),
+                ));
+            }
         }
     }
     assert!(

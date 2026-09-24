@@ -31,6 +31,7 @@ tests:
     plan: |
       Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
         TableScan: selector_0
+    physical: |
 
   - name: aggregation over an instant selector
     description: >

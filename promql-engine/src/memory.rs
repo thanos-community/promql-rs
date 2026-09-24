@@ -258,7 +258,7 @@ fn chunk_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::{collect, ExecutionPlanProperties};
     use datafusion::prelude::SessionContext;
     use promql_parser::ast::MatchOp;
     use promql_parser::posrange::PositionRange;
@@ -420,6 +420,106 @@ mod tests {
         assert_eq!(src.series().len(), 1);
         assert_eq!(src.series()[0].values(), [2.0]);
         assert_eq!(src.series()[0].label("env"), "");
+    }
+
+    async fn select_all(src: &MemorySeriesSource) -> Arc<dyn ExecutionPlan> {
+        let ctx = SessionContext::new();
+        src.select(&ctx.state(), &[], SelectHints::range(0, i64::MAX))
+            .await
+            .unwrap()
+    }
+
+    fn pods(batches: &[RecordBatch]) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let labels = b.column_by_name(LABELS).unwrap().as_struct();
+                (0..b.num_rows())
+                    .map(|r| {
+                        labels
+                            .fields()
+                            .iter()
+                            .zip(labels.columns())
+                            .map(|(f, c)| format!("{}={}", f.name(), c.as_string_view().value(r)))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The store's order is DataFusion's struct order, the one
+    /// `SeriesSetExec` declares: `{b="1"}` is `("", "1")` and precedes
+    /// `{a="1"}`, `("1", "")`, although Prometheus sorts them the other
+    /// way round and `from_descriptions` merges them in that order.
+    #[tokio::test]
+    async fn series_come_out_in_struct_order() {
+        let series: Vec<SeriesDescription> = [r#"x{a="1"} 1"#, r#"x{b="1"} 1"#, r#"x{a="1",b="1"} 1"#]
+            .iter()
+            .map(|l| promql_parser::parse_series_desc(l).unwrap())
+            .collect();
+        let src = MemorySeriesSource::from_descriptions(&series, 1.0);
+        let ctx = SessionContext::new();
+        let plan = src
+            .select(&ctx.state(), &[], SelectHints::range(0, 1_000))
+            .await
+            .unwrap();
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        assert_eq!(
+            pods(&batches),
+            [
+                "__name__=x,a=,b=1",
+                "__name__=x,a=1,b=",
+                "__name__=x,a=1,b=1",
+            ]
+        );
+    }
+
+    /// Every series lands whole in one partition, its chunk rows in time
+    /// order, and the partitions together hold exactly the unpartitioned
+    /// rows, each partition itself in struct order.
+    #[tokio::test]
+    async fn partitions_keep_each_series_whole_and_ordered() {
+        let many: Vec<Series> = (0..16)
+            .map(|i| counter(&[("__name__", "x"), ("pod", &format!("p{i:02}"))], 0.0, 1.0, 10))
+            .collect();
+        let whole = select_all(&MemorySeriesSource::try_new(many.clone()).unwrap()).await;
+        let parted = select_all(
+            &MemorySeriesSource::try_new(many)
+                .unwrap()
+                .partitions(4)
+                .chunked(60_000),
+        )
+        .await;
+        assert_eq!(parted.output_partitioning().partition_count(), 4);
+
+        let ctx = SessionContext::new();
+        let mut seen: Vec<String> = Vec::new();
+        for p in 0..4 {
+            let stream = parted.execute(p, ctx.task_ctx()).unwrap();
+            let batches = datafusion::physical_plan::common::collect(stream).await.unwrap();
+            let rows = pods(&batches);
+            assert!(!rows.is_empty(), "partition {p} is empty; 16 series should spread");
+            let mut series = rows.clone();
+            series.dedup();
+            assert!(series.windows(2).all(|w| w[0] < w[1]), "partition {p}: {rows:?}");
+            let mut runs: Vec<(String, Vec<i64>)> = Vec::new();
+            for s in crate::series::decode(&batches).unwrap() {
+                let key = format!("{:?}", s.labels().collect::<Vec<_>>());
+                match runs.last_mut() {
+                    Some((k, ts)) if *k == key => ts.extend_from_slice(s.timestamps()),
+                    _ => runs.push((key, s.timestamps().to_vec())),
+                }
+            }
+            for (key, ts) in &runs {
+                assert_eq!(ts.len(), 10, "partition {p}: {key} lost samples");
+                assert!(ts.windows(2).all(|w| w[0] < w[1]), "partition {p}: {key} {ts:?}");
+            }
+            seen.extend(series);
+        }
+        seen.sort();
+        assert_eq!(seen, pods(&collect(whole, ctx.task_ctx()).await.unwrap()));
     }
 
     #[tokio::test]

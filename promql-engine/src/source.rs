@@ -206,3 +206,192 @@ impl TableProvider for SelectorTable {
         )?))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{
+        ArrayRef, Float64Array, ListArray, RecordBatch, StringViewArray, StructArray,
+        TimestampMillisecondArray,
+    };
+    use datafusion::arrow::buffer::OffsetBuffer;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::{collect, ExecutionPlanProperties};
+    use datafusion::prelude::SessionContext;
+
+    use crate::series::{sample_fields, sample_item, schema};
+
+    /// Rows `(labels, timestamps)` of one batch over the label `names`;
+    /// a label missing from a row is `""`, as in the canonical shape.
+    fn batch(names: &[&str], rows: &[(&[(&str, &str)], &[i64])]) -> RecordBatch {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let schema = schema(&names);
+        let columns: Vec<ArrayRef> = names
+            .iter()
+            .map(|n| {
+                let values = rows.iter().map(|(labels, _)| {
+                    labels.iter().find(|(k, _)| k == n).map_or("", |(_, v)| *v)
+                });
+                Arc::new(StringViewArray::from_iter_values(values)) as ArrayRef
+            })
+            .collect();
+        let labels = match schema.field(0).data_type() {
+            datafusion::arrow::datatypes::DataType::Struct(f) if f.is_empty() => {
+                StructArray::new_empty_fields(rows.len(), None)
+            }
+            datafusion::arrow::datatypes::DataType::Struct(f) => {
+                StructArray::new(f.clone(), columns, None)
+            }
+            _ => unreachable!("canonical"),
+        };
+        let ts: Vec<i64> = rows.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+        let entries = StructArray::new(
+            sample_fields(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(ts.clone())),
+                Arc::new(Float64Array::from(vec![1.0; ts.len()])),
+            ],
+            None,
+        );
+        let offsets = OffsetBuffer::from_lengths(rows.iter().map(|(_, t)| t.len()));
+        let samples = ListArray::new(sample_item(), offsets, Arc::new(entries), None);
+        RecordBatch::try_new(schema, vec![Arc::new(labels), Arc::new(samples)]).unwrap()
+    }
+
+    fn series_set(partitions: Vec<Vec<RecordBatch>>) -> Arc<SeriesSetExec> {
+        let schema = partitions
+            .iter()
+            .flatten()
+            .next()
+            .expect("at least one batch")
+            .schema();
+        let child = MemorySourceConfig::try_new_exec(&partitions, schema, None).unwrap();
+        Arc::new(SeriesSetExec::new(child))
+    }
+
+    async fn run(partitions: Vec<Vec<RecordBatch>>) -> std::result::Result<Vec<RecordBatch>, EngineError> {
+        let ctx = SessionContext::new();
+        Ok(collect(series_set(partitions), ctx.task_ctx()).await?)
+    }
+
+    async fn refused(partitions: Vec<Vec<RecordBatch>>) -> String {
+        match run(partitions).await {
+            Err(EngineError::Source(msg)) => msg,
+            other => panic!("expected EngineError::Source, got {other:?}"),
+        }
+    }
+
+    const A: &[(&str, &str)] = &[("pod", "a")];
+    const B: &[(&str, &str)] = &[("pod", "b")];
+
+    #[tokio::test]
+    async fn descending_labels_are_refused() {
+        let msg = refused(vec![vec![batch(&["pod"], &[(B, &[1]), (A, &[1])])]]).await;
+        assert!(msg.contains(r#"pod="a""#), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_closed_series_reappearing_is_refused() {
+        let msg = refused(vec![vec![
+            batch(&["pod"], &[(A, &[1, 2])]),
+            batch(&["pod"], &[(B, &[1])]),
+            batch(&["pod"], &[(A, &[3])]),
+        ]])
+        .await;
+        assert!(msg.contains(r#"pod="a""#), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_first_timestamp_going_backwards_is_refused() {
+        let msg = refused(vec![vec![
+            batch(&["pod"], &[(A, &[100, 200])]),
+            batch(&["pod"], &[(A, &[50])]),
+        ]])
+        .await;
+        assert!(msg.contains(r#"pod="a""#) && msg.contains("50"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_series_split_across_three_batches_passes_untouched() {
+        let input = vec![
+            batch(&["pod"], &[(A, &[1, 2])]),
+            batch(&["pod"], &[(A, &[3])]),
+            batch(&["pod"], &[(A, &[3, 4]), (B, &[1])]),
+        ];
+        let out = run(vec![input.clone()]).await.unwrap();
+        assert_eq!(out, input);
+    }
+
+    /// An empty row has no first timestamp to check, and carries nothing
+    /// an operator could fold, so neither its position nor its labels
+    /// can make a result wrong.
+    #[tokio::test]
+    async fn empty_rows_are_not_checked() {
+        run(vec![vec![
+            batch(&["pod"], &[(A, &[100, 200]), (A, &[]), (A, &[300])]),
+            batch(&["pod"], &[(B, &[1]), (A, &[]), (B, &[2])]),
+        ]])
+        .await
+        .unwrap();
+    }
+
+    /// `labels ASC` is DataFusion's struct order: fields by name, compared
+    /// one at a time, an absent label as `""`. `{b="1"}` is `("", "1")`
+    /// and sorts before `{a="1"}`, `("1", "")`, the reverse of Prometheus's
+    /// `labels.Compare`; the declaration can only be true in the order
+    /// DataFusion compares in.
+    #[tokio::test]
+    async fn sparse_label_sets_pass_in_struct_order() {
+        run(vec![vec![batch(
+            &["a", "b"],
+            &[(&[("b", "1")], &[1]), (&[("a", "1")], &[1]), (&[("a", "1"), ("b", "1")], &[1])],
+        )]])
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prometheus_order_is_refused_where_it_differs() {
+        refused(vec![vec![batch(
+            &["a", "b"],
+            &[(&[("a", "1")], &[1]), (&[("b", "1")], &[1])],
+        )]])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_label_set_without_labels_is_one_series() {
+        run(vec![vec![
+            batch(&[], &[(&[], &[1, 2])]),
+            batch(&[], &[(&[], &[3])]),
+        ]])
+        .await
+        .unwrap();
+        refused(vec![vec![batch(&[], &[(&[], &[2]), (&[], &[1])])]]).await;
+    }
+
+    /// Each partition is its own stream of series; the same label set in
+    /// two partitions is the plan's problem, not the order check's.
+    #[tokio::test]
+    async fn partitions_are_checked_independently() {
+        let out = run(vec![
+            vec![batch(&["pod"], &[(B, &[1])])],
+            vec![batch(&["pod"], &[(A, &[1])])],
+        ])
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn declares_labels_ascending_and_keeps_the_partitioning() {
+        let exec = series_set(vec![
+            vec![batch(&["pod"], &[(A, &[1])])],
+            vec![batch(&["pod"], &[(B, &[1])])],
+        ]);
+        assert_eq!(exec.output_partitioning().partition_count(), 2);
+        let ordering = exec.output_ordering().expect("an ordering");
+        assert_eq!(ordering.to_string(), "[labels@0 ASC]");
+        assert_eq!(exec.maintains_input_order(), [true]);
+    }
+}

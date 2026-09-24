@@ -34,3 +34,29 @@ pub enum EngineError {
     #[error("runtime: {0}")]
     Runtime(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store-order violation is raised inside an `ExecutionPlan`, where
+    /// only a `DataFusionError` can be returned; callers must still be
+    /// able to match on the variant.
+    #[test]
+    fn a_source_error_survives_the_trip_through_datafusion() {
+        let wrapped = DataFusionError::External(Box::new(EngineError::Source("out of order".into())));
+        assert!(matches!(EngineError::from(wrapped), EngineError::Source(m) if m == "out of order"));
+
+        let in_context = DataFusionError::Context(
+            "while collecting".into(),
+            Box::new(DataFusionError::External(Box::new(EngineError::Source("x".into())))),
+        );
+        assert!(matches!(EngineError::from(in_context), EngineError::Source(_)));
+    }
+
+    #[test]
+    fn any_other_datafusion_error_stays_one() {
+        let e = EngineError::from(DataFusionError::Execution("boom".into()));
+        assert!(matches!(e, EngineError::DataFusion(_)), "{e:?}");
+    }
+}
