@@ -230,15 +230,17 @@ impl TableProvider for SelectorTable {
 /// `InputOrderMode::Sorted`, holding one open series per partition instead
 /// of every series of the scan. A store cannot be trusted with that on its
 /// word, because a wrong declaration does not fail, it splits a series in
-/// two and answers twice. So every non-empty row is compared with the one
-/// before it in its partition: labels must not descend, which also catches
-/// a closed series reappearing, and within one label set the first sample
-/// timestamp must not go backwards. Nothing is sorted or buffered to
-/// repair a violation; that would be the whole-series concatenation chunk
-/// rows exist to avoid. It is an [`EngineError::Source`] instead.
-///
-/// Empty rows are not compared: they carry nothing to fold, so neither
-/// their labels nor their position can change an answer.
+/// two and answers twice. So every row, empty ones included, is compared
+/// with the one before it in its partition: labels must not descend, which
+/// also catches a closed series reappearing. An empty row still carries a
+/// label set and still closes the series before it, even though it has
+/// nothing to fold; skipping its label check would let DataFusion's grouped
+/// aggregate close a series on a row this check never looked at. Only the
+/// first-sample-timestamp check is skipped for an empty row, since it has
+/// no first sample: within one label set the first sample timestamp of the
+/// next non-empty row must not go backwards. Nothing is sorted or buffered
+/// to repair a violation; that would be the whole-series concatenation
+/// chunk rows exist to avoid. It is an [`EngineError::Source`] instead.
 ///
 /// The check is per partition. Keeping a series inside one partition is
 /// the plan's concern, not something a per-partition stream can see.
@@ -314,7 +316,7 @@ impl ExecutionPlan for SeriesSetExec {
             input,
             converter: RowConverter::new(vec![SortField::new(labels)])?,
             prev: None,
-            prev_first_t: i64::MIN,
+            prev_first_t: None,
         }))
     }
 
@@ -329,7 +331,9 @@ struct SeriesSetStream {
     /// with a row of the next.
     converter: RowConverter,
     prev: Option<OwnedRow>,
-    prev_first_t: i64,
+    /// The last non-empty row's first sample timestamp within the current
+    /// series, `None` until one has been seen.
+    prev_first_t: Option<i64>,
 }
 
 impl SeriesSetStream {
@@ -352,10 +356,17 @@ impl SeriesSetStream {
             .convert_columns(std::slice::from_ref(labels))?;
         for r in 0..batch.num_rows() {
             let (start, end) = (offsets[r] as usize, offsets[r + 1] as usize);
-            if start == end {
-                continue;
+            for i in start + 1..end {
+                if timestamps[i] < timestamps[i - 1] {
+                    return Err(source_error(format!(
+                        "series {}: sample at {} follows one at {}; samples within a row \
+                         must ascend by timestamp",
+                        format_labels(labels.as_struct(), r),
+                        timestamps[i],
+                        timestamps[i - 1],
+                    )));
+                }
             }
-            let first_t = timestamps[start];
             let row = rows.row(r);
             match self.prev.as_ref().map(|p| p.row().cmp(&row)) {
                 Some(Ordering::Greater) => {
@@ -366,18 +377,27 @@ impl SeriesSetStream {
                         format_labels(labels.as_struct(), r),
                     )));
                 }
-                Some(Ordering::Equal) if first_t < self.prev_first_t => {
-                    return Err(source_error(format!(
-                        "series {}: a row starting at {first_t} follows one starting at {}; \
-                         the rows of a series must ascend by first sample timestamp",
-                        format_labels(labels.as_struct(), r),
-                        self.prev_first_t,
-                    )));
+                Some(Ordering::Equal) => {
+                    if start != end {
+                        let first_t = timestamps[start];
+                        if let Some(prev_first_t) = self.prev_first_t {
+                            if first_t < prev_first_t {
+                                return Err(source_error(format!(
+                                    "series {}: a row starting at {first_t} follows one \
+                                     starting at {prev_first_t}; the rows of a series must \
+                                     ascend by first sample timestamp",
+                                    format_labels(labels.as_struct(), r),
+                                )));
+                            }
+                        }
+                        self.prev_first_t = Some(first_t);
+                    }
                 }
-                Some(Ordering::Equal) => {}
-                _ => self.prev = Some(row.owned()),
+                _ => {
+                    self.prev = Some(row.owned());
+                    self.prev_first_t = (start != end).then(|| timestamps[start]);
+                }
             }
-            self.prev_first_t = first_t;
         }
         Ok(())
     }
