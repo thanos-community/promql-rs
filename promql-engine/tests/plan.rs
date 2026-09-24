@@ -67,10 +67,11 @@ use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::physical_expr::expressions::{Column, UnKnownColumn};
+use datafusion::physical_expr::expressions::{lit, Column, UnKnownColumn};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
@@ -549,4 +550,44 @@ fn a_union_over_coalesced_children_is_accepted() {
         displayable(plan.as_ref()).indent(true)
     );
     check_selector_plans(&plan).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// `x` joined with itself, partitioned, with a `FilterExec` between each
+/// side and the selector: `FilterExec` reports the same
+/// `output_partitioning()` as its input (`filter.rs`'s
+/// `compute_properties`), so `Hash([labels], n)` reaches the join
+/// unchanged and the join must still be refused.
+#[test]
+fn a_partitioned_join_over_a_filter_over_the_store_partitioning_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let filtered = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+        Arc::new(FilterExec::try_new(lit(true), input).unwrap())
+    };
+    let (left, right) = (
+        filtered(physical_plan(&source, "x")),
+        filtered(physical_plan(&source, "x")),
+    );
+    let on = vec![(
+        Arc::new(Column::new_with_schema("labels", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("labels", &right.schema()).unwrap()) as _,
+    )];
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap(),
+    );
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    match check_selector_plans(&plan) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
+    }
 }

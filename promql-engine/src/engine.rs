@@ -290,14 +290,39 @@ fn is_labels(expr: &dyn datafusion::physical_expr::PhysicalExpr) -> bool {
 }
 
 /// Whether `node` still carries [`SeriesSetExec`]'s declared partitioning
-/// through nothing but projections, cooperative yields or a selector
-/// aggregate. Shared by the join guard and the interleave guard: one
-/// trusting side is enough to refuse either, because DataFusion would hash
-/// only the other side to match it.
+/// through nothing but projections, cooperative yields, a selector
+/// aggregate, or a single-child node DataFusion reports as leaving its
+/// child's `output_partitioning()` unchanged — `FilterExec`,
+/// `GlobalLimitExec`, `LocalLimitExec` and `CoalesceBatchesExec` among
+/// them. Shared by the join guard and the interleave guard: one trusting
+/// side is enough to refuse either, because DataFusion would hash only the
+/// other side to match it.
 fn trusts_store_partitioning(node: &Arc<dyn ExecutionPlan>) -> bool {
     reaches(node, &|n| n.is::<SeriesSetExec>(), &|n| {
-        n.is::<ProjectionExec>() || n.is::<CooperativeExec>() || selector_aggregate(n).is_some()
+        n.is::<ProjectionExec>()
+            || n.is::<CooperativeExec>()
+            || selector_aggregate(n).is_some()
+            || passes_partitioning_through(n)
     })
+}
+
+/// Whether `node` has exactly one child and reports the same
+/// `output_partitioning()` as that child, so a Hash(labels, n) declared
+/// below it reaches above it unchanged. A positive rule on
+/// `output_partitioning()` instead of naming node types: DataFusion
+/// guarantees the property, not the list, and an allowlist only grows as
+/// more pass-through operators turn up. Excludes `RepartitionExec`: its
+/// whole purpose is to declare new partitioning, and `Partitioning::Hash`
+/// equality does not distinguish a genuine re-hash of the same width from
+/// a passthrough of the declaration this guard exists to catch.
+fn passes_partitioning_through(node: &Arc<dyn ExecutionPlan>) -> bool {
+    if node.is::<RepartitionExec>() {
+        return false;
+    }
+    match node.children().as_slice() {
+        [child] => node.properties().partitioning == child.properties().partitioning,
+        _ => false,
+    }
 }
 
 /// Whether `node`, or the single-child chain below it through `through`,
