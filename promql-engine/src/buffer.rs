@@ -430,6 +430,23 @@ mod tests {
         assert_eq!(rows(&out.take_all())[0].len(), 1001);
     }
 
+    /// The kernels step by addition, and the step after the last one lies
+    /// past `i64::MAX` here.
+    #[test]
+    fn a_grid_ending_at_the_end_of_time_does_not_overflow() {
+        let p = Params {
+            start_ms: i64::MAX - 2 * M,
+            end_ms: i64::MAX,
+            ..params()
+        };
+        let (ts, vs) = ([i64::MAX - 2 * M, i64::MAX - M], [1.0, 2.0]);
+        for func in kernels() {
+            let got = eval(func, p, &[(&ts, &vs)]);
+            assert!(!got.is_empty(), "{}", name(func));
+            assert!(got.iter().all(|(t, _)| *t >= p.start_ms), "{got:?}");
+        }
+    }
+
     /// A 30-day series is one row from a store that does not chunk it, so
     /// the buffer must not take a copy of a chunk to walk it.
     #[test]

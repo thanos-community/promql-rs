@@ -411,15 +411,13 @@ pub(crate) fn advance_range(
         (false, None) => return,
     };
     let base = *base;
-    let len = base + ts.len();
-    let slice = |lo: usize, hi: usize, range_end: i64| -> Window<'_> {
-        Window {
-            ts: &ts[lo - base..hi - base],
-            vs: &vs[lo - base..hi - base],
-            range_start: range_end - p.window_ms,
-            range_end,
-            range_ms: p.window_ms,
-        }
+    // Indices relative to the slices.
+    let window = |l: usize, h: usize, range_end: i64| Window {
+        ts: &ts[l..h],
+        vs: &vs[l..h],
+        range_start: range_end - p.window_ms,
+        range_end,
+        range_ms: p.window_ms,
     };
 
     // `@` pins the window: it is evaluated once, when it is ready, and
@@ -429,9 +427,9 @@ pub(crate) fn advance_range(
         if range_end > ready {
             return;
         }
-        let lo = base + ts.partition_point(|t| *t <= range_end - p.window_ms);
-        let hi = base + ts.partition_point(|t| *t <= range_end);
-        if let Some(v) = evaluate(func, &slice(lo, hi, range_end)) {
+        let l = ts.partition_point(|t| *t <= range_end - p.window_ms);
+        let h = ts.partition_point(|t| *t <= range_end);
+        if let Some(v) = evaluate(func, &window(l, h, range_end)) {
             for step in p.steps() {
                 emit(step, v);
             }
@@ -444,59 +442,62 @@ pub(crate) fn advance_range(
     // every sample enter once and leave once, across chunks too. The two
     // loops are one `match` above the step loop rather than a branch
     // inside it, so the refolding path pays neither the calls nor the
-    // dispatch in them.
-    let step_ms = i128::from(p.step_ms);
+    // dispatch in them. As in `advance_selector`, the cursor lives in
+    // locals relative to the slice and the step moves by addition, which
+    // may wrap past the last step, unread; a sweep's indices stay absolute.
+    let (mut l, mut h, mut next) = (*lo - base, *hi - base, *next_step);
+    let mut step = (i128::from(p.start_ms) + next * i128::from(p.step_ms)) as i64;
     match sweep {
         None => {
-            while *next_step < steps {
-                let step = (i128::from(p.start_ms) + *next_step * step_ms) as i64;
+            while next < steps {
                 let range_end = step - p.offset_ms;
                 if range_end > ready {
-                    return;
+                    break;
                 }
                 let range_start = range_end - p.window_ms;
-                while *lo < len && ts[*lo - base] <= range_start {
-                    *lo += 1;
+                while l < ts.len() && ts[l] <= range_start {
+                    l += 1;
                 }
-                *hi = (*hi).max(*lo);
-                while *hi < len && ts[*hi - base] <= range_end {
-                    *hi += 1;
+                h = h.max(l);
+                while h < ts.len() && ts[h] <= range_end {
+                    h += 1;
                 }
-                if let Some(v) = evaluate(func, &slice(*lo, *hi, range_end)) {
+                if let Some(v) = evaluate(func, &window(l, h, range_end)) {
                     emit(step, v);
                 }
-                *next_step += 1;
+                next += 1;
+                step = step.wrapping_add(p.step_ms);
             }
         }
         Some(sweep) => {
-            while *next_step < steps {
-                let step = (i128::from(p.start_ms) + *next_step * step_ms) as i64;
+            while next < steps {
                 let range_end = step - p.offset_ms;
                 if range_end > ready {
-                    return;
+                    break;
                 }
                 let range_start = range_end - p.window_ms;
-                while *lo < len && ts[*lo - base] <= range_start {
-                    if *lo < *hi {
-                        sweep.leave(*lo);
+                while l < ts.len() && ts[l] <= range_start {
+                    if l < h {
+                        sweep.leave(base + l);
                     }
-                    *lo += 1;
+                    l += 1;
                 }
-                // A gap wider than the window leaves `hi` behind `lo`;
-                // the samples it skips never entered, and the state is
-                // empty.
-                *hi = (*hi).max(*lo);
-                while *hi < len && ts[*hi - base] <= range_end {
-                    sweep.enter(*hi, *lo, base, vs);
-                    *hi += 1;
+                // A gap wider than the window leaves `h` behind `l`; the
+                // samples it skips never entered, and the state is empty.
+                h = h.max(l);
+                while h < ts.len() && ts[h] <= range_end {
+                    sweep.enter(base + h, base + l, base, vs);
+                    h += 1;
                 }
-                if let Some(v) = sweep.value(&slice(*lo, *hi, range_end), *lo) {
+                if let Some(v) = sweep.value(&window(l, h, range_end), base + l) {
                     emit(step, v);
                 }
-                *next_step += 1;
+                next += 1;
+                step = step.wrapping_add(p.step_ms);
             }
         }
     }
+    (*lo, *hi, *next_step) = (base + l, base + h, next);
 }
 
 /// The DataFusion function. Stateless: every parameter is an argument.

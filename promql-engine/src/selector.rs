@@ -83,25 +83,32 @@ pub(crate) fn advance_selector(
         return;
     }
 
-    let end = it.base + ts.len();
-    while it.next_step < steps {
-        let step = it.step_at(it.next_step);
+    // The walk keeps its cursor in locals, relative to the slice, and moves
+    // the step by addition. Through `it` every advance is a store the
+    // compiler must keep, and `step_at` is an i128 multiply per step, which
+    // together cost the 30-day selector 7%. The addition past the last step
+    // may wrap near `i64::MAX`; that value is never read.
+    let (mut next, mut h) = (it.next_step, it.hi - it.base);
+    let mut step = it.step_at(next);
+    while next < steps {
         let ref_time = step - p.offset_ms;
         if ref_time > last_t {
             break;
         }
-        while it.hi < end && ts[it.hi - it.base] <= ref_time {
-            it.hi += 1;
+        while h < ts.len() && ts[h] <= ref_time {
+            h += 1;
         }
-        if it.hi > it.base {
-            let i = it.hi - 1 - it.base;
-            let (t, v) = (ts[i], vs[i]);
+        if h > 0 {
+            let (t, v) = (ts[h - 1], vs[h - 1]);
             if t > ref_time - p.window_ms && !is_stale(v) {
                 out.push(step, v);
             }
         }
-        it.next_step += 1;
+        next += 1;
+        step = step.wrapping_add(p.step_ms);
     }
+    it.next_step = next;
+    it.hi = it.base + h;
     // The candidate for the next step is the last sample read, or a later one.
     it.lo = it.hi.saturating_sub(1).max(it.base);
 }
