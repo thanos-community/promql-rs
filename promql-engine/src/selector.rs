@@ -16,8 +16,7 @@
 //! `vectorSelectorSingle`: the expansion is [`crate::source::SelectorTable`],
 //! [`EvalSeries`] is the accumulator both the selector and the range
 //! functions run in, and [`advance_selector`] is one series' walk across the
-//! grid. [`eval_series`] and [`apply`] are the one-row walk it replaced, kept
-//! as the oracle the tests below pin it against.
+//! grid.
 
 use std::sync::Arc;
 
@@ -51,69 +50,6 @@ pub const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 pub fn is_stale(v: f64) -> bool {
     v.to_bits() == STALE_NAN_BITS
-}
-
-/// The value the selector yields at one lookup time, if any.
-///
-/// The last sample at or before `ref_time`, provided it is younger than
-/// `lookback`: `ref_time - lookback < t <= ref_time`, half-open. A
-/// StaleNaN there means the series was marked stale, so nothing.
-fn lookup(ts: &[i64], vs: &[f64], ref_time: i64, window_ms: i64) -> Option<f64> {
-    // Index of the first sample after ref_time; the candidate is the one
-    // before it.
-    let i = ts.partition_point(|t| *t <= ref_time);
-    if i == 0 {
-        return None;
-    }
-    let (t, v) = (ts[i - 1], vs[i - 1]);
-    if t <= ref_time - window_ms || is_stale(v) {
-        return None;
-    }
-    Some(v)
-}
-
-/// Evaluate one series on the step grid: the body of upstream's
-/// `evalSeries` loop for one series, with `vectorSelectorSingle` inlined
-/// as a single forward sweep.
-///
-/// `ts` and `vs` are one series' samples, sorted ascending. `emit` is
-/// called with `(step_timestamp, value)` for every step that has a value,
-/// in step order.
-pub fn eval_series(ts: &[i64], vs: &[f64], p: &Params, mut emit: impl FnMut(i64, f64)) {
-    debug_assert_eq!(ts.len(), vs.len());
-    if p.step_ms <= 0 || p.end_ms < p.start_ms {
-        return;
-    }
-
-    // `@` pins the lookup time, so the answer is the same at every step:
-    // one lookup, repeated across the grid at step timestamps.
-    if let Some(at) = p.at_ms {
-        if let Some(v) = lookup(ts, vs, at - p.offset_ms, p.window_ms) {
-            for step in p.steps() {
-                emit(step, v);
-            }
-        }
-        return;
-    }
-
-    // Without `@`, the lookup time advances with the step, so `hi` — the
-    // count of samples at or before it — only ever moves forward. One pass
-    // over the series serves every step.
-    let mut hi = 0usize;
-    for step in p.steps() {
-        let ref_time = step - p.offset_ms;
-        while hi < ts.len() && ts[hi] <= ref_time {
-            hi += 1;
-        }
-        if hi == 0 {
-            continue;
-        }
-        let (t, v) = (ts[hi - 1], vs[hi - 1]);
-        if t <= ref_time - p.window_ms || is_stale(v) {
-            continue;
-        }
-        emit(step, v);
-    }
 }
 
 /// `vectorSelectorSingle` for every step the buffered samples can answer
@@ -439,72 +375,6 @@ impl AggregateUDFImpl for VectorSelector {
     }
 }
 
-/// Read literal argument `i` as an `Int64`, `None` for SQL NULL.
-///
-/// The range kernel shares this helper, so `caller` names the function
-/// the query called rather than this module.
-pub(crate) fn int_arg(args: &ScalarFunctionArgs, i: usize, caller: &str) -> Result<Option<i64>> {
-    match &args.args[i] {
-        ColumnarValue::Scalar(ScalarValue::Int64(v)) => Ok(*v),
-        ColumnarValue::Scalar(ScalarValue::Null) => Ok(None),
-        other => Err(DataFusionError::Execution(format!(
-            "{caller}: argument {i} must be an Int64 literal, got {:?}",
-            other.data_type()
-        ))),
-    }
-}
-
-/// Run the kernel over every row of a samples column.
-pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
-    let entries = samples.values().as_struct();
-    let ts: &[i64] = entries
-        .column_by_name(series::TIMESTAMP)
-        .expect("validated by return_type")
-        .as_primitive::<TimestampMillisecondType>()
-        .values();
-    let vs: &[f64] = entries
-        .column_by_name(series::VALUE)
-        .expect("validated by return_type")
-        .as_primitive::<Float64Type>()
-        .values();
-    let offsets = samples.offsets();
-
-    // A starting size, not a ceiling: one sample can serve many steps.
-    let mut out_ts: Vec<i64> = Vec::with_capacity(ts.len());
-    let mut out_vs: Vec<f64> = Vec::with_capacity(ts.len());
-    let mut out_offsets: Vec<i32> = Vec::with_capacity(samples.len() + 1);
-    out_offsets.push(0);
-    for row in 0..samples.len() {
-        // A null row is an absent series, not an empty one, and its
-        // offsets may still span samples.
-        if !samples.is_null(row) {
-            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            eval_series(&ts[a..b], &vs[a..b], p, |t, v| {
-                out_ts.push(t);
-                out_vs.push(v);
-            });
-        }
-        out_offsets.push(out_ts.len() as i32);
-    }
-
-    let entries = StructArray::new(
-        series::sample_fields(),
-        vec![
-            Arc::new(TimestampMillisecondArray::from(out_ts)),
-            Arc::new(Float64Array::from(out_vs)),
-        ],
-        None,
-    );
-    ListArray::new(
-        series::sample_item(),
-        OffsetBuffer::new(out_offsets.into()),
-        Arc::new(entries),
-        // One output row per input row, in order, so the input's
-        // validity is the output's.
-        samples.nulls().cloned(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,12 +409,6 @@ mod tests {
                 ts.iter().copied().zip(vs.iter().copied()).collect()
             })
             .collect()
-    }
-
-    fn oracle(ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
-        let mut out = Vec::new();
-        eval_series(ts, vs, &p, |t, v| out.push((t, v)));
-        out
     }
 
     fn params() -> Params {
@@ -763,7 +627,7 @@ mod tests {
     }
 
     /// Gaps longer than the lookback, a stale marker, a NaN and repeated
-    /// values: every branch `eval_series` has, across the grids below.
+    /// values: every branch `advance_selector` has, across the grids below.
     fn a_rough_series() -> (Vec<i64>, Vec<f64>) {
         let stale = f64::from_bits(STALE_NAN_BITS);
         [
@@ -847,7 +711,7 @@ mod tests {
     fn chunk_splits_select_what_one_row_selects() {
         let (ts, vs) = a_rough_series();
         for p in grids() {
-            let expected = oracle(&ts, &vs, p);
+            let expected = run(&ts, &vs, p);
             for k in 1..=ts.len() {
                 let chunks: Vec<(&[i64], &[f64])> = ts.chunks(k).zip(vs.chunks(k)).collect();
                 let got = select(&chunks, p);
@@ -863,7 +727,7 @@ mod tests {
     fn chunks_repeating_the_previous_tail_select_the_same() {
         let (ts, vs) = a_rough_series();
         for p in grids() {
-            let expected = oracle(&ts, &vs, p);
+            let expected = run(&ts, &vs, p);
             for k in 2..=ts.len() {
                 // Each chunk starts one sample back, a duplicate of the
                 // previous chunk's last one.

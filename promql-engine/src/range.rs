@@ -618,38 +618,6 @@ impl AggregateUDFImpl for RangeFunction {
     }
 }
 
-/// Run the kernel over every row of a samples column, each row being a
-/// whole series in one chunk.
-///
-/// This is the cursor fed one chunk per series: no plan calls it any more,
-/// it stays as the one-row oracle until the scalar path is deleted.
-pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
-    // Offsets index the child as it is, so a sliced `ListArray`, whose
-    // offsets need not start at zero and whose child may still hold the
-    // dropped rows' samples, needs no rebasing.
-    let offsets = samples.offsets();
-    let (ts, vs) = series::sample_slices(samples.values().as_struct());
-
-    let mut out = SamplesBuilder::default();
-    // One cursor for the column, so the buffers and the sweep's queues
-    // keep their capacity from series to series.
-    let mut it = BufferedSeriesIterator::new(Kernel::Range(func), *p);
-    for row in 0..samples.len() {
-        // A null row is an absent series, not an empty one, and its
-        // offsets may still span samples.
-        if !samples.is_null(row) {
-            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            it.push(&ts[a..b], &vs[a..b], &mut out);
-        }
-        it.close(&mut out);
-    }
-
-    let (field, offsets, values, _) = out.take_all().into_parts();
-    // One output row per input row, in order, so the input's validity is
-    // the output's.
-    ListArray::new(field, offsets, values, samples.nulls().cloned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,38 +629,15 @@ mod tests {
     const S: i64 = 1000;
     const M: i64 = 60 * S;
 
-    /// Routes through `apply` (a one-row samples column) rather than
-    /// calling `advance_range` directly, so the staleness filter, which
-    /// lives in `apply` now, is exercised by every test that uses `run`.
+    /// One series in one chunk, pushed and closed.
     fn run(func: Func, ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(ts.to_vec())),
-                Arc::new(Float64Array::from(vs.to_vec())),
-            ],
-            None,
-        );
-        let samples = ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, ts.len() as i32].into()),
-            Arc::new(entries),
-            None,
-        );
-        let out = apply(func, &samples, &p);
-        let row = out.value(0);
-        let row = row.as_struct();
-        let out_ts = row
-            .column_by_name(series::TIMESTAMP)
-            .unwrap()
-            .as_primitive::<TimestampMillisecondType>()
-            .values();
-        let out_vs = row
-            .column_by_name(series::VALUE)
-            .unwrap()
-            .as_primitive::<Float64Type>()
-            .values();
-        out_ts.iter().copied().zip(out_vs.iter().copied()).collect()
+        let mut it = BufferedSeriesIterator::new(Kernel::Range(func), p);
+        let mut out = SamplesBuilder::default();
+        it.push(ts, vs, &mut out);
+        it.close(&mut out);
+        let row = out.take_all().value(0);
+        let (ts, vs) = series::sample_slices(row.as_struct());
+        ts.iter().copied().zip(vs.iter().copied()).collect()
     }
 
     /// One step at 5m over a 5m window.
