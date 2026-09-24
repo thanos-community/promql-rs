@@ -14,13 +14,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use datafusion::arrow::array::builder::BooleanBufferBuilder;
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, ListArray, StructArray,
-    TimestampMillisecondArray,
+    Array, ArrayRef, AsArray, Float64Array, ListArray, StructArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::filter;
 use datafusion::arrow::datatypes::{
     DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
 };
@@ -31,6 +28,7 @@ use datafusion::logical_expr::{
     Signature, Volatility,
 };
 
+use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::math;
 use crate::params::Params;
 use crate::selector::{int_arg, is_stale};
@@ -271,7 +269,7 @@ pub(crate) enum Sweep {
 impl Sweep {
     /// Between series, so that one `Sweep` can be hoisted above a row
     /// loop and keep the `VecDeque`s' capacity.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         match self {
             Sweep::Counter { resets, .. } => resets.clear(),
             Sweep::Extremum { candidates, .. } => candidates.clear(),
@@ -297,16 +295,19 @@ impl Sweep {
     }
 
     /// Sample `i` joins the window's end; `lo` is its start, so a pair
-    /// arrives with `i` only once its left half is inside.
-    fn enter(&mut self, i: usize, lo: usize, vs: &[f64]) {
+    /// arrives with `i` only once its left half is inside. `vs` holds
+    /// ordinals from `base` on: the tracked indices stay absolute so that
+    /// trimming the buffer's front never has to rewrite them.
+    fn enter(&mut self, i: usize, lo: usize, base: usize, vs: &[f64]) {
+        let at = |j: usize| vs[j - base];
         match self {
             Sweep::Counter { resets, .. } => {
-                if i > lo && vs[i] < vs[i - 1] {
+                if i > lo && at(i) < at(i - 1) {
                     resets.push_back(i - 1);
                 }
             }
             Sweep::Extremum { candidates, max } => {
-                if vs[i].is_nan() {
+                if at(i).is_nan() {
                     return;
                 }
                 // A strict comparison keeps the earliest of equal
@@ -314,9 +315,9 @@ impl Sweep {
                 // and the only way `-0.0` against `0.0` agrees.
                 while let Some(&back) = candidates.back() {
                     let beaten = if *max {
-                        vs[back] < vs[i]
+                        at(back) < at(i)
                     } else {
-                        vs[back] > vs[i]
+                        at(back) > at(i)
                     };
                     if !beaten {
                         break;
@@ -367,92 +368,130 @@ impl Sweep {
     }
 }
 
-/// Evaluate one series on the step grid.
+/// Evaluate the steps of `it`'s open series that are ready.
 ///
-/// `ts`/`vs` are one series' samples, ascending and already free of
-/// StaleNaN entries, which `apply` filters once over the whole batch.
-/// `sweep` is `None` for the functions that refold the window per step;
-/// where it is `Some` it must already be [`Sweep::reset`] for this
-/// series. `emit` receives `(step_timestamp, value)` in step order.
-pub(crate) fn range_function(
+/// Without `done`, a step is ready once its window's end is at or before
+/// `last_t`: the samples still to come are all later, so they cannot
+/// land in it. With `done` there are no samples to come, and every step
+/// left is ready. Evaluating as the chunks arrive, rather than at close,
+/// is what lets the buffer drop everything below `lo` between chunks.
+///
+/// `it.ts`/`it.vs` must already be free of StaleNaN entries, and a
+/// `Sweep`, if any, must have seen only this series. `emit` receives
+/// `(step_timestamp, value)` in step order, each step at most once.
+pub(crate) fn advance_range(
+    it: &mut BufferedSeriesIterator,
     func: Func,
-    ts: &[i64],
-    vs: &[f64],
-    p: &Params,
-    sweep: Option<&mut Sweep>,
+    done: bool,
     mut emit: impl FnMut(i64, f64),
 ) {
+    let BufferedSeriesIterator {
+        sweep,
+        params: p,
+        ts,
+        vs,
+        base,
+        lo,
+        hi,
+        next_step,
+        last_t,
+        ..
+    } = it;
     debug_assert_eq!(ts.len(), vs.len());
-    if p.step_ms <= 0 || p.end_ms < p.start_ms || p.window_ms <= 0 {
+    let end = i128::from(p.end_ms);
+    if p.step_ms <= 0 || p.end_ms < p.start_ms || p.window_ms <= 0 || *next_step > end {
         return;
     }
-
+    // A window ending after this may still gain a sample.
+    let ready = match (done, *last_t) {
+        (true, _) => i64::MAX,
+        (false, Some(t)) => t,
+        (false, None) => return,
+    };
+    let base = *base;
+    let len = base + ts.len();
     let slice = |lo: usize, hi: usize, range_end: i64| -> Window<'_> {
         Window {
-            ts: &ts[lo..hi],
-            vs: &vs[lo..hi],
+            ts: &ts[lo - base..hi - base],
+            vs: &vs[lo - base..hi - base],
             range_start: range_end - p.window_ms,
             range_end,
             range_ms: p.window_ms,
         }
     };
 
-    // `@` pins the window; evaluate once and repeat across the grid.
+    // `@` pins the window: it is evaluated once, when it is ready, and
+    // repeated across the whole grid.
     if let Some(at) = p.at_ms {
         let range_end = at - p.offset_ms;
-        let lo = ts.partition_point(|t| *t <= range_end - p.window_ms);
-        let hi = ts.partition_point(|t| *t <= range_end);
+        if range_end > ready {
+            return;
+        }
+        let lo = base + ts.partition_point(|t| *t <= range_end - p.window_ms);
+        let hi = base + ts.partition_point(|t| *t <= range_end);
         if let Some(v) = evaluate(func, &slice(lo, hi, range_end)) {
             for step in p.steps() {
                 emit(step, v);
             }
         }
+        *next_step = end + 1;
         return;
     }
 
     // Both window edges only move forward with the step, so a sweep sees
-    // every sample enter once and leave once. The two loops are one
-    // `match` above the step loop rather than a branch inside it, so the
-    // refolding path pays neither the calls nor the dispatch in them.
-    let (mut lo, mut hi) = (0usize, 0usize);
+    // every sample enter once and leave once, across chunks too. The two
+    // loops are one `match` above the step loop rather than a branch
+    // inside it, so the refolding path pays neither the calls nor the
+    // dispatch in them.
+    let step_ms = i128::from(p.step_ms);
     match sweep {
         None => {
-            for step in p.steps() {
+            while *next_step <= end {
+                let step = *next_step as i64;
                 let range_end = step - p.offset_ms;
+                if range_end > ready {
+                    return;
+                }
                 let range_start = range_end - p.window_ms;
-                while lo < ts.len() && ts[lo] <= range_start {
-                    lo += 1;
+                while *lo < len && ts[*lo - base] <= range_start {
+                    *lo += 1;
                 }
-                hi = hi.max(lo);
-                while hi < ts.len() && ts[hi] <= range_end {
-                    hi += 1;
+                *hi = (*hi).max(*lo);
+                while *hi < len && ts[*hi - base] <= range_end {
+                    *hi += 1;
                 }
-                if let Some(v) = evaluate(func, &slice(lo, hi, range_end)) {
+                if let Some(v) = evaluate(func, &slice(*lo, *hi, range_end)) {
                     emit(step, v);
                 }
+                *next_step += step_ms;
             }
         }
         Some(sweep) => {
-            for step in p.steps() {
+            while *next_step <= end {
+                let step = *next_step as i64;
                 let range_end = step - p.offset_ms;
+                if range_end > ready {
+                    return;
+                }
                 let range_start = range_end - p.window_ms;
-                while lo < ts.len() && ts[lo] <= range_start {
-                    if lo < hi {
-                        sweep.leave(lo);
+                while *lo < len && ts[*lo - base] <= range_start {
+                    if *lo < *hi {
+                        sweep.leave(*lo);
                     }
-                    lo += 1;
+                    *lo += 1;
                 }
                 // A gap wider than the window leaves `hi` behind `lo`;
                 // the samples it skips never entered, and the state is
                 // empty.
-                hi = hi.max(lo);
-                while hi < ts.len() && ts[hi] <= range_end {
-                    sweep.enter(hi, lo, vs);
-                    hi += 1;
+                *hi = (*hi).max(*lo);
+                while *hi < len && ts[*hi - base] <= range_end {
+                    sweep.enter(*hi, *lo, base, vs);
+                    *hi += 1;
                 }
-                if let Some(v) = sweep.value(&slice(lo, hi, range_end), lo) {
+                if let Some(v) = sweep.value(&slice(*lo, *hi, range_end), *lo) {
                     emit(step, v);
                 }
+                *next_step += step_ms;
             }
         }
     }
@@ -572,56 +611,20 @@ impl ScalarUDFImpl for RangeFunction {
     }
 }
 
-/// Run the kernel over every row of a samples column.
+/// Run the kernel over every row of a samples column, each row being a
+/// whole series in one chunk.
 ///
-/// Staleness markers are not samples (`matrixIterSlice` skips them). They
-/// are filtered here, once over the whole child struct, rather than in
-/// `range_function`, which would have to copy a vector per stale row.
+/// This is the cursor fed one chunk per series, kept only until the
+/// range function is an aggregate that feeds it chunk rows itself.
+/// Staleness markers are not samples (`matrixIterSlice` skips them); they
+/// are dropped while copying into the cursor's buffer, which the cursor
+/// pays for anyway.
 pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
-    let raw_offsets = samples.offsets();
-    // A sliced `ListArray` shares its child and offsets verbatim with the
-    // unsliced original, so `raw_offsets[0]` may be non-zero and the
-    // child may hold elements outside every row. Restrict to the range
-    // the offsets actually cover before masking and filtering it.
-    let first = raw_offsets[0] as usize;
-    let last = raw_offsets[samples.len()] as usize;
-    let child = samples.values().as_struct().slice(first, last - first);
-    let vs_col = child
-        .column_by_name(series::VALUE)
-        .expect("validated by return_type")
-        .as_primitive::<Float64Type>();
-
-    // A batch with no staleness marker at all, the common case, never
-    // needs a mask; the cheap slice scan decides that before paying for
-    // one bit per sample.
-    let any_stale = vs_col.values().iter().any(|v| is_stale(*v));
-
-    let (child, offsets): (StructArray, Vec<i32>) = if any_stale {
-        let mut keep_buf = BooleanBufferBuilder::new(vs_col.len());
-        for v in vs_col.values() {
-            keep_buf.append(!is_stale(*v));
-        }
-        let keep = BooleanArray::new(keep_buf.finish(), None);
-        let filtered = filter(&child, &keep).expect("mask length matches child length");
-        let mut kept_offsets = Vec::with_capacity(samples.len() + 1);
-        kept_offsets.push(0i32);
-        let mut kept = 0i32;
-        for row in 0..samples.len() {
-            let (a, b) = (
-                raw_offsets[row] as usize - first,
-                raw_offsets[row + 1] as usize - first,
-            );
-            kept += keep.slice(a, b - a).true_count() as i32;
-            kept_offsets.push(kept);
-        }
-        (filtered.as_struct().clone(), kept_offsets)
-    } else {
-        let rebased: Vec<i32> = (0..=samples.len())
-            .map(|row| raw_offsets[row] as usize as i32 - first as i32)
-            .collect();
-        (child, rebased)
-    };
-
+    // Offsets index the child as it is, so a sliced `ListArray`, whose
+    // offsets need not start at zero and whose child may still hold the
+    // dropped rows' samples, needs no rebasing.
+    let offsets = samples.offsets();
+    let child = samples.values().as_struct();
     let ts: &[i64] = child
         .column_by_name(series::TIMESTAMP)
         .expect("validated by return_type")
@@ -638,16 +641,29 @@ pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
     let mut out_vs: Vec<f64> = Vec::with_capacity(ts.len());
     let mut out_offsets: Vec<i32> = Vec::with_capacity(samples.len() + 1);
     out_offsets.push(0);
-    let mut sweep = Sweep::new(func);
+    // One cursor for the column, so the buffers and the sweep's queues
+    // keep their capacity from series to series.
+    let mut it = BufferedSeriesIterator::new(Kernel::Range(func), *p);
     for row in 0..samples.len() {
         // A null row is an absent series, not an empty one, and its
         // offsets may still span samples.
         if !samples.is_null(row) {
-            if let Some(sweep) = sweep.as_mut() {
+            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
+            it.ts.clear();
+            it.vs.clear();
+            for (t, v) in ts[a..b].iter().zip(&vs[a..b]) {
+                if !is_stale(*v) {
+                    it.ts.push(*t);
+                    it.vs.push(*v);
+                }
+            }
+            (it.base, it.lo, it.hi) = (0, 0, 0);
+            it.next_step = i128::from(p.start_ms);
+            it.last_t = ts[a..b].last().copied();
+            if let Some(sweep) = it.sweep.as_mut() {
                 sweep.reset();
             }
-            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            range_function(func, &ts[a..b], &vs[a..b], p, sweep.as_mut(), |t, v| {
+            advance_range(&mut it, func, true, |t, v| {
                 out_ts.push(t);
                 out_vs.push(v);
             });
@@ -676,7 +692,6 @@ pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::{BufferedSeriesIterator, Kernel};
     use crate::selector::STALE_NAN_BITS;
     use datafusion::arrow::buffer::NullBuffer;
     use datafusion::common::config::ConfigOptions;
@@ -685,7 +700,7 @@ mod tests {
     const M: i64 = 60 * S;
 
     /// Routes through `apply` (a one-row samples column) rather than
-    /// calling `range_function` directly, so the staleness filter, which
+    /// calling `advance_range` directly, so the staleness filter, which
     /// lives in `apply` now, is exercised by every test that uses `run`.
     fn run(func: Func, ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
         let entries = StructArray::new(
@@ -895,7 +910,7 @@ mod tests {
         assert_eq!(out, vec![(0, 10.0), (30 * S, 10.0), (M, 10.0)]);
     }
 
-    /// Every function, because both branches of `range_function` are
+    /// Every function, because both branches of `advance_range` are
     /// sliding walks that carry `lo`/`hi` across steps: the swept one
     /// carries kernel state too, the other only the bounds. `fresh`
     /// recomputes both bounds per step with `partition_point`, so it
