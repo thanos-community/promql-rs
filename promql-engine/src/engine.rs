@@ -20,13 +20,21 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::coop::CooperativeExec;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::{self, displayable, ExecutionPlan, InputOrderMode, Partitioning};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::error::EngineError;
 use crate::labelset;
 pub use crate::plan::RangeQuery;
-use crate::series;
-use crate::source::SeriesSource;
+use crate::series::{self, LABELS};
+use crate::source::{SeriesSetExec, SeriesSource};
 use crate::{aggregate, labels, range, selector};
 
 pub struct Engine {
@@ -80,6 +88,26 @@ impl Engine {
         crate::plan::plan(&self.ctx.state(), source, &expr, range).await
     }
 
+    /// The optimized `ExecutionPlan` a range query runs, for inspection.
+    /// It has passed [`check_selector_plans`], so it is exactly what
+    /// [`Self::range_query_async`] executes.
+    pub async fn physical_plan_async(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        range: &RangeQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>, EngineError> {
+        let plan = self.plan_async(source, query, range).await?;
+        let exec = self
+            .ctx
+            .execute_logical_plan(plan)
+            .await?
+            .create_physical_plan()
+            .await?;
+        check_selector_plans(&exec)?;
+        Ok(exec)
+    }
+
     /// Evaluate a range query. Batches are in the canonical schema
     /// ([`crate::series`]) with empty series already dropped; call
     /// [`series::decode`] to get [`Series`](crate::Series) instead.
@@ -89,9 +117,8 @@ impl Engine {
         query: &str,
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
-        let plan = self.plan_async(source, query, range).await?;
-        let df = self.ctx.execute_logical_plan(plan).await?;
-        let batches = df.collect().await?;
+        let exec = self.physical_plan_async(source, query, range).await?;
+        let batches = physical_plan::collect(exec, self.ctx.task_ctx()).await?;
         // One `collect()` shares a single output schema across all its
         // batches, so validating it once and comparing later batches by
         // pointer skips the redundant re-walk of the label fields.
@@ -128,6 +155,108 @@ impl Engine {
                 "this engine has no runtime; build it with Engine::blocking() or use the *_async methods".into(),
             )
         })
+    }
+}
+
+/// Refuse a plan in which a selector or range-function aggregate would not
+/// hold exactly one open series per partition.
+///
+/// The session flags in [`Engine::new`] produce such plans today, but
+/// nothing makes DataFusion keep doing so: an upgrade or a new optimizer
+/// rule that loses `InputOrderMode::Sorted` does not fail, it buffers every
+/// series of the scan and answers out of order. `EvalSeries`' contiguity
+/// checks catch the rows that then arrive interleaved, but only for data
+/// that happens to interleave, so the shape is checked here on every plan.
+///
+/// Accepted: a Partial or Single aggregate, Sorted, whose input reaches
+/// [`SeriesSetExec`] through nothing but projections and cooperative
+/// yields; and a Final aggregate, Sorted, over such a Partial through an
+/// order-preserving merge or hash repartition. Anything that deals rows
+/// out anew below the Partial — round-robin, a hash split of chunk rows —
+/// can put one series in two partitions, each of which folds half of it.
+///
+/// A sort on a `labels` column is refused wherever it sits: Arrow cannot
+/// sort a struct, so the plan would otherwise fail inside the sort.
+pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineError> {
+    let refuse = |why: &str| {
+        EngineError::Query(format!(
+            "refusing a plan in which {why}:\n{}",
+            displayable(plan.as_ref()).indent(true)
+        ))
+    };
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        stack.extend(node.children());
+        if let Some(sort) = node.downcast_ref::<SortExec>() {
+            if sort.expr().iter().any(|e| is_labels(e.expr.as_ref())) {
+                return Err(refuse("a sort orders by labels"));
+            }
+            continue;
+        }
+        let Some(agg) = selector_aggregate(node) else {
+            continue;
+        };
+        if agg.input_order_mode() != &InputOrderMode::Sorted {
+            return Err(refuse("a selector aggregate does not run Sorted"));
+        }
+        let fed = match agg.mode() {
+            AggregateMode::Partial | AggregateMode::Single => {
+                reaches(agg.input(), &|n| n.is::<SeriesSetExec>(), &|n| {
+                    n.is::<ProjectionExec>() || n.is::<CooperativeExec>()
+                })
+            }
+            AggregateMode::Final | AggregateMode::FinalPartitioned => reaches(
+                agg.input(),
+                &|n| selector_aggregate(n).is_some_and(|a| *a.mode() == AggregateMode::Partial),
+                &|n| {
+                    n.is::<ProjectionExec>()
+                        || n.is::<CooperativeExec>()
+                        || n.is::<SortPreservingMergeExec>()
+                        || n.downcast_ref::<RepartitionExec>().is_some_and(|r| {
+                            r.preserve_order() && matches!(r.partitioning(), Partitioning::Hash(..))
+                        })
+                },
+            ),
+            AggregateMode::SinglePartitioned | AggregateMode::PartialReduce => false,
+        };
+        if !fed {
+            return Err(refuse(
+                "a selector aggregate's input does not come straight from the store",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn selector_aggregate(node: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
+    node.downcast_ref::<AggregateExec>().filter(|agg| {
+        agg.aggr_expr()
+            .iter()
+            .any(|e| [selector::NAME, range::NAME].contains(&e.fun().name()))
+    })
+}
+
+fn is_labels(expr: &dyn datafusion::physical_expr::PhysicalExpr) -> bool {
+    expr.downcast_ref::<Column>()
+        .is_some_and(|c| c.name() == LABELS)
+}
+
+/// Whether `node`, or the single-child chain below it through `through`,
+/// ends in a node that is `target`.
+fn reaches(
+    node: &Arc<dyn ExecutionPlan>,
+    target: &dyn Fn(&Arc<dyn ExecutionPlan>) -> bool,
+    through: &dyn Fn(&Arc<dyn ExecutionPlan>) -> bool,
+) -> bool {
+    let mut node = node;
+    loop {
+        if target(node) {
+            return true;
+        }
+        match node.children().as_slice() {
+            [child] if through(node) => node = child,
+            _ => return false,
+        }
     }
 }
 

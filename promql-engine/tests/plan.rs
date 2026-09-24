@@ -285,14 +285,11 @@ fn under_the_selector(
     wrap: impl Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
     plan.transform_up(|node| {
-        let is_selector = node
-
-            .downcast_ref::<AggregateExec>()
-            .is_some_and(|agg| {
-                agg.aggr_expr()
-                    .iter()
-                    .any(|e| e.fun().name() == selector::NAME)
-            });
+        let is_selector = node.downcast_ref::<AggregateExec>().is_some_and(|agg| {
+            agg.aggr_expr()
+                .iter()
+                .any(|e| e.fun().name() == selector::NAME)
+        });
         if !is_selector {
             return Ok(Transformed::no(node));
         }
@@ -369,7 +366,11 @@ impl SeriesSource for PrometheusOrdered {
         ];
         let batch = encode(&label_names_of(&series), &series).unwrap();
         let schema = batch.schema();
-        Ok(MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?)
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )?)
     }
 }
 
