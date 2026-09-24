@@ -114,3 +114,35 @@ tests:
       Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples
         Aggregate: groupBy=[[selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(300000), Int64(NULL)) AS samples]]
           TableScan: selector_0
+
+  - name: instant selector over chunk rows
+    description: >
+      The store hands each series over as several chunk rows, each its own
+      batch, which only the physical plan shows as the number of batches
+      under SeriesSetExec. The logical plan is the one-row case's: a
+      series split over chunk rows is still one group of the Sorted
+      aggregate.
+    chunked_ms: 150000
+    load:
+      - x{pod="a"} 1+1x19
+      - x{pod="b"} 2+3x19
+    query: |
+      x
+    plan: |
+    physical: |
+
+  - name: range function over chunk rows in four partitions
+    description: >
+      Four store partitions, each series whole in one of them and chunked
+      within it. Each partition's Partial folds its own series Sorted; an
+      order-preserving hash split on labels hands each finished series to
+      one Final, which stays Sorted too.
+    chunked_ms: 150000
+    partitions: 4
+    load:
+      - x{pod="a"} 1+1x19
+      - x{pod="b"} 2+3x19
+    query: |
+      rate(x[5m])
+    plan: |
+    physical: |

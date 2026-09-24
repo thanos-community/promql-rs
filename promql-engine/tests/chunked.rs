@@ -140,3 +140,88 @@ fn chunks_over_four_partitions() {
         assert_same_on(&source, q, RangeQuery::new(300_000, 600_000, 30_000));
     }
 }
+
+/// Many steps, so each step's window is finalised while later chunks are
+/// still arriving rather than all at series close.
+fn multi_step() -> RangeQuery {
+    RangeQuery::new(0, 600_000, 30_000)
+}
+
+#[test]
+fn offset_across_chunks() {
+    for q in ["x offset 2m", "rate(x[5m] offset 2m)"] {
+        assert_same_as_unchunked(q, multi_step());
+    }
+}
+
+#[test]
+fn at_across_chunks() {
+    // One `@` inside the data, one on a chunk boundary, one after the end.
+    for q in [
+        "x @ 200",
+        "rate(x[5m] @ 300)",
+        "count_over_time(x[10m] @ 450)",
+        "x @ 900",
+    ] {
+        assert_same_as_unchunked(q, multi_step());
+    }
+}
+
+#[test]
+fn extrema_across_chunks() {
+    for q in ["min_over_time(x[5m])", "max_over_time(x[5m])"] {
+        assert_same_as_unchunked(q, multi_step());
+    }
+}
+
+#[test]
+fn irate_across_chunks() {
+    assert_same_as_unchunked("irate(x[1m])", multi_step());
+}
+
+#[test]
+fn every_query_over_many_steps() {
+    for q in ["x", "rate(x[5m])", "sum(x)", "count_over_time(x[10m])"] {
+        assert_same_as_unchunked(q, multi_step());
+    }
+}
+
+/// `chunked(0)`: one sample per row, so every window crosses rows.
+#[test]
+fn one_sample_per_row() {
+    let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0).chunked(0);
+    for q in [
+        "x",
+        "rate(x[5m])",
+        "sum(x)",
+        "count_over_time(x[10m])",
+        "irate(x[1m])",
+        "max_over_time(x[5m] offset 1m)",
+    ] {
+        assert_same_on(&source, q, multi_step());
+    }
+}
+
+/// Partition counts below, at and above the number of series, alone and
+/// under chunking: a series lands whole in one partition either way.
+#[test]
+fn partitions_match_unpartitioned() {
+    for n in [1, 2, 4, 7] {
+        for chunk_ms in [None, Some(0), Some(CHUNK_MS)] {
+            let mut source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0);
+            if let Some(ms) = chunk_ms {
+                source = source.chunked(ms);
+            }
+            let source = source.partitions(n);
+            for q in [
+                "x",
+                "rate(x[5m])",
+                "sum(x)",
+                "sum by (pod) (rate(x[5m]))",
+                "count_over_time(x[10m])",
+            ] {
+                assert_same_on(&source, q, multi_step());
+            }
+        }
+    }
+}
