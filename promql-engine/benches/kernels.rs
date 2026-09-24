@@ -17,8 +17,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use datafusion::arrow::array::{ArrayRef, AsArray, BooleanBufferBuilder, ListArray};
-use datafusion::logical_expr::{EmitTo, GroupsAccumulator};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanBufferBuilder};
+use datafusion::arrow::datatypes::{Field, FieldRef, Schema};
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::function::AccumulatorArgs;
+use datafusion::logical_expr::{AggregateUDF, EmitTo, GroupsAccumulator};
+use datafusion::physical_expr::expressions::{Column, Literal};
+use datafusion::physical_expr::PhysicalExpr;
 use promql_engine::aggregate::{Grouped, Op};
 use promql_engine::math::{self, FlagLane, Welford};
 use promql_engine::params::Params;
@@ -215,60 +220,123 @@ fn math_reductions(c: &mut Criterion) {
     g.finish();
 }
 
+/// The selector or a range function as the plan runs it: its aggregate's
+/// accumulator, built from the same literal arguments the planner writes,
+/// fed a `samples` column and emptied. Params reach the kernel only as
+/// those literals, so this is the one public way in, and it keeps the
+/// output's Arrow building in the timed path because the plan pays it too.
+fn eval_series(
+    udaf: &AggregateUDF,
+    func: Option<Func>,
+    p: &Params,
+    samples: &ArrayRef,
+    groups: &[usize],
+    total: usize,
+) -> ArrayRef {
+    let mut args: Vec<ScalarValue> = func
+        .map(|f| ScalarValue::from(f.as_str()))
+        .into_iter()
+        .collect();
+    args.extend([
+        ScalarValue::Int64(Some(p.start_ms)),
+        ScalarValue::Int64(Some(p.end_ms)),
+        ScalarValue::Int64(Some(p.step_ms)),
+        ScalarValue::Int64(Some(p.window_ms)),
+        ScalarValue::Int64(Some(p.offset_ms)),
+        ScalarValue::Int64(p.at_ms),
+    ]);
+    let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new(series::SAMPLES, 0))];
+    exprs.extend(
+        args.into_iter()
+            .map(|v| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>),
+    );
+    let schema = Schema::new(vec![Field::new(
+        series::SAMPLES,
+        series::samples_type(),
+        false,
+    )]);
+    let fields: Vec<FieldRef> = exprs
+        .iter()
+        .map(|e| e.return_field(&schema).unwrap())
+        .collect();
+    let mut acc = udaf
+        .create_groups_accumulator(AccumulatorArgs {
+            return_field: Arc::new(Field::new(series::SAMPLES, series::samples_type(), false)),
+            schema: &schema,
+            ignore_nulls: false,
+            order_bys: &[],
+            is_reversed: false,
+            name: udaf.name(),
+            is_distinct: false,
+            exprs: &exprs,
+            expr_fields: &fields,
+        })
+        .unwrap();
+    acc.update_batch(std::slice::from_ref(samples), groups, None, total)
+        .unwrap();
+    acc.evaluate(EmitTo::All).unwrap()
+}
+
+/// A grid the literals got wrong answers no step, and the bench would then
+/// time an empty walk without anyone noticing.
+fn assert_answers(out: &ArrayRef) {
+    let out = out.as_list::<i32>();
+    assert!((0..out.len()).all(|r| !out.value(r).is_empty()));
+}
+
 /// One series walked across the step grid: upstream's `evalSeries` loop.
 fn selector_eval_series(c: &mut Criterion) {
+    let udaf = selector::udaf();
     let mut g = c.benchmark_group("selector/eval_series");
     for n in LENGTHS {
         let (ts, vs) = counter(n);
         let stale = with_stale(&vs, 100);
+        let plain = samples_of(&[(ts.clone(), vs)]);
+        let stale = samples_of(&[(ts, stale)]);
         let p = selector_params(n);
         let pinned = Params {
             at_ms: Some(p.end_ms),
             ..p
         };
         g.throughput(Throughput::Elements(n as u64));
-        for (name, vs, p) in [
-            ("plain", &vs, &p),
+        for (name, column, p) in [
+            ("plain", &plain, &p),
             ("stale_every_100", &stale, &p),
-            ("at_pinned", &vs, &pinned),
+            ("at_pinned", &plain, &pinned),
         ] {
+            assert_answers(&eval_series(&udaf, None, p, column, &[0], 1));
             g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| {
-                    let mut acc = 0.0;
-                    selector::eval_series(black_box(&ts), black_box(vs), p, |_, v| acc += v);
-                    acc
-                })
+                b.iter(|| eval_series(&udaf, None, p, black_box(column), &[0], 1))
             });
         }
     }
     g.finish();
 }
 
-/// The vector selector over a whole Arrow column of series, allocation
-/// of the output included.
+/// The vector selector over a whole Arrow column of series, one group per
+/// series, allocation of the output included.
 fn selector_apply(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
     let all = labelled(k, n);
     let batch = series::encode(&series::label_names_of(&all), &all).unwrap();
-    let samples = batch
-        .column_by_name(series::SAMPLES)
-        .unwrap()
-        .as_list::<i32>()
-        .clone();
+    let samples = Arc::clone(batch.column_by_name(series::SAMPLES).unwrap());
+    let groups: Vec<usize> = (0..k).collect();
+    let udaf = selector::udaf();
     let p = selector_params(n);
     let mut g = c.benchmark_group("selector/apply");
     g.throughput(Throughput::Elements((k * n) as u64));
     g.bench_function(BenchmarkId::from_parameter(format!("{k}x{n}")), |b| {
-        b.iter(|| selector::apply(black_box(&samples), &p))
+        b.iter(|| eval_series(&udaf, None, &p, black_box(&samples), &groups, k))
     });
     g.finish();
 }
 
-/// One series through a range function across the step grid. The sweep
-/// itself is crate-private, so this drives it through the public column
-/// entry point over a single row; the list wrapper is one row's worth of
-/// overhead on top of the same walk.
+/// One series through a range function across the step grid. The window
+/// buffer and the sweep are crate-private, so this drives them through the
+/// function's accumulator over a single row; the accumulator is one row's
+/// worth of overhead on top of the same walk.
 fn range_function(c: &mut Criterion) {
+    let udaf = range::udaf();
     let mut g = c.benchmark_group("range/range_function");
     for n in LENGTHS {
         let (ts, vs) = counter(n);
@@ -284,30 +352,28 @@ fn range_function(c: &mut Criterion) {
             ("max_over_time", Func::MaxOverTime, &plain),
             ("rate_stale_every_100", Func::Rate, &stale),
         ] {
-            let column: &ListArray = column.as_list::<i32>();
+            assert_answers(&eval_series(&udaf, Some(func), &p, column, &[0], 1));
             g.bench_function(BenchmarkId::new(name, n), |b| {
-                b.iter(|| range::apply(func, black_box(column), &p))
+                b.iter(|| eval_series(&udaf, Some(func), &p, black_box(column), &[0], 1))
             });
         }
     }
     g.finish();
 }
 
-/// `rate` over a whole Arrow column of series.
+/// `rate` over a whole Arrow column of series, one group per series.
 fn range_apply(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
     let all = labelled(k, n);
     let batch = series::encode(&series::label_names_of(&all), &all).unwrap();
-    let samples = batch
-        .column_by_name(series::SAMPLES)
-        .unwrap()
-        .as_list::<i32>()
-        .clone();
+    let samples = Arc::clone(batch.column_by_name(series::SAMPLES).unwrap());
+    let groups: Vec<usize> = (0..k).collect();
+    let udaf = range::udaf();
     let p = range_params(n);
     let mut g = c.benchmark_group("range/apply");
     g.throughput(Throughput::Elements((k * n) as u64));
     g.bench_function(BenchmarkId::new("rate", format!("{k}x{n}")), |b| {
-        b.iter(|| range::apply(Func::Rate, black_box(&samples), &p))
+        b.iter(|| eval_series(&udaf, Some(Func::Rate), &p, black_box(&samples), &groups, k))
     });
     g.finish();
 }
