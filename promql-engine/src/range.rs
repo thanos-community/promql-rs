@@ -278,7 +278,7 @@ impl Sweep {
         }
     }
 
-    fn new(func: Func) -> Option<Sweep> {
+    pub(crate) fn new(func: Func) -> Option<Sweep> {
         Some(match func {
             Func::Rate | Func::Increase => Sweep::Counter {
                 resets: VecDeque::new(),
@@ -676,6 +676,7 @@ pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{BufferedSeriesIterator, Kernel};
     use crate::selector::STALE_NAN_BITS;
     use datafusion::arrow::buffer::NullBuffer;
     use datafusion::common::config::ConfigOptions;
@@ -1061,6 +1062,95 @@ mod tests {
                         a.1,
                         b.1
                     );
+                }
+            }
+        }
+    }
+
+    /// Feeds `ts`/`vs` through the cursor `k` samples at a time, as if
+    /// `base` samples had already been trimmed off the front, and trims
+    /// below `lo` after every chunk the way `BufferedSeriesIterator::push`
+    /// does, so that every ordinal the sweep holds is shifted off its
+    /// buffer index.
+    fn cursor(
+        func: Func,
+        ts: &[i64],
+        vs: &[f64],
+        p: Params,
+        base: usize,
+        k: usize,
+    ) -> Vec<(i64, f64)> {
+        let mut it = BufferedSeriesIterator::new(Kernel::Range(func), p);
+        (it.base, it.lo, it.hi) = (base, base, base);
+        let mut out = Vec::new();
+        for (cts, cvs) in ts.chunks(k).zip(vs.chunks(k)) {
+            for (t, v) in cts.iter().zip(cvs) {
+                if !is_stale(*v) {
+                    it.ts.push(*t);
+                    it.vs.push(*v);
+                }
+            }
+            it.last_t = cts.last().copied();
+            advance_range(&mut it, func, false, |t, v| out.push((t, v)));
+            let dead = it.lo - it.base;
+            it.ts.drain(..dead);
+            it.vs.drain(..dead);
+            it.base += dead;
+        }
+        advance_range(&mut it, func, true, |t, v| out.push((t, v)));
+        out
+    }
+
+    #[test]
+    fn advance_range_matches_apply_across_a_base_shift() {
+        let (ts, vs) = a_rough_series();
+        let plain = Params {
+            start_ms: 0,
+            end_ms: 20 * M,
+            step_ms: 15 * S,
+            window_ms: 2 * M,
+            offset_ms: 45 * S,
+            at_ms: None,
+        };
+        let params = [
+            plain,
+            Params {
+                offset_ms: 0,
+                ..plain
+            },
+            Params {
+                at_ms: Some(5 * M),
+                ..plain
+            },
+            Params {
+                at_ms: Some(17 * M),
+                ..plain
+            },
+        ];
+        for p in params {
+            for func in ALL {
+                let expected = run(func, &ts, &vs, p);
+                for base in [1, 7, 1000] {
+                    for k in [1, 2, 3, 5, ts.len()] {
+                        let got = cursor(func, &ts, &vs, p, base, k);
+                        let name = func.as_str();
+                        assert_eq!(
+                            got.len(),
+                            expected.len(),
+                            "{name} base={base} k={k} p={p:?}"
+                        );
+                        for (a, b) in got.iter().zip(&expected) {
+                            assert_eq!(a.0, b.0, "{name} base={base} k={k} p={p:?}");
+                            assert_eq!(
+                                a.1.to_bits(),
+                                b.1.to_bits(),
+                                "{name} base={base} k={k} p={p:?} at {}: {} vs {}",
+                                a.0,
+                                a.1,
+                                b.1
+                            );
+                        }
+                    }
                 }
             }
         }
