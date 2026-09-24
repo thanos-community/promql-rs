@@ -1,7 +1,8 @@
 # promql-engine benchmarks
 
 `kernels` times the engine's kernels without DataFusion, `engine` whole
-queries through DataFusion. The doc comment at the top of each file says
+queries through DataFusion, and `memory` measures peak heap of single
+queries instead of time. The doc comment at the top of each file says
 how to compare two states of the code.
 
 ## Profiling
@@ -28,3 +29,17 @@ for a bench whose hot path is under a few percent.
 For ad-hoc profiling of a whole process on macOS, including threads the
 bench does not own, `samply record` on the bench binary opens the result
 in the Firefox Profiler.
+
+## Heap profiles
+
+`memory` counts live bytes under its own global allocator. With the
+`heap-profile` feature that allocator wraps jemalloc with profiling on,
+and `MEMORY_HEAP_DIR` makes it write a pprof heap profile per case:
+
+```sh
+MEMORY_HEAP_DIR=/tmp/heap cargo bench -p promql-engine --features heap-profile \
+  --bench memory -- streamed/30d_1000/one_row_x1/selector
+go tool pprof -sample_index=inuse_space -top -cum /tmp/heap/streamed_30d_1000_one_row_x1_selector.pb
+```
+
+Run one case per process; the doc comment in `memory.rs` says why.
