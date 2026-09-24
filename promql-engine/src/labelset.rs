@@ -25,7 +25,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use datafusion::arrow::array::{AsArray, RecordBatch, StringViewArray};
-use datafusion::arrow::compute::interleave_record_batch;
 use datafusion::arrow::datatypes::TimestampMillisecondType;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::row::{RowConverter, SortField};
@@ -131,20 +130,29 @@ pub fn sort_by_labelset(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, Eng
     if order.is_sorted_by(|x, y| cmp(x, y) != Ordering::Greater) {
         return Ok(batches.to_vec());
     }
-    order.sort_unstable_by(cmp);
-    let batches: Vec<&RecordBatch> = batches.iter().collect();
-    // One batch per input batch's worth of rows keeps each within the
-    // sizes the plan already produced, so no list offsets overflow.
-    let per_batch = batches
-        .iter()
-        .map(|b| b.num_rows())
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    order
-        .chunks(per_batch)
-        .map(|at| interleave_record_batch(&batches, at).map_err(arrow_error))
-        .collect()
+    order.sort_by(cmp);
+    // Slices of the input rather than `interleave_record_batch`: the
+    // samples are nearly the whole result (a 30d selector over 1000
+    // series is ~650 MB of them) and interleave copies every one, while
+    // `RecordBatch::slice` only bumps the Arc'd buffers. The cost is more,
+    // shorter batches, one per run of rows that stayed adjacent. A store
+    // that hashes series across partitions interleaves them row by row,
+    // so expect about one batch per series; consumers already take any
+    // number of batches.
+    let mut runs: Vec<RecordBatch> = Vec::new();
+    let mut run: Option<(usize, usize, usize)> = None;
+    for (b, row) in order {
+        run = match run {
+            Some((rb, start, len)) if rb == b && start + len == row => Some((rb, start, len + 1)),
+            Some((rb, start, len)) => {
+                runs.push(batches[rb].slice(start, len));
+                Some((b, row, 1))
+            }
+            None => Some((b, row, 1)),
+        };
+    }
+    runs.extend(run.map(|(b, start, len)| batches[b].slice(start, len)));
+    Ok(runs)
 }
 
 /// `labels.Compare` of two rows, read off the columns without collecting
@@ -300,5 +308,54 @@ mod tests {
         let mut want = sets.clone();
         want.sort();
         assert_eq!(got, want);
+    }
+
+    /// The value buffer behind a batch's samples: shared with the input
+    /// when the output is a slice of it, fresh when the rows were copied.
+    fn values_buffer(batch: &RecordBatch) -> *const u8 {
+        batch
+            .column_by_name(SAMPLES)
+            .unwrap()
+            .as_list::<i32>()
+            .values()
+            .as_struct()
+            .column_by_name(crate::series::VALUE)
+            .unwrap()
+            .to_data()
+            .buffers()[0]
+            .as_ptr()
+    }
+
+    /// Two partitions whose rows alternate in label-set order: the output
+    /// is one slice per row, and every slice still points at its input's
+    /// samples.
+    #[test]
+    fn sort_by_labelset_slices_without_copying_samples() {
+        let series: Vec<Series> = (0..6)
+            .map(|i| row(&format!("p{i}"), "x", vec![0, 1, 2]))
+            .collect();
+        let names = label_names_of(&series);
+        let even: Vec<Series> = series.iter().step_by(2).cloned().collect();
+        let odd: Vec<Series> = series.iter().skip(1).step_by(2).cloned().collect();
+        let batches = [
+            encode(&names, &odd).unwrap(),
+            encode(&names, &even).unwrap(),
+        ];
+        let inputs: Vec<*const u8> = batches.iter().map(values_buffer).collect();
+
+        let sorted = sort_by_labelset(&batches).unwrap();
+        assert_eq!(sorted.len(), 6);
+        for batch in &sorted {
+            assert!(
+                inputs.contains(&values_buffer(batch)),
+                "samples were copied"
+            );
+        }
+        let pods: Vec<String> = crate::series::decode(&sorted)
+            .unwrap()
+            .iter()
+            .map(|s| s.label("pod").to_string())
+            .collect();
+        assert_eq!(pods, ["p0", "p1", "p2", "p3", "p4", "p5"]);
     }
 }
