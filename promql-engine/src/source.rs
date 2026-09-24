@@ -23,7 +23,7 @@
 //!    series, rows ascend by first sample timestamp and samples by
 //!    timestamp.
 //!
-//! The engine trusts the first and checks the other two, one row
+//! The engine trusts the first and checks the other two, one label
 //! comparison per row, in [`SeriesSetExec`]: an operator that closes a
 //! series at the next label set would otherwise answer wrong without
 //! noticing.
@@ -39,7 +39,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{AsArray, RecordBatch, StructArray};
+use datafusion::arrow::array::{make_comparator, Array, AsArray, RecordBatch, StructArray};
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{SchemaRef, TimestampMillisecondType};
 use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion::catalog::{Session, TableProvider};
@@ -327,9 +328,10 @@ impl ExecutionPlan for SeriesSetExec {
 
 struct SeriesSetStream {
     input: SendableRecordBatchStream,
-    /// One converter for the whole stream, so a row of one batch compares
-    /// with a row of the next.
+    /// One converter for the whole stream, so the first row of a batch
+    /// compares with the last of the batch before.
     converter: RowConverter,
+    /// The last row's labels, `None` until a row has been seen.
     prev: Option<OwnedRow>,
     /// The last non-empty row's first sample timestamp within the current
     /// series, `None` until one has been seen.
@@ -337,7 +339,16 @@ struct SeriesSetStream {
 }
 
 impl SeriesSetStream {
+    /// Adjacent rows of one batch are compared on the label columns as
+    /// they are. Converting every row, as the boundary row is, copies each
+    /// label set into row format and allocates one per series; with a
+    /// sample walk that could not vectorise, that was the 8 to 15% of a
+    /// 10,000-series query that switching the check off saved.
     fn check(&mut self, batch: &RecordBatch) -> Result<()> {
+        let n = batch.num_rows();
+        if n == 0 {
+            return Ok(());
+        }
         let labels = batch.column_by_name(LABELS).expect("canonical");
         let samples = batch
             .column_by_name(SAMPLES)
@@ -351,26 +362,34 @@ impl SeriesSetStream {
             .as_primitive::<TimestampMillisecondType>()
             .values();
         let offsets = samples.value_offsets();
-        let rows = self
-            .converter
-            .convert_columns(std::slice::from_ref(labels))?;
-        for r in 0..batch.num_rows() {
+        let cmp = make_comparator(labels, labels, SortOptions::default())?;
+        let first = self.converter.convert_columns(&[labels.slice(0, 1)])?;
+        for r in 0..n {
             let (start, end) = (offsets[r] as usize, offsets[r + 1] as usize);
-            for i in start + 1..end {
-                if timestamps[i] < timestamps[i - 1] {
-                    return Err(source_error(format!(
-                        "series {}: sample at {} follows one at {}; samples within a row \
-                         must ascend by timestamp",
-                        format_labels(labels.as_struct(), r),
-                        timestamps[i],
-                        timestamps[i - 1],
-                    )));
-                }
+            // Whole rows at a time, so the scan vectorises; only a row that
+            // fails is walked again for the message.
+            if !timestamps[start..end].is_sorted() {
+                let i = (start + 1..end)
+                    .find(|&i| timestamps[i] < timestamps[i - 1])
+                    .expect("an unsorted row has a descent");
+                return Err(source_error(format!(
+                    "series {}: sample at {} follows one at {}; samples within a row \
+                     must ascend by timestamp",
+                    format_labels(labels.as_struct(), r),
+                    timestamps[i],
+                    timestamps[i - 1],
+                )));
             }
-            let row = rows.row(r);
-            match self.prev.as_ref().map(|p| p.row().cmp(&row)) {
+            let order = match r {
+                0 => self.prev.as_ref().map(|p| p.row().cmp(&first.row(0))),
+                _ => Some(cmp(r - 1, r)),
+            };
+            match order {
                 Some(Ordering::Greater) => {
-                    let prev = self.prev_labels()?;
+                    let prev = match r {
+                        0 => self.prev_labels()?,
+                        _ => format_labels(labels.as_struct(), r - 1),
+                    };
                     return Err(source_error(format!(
                         "series {} arrived after {prev}; series must be sorted by labels in \
                          struct order, and the rows of a series consecutive",
@@ -393,12 +412,11 @@ impl SeriesSetStream {
                         self.prev_first_t = Some(first_t);
                     }
                 }
-                _ => {
-                    self.prev = Some(row.owned());
-                    self.prev_first_t = (start != end).then(|| timestamps[start]);
-                }
+                _ => self.prev_first_t = (start != end).then(|| timestamps[start]),
             }
         }
+        let last = self.converter.convert_columns(&[labels.slice(n - 1, 1)])?;
+        self.prev = Some(last.row(0).owned());
         Ok(())
     }
 
@@ -599,6 +617,63 @@ mod tests {
     async fn samples_out_of_order_within_a_row_are_refused() {
         let msg = refused(vec![vec![batch(&["pod"], &[(A, &[200, 100])])]]).await;
         assert!(msg.contains(r#"pod="a""#), "{msg}");
+    }
+
+    /// The check runs a row at a time, not the batch's samples as one
+    /// sequence: a descent at a row boundary is two rows, one deep inside a
+    /// long row of a later series is an error.
+    #[tokio::test]
+    async fn a_descent_deep_in_a_later_row_is_refused() {
+        let long: Vec<i64> = (0..40).map(|i| if i == 37 { 0 } else { i * 10 }).collect();
+        let msg = refused(vec![vec![batch(&["pod"], &[(A, &[500, 600]), (B, &long)])]]).await;
+        assert!(
+            msg.contains(r#"pod="b""#) && msg.contains("follows one at 360"),
+            "{msg}"
+        );
+    }
+
+    /// A batch with no rows carries no series and must not reset what the
+    /// next batch is compared against.
+    #[tokio::test]
+    async fn an_empty_batch_between_series_changes_nothing() {
+        run(vec![vec![
+            batch(&["pod"], &[(A, &[1])]),
+            batch(&["pod"], &[]),
+            batch(&["pod"], &[(A, &[2]), (B, &[1])]),
+        ]])
+        .await
+        .unwrap();
+        let msg = refused(vec![vec![
+            batch(&["pod"], &[(B, &[1])]),
+            batch(&["pod"], &[]),
+            batch(&["pod"], &[(A, &[1])]),
+        ]])
+        .await;
+        assert!(
+            msg.contains(r#"pod="a""#) && msg.contains(r#"pod="b""#),
+            "{msg}"
+        );
+    }
+
+    /// The first row of a batch is compared with the last of the one
+    /// before, not with the first series of the stream.
+    #[tokio::test]
+    async fn a_batch_boundary_compares_against_the_last_series() {
+        run(vec![vec![
+            batch(&["pod"], &[(A, &[1]), (B, &[1])]),
+            batch(&["pod"], &[(B, &[2]), (C, &[1])]),
+        ]])
+        .await
+        .unwrap();
+        let msg = refused(vec![vec![
+            batch(&["pod"], &[(A, &[1]), (C, &[1])]),
+            batch(&["pod"], &[(B, &[1])]),
+        ]])
+        .await;
+        assert!(
+            msg.contains(r#"pod="b""#) && msg.contains(r#"pod="c""#),
+            "{msg}"
+        );
     }
 
     /// `labels ASC` is DataFusion's struct order: fields by name, compared
