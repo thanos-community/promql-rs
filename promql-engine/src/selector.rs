@@ -52,7 +52,14 @@ pub fn is_stale(v: f64) -> bool {
 ///
 /// Stale markers stay in the buffer: one that is the latest sample hides
 /// the series, which dropping it would undo.
-pub(crate) fn advance_selector(it: &mut BufferedSeriesIterator, out: &mut SamplesBuilder) {
+///
+/// `ts`/`vs` are the series' samples from ordinal `it.base` on.
+pub(crate) fn advance_selector(
+    it: &mut BufferedSeriesIterator,
+    ts: &[i64],
+    vs: &[f64],
+    out: &mut SamplesBuilder,
+) {
     let Some(last_t) = it.last_t else {
         return;
     };
@@ -65,7 +72,7 @@ pub(crate) fn advance_selector(it: &mut BufferedSeriesIterator, out: &mut Sample
         if it.next_step >= steps || at - p.offset_ms > last_t {
             return;
         }
-        if let Some(&v) = it.vs.last() {
+        if let Some(&v) = vs.last() {
             if !is_stale(v) {
                 for step in p.steps() {
                     out.push(step, v);
@@ -76,19 +83,19 @@ pub(crate) fn advance_selector(it: &mut BufferedSeriesIterator, out: &mut Sample
         return;
     }
 
-    let end = it.base + it.ts.len();
+    let end = it.base + ts.len();
     while it.next_step < steps {
         let step = it.step_at(it.next_step);
         let ref_time = step - p.offset_ms;
         if ref_time > last_t {
             break;
         }
-        while it.hi < end && it.ts[it.hi - it.base] <= ref_time {
+        while it.hi < end && ts[it.hi - it.base] <= ref_time {
             it.hi += 1;
         }
         if it.hi > it.base {
             let i = it.hi - 1 - it.base;
-            let (t, v) = (it.ts[i], it.vs[i]);
+            let (t, v) = (ts[i], vs[i]);
             if t > ref_time - p.window_ms && !is_stale(v) {
                 out.push(step, v);
             }

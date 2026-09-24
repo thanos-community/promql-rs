@@ -377,11 +377,14 @@ impl Sweep {
 /// left is ready. Evaluating as the chunks arrive, rather than at close,
 /// is what lets the buffer drop everything below `lo` between chunks.
 ///
-/// `it.ts`/`it.vs` must already be free of StaleNaN entries, and a
-/// `Sweep`, if any, must have seen only this series. `emit` receives
-/// `(step_timestamp, value)` in step order, each step at most once.
+/// `ts`/`vs` are the series' samples from ordinal `it.base` on and must
+/// already be free of StaleNaN entries, and a `Sweep`, if any, must have
+/// seen only this series. `emit` receives `(step_timestamp, value)` in
+/// step order, each step at most once.
 pub(crate) fn advance_range(
     it: &mut BufferedSeriesIterator,
+    ts: &[i64],
+    vs: &[f64],
     func: Func,
     done: bool,
     mut emit: impl FnMut(i64, f64),
@@ -389,8 +392,6 @@ pub(crate) fn advance_range(
     let BufferedSeriesIterator {
         sweep,
         params: p,
-        ts,
-        vs,
         base,
         lo,
         hi,
@@ -1011,13 +1012,15 @@ mod tests {
                 }
             }
             it.last_t = cts.last().copied();
-            advance_range(&mut it, func, false, |t, v| out.push((t, v)));
+            let (bts, bvs) = (it.ts.clone(), it.vs.clone());
+            advance_range(&mut it, &bts, &bvs, func, false, |t, v| out.push((t, v)));
             let dead = it.lo - it.base;
             it.ts.drain(..dead);
             it.vs.drain(..dead);
             it.base += dead;
         }
-        advance_range(&mut it, func, true, |t, v| out.push((t, v)));
+        let (bts, bvs) = (it.ts.clone(), it.vs.clone());
+        advance_range(&mut it, &bts, &bvs, func, true, |t, v| out.push((t, v)));
         out
     }
 

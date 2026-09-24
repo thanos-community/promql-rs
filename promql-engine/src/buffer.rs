@@ -2,11 +2,14 @@
 //! `storage.BufferedSeriesIterator` (`storage/buffer.go`), fed row by row
 //! instead of pulling from a chunk iterator.
 //!
-//! A chunk row's samples are copied into one contiguous buffer rather than
-//! kept as slices of their batch. A retained slice would pin the whole
-//! batch's child buffers, other series' samples included, and every kernel
-//! indexes one contiguous slice; the copy replaces the staleness filter the
-//! range kernel pays anyway.
+//! What a later chunk row's steps still read is copied into one contiguous
+//! buffer rather than kept as a slice of its batch. A retained slice would
+//! pin the whole batch's child buffers, other series' samples included, and
+//! every kernel indexes one contiguous slice; the copy replaces the
+//! staleness filter the range kernel pays anyway. A row that arrives with
+//! the buffer empty, every row of a store that does not chunk, is walked
+//! where it lies and only its tail is copied: copying it first would copy
+//! the whole series.
 //!
 //! Steps are evaluated as soon as their window can no longer change, not at
 //! series close. Otherwise the buffer would hold the whole series, which is
@@ -76,8 +79,12 @@ impl BufferedSeriesIterator {
             self.last_t = self.last_t.max(Some(last));
             return;
         }
+        if self.ts.is_empty() && self.in_place(vs) {
+            self.push_in_place(ts, vs, out);
+            return;
+        }
         self.append(ts, vs);
-        self.advance(false, out);
+        self.advance_buffered(false, out);
         self.reduce_delta();
     }
 
@@ -88,7 +95,7 @@ impl BufferedSeriesIterator {
         if !self.ts.is_empty() {
             // Every sample is in: no window can change any more.
             self.last_t = Some(i64::MAX);
-            self.advance(true, out);
+            self.advance_buffered(true, out);
         }
         out.finish_row();
         self.ts.clear();
@@ -119,11 +126,51 @@ impl BufferedSeriesIterator {
         (i128::from(self.params.start_ms) + i * i128::from(self.params.step_ms)) as i64
     }
 
-    fn advance(&mut self, done: bool, out: &mut SamplesBuilder) {
+    /// `ts`/`vs` are the series' samples from ordinal `base` on, the
+    /// buffer's or a chunk's.
+    fn advance(&mut self, ts: &[i64], vs: &[f64], done: bool, out: &mut SamplesBuilder) {
         match self.kernel {
-            Kernel::Selector => advance_selector(self, out),
-            Kernel::Range(func) => advance_range(self, func, done, |t, v| out.push(t, v)),
+            Kernel::Selector => advance_selector(self, ts, vs, out),
+            Kernel::Range(func) => advance_range(self, ts, vs, func, done, |t, v| out.push(t, v)),
         }
+    }
+
+    /// The kernels take the samples as slices so that a chunk can be walked
+    /// in place; the buffer is lent to them for the call, which moves no
+    /// samples.
+    fn advance_buffered(&mut self, done: bool, out: &mut SamplesBuilder) {
+        let (ts, vs) = (std::mem::take(&mut self.ts), std::mem::take(&mut self.vs));
+        self.advance(&ts, &vs, done, out);
+        (self.ts, self.vs) = (ts, vs);
+    }
+
+    /// Whether a chunk can be walked as it arrived. A pinned window is
+    /// trimmed on copy, and the range kernels must not see a stale marker,
+    /// so either goes through [`append`](Self::append).
+    fn in_place(&self, vs: &[f64]) -> bool {
+        self.params.at_ms.is_none()
+            && (matches!(self.kernel, Kernel::Selector) || !vs.iter().any(|v| is_stale(*v)))
+    }
+
+    /// Walks the chunk's steps off the chunk itself, then copies what a
+    /// later step still reads. With nothing buffered the chunk's first
+    /// sample is ordinal `base`, so the kernels' ordinals, a sweep's
+    /// included, hold across the copy exactly as across `reduce_delta`.
+    fn push_in_place(&mut self, ts: &[i64], vs: &[f64], out: &mut SamplesBuilder) {
+        debug_assert!(self.lo == self.base && self.hi == self.base);
+        let from = self
+            .last_t
+            .map_or(0, |last| ts.partition_point(|t| *t <= last));
+        let (ts, vs) = (&ts[from..], &vs[from..]);
+        let Some(&last) = ts.last() else {
+            return;
+        };
+        self.last_t = Some(last);
+        self.advance(ts, vs, false, out);
+        let keep = self.lo - self.base;
+        self.ts.extend_from_slice(&ts[keep..]);
+        self.vs.extend_from_slice(&vs[keep..]);
+        self.base = self.lo;
     }
 
     /// A chunk that ends at or before every window's start, or arrives after
@@ -381,6 +428,40 @@ mod tests {
         }
         it.close(&mut out);
         assert_eq!(rows(&out.take_all())[0].len(), 1001);
+    }
+
+    /// A 30-day series is one row from a store that does not chunk it, so
+    /// the buffer must not take a copy of a chunk to walk it.
+    #[test]
+    fn a_chunk_is_walked_in_place_and_only_its_tail_copied() {
+        let p = Params {
+            end_ms: 1000 * M,
+            ..params()
+        };
+        let (ts, vs): (Vec<i64>, Vec<f64>) = (0..1000).map(|i| (i * M, i as f64)).unzip();
+        for func in kernels() {
+            let mut it = BufferedSeriesIterator::new(kernel(func), p);
+            let mut out = SamplesBuilder::default();
+            it.push(&ts, &vs, &mut out);
+            assert!(
+                it.ts.capacity() <= 5,
+                "{}: {} samples of capacity after one chunk",
+                name(func),
+                it.ts.capacity()
+            );
+            // A second chunk with the tail still buffered is appended to it.
+            it.push(&[1000 * M], &[1000.0], &mut out);
+            it.close(&mut out);
+            let whole = eval(
+                func,
+                p,
+                &[(
+                    &[ts.as_slice(), &[1000 * M]].concat(),
+                    &[vs.as_slice(), &[1000.0]].concat(),
+                )],
+            );
+            assert_bits(&rows(&out.take_all())[0], &whole, &name(func));
+        }
     }
 
     // Range kernels and the chunk_ms sweep: whatever the cut points, a series
