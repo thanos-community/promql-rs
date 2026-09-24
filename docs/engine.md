@@ -207,10 +207,12 @@ Parallelism below the selector is the store's partition count and
 and they finish in any order. Prometheus sorts a range query's matrix
 before returning it (prom `promql/engine.go`, `sort.Sort(mat)`), and so
 does `range_query_async`, once, over finished rows: O(series log
-series) comparisons, then one copy of the samples into the new order,
-which a single store partition skips only when every series carries the
-same label names, so struct order and `labels.Compare` agree; a single
-partition whose series differ in label names still pays for the copy.
+series) comparisons over the labels, then the result re-cut into
+`RecordBatch::slice`s of the collected batches in the new order, so no
+sample is copied. The price is batch count: hashed partitions interleave
+row by row and the result comes back as about one batch per series.
+Already-ordered rows, a single partition whose series all carry the same
+label names, come back untouched.
 The order is `labels.Compare` over the
 labels a series has. The `labels` struct's own order is not it: it
 compares field by field and an absent label is `""`, so two series with

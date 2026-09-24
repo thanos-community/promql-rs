@@ -349,16 +349,26 @@ fn series_come_back_in_label_set_order() {
     lines.push(r#"x{app="q"} 1+1x19"#.into());
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let descriptions = load(&lines);
-    let label_sets = |series: &[Series]| -> Vec<Vec<(String, String)>> {
+    // Samples as bits, so a row that came back under the wrong label set,
+    // or lost or doubled a point in the reorder, fails here too.
+    type Row = (Vec<(String, String)>, Vec<i64>, Vec<u64>);
+    let label_sets = |series: &[Series]| -> Vec<Row> {
         series
             .iter()
-            .map(|s| s.labels().map(|(n, v)| (n.into(), v.into())).collect())
+            .map(|s| {
+                (
+                    s.labels().map(|(n, v)| (n.into(), v.into())).collect(),
+                    s.timestamps().to_vec(),
+                    s.values().iter().map(|v| v.to_bits()).collect(),
+                )
+            })
             .collect()
     };
     let unpartitioned = MemorySeriesSource::from_descriptions(&descriptions, 30.0);
     for q in ["x", "rate(x[5m])", "sum by (pod) (rate(x[5m]))"] {
         let want = label_sets(&query(&unpartitioned, q, multi_step()));
-        assert!(want.is_sorted(), "{q}: {want:?}");
+        let names: Vec<_> = want.iter().map(|r| &r.0).collect();
+        assert!(names.is_sorted(), "{q}: {names:?}");
         for n in [4, 7] {
             let source = MemorySeriesSource::from_descriptions(&descriptions, 30.0)
                 .chunked(CHUNK_MS)
