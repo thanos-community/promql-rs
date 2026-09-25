@@ -30,19 +30,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::catalog::Session;
-use datafusion::datasource::provider_as_source;
+use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{AggregateExpr, AtModifier, Call, Expr, VectorSelector};
 
 use crate::aggregate::{self, Op};
+use crate::elementwise;
 use crate::error::EngineError;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::params::{step_count, Params};
 use crate::range::{self, Func};
 use crate::selector;
-use crate::series::{LABELS, SAMPLES};
+use crate::series::{Series, LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
+use crate::{scalar, series};
 
 /// The range a query is evaluated over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +104,22 @@ pub async fn plan(
         source,
         query,
         selectors: 0,
+        stages: 0,
     };
     Ok(planner.expr(expr, Above::default()).await?.plan)
+}
+
+/// The step grid alone, for the expressions that are a function of the
+/// step and nothing else.
+fn grid_of(query: &RangeQuery) -> Params {
+    Params {
+        start_ms: query.start_ms,
+        end_ms: query.end_ms,
+        step_ms: query.step_ms,
+        window_ms: 0,
+        offset_ms: 0,
+        at_ms: None,
+    }
 }
 
 /// A planned subexpression: the plan and the label names in its schema.
@@ -118,6 +134,9 @@ struct Planner<'a> {
     query: &'a RangeQuery,
     /// Selectors seen so far; each becomes its own table `selector_N`.
     selectors: usize,
+    /// Named nodes built so far — a folded table, an operator's alias.
+    /// One counter for both, so no two names in one plan can collide.
+    stages: usize,
 }
 
 type Planning<'f> = Pin<Box<dyn Future<Output = Result<Planned, EngineError>> + Send + 'f>>;
@@ -132,6 +151,43 @@ struct Above<'a> {
 }
 
 impl Planner<'_> {
+    /// A name nothing else in this plan has, for a node the planner
+    /// invents rather than one the store named.
+    fn stage(&mut self, what: &str) -> String {
+        let n = self.stages;
+        self.stages += 1;
+        format!("{what}_{n}")
+    }
+
+    /// The one unlabelled series a scalar expression is, over the grid.
+    ///
+    /// Upstream's `funcVector` hands back `Sample{Metric:
+    /// labels.Labels{}, F: …}` (`promql/functions.go:2028-2034` at
+    /// 83962c35), the scalar's value with an empty label set.
+    ///
+    /// Nothing here reads a series, so the values are folded while
+    /// planning ([`crate::scalar`]) and the plan is the table holding
+    /// them: no store is asked, and no kernel runs. The table is
+    /// numbered because a query can hold more than one of them —
+    /// `vector(1) + vector(2)`, once binary operators land — and two
+    /// scans of the same name in one plan are one scan.
+    fn scalar_series(&mut self, expr: &Expr) -> Result<LogicalPlan, EngineError> {
+        let mut timestamps = Vec::new();
+        let mut values = Vec::new();
+        for ts in grid_of(self.query).steps() {
+            values.push(scalar::fold(expr, ts)?);
+            timestamps.push(ts);
+        }
+
+        let series = Series::new(&[], timestamps, values).map_err(EngineError::Schema)?;
+        let batch = series::encode(&[], &[series]).map_err(EngineError::Schema)?;
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        // Not `selector_N`: nothing was selected, and a plan text that
+        // said so would be misleading.
+        let name = self.stage("scalar");
+        Ok(LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(table)), None)?.build()?)
+    }
+
     /// Plan one node. `above` is what the store will be told sits over
     /// the selector this subtree bottoms out in.
     fn expr<'f>(&'f mut self, expr: &'f Expr, above: Above<'f>) -> Planning<'f> {
@@ -217,11 +273,108 @@ impl Planner<'_> {
         Ok(Planned { plan, label_names })
     }
 
+    /// One function call, sent to the operator its shape calls for.
+    ///
+    /// The arity and argument types are settled first, in upstream's
+    /// words: a call this engine cannot plan and a call Prometheus would
+    /// not accept are different answers, and only the second is the
+    /// user's mistake.
+    async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        crate::function::check_call(call)?;
+        let name = call.func.name.as_str();
+        if name == "vector" {
+            return Ok(Planned {
+                plan: self.scalar_series(&call.args[0])?,
+                label_names: Vec::new(),
+            });
+        }
+        if let Some(func) = elementwise::Func::parse(name) {
+            return self.elementwise(call, func).await;
+        }
+        self.range_function(call).await
+    }
+
+    /// A function applied to one sample at a time: `abs(x)` and its
+    /// family. The vector is the first argument and the rest are
+    /// scalars, already checked to be scalars by [`crate::function`].
+    async fn elementwise(
+        &mut self,
+        call: &Call,
+        func: elementwise::Func,
+    ) -> Result<Planned, EngineError> {
+        let mut args = Vec::new();
+        for arg in &call.args[1..] {
+            args.push(self.constant(arg, func.as_str())?);
+        }
+        // Upstream's `extractFuncFromPath` tells the store the innermost
+        // call it sits under, which for `abs(x)` is this one.
+        let input = self
+            .expr(
+                &call.args[0],
+                Above {
+                    func: Some(func.as_str()),
+                    grouping: None,
+                },
+            )
+            .await?;
+        let (labels_expr, label_names) = if func.drops_metric_name() {
+            labels::keep(&input.label_names, |n| n != METRIC_NAME)
+        } else {
+            (col(LABELS), input.label_names)
+        };
+        // A name of its own for what this function reads. Without it the
+        // projection below can be merged into the one under it, and the
+        // merged node would hold both the input's qualified `labels` and
+        // this one's plain `labels` — the same column under two names,
+        // which DataFusion resolves as ambiguous.
+        let stage = self.stage(func.as_str());
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(stage)?
+            .project(vec![
+                labels_expr.alias(LABELS),
+                elementwise::call(
+                    col(SAMPLES),
+                    func,
+                    args.first().copied(),
+                    args.get(1).copied(),
+                )
+                .alias(SAMPLES),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// A scalar argument as the one number the whole plan will use.
+    ///
+    /// Upstream evaluates a function's scalar arguments at every step,
+    /// so `clamp_max(x, time())` narrows as the query walks forward.
+    /// Here they are folded while planning, which only holds for an
+    /// argument that does not move; one that does is named as the gap it
+    /// is rather than silently taken at its first value.
+    fn constant(&self, expr: &Expr, func: &str) -> Result<f64, EngineError> {
+        let mut folded: Option<f64> = None;
+        for ts in grid_of(self.query).steps() {
+            let v = scalar::fold(expr, ts)?;
+            match folded {
+                Some(first) if first.to_bits() != v.to_bits() => {
+                    return Err(EngineError::Unsupported(format!(
+                        "the {func} function with a scalar argument that changes between steps"
+                    )))
+                }
+                _ => folded = Some(v),
+            }
+        }
+        // An empty grid cannot happen: the step check above has already
+        // refused a non-positive step, and start..=end always holds one
+        // step.
+        folded.ok_or_else(|| EngineError::Query("the query has no steps".into()))
+    }
+
     /// A function of one range selector: `rate(x[5m])` and its family.
     ///
     /// Takes no `Above`: this call is itself what stands directly over the
     /// selector, so nothing higher reaches the store.
-    async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    async fn range_function(&mut self, call: &Call) -> Result<Planned, EngineError> {
         let name = call.func.name.as_str();
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
@@ -242,6 +395,8 @@ impl Planner<'_> {
                     describe(other)
                 )))
             }
+            // Out of reach: every range function this engine knows takes
+            // exactly one argument, and `check_call` has already said so.
             _ => {
                 return Err(EngineError::Query(format!(
                     "{name} expects exactly one argument, got {}",
