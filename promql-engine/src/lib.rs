@@ -29,6 +29,7 @@
 //! store hands over would then be a type mismatch.
 
 pub mod aggregate;
+pub mod binary;
 pub mod elementwise;
 pub mod engine;
 pub mod error;

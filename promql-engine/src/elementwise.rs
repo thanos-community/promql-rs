@@ -36,8 +36,22 @@ use crate::series;
 pub const NAME: &str = "promql_elementwise";
 
 /// The instant-vector functions that map a value to a value.
+///
+/// A binary operator with a scalar on one side is one of these too:
+/// upstream's `VectorscalarBinop` (`promql/engine.go:3177` at 83962c35)
+/// walks the vector and writes the value back into the same sample,
+/// which is this kernel exactly. The scalar is folded while planning,
+/// so the operator arrives here with one operand already a number.
+/// A comparison is the one of these that drops samples rather than
+/// rewriting them, which is why [`apply`] has a second path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func {
+    Binary {
+        op: crate::binary::Op,
+        /// The `bool` modifier, carried here because it decides both
+        /// the value and whether `__name__` survives.
+        return_bool: bool,
+    },
     Abs,
     Ceil,
     Floor,
@@ -97,12 +111,19 @@ impl Func {
             "atanh" => Func::Atanh,
             "deg" => Func::Deg,
             "rad" => Func::Rad,
-            _ => return None,
+            // Last, and reachable only from a plan's own literal: an
+            // operator's spelling is never a function name, so no call
+            // can land here.
+            other => {
+                let (op, return_bool) = crate::binary::parse_literal(other)?;
+                return Some(Func::Binary { op, return_bool });
+            }
         })
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Func::Binary { op, return_bool } => crate::binary::literal(*op, *return_bool),
             Func::Abs => "abs",
             Func::Ceil => "ceil",
             Func::Floor => "floor",
@@ -133,17 +154,44 @@ impl Func {
         }
     }
 
-    /// Every one of these sets `DropName: true` on the sample it emits,
-    /// so none of them keeps `__name__`.
+    /// Every function here sets `DropName: true` on the sample it
+    /// emits. A binary operator answers for itself: a comparison
+    /// without `bool` hands back a sample that was already there, and
+    /// it is still that metric.
     pub fn drops_metric_name(&self) -> bool {
-        true
+        match self {
+            Func::Binary { op, return_bool } => op.drops_metric_name(*return_bool),
+            _ => true,
+        }
     }
 
     /// The function with its scalar arguments folded in, ready to run
     /// over values. `a` and `b` are the call's arguments after the
     /// vector, absent where the call did not give them.
+    ///
+    /// A binary operator has no second argument to spend, so the two
+    /// slots say which side its scalar was written on: `a` for
+    /// `vector op scalar`, `b` for `scalar op vector`. Upstream's
+    /// `VectorscalarBinop` carries the same fact as its `swap` flag.
     pub fn bind(self, a: Option<f64>, b: Option<f64>) -> Bound {
         match self {
+            Func::Binary { op, return_bool } => match (a, b) {
+                (None, Some(scalar)) => Bound::Binary {
+                    op,
+                    return_bool,
+                    scalar,
+                    swap: true,
+                },
+                // A call with neither operand cannot come from the
+                // planner; reachable from SQL, where a missing number
+                // is a NaN rather than a panic.
+                (a, _) => Bound::Binary {
+                    op,
+                    return_bool,
+                    scalar: a.unwrap_or(f64::NAN),
+                    swap: false,
+                },
+            },
             // `round(v)` is `round(v, 1)`: the default is in upstream's
             // signature, not in a branch.
             Func::Round => Bound::Round(a.unwrap_or(1.0)),
@@ -180,7 +228,7 @@ impl Func {
             Func::Atanh => f64::atanh,
             Func::Deg => |v| v * 180.0 / std::f64::consts::PI,
             Func::Rad => |v| v * std::f64::consts::PI / 180.0,
-            Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
+            Func::Binary { .. } | Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
                 unreachable!("{} takes its arguments through bind", self.as_str())
             }
         }
@@ -206,6 +254,15 @@ fn sgn(v: f64) -> f64 {
 #[derive(Debug, Clone, Copy)]
 pub enum Bound {
     Map(fn(f64) -> f64),
+    /// A binary operator with the scalar operand folded in. `swap` is
+    /// upstream's: it says the scalar was written on the left, and the
+    /// operands go back in that order for the ones that care.
+    Binary {
+        op: crate::binary::Op,
+        return_bool: bool,
+        scalar: f64,
+        swap: bool,
+    },
     Round(f64),
     Clamp {
         min: f64,
@@ -226,17 +283,48 @@ impl Bound {
         }
     }
 
-    pub fn value(&self, v: f64) -> f64 {
+    /// Whether this bound answers `None` for some sample, so that
+    /// [`apply`] has to rebuild the row boundaries rather than only the
+    /// values. Only a filtering comparison does.
+    fn drops_samples(&self) -> bool {
+        matches!(
+            self,
+            Bound::Binary {
+                op,
+                return_bool: false,
+                ..
+            } if op.is_comparison()
+        )
+    }
+
+    /// The sample's new value, or `None` where the operator drops the
+    /// sample rather than rewriting it.
+    pub fn value(&self, v: f64) -> Option<f64> {
         match self {
-            Bound::Map(f) => f(v),
+            Bound::Map(f) => Some(f(v)),
+            Bound::Binary {
+                op,
+                return_bool,
+                scalar,
+                swap,
+            } => {
+                let (lhs, rhs) = if *swap { (*scalar, v) } else { (v, *scalar) };
+                // Upstream keeps the *vector* element's value whichever
+                // side the scalar was written on, which only shows when
+                // a comparison is swapped: `1 < x` answers with x.
+                if op.is_comparison() && !return_bool {
+                    return op.compare(lhs, rhs).then_some(v);
+                }
+                op.value(lhs, rhs, *return_bool)
+            }
             // Inverted as upstream inverts it: dividing by `to_nearest`
             // and multiplying back is a different float from multiplying
             // by its reciprocal, and upstream took the reciprocal.
             Bound::Round(to_nearest) => {
                 let inverse = 1.0 / to_nearest;
-                (v * inverse + 0.5).floor() / inverse
+                Some((v * inverse + 0.5).floor() / inverse)
             }
-            Bound::Clamp { min, max } => go_max(*min, go_min(*max, v)),
+            Bound::Clamp { min, max } => Some(go_max(*min, go_min(*max, v))),
             Bound::Nothing => unreachable!("an empty result has no values"),
         }
     }
@@ -372,9 +460,13 @@ fn float_arg(args: &ScalarFunctionArgs, i: usize) -> Result<Option<f64>> {
 
 /// Run `bound` over every value of a samples column.
 ///
-/// The timestamps and the row boundaries come back untouched: an
-/// elementwise function moves no sample between series and drops none,
-/// so only the values are rebuilt.
+/// A function moves no sample between series, so a row is still a
+/// series and the timestamps keep their values. What the row boundaries
+/// do depends on the bound: a function rewrites every sample and the
+/// offsets come back untouched, while a comparison answers for some of
+/// them and nothing for the rest, so the rows are rebuilt around what
+/// survived — upstream's `keep`, which leaves a sample out of the
+/// Vector entirely.
 pub fn apply(samples: &ListArray, bound: Bound) -> ListArray {
     let entries = samples.values().as_struct();
     let timestamps = entries
@@ -389,7 +481,15 @@ pub fn apply(samples: &ListArray, bound: Bound) -> ListArray {
         return empty_rows(samples.len(), samples.nulls().cloned());
     }
 
-    let mapped: Float64Array = values.values().iter().map(|v| bound.value(*v)).collect();
+    if bound.drops_samples() {
+        return filtered(samples, timestamps.as_primitive(), values, bound);
+    }
+
+    let mapped: Float64Array = values
+        .values()
+        .iter()
+        .map(|v| bound.value(*v).expect("this bound drops nothing"))
+        .collect();
     let entries = StructArray::new(
         series::sample_fields(),
         vec![Arc::clone(timestamps), Arc::new(mapped)],
@@ -398,6 +498,45 @@ pub fn apply(samples: &ListArray, bound: Bound) -> ListArray {
     ListArray::new(
         series::sample_item(),
         samples.offsets().clone(),
+        Arc::new(entries),
+        samples.nulls().cloned(),
+    )
+}
+
+/// [`apply`] for a bound that drops samples: the rows are rebuilt from
+/// the ones it kept, so the offsets move with them.
+fn filtered(
+    samples: &ListArray,
+    timestamps: &TimestampMillisecondArray,
+    values: &Float64Array,
+    bound: Bound,
+) -> ListArray {
+    let offsets = samples.offsets();
+    let mut kept_timestamps = Vec::with_capacity(values.len());
+    let mut kept_values = Vec::with_capacity(values.len());
+    let mut row_ends = Vec::with_capacity(samples.len() + 1);
+    row_ends.push(0i32);
+    for row in 0..samples.len() {
+        let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
+        for i in lo..hi {
+            if let Some(value) = bound.value(values.value(i)) {
+                kept_timestamps.push(timestamps.value(i));
+                kept_values.push(value);
+            }
+        }
+        row_ends.push(kept_values.len() as i32);
+    }
+    let entries = StructArray::new(
+        series::sample_fields(),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(kept_timestamps)),
+            Arc::new(Float64Array::from(kept_values)),
+        ],
+        None,
+    );
+    ListArray::new(
+        series::sample_item(),
+        OffsetBuffer::new(row_ends.into()),
         Arc::new(entries),
         samples.nulls().cloned(),
     )
@@ -426,7 +565,11 @@ mod tests {
     use super::*;
 
     fn value(name: &str, v: f64) -> f64 {
-        Func::parse(name).expect(name).bind(None, None).value(v)
+        Func::parse(name)
+            .expect(name)
+            .bind(None, None)
+            .value(v)
+            .expect("a function answers for every sample")
     }
 
     #[test]
@@ -482,7 +625,7 @@ mod tests {
     /// `floor(v + 0.5)` does and what `math.Round` does not.
     #[test]
     fn round_settles_ties_upwards() {
-        let round = |v: f64, to: Option<f64>| Func::Round.bind(to, None).value(v);
+        let round = |v: f64, to: Option<f64>| Func::Round.bind(to, None).value(v).unwrap();
         assert_eq!(round(2.5, None), 3.0);
         assert_eq!(round(-2.5, None), -2.0);
         assert_eq!(round(1.4, None), 1.0);
@@ -498,7 +641,7 @@ mod tests {
 
     #[test]
     fn clamp_is_max_of_min_and_bounds_that_cross_give_nothing() {
-        let clamp = |v: f64, min, max| Func::Clamp.bind(Some(min), Some(max)).value(v);
+        let clamp = |v: f64, min, max| Func::Clamp.bind(Some(min), Some(max)).value(v).unwrap();
         assert_eq!(clamp(5.0, 0.0, 1.0), 1.0);
         assert_eq!(clamp(-5.0, 0.0, 1.0), 0.0);
         assert_eq!(clamp(0.5, 0.0, 1.0), 0.5);
@@ -512,15 +655,16 @@ mod tests {
         // other operand, which would clamp a NaN to a bound.
         assert!(clamp(f64::NAN, 0.0, 1.0).is_nan());
 
-        assert_eq!(Func::ClampMin.bind(Some(3.0), None).value(1.0), 3.0);
-        assert_eq!(Func::ClampMin.bind(Some(3.0), None).value(9.0), 9.0);
-        assert_eq!(Func::ClampMax.bind(Some(3.0), None).value(9.0), 3.0);
-        assert_eq!(Func::ClampMax.bind(Some(3.0), None).value(1.0), 1.0);
+        assert_eq!(Func::ClampMin.bind(Some(3.0), None).value(1.0), Some(3.0));
+        assert_eq!(Func::ClampMin.bind(Some(3.0), None).value(9.0), Some(9.0));
+        assert_eq!(Func::ClampMax.bind(Some(3.0), None).value(9.0), Some(3.0));
+        assert_eq!(Func::ClampMax.bind(Some(3.0), None).value(1.0), Some(1.0));
         // `min.max(max.min(v))` with a NaN bound answers as Go's
         // math.Max(min, math.Min(max, v)) does.
         assert!(Func::ClampMin
             .bind(Some(f64::NAN), None)
             .value(1.0)
+            .unwrap()
             .is_nan());
     }
 

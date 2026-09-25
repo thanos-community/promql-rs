@@ -227,17 +227,47 @@ pub fn group_exprs(keys: &[String]) -> Vec<Expr> {
 }
 
 /// The `labels` struct of an aggregation's output, from the group columns
-/// [`group_exprs`] produced.
+/// [`group_exprs`] produced, plus any `extra` label the aggregation
+/// carried up beside them — a binary comparison keeps the left side's
+/// `__name__`, which the match signature had to leave out.
 ///
 /// Built through `Column` directly because `col` parses its argument as a
 /// SQL identifier: it would read a label named `service.name` as relation
 /// `service` column `name`, and fold `Region` to `region`.
-pub fn regroup(keys: &[String]) -> Expr {
+pub fn regroup(keys: &[String], extra: Vec<(String, Expr)>) -> Expr {
+    let mut pairs: Vec<(String, Expr)> = keys
+        .iter()
+        .map(|k| {
+            let column = Column::new_unqualified(group_alias(k));
+            (k.clone(), Expr::Column(column))
+        })
+        .chain(extra)
+        .collect();
+    // `call` takes its pairs sorted; the keys already are, and an extra
+    // name lands wherever it belongs among them.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    call(pairs)
+}
+
+/// The `labels` struct over `names`, reading the fields `input` has and
+/// spelling the rest absent.
+///
+/// Two operands of a binary operator rarely carry the same label names,
+/// and they have to share one schema before a single grouping can find
+/// the match groups. A name one side never carried is `""`, which is
+/// how the shape spells absent — so a series without it matches one
+/// whose value is empty, exactly as two label sets compare upstream.
+pub fn widen(input: &[String], names: &[String]) -> Expr {
     call(
-        keys.iter()
-            .map(|k| {
-                let column = Column::new_unqualified(group_alias(k));
-                (k.clone(), Expr::Column(column))
+        names
+            .iter()
+            .map(|n| {
+                let value = if input.iter().any(|have| have == n) {
+                    get_field(col(LABELS), n.as_str())
+                } else {
+                    lit("")
+                };
+                (n.clone(), value)
             })
             .collect(),
     )
@@ -278,7 +308,7 @@ mod tests {
         let source = Arc::new(LogicalTableSource::new(series::schema(input)));
         let plan = LogicalPlanBuilder::scan("series", source, None)?
             .aggregate(group_exprs(keys), vec![count(col(SAMPLES)).alias(SAMPLES)])?
-            .project(vec![regroup(keys).alias(LABELS), col(SAMPLES)])?
+            .project(vec![regroup(keys, Vec::new()).alias(LABELS), col(SAMPLES)])?
             .build()?;
         match plan
             .schema()
@@ -330,7 +360,7 @@ mod tests {
         };
         assert_eq!(aliased, "__group__service.name");
 
-        let read = match &regroup(&keys) {
+        let read = match &regroup(&keys, Vec::new()) {
             Expr::ScalarFunction(f) => match &f.args[1] {
                 Expr::Column(c) => c.clone(),
                 other => panic!("expected a column, got {other:?}"),
