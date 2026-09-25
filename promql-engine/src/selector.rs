@@ -34,8 +34,9 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
+use crate::buffer::BufferedSeriesIterator;
 use crate::params::Params;
-use crate::series;
+use crate::series::{self, SamplesBuilder};
 
 pub const NAME: &str = "promql_vector_selector";
 
@@ -45,6 +46,73 @@ pub const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 
 pub fn is_stale(v: f64) -> bool {
     v.to_bits() == STALE_NAN_BITS
+}
+
+/// `vectorSelectorSingle` for every step the buffered samples can answer
+/// for good: those whose lookup time is at or before `last_t`, since a
+/// later sample is later than that.
+///
+/// Stale markers stay in the buffer: one that is the latest sample hides
+/// the series, which dropping it would undo.
+///
+/// `ts`/`vs` are the series' samples from ordinal `it.base` on.
+pub(crate) fn advance_selector(
+    it: &mut BufferedSeriesIterator,
+    ts: &[i64],
+    vs: &[f64],
+    out: &mut SamplesBuilder,
+) {
+    let Some(last_t) = it.last_t else {
+        return;
+    };
+    let p = it.params;
+    let steps = it.steps();
+
+    // `@` pins the lookup, so the answer is one value repeated across the
+    // grid. The buffer holds only the pinned window's latest sample.
+    if let Some(at) = p.at_ms {
+        if it.next_step >= steps || at - p.offset_ms > last_t {
+            return;
+        }
+        if let Some(&v) = vs.last() {
+            if !is_stale(v) {
+                for step in p.steps() {
+                    out.push(step, v);
+                }
+            }
+        }
+        it.next_step = steps;
+        return;
+    }
+
+    // The walk keeps its cursor in locals, relative to the slice, and moves
+    // the step by addition. Through `it` every advance is a store the
+    // compiler must keep, and `step_at` is an i128 multiply per step, which
+    // together cost the 30-day selector 7%. The addition past the last step
+    // may wrap near `i64::MAX`; that value is never read.
+    let (mut next, mut h) = (it.next_step, it.hi - it.base);
+    let mut step = it.step_at(next);
+    while next < steps {
+        let ref_time = step - p.offset_ms;
+        if ref_time > last_t {
+            break;
+        }
+        while h < ts.len() && ts[h] <= ref_time {
+            h += 1;
+        }
+        if h > 0 {
+            let (t, v) = (ts[h - 1], vs[h - 1]);
+            if t > ref_time - p.window_ms && !is_stale(v) {
+                out.push(step, v);
+            }
+        }
+        next += 1;
+        step = step.wrapping_add(p.step_ms);
+    }
+    it.next_step = next;
+    it.hi = it.base + h;
+    // The candidate for the next step is the last sample read, or a later one.
+    it.lo = it.hi.saturating_sub(1).max(it.base);
 }
 
 /// The value the selector yields at one lookup time, if any.
@@ -280,14 +348,36 @@ pub fn apply(samples: &ListArray, p: &Params) -> ListArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Kernel;
     use datafusion::arrow::buffer::NullBuffer;
 
     const M: i64 = 60_000;
 
     fn run(ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
-        let mut out = Vec::new();
-        eval_series(ts, vs, &p, |t, v| out.push((t, v)));
-        out
+        select(&[(ts, vs)], p)
+    }
+
+    /// One series pushed as `chunks`, then closed.
+    fn select(chunks: &[(&[i64], &[f64])], p: Params) -> Vec<(i64, f64)> {
+        let mut it = BufferedSeriesIterator::new(Kernel::Selector, p);
+        let mut out = SamplesBuilder::default();
+        for (ts, vs) in chunks {
+            it.push(ts, vs, &mut out);
+        }
+        it.close(&mut out);
+        let mut rows = rows(&out.take_all());
+        assert_eq!(rows.len(), 1);
+        rows.pop().unwrap()
+    }
+
+    fn rows(list: &ListArray) -> Vec<Vec<(i64, f64)>> {
+        (0..list.len())
+            .map(|r| {
+                let row = list.value(r);
+                let (ts, vs) = series::sample_slices(row.as_struct());
+                ts.iter().copied().zip(vs.iter().copied()).collect()
+            })
+            .collect()
     }
 
     fn params() -> Params {
@@ -422,6 +512,127 @@ mod tests {
             },
         );
         assert!(out.is_empty());
+    }
+
+    /// Gaps longer than the lookback, a stale marker, a NaN and repeated
+    /// values: every branch `advance_selector` has, across the grids below.
+    fn a_rough_series() -> (Vec<i64>, Vec<f64>) {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        [
+            (0, 1.0),
+            (30_000, 2.0),
+            (90_000, 2.0),
+            (120_000, f64::NAN),
+            (150_000, 5.0),
+            (180_000, stale),
+            (240_000, 4.0),
+            (270_000, -0.0),
+            (300_000, 9.0),
+            (900_000, 3.0),
+            (930_000, stale),
+            (960_000, 3.0),
+            (1_020_000, 2.0),
+        ]
+        .into_iter()
+        .unzip()
+    }
+
+    fn grids() -> Vec<Params> {
+        let base = Params {
+            start_ms: 0,
+            end_ms: 20 * M,
+            step_ms: 30_000,
+            window_ms: 2 * M,
+            offset_ms: 0,
+            at_ms: None,
+        };
+        vec![
+            base,
+            Params {
+                step_ms: 7_000,
+                ..base
+            },
+            Params {
+                start_ms: 16 * M,
+                ..base
+            },
+            Params {
+                offset_ms: 90_000,
+                ..base
+            },
+            Params {
+                offset_ms: -M,
+                ..base
+            },
+            Params {
+                window_ms: 5 * M,
+                ..base
+            },
+            Params {
+                at_ms: Some(150_000),
+                ..base
+            },
+            Params {
+                at_ms: Some(160_000),
+                offset_ms: -M,
+                ..base
+            },
+            Params {
+                at_ms: Some(185_000),
+                ..base
+            },
+            Params {
+                at_ms: Some(20 * M),
+                ..base
+            },
+        ]
+    }
+
+    fn close_enough(a: &[(i64, f64)], b: &[(i64, f64)]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| x.0 == y.0 && x.1.to_bits() == y.1.to_bits())
+    }
+
+    #[test]
+    fn chunk_splits_select_what_one_row_selects() {
+        let (ts, vs) = a_rough_series();
+        for p in grids() {
+            let expected = run(&ts, &vs, p);
+            for k in 1..=ts.len() {
+                let chunks: Vec<(&[i64], &[f64])> = ts.chunks(k).zip(vs.chunks(k)).collect();
+                let got = select(&chunks, p);
+                assert!(
+                    close_enough(&got, &expected),
+                    "{p:?}, chunks of {k}: {got:?} != {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_repeating_the_previous_tail_select_the_same() {
+        let (ts, vs) = a_rough_series();
+        for p in grids() {
+            let expected = run(&ts, &vs, p);
+            for k in 2..=ts.len() {
+                // Each chunk starts one sample back, a duplicate of the
+                // previous chunk's last one.
+                let chunks: Vec<(&[i64], &[f64])> = (0..ts.len())
+                    .step_by(k - 1)
+                    .map(|a| {
+                        let b = (a + k).min(ts.len());
+                        (&ts[a..b], &vs[a..b])
+                    })
+                    .collect();
+                let got = select(&chunks, p);
+                assert!(
+                    close_enough(&got, &expected),
+                    "{p:?}, overlapping chunks of {k}: {got:?} != {expected:?}"
+                );
+            }
+        }
     }
 
     #[test]

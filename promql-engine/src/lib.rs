@@ -29,6 +29,9 @@
 //! store hands over would then be a type mismatch.
 
 pub mod aggregate;
+// Wired into the selector and range aggregates by chunk-rows-engine.
+#[allow(dead_code)]
+mod buffer;
 pub mod engine;
 pub mod error;
 pub mod labels;
@@ -40,6 +43,8 @@ pub mod params;
 pub mod plan;
 pub mod range;
 pub mod selector;
+// `SamplesBuilder`, whose only caller so far is `buffer`.
+#[allow(dead_code)]
 pub mod series;
 pub mod source;
 
