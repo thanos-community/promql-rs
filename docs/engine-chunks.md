@@ -1,7 +1,5 @@
 # How `rate` crosses a chunk boundary
 
-Interactive version with the step-through fold and the Arrow buffer inspector: https://thanos-community.github.io/promql-rs/engine-chunks.html
-
 promql-engine internals · companion to [engine.md](engine.md) and [series-source.md](series-source.md)
 
 If a store streams one Arrow row per chunk, and may cut its `RecordBatch`es anywhere, how are two chunks aligned so that `rate` can reach the last value of one and the first value of the next?

@@ -116,11 +116,14 @@ ordering is checked per row, see *Violations*.
    proxy sorts chunks itself (`pkg/store/proxy_merge.go:180-182`), so a
    store adapted from it sorts each series' chunk metas before emitting
    rows, touching metas, not samples.
-4. *Declared.* The returned plan declares that ordering as its output
-   ordering, `(labels, first sample timestamp)`, and, when it has more than
-   one partition, hash partitioning on `labels`. The engine refuses a plan
-   that loses it, because the whole memory bound rests on DataFusion being
-   able to prove it, see [`engine.md`](engine.md).
+4. *Handed over in that order.* The store's obligation stops at emitting
+   rows in this order; declaring it as the plan's output ordering,
+   `(labels, first sample timestamp)`, and, when it has more than one
+   partition, hash partitioning on `labels`, is the engine's job, and it
+   checks the declaration against what actually arrives row by row. The
+   engine refuses a plan that loses the ordering, because the whole memory
+   bound rests on DataFusion being able to prove it, see
+   [`engine.md`](engine.md).
 
 **Violations.** The engine never sorts or buffers to repair order. It always
 checks, one comparison per row: labels non-decreasing between adjacent rows
