@@ -1,5 +1,6 @@
 //! Golden parity corpus: a fixed set of range-query results, recorded once
-//! from today's one-row-per-series engine (`b2c7c59`), replayed against
+//! from the one-row-per-series engine this branch stacks on — main at
+//! `4dea702` plus the memory source's chunk knobs — replayed against
 //! whatever `SeriesSource` shape a later step introduces.
 //!
 //! `tests/chunked.rs` recomputes the unchunked answer on every run and
@@ -11,7 +12,8 @@
 //! `tests/testdata/parity.json` holds the corpus: the series (as
 //! `promqltest` load lines) and, per case, the query, its range, and the
 //! recorded output. `regenerate_corpus` below is the only thing that
-//! writes it, and only when asked — see its doc for why.
+//! writes it, and only when asked, with `PROMQL_REGEN_PARITY=1` — see its
+//! doc for why.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
