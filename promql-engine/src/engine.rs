@@ -50,18 +50,21 @@ pub struct Engine {
 impl Engine {
     /// An engine for async callers. Use the `*_async` methods.
     pub fn new() -> Self {
-        // The first two would let one series' chunk rows reach the selector
-        // aggregate from more than one partition, which then folds half a
-        // series in each: round-robin repartitioning inserts itself under a
-        // partial aggregate, and a scan split by byte range cuts through a
-        // series. Hash repartitioning for aggregations would split even a
-        // one-partition selector into a Partial and a FinalPartitioned
-        // across a shuffle to reach target_partitions, a second pass over
-        // every finished series that `check_selector_plans` refuses.
-        let config = SessionConfig::new()
+        // A scan split by byte range cuts through a series. Round-robin is
+        // off out of caution: with the selector SinglePartitioned over
+        // Hash(labels) DataFusion only places it above the selector, over
+        // finished series, but nothing but that requirement keeps it there.
+        // Hash repartitioning for aggregations is what lets the selector run
+        // SinglePartitioned per store partition. The plan then ends in
+        // several partitions, and `range_query_async` restores the order.
+        let mut config = SessionConfig::new()
             .with_round_robin_repartition(false)
             .with_repartition_file_scans(false)
-            .with_repartition_aggregations(false);
+            .with_repartition_aggregations(true);
+        // Below this many input partitions EnforceDistribution re-hashes a
+        // satisfied Hash(labels) input anyway, to reach target_partitions,
+        // which splits the selector into Partial and FinalPartitioned.
+        config.options_mut().optimizer.subset_repartition_threshold = 1;
         let ctx = SessionContext::new_with_config(config);
         ctx.register_udaf(selector::udaf());
         ctx.register_udf(labels::udf());
@@ -178,9 +181,9 @@ impl Engine {
 /// checks catch the rows that then arrive interleaved, but only for data
 /// that happens to interleave, so the shape is checked here on every plan.
 ///
-/// Accepted: a Partial or Single aggregate, Sorted, whose input reaches
-/// [`SeriesSetExec`] through nothing but projections and cooperative
-/// yields; and a Final aggregate, Sorted, over such a Partial through an
+/// Accepted: a Partial, Single or SinglePartitioned aggregate, Sorted,
+/// whose input reaches [`SeriesSetExec`] through nothing but projections
+/// and cooperative yields; and a Final aggregate, Sorted, over such a Partial through an
 /// order-preserving merge or hash repartition. Anything that deals rows
 /// out anew below the Partial — round-robin, a hash split of chunk rows —
 /// can put one series in two partitions, each of which folds half of it.
@@ -210,7 +213,7 @@ pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineE
             return Err(refuse("a selector aggregate does not run Sorted"));
         }
         let fed = match agg.mode() {
-            AggregateMode::Partial | AggregateMode::Single => {
+            AggregateMode::Partial | AggregateMode::Single | AggregateMode::SinglePartitioned => {
                 reaches(agg.input(), &|n| n.is::<SeriesSetExec>(), &|n| {
                     n.is::<ProjectionExec>() || n.is::<CooperativeExec>()
                 })
@@ -227,7 +230,7 @@ pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineE
                         })
                 },
             ),
-            AggregateMode::SinglePartitioned | AggregateMode::PartialReduce => false,
+            AggregateMode::PartialReduce => false,
         };
         if !fed {
             return Err(refuse(

@@ -51,7 +51,7 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics,
 };
 use futures::{Stream, StreamExt};
 use promql_parser::ast::LabelMatcher;
@@ -255,11 +255,20 @@ impl SeriesSetExec {
     /// `input` must have a schema that passed [`series::validate`].
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
         let schema = input.schema();
-        let labels = Column::new(LABELS, schema.index_of(LABELS).expect("a canonical schema"));
-        let ordering = [PhysicalSortExpr::new_default(Arc::new(labels))];
+        let labels: Arc<dyn PhysicalExpr> = Arc::new(Column::new(
+            LABELS,
+            schema.index_of(LABELS).expect("a canonical schema"),
+        ));
+        let ordering = [PhysicalSortExpr::new_default(Arc::clone(&labels))];
         let eq = EquivalenceProperties::new_with_orderings(schema, [ordering]);
+        // Every series whole in one partition is hash partitioning on
+        // `labels` in DataFusion's sense, so an aggregate grouped by
+        // `labels` needs no shuffle and plans SinglePartitioned. The store's
+        // hash is not DataFusion's; see docs for which operators that fools.
+        let n = input.properties().partitioning.partition_count();
         let properties = PlanProperties::clone(input.properties())
             .with_eq_properties(eq)
+            .with_partitioning(Partitioning::Hash(vec![labels], n))
             .into();
         Self { input, properties }
     }
