@@ -28,6 +28,9 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coop::CooperativeExec;
+use datafusion::physical_plan::joins::{
+    HashJoinExec, PartitionMode, SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
+};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -190,6 +193,13 @@ impl Engine {
 ///
 /// A sort on a `labels` column is refused wherever it sits: Arrow cannot
 /// sort a struct, so the plan would otherwise fail inside the sort.
+///
+/// So is a partitioned join with an input whose partitioning is still the
+/// one [`SeriesSetExec`] declares. That declaration names the right key
+/// but not DataFusion's hash, so partition i of the store is not partition
+/// i of anything DataFusion hashed, nor of another store's. Aggregates only
+/// need a key in one partition and are fine; a join matches partitions by
+/// index and would silently miss rows.
 pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineError> {
     let refuse = |why: &str| {
         EngineError::Query(format!(
@@ -200,6 +210,19 @@ pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineE
     let mut stack = vec![plan];
     while let Some(node) = stack.pop() {
         stack.extend(node.children());
+        if joins_by_partition(node)
+            && node.children().into_iter().any(|input| {
+                reaches(input, &|n| n.is::<SeriesSetExec>(), &|n| {
+                    n.is::<ProjectionExec>()
+                        || n.is::<CooperativeExec>()
+                        || selector_aggregate(n).is_some()
+                })
+            })
+        {
+            return Err(refuse(
+                "a partitioned join relies on the store's partitioning",
+            ));
+        }
         if let Some(sort) = node.downcast_ref::<SortExec>() {
             if sort.expr().iter().any(|e| is_labels(e.expr.as_ref())) {
                 return Err(refuse("a sort orders by labels"));
@@ -247,6 +270,15 @@ fn selector_aggregate(node: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
             .iter()
             .any(|e| [selector::NAME, range::NAME].contains(&e.fun().name()))
     })
+}
+
+fn joins_by_partition(node: &Arc<dyn ExecutionPlan>) -> bool {
+    node.downcast_ref::<HashJoinExec>()
+        .is_some_and(|j| *j.partition_mode() == PartitionMode::Partitioned)
+        || node
+            .downcast_ref::<SymmetricHashJoinExec>()
+            .is_some_and(|j| j.partition_mode() == StreamJoinPartitionMode::Partitioned)
+        || node.is::<SortMergeJoinExec>()
 }
 
 fn is_labels(expr: &dyn datafusion::physical_expr::PhysicalExpr) -> bool {

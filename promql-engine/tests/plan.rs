@@ -65,10 +65,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{JoinType, NullEquality};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_expr::expressions::{Column, UnKnownColumn};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -459,4 +461,50 @@ fn the_label_projection_drops_the_hash_partitioning() {
         panic!("{shown}");
     };
     assert!(exprs[0].is::<UnKnownColumn>(), "{exprs:?}\n{shown}");
+}
+
+/// `x` joined with itself partition by partition: the planner cannot
+/// produce this yet, binary operators are unsupported, but nothing stops
+/// DataFusion from trusting SeriesSetExec's Hash(labels) once they are.
+/// A hash repartition on each side replaces that trust with DataFusion's
+/// own hash, and is accepted.
+#[test]
+fn a_partitioned_join_over_the_store_partitioning_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let join = |wrap: &dyn Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>| {
+        let (left, right) = (
+            wrap(physical_plan(&source, "x")),
+            wrap(physical_plan(&source, "x")),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("labels", &left.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("labels", &right.schema()).unwrap()) as _,
+        )];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+        plan
+    };
+    let trusted = join(&|input| input);
+    let shown = displayable(trusted.as_ref()).indent(true).to_string();
+    match check_selector_plans(&trusted) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
+    }
+    let rehashed = join(&|input| {
+        let labels = Arc::new(Column::new_with_schema("labels", &input.schema()).unwrap());
+        Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![labels], 4)).unwrap())
+    });
+    check_selector_plans(&rehashed).unwrap_or_else(|e| panic!("{e}"));
 }
