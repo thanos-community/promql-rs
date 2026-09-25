@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -33,6 +34,25 @@ use crate::{aggregate, binary, elementwise, labels, range, selector};
 pub struct Engine {
     ctx: SessionContext,
     rt: Option<tokio::runtime::Runtime>,
+}
+
+/// A failure out of DataFusion as the caller should read it.
+///
+/// A UDAF has no way to fail but a `DataFusionError`, so the matching
+/// errors [`crate::binary`] raises arrive looking exactly like a bug in
+/// this crate. They are neither: Prometheus refuses the same query with
+/// the same words, so they are an answer. Named one by one rather than
+/// lifting every execution error, which would turn the next real bug
+/// into a query result. The `instant-label-functions` branch hangs its
+/// own same-labelset error on this hook, so the merge adds a text
+/// rather than a mechanism.
+fn lift(error: DataFusionError) -> EngineError {
+    match error.find_root() {
+        DataFusionError::Execution(message) if binary::is_matching_error(message) => {
+            EngineError::Query(message.clone())
+        }
+        _ => EngineError::DataFusion(error),
+    }
 }
 
 impl Engine {
@@ -102,8 +122,8 @@ impl Engine {
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
         let plan = self.plan_async(source, query, range).await?;
-        let df = self.ctx.execute_logical_plan(plan).await?;
-        let batches = df.collect().await?;
+        let df = self.ctx.execute_logical_plan(plan).await.map_err(lift)?;
+        let batches = df.collect().await.map_err(lift)?;
         // One `collect()` shares a single output schema across all its
         // batches, so validating it once and comparing later batches by
         // pointer skips the redundant re-walk of the label fields.

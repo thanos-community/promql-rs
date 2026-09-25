@@ -192,6 +192,27 @@ fn binary(c: &mut Criterion) {
         // most of them, which is the expensive half of that path.
         ("vector_scalar_compare", "http_requests_total > 100"),
         ("vector_vector", "http_requests_total + http_requests_total"),
+        // The fan-out: every series of a route matches the one sum of
+        // it, so a match group here is a lane per series rather than
+        // the single pair the cases above pay for.
+        (
+            "group_left",
+            "http_requests_total / on(route) group_left() sum by (route) (http_requests_total)",
+        ),
+        // A set operator holds both sides of every match group whole,
+        // and `or` is the one that then emits both — the widest a group
+        // gets for the least arithmetic.
+        (
+            "or",
+            "http_requests_total or on(route) sum by (route) (http_requests_total)",
+        ),
+        // A fill turns the sides that did not match from something to
+        // skip into something to answer for, which is the per-step
+        // bookkeeping at its widest.
+        (
+            "fill",
+            "http_requests_total / on(route) group_left() fill(0) sum by (route) (http_requests_total)",
+        ),
     ] {
         g.bench_function(BenchmarkId::new(qname, shape.id()), |b| {
             b.iter(|| {
