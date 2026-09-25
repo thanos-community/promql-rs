@@ -11,7 +11,8 @@
 //! `docs/series-source.md` is the design note for the trait and the shape.
 //! Above them, [`plan`] turns a parsed expression into a `LogicalPlan`
 //! over the store's plan, with [`selector`], [`aggregate`] and [`range`]
-//! as DataFusion functions over the samples list, and [`engine`] runs it.
+//! as DataFusion aggregate functions over the samples list, and [`engine`]
+//! runs it.
 //!
 //! ```text
 //! PromQL text ─► parser ─► Expr ─► plan::plan ─► LogicalPlan ─► DataFusion
@@ -29,9 +30,6 @@
 //! store hands over would then be a type mismatch.
 
 pub mod aggregate;
-// Wired into the selector and range aggregates by the engine change above
-// this one in the stack.
-#[allow(dead_code)]
 mod buffer;
 pub mod engine;
 pub mod error;
@@ -44,8 +42,6 @@ pub mod params;
 pub mod plan;
 pub mod range;
 pub mod selector;
-// `SamplesBuilder`, whose only caller so far is `buffer`.
-#[allow(dead_code)]
 pub mod series;
 pub mod source;
 

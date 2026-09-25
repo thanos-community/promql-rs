@@ -29,7 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::PhysicalExpr;
@@ -205,4 +205,8 @@ impl TableProvider for SelectorTable {
             Arc::clone(&self.plan),
         )?))
     }
+}
+
+pub(crate) fn source_error(msg: String) -> DataFusionError {
+    DataFusionError::External(Box::new(EngineError::Source(msg)))
 }

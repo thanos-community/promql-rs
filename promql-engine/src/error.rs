@@ -25,12 +25,118 @@ pub enum EngineError {
     #[error("series source schema: {0}")]
     Schema(String),
 
+    /// A store broke the order it promised: rows of a series not
+    /// consecutive, series not label-sorted, or a series' first sample
+    /// timestamps going backwards. Found while executing, so it reaches
+    /// the caller through DataFusion, and is unwrapped from it again.
+    #[error("series source order: {0}")]
+    Source(String),
+
     /// DataFusion refused or failed the plan.
     #[error("datafusion: {0}")]
-    DataFusion(#[from] DataFusionError),
+    DataFusion(DataFusionError),
 
     /// A blocking call on an engine without a runtime, or a runtime that
     /// could not be built.
     #[error("runtime: {0}")]
     Runtime(String),
+}
+
+impl From<DataFusionError> for EngineError {
+    /// An operator can only fail with a `DataFusionError`, so an engine
+    /// error raised inside one travels as `External` and is taken back out
+    /// here; otherwise every such error would reach callers as an opaque
+    /// `DataFusion` string.
+    fn from(e: DataFusionError) -> Self {
+        match e {
+            DataFusionError::External(inner) => match inner.downcast::<EngineError>() {
+                Ok(engine) => *engine,
+                Err(inner) => EngineError::DataFusion(DataFusionError::External(inner)),
+            },
+            DataFusionError::Context(ctx, inner) => match EngineError::from(*inner) {
+                EngineError::DataFusion(inner) => {
+                    EngineError::DataFusion(DataFusionError::Context(ctx, Box::new(inner)))
+                }
+                engine => engine,
+            },
+            // A repartition hands one input error to every output partition,
+            // so it arrives shared and usually cannot be moved out.
+            DataFusionError::Shared(shared) => match std::sync::Arc::try_unwrap(shared) {
+                Ok(e) => EngineError::from(e),
+                Err(shared) => match shared.as_ref() {
+                    DataFusionError::External(inner) => inner
+                        .downcast_ref::<EngineError>()
+                        .and_then(EngineError::copied)
+                        .unwrap_or(EngineError::DataFusion(DataFusionError::Shared(shared))),
+                    _ => EngineError::DataFusion(DataFusionError::Shared(shared)),
+                },
+            },
+            e => EngineError::DataFusion(e),
+        }
+    }
+}
+
+impl EngineError {
+    /// `DataFusionError` is not `Clone`, so an engine error wrapping one
+    /// cannot be copied out of a shared reference; every other can.
+    fn copied(&self) -> Option<EngineError> {
+        Some(match self {
+            EngineError::Unsupported(m) => EngineError::Unsupported(m.clone()),
+            EngineError::Query(m) => EngineError::Query(m.clone()),
+            EngineError::Schema(m) => EngineError::Schema(m.clone()),
+            EngineError::Source(m) => EngineError::Source(m.clone()),
+            EngineError::Runtime(m) => EngineError::Runtime(m.clone()),
+            EngineError::DataFusion(_) => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store-order violation is raised inside an `ExecutionPlan`, where
+    /// only a `DataFusionError` can be returned; callers must still be
+    /// able to match on the variant.
+    #[test]
+    fn a_source_error_survives_the_trip_through_datafusion() {
+        let wrapped =
+            DataFusionError::External(Box::new(EngineError::Source("out of order".into())));
+        assert!(
+            matches!(EngineError::from(wrapped), EngineError::Source(m) if m == "out of order")
+        );
+
+        let in_context = DataFusionError::Context(
+            "while collecting".into(),
+            Box::new(DataFusionError::External(Box::new(EngineError::Source(
+                "x".into(),
+            )))),
+        );
+        assert!(matches!(
+            EngineError::from(in_context),
+            EngineError::Source(_)
+        ));
+    }
+
+    #[test]
+    fn a_source_error_survives_a_repartition_sharing_it() {
+        let external =
+            || DataFusionError::External(Box::new(EngineError::Source("out of order".into())));
+        let alone = DataFusionError::Shared(std::sync::Arc::new(external()));
+        assert!(matches!(EngineError::from(alone), EngineError::Source(_)));
+
+        let held = std::sync::Arc::new(external());
+        let other_partition = std::sync::Arc::clone(&held);
+        assert!(matches!(
+            EngineError::from(DataFusionError::Shared(held)),
+            EngineError::Source(m) if m == "out of order"
+        ));
+        drop(other_partition);
+    }
+
+    #[test]
+    fn any_other_datafusion_error_stays_one() {
+        let e = EngineError::from(DataFusionError::Execution("boom".into()));
+        assert!(matches!(e, EngineError::DataFusion(_)), "{e:?}");
+    }
 }

@@ -39,10 +39,10 @@ impl Engine {
     /// An engine for async callers. Use the `*_async` methods.
     pub fn new() -> Self {
         let ctx = SessionContext::new_with_config(SessionConfig::new());
-        ctx.register_udf(selector::udf());
+        ctx.register_udaf(selector::udaf());
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
-        ctx.register_udf(range::udf());
+        ctx.register_udaf(range::udaf());
         Self { ctx, rt: None }
     }
 
