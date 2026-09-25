@@ -4,8 +4,9 @@
 //! It exists for tests, the conformance suite seeds it from the corpus's
 //! `load` blocks, but it is also the executable statement of what a real
 //! store has to do: apply the matchers with [`crate::matcher`]'s
-//! semantics, keep only samples inside the range, hand over one row per
-//! series with samples in timestamp order, in the canonical schema. A
+//! semantics, keep only samples inside the range, hand over each series'
+//! rows consecutively, series in struct order and samples in timestamp
+//! order, in the canonical schema. A
 //! store implementer who wants to know "what exactly am I promising" can
 //! read `select` below.
 //!
@@ -25,8 +26,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{AsArray, RecordBatch};
-use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::array::{AsArray, RecordBatch, UInt32Array};
+use datafusion::arrow::compute::{filter_record_batch, take_record_batch};
+use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result};
@@ -41,6 +43,8 @@ use crate::source::{SelectHints, SeriesSource};
 
 #[derive(Debug)]
 pub struct MemorySeriesSource {
+    /// Sorted by labels in struct order, the order `SeriesSetExec`
+    /// declares, so a selection is sorted by construction.
     batch: RecordBatch,
 }
 
@@ -57,8 +61,9 @@ impl MemorySeriesSource {
     /// one series split in two, and it is caught here rather than on
     /// every query.
     pub fn try_new(series: Vec<Series>) -> std::result::Result<Self, String> {
+        let batch = encode(&label_names_of(&series), &series)?;
         Ok(Self {
-            batch: encode(&label_names_of(&series), &series)?,
+            batch: sort_by_labels(&batch).map_err(|e| e.to_string())?,
         })
     }
 
@@ -155,8 +160,9 @@ impl SeriesSource for MemorySeriesSource {
             clip(&selected, hints.start_ms, hints.end_ms).map_err(DataFusionError::Execution)?;
 
         // Obligations 2 and 3, partition and order, come for free: the
-        // stored batch already holds one row per series with its samples
-        // ascending, and neither step here reorders anything.
+        // stored batch already holds one row per series in struct order
+        // with its samples ascending, and neither step here reorders
+        // anything.
         let schema = selected.schema();
         Ok(MemorySourceConfig::try_new_exec(
             &[vec![selected]],
@@ -164,6 +170,19 @@ impl SeriesSource for MemorySeriesSource {
             None,
         )?)
     }
+}
+
+/// `batch`'s rows in struct order of their labels, the order DataFusion
+/// compares `labels` in, which is what `SeriesSetExec` declares and
+/// checks. It differs from the `(name, value)` order the rows may have
+/// been merged in, so it cannot be skipped for series that "look" sorted.
+fn sort_by_labels(batch: &RecordBatch) -> Result<RecordBatch> {
+    let labels = batch.column_by_name(LABELS).expect("canonical");
+    let converter = RowConverter::new(vec![SortField::new(labels.data_type().clone())])?;
+    let rows = converter.convert_columns(std::slice::from_ref(labels))?;
+    let mut order: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    order.sort_unstable_by_key(|&i| rows.row(i as usize));
+    Ok(take_record_batch(batch, &UInt32Array::from(order))?)
 }
 
 #[cfg(test)]
@@ -331,6 +350,54 @@ mod tests {
         assert_eq!(src.series().len(), 1);
         assert_eq!(src.series()[0].values(), [2.0]);
         assert_eq!(src.series()[0].label("env"), "");
+    }
+
+    fn pods(batches: &[RecordBatch]) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let labels = b.column_by_name(LABELS).unwrap().as_struct();
+                (0..b.num_rows())
+                    .map(|r| {
+                        labels
+                            .fields()
+                            .iter()
+                            .zip(labels.columns())
+                            .map(|(f, c)| format!("{}={}", f.name(), c.as_string_view().value(r)))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The store's order is DataFusion's struct order, the one
+    /// `SeriesSetExec` declares: `{b="1"}` is `("", "1")` and precedes
+    /// `{a="1"}`, `("1", "")`, although Prometheus sorts them the other
+    /// way round and `from_descriptions` merges them in that order.
+    #[tokio::test]
+    async fn series_come_out_in_struct_order() {
+        let series: Vec<SeriesDescription> =
+            [r#"x{a="1"} 1"#, r#"x{b="1"} 1"#, r#"x{a="1",b="1"} 1"#]
+                .iter()
+                .map(|l| promql_parser::parse_series_desc(l).unwrap())
+                .collect();
+        let src = MemorySeriesSource::from_descriptions(&series, 1.0);
+        let ctx = SessionContext::new();
+        let plan = src
+            .select(&ctx.state(), &[], SelectHints::range(0, 1_000))
+            .await
+            .unwrap();
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        assert_eq!(
+            pods(&batches),
+            [
+                "__name__=x,a=,b=1",
+                "__name__=x,a=1,b=",
+                "__name__=x,a=1,b=1",
+            ]
+        );
     }
 
     #[tokio::test]
