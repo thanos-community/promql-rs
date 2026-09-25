@@ -90,7 +90,8 @@ impl Engine {
     }
 
     /// Evaluate a range query. Batches are in the canonical schema
-    /// ([`crate::series`]) with empty series already dropped; call
+    /// ([`crate::series`]) with empty series already dropped, series in
+    /// Prometheus's label-set order; call
     /// [`series::decode`] to get [`Series`](crate::Series) instead.
     pub async fn range_query_async(
         &self,
@@ -117,7 +118,7 @@ impl Engine {
             })
             .collect::<Result<_, EngineError>>()?;
         labelset::reject_same_labelset(&batches)?;
-        Ok(batches)
+        labelset::sort_by_labelset(&batches)
     }
 
     /// [`Self::range_query_async`], blocking on the engine's own runtime.
