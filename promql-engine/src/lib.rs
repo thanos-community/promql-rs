@@ -31,6 +31,7 @@
 pub mod aggregate;
 pub mod engine;
 pub mod error;
+pub mod function;
 pub mod labels;
 mod labelset;
 pub mod matcher;
@@ -39,9 +40,11 @@ pub mod memory;
 pub mod params;
 pub mod plan;
 pub mod range;
+pub mod scalar;
 pub mod selector;
 pub mod series;
 pub mod source;
+pub mod value_type;
 
 pub use engine::{Engine, RangeQuery};
 pub use error::EngineError;
