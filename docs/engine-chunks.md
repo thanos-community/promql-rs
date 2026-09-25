@@ -1,6 +1,6 @@
 # How `rate` crosses a chunk boundary
 
-promql-engine internals · companion to [engine.md](engine.md) and [series-source.md](series-source.md)
+promql-engine internals · companion to [engine.md](engine.md) and [series-source.md](series-source.md) · [illustrated version](engine-chunks.html) with the step-through fold and the Arrow buffer inspector
 
 If a store streams one Arrow row per chunk, and may cut its `RecordBatch`es anywhere, how are two chunks aligned so that `rate` can reach the last value of one and the first value of the next?
 
