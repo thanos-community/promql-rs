@@ -18,9 +18,19 @@ promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# Only for the memory bench's heap profiles; the library never uses them.
+jemalloc_pprof = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
+
+[features]
+# jemalloc under the memory bench's counter, with heap profiling on, so it
+# can dump pprof heap profiles. Off by default to keep jemalloc's C build
+# out of every test and bench build.
+heap-profile = ["dep:jemalloc_pprof", "dep:tikv-jemallocator"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+futures = { workspace = true }
 pprof = { workspace = true }
 serde = { workspace = true }
 serde_norway = { workspace = true }
@@ -36,4 +46,8 @@ harness = false
 
 [[bench]]
 name = "engine"
+harness = false
+
+[[bench]]
+name = "memory"
 harness = false

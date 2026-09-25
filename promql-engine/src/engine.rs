@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::error::EngineError;
@@ -68,6 +69,24 @@ impl Engine {
         let expr =
             promql_parser::parse_expr(query).map_err(|e| EngineError::Query(e.to_string()))?;
         crate::plan::plan(&self.ctx.state(), source, &expr, range).await
+    }
+
+    /// The optimized plan a range query runs, for a caller that wants to
+    /// stream it directly instead of paying for [`Self::range_query_async`]'s
+    /// buffering; the memory bench is the one such caller.
+    pub async fn physical_plan_async(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        range: &RangeQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>, EngineError> {
+        let plan = self.plan_async(source, query, range).await?;
+        Ok(self
+            .ctx
+            .execute_logical_plan(plan)
+            .await?
+            .create_physical_plan()
+            .await?)
     }
 
     /// Evaluate a range query. Batches are in the canonical schema
