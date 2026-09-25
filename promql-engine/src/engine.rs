@@ -35,6 +35,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::union::InterleaveExec;
 use datafusion::physical_plan::{self, displayable, ExecutionPlan, InputOrderMode, Partitioning};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
@@ -194,12 +195,18 @@ impl Engine {
 /// A sort on a `labels` column is refused wherever it sits: Arrow cannot
 /// sort a struct, so the plan would otherwise fail inside the sort.
 ///
-/// So is a partitioned join with an input whose partitioning is still the
-/// one [`SeriesSetExec`] declares. That declaration names the right key
-/// but not DataFusion's hash, so partition i of the store is not partition
-/// i of anything DataFusion hashed, nor of another store's. Aggregates only
-/// need a key in one partition and are fine; a join matches partitions by
-/// index and would silently miss rows.
+/// So is a partitioned join, or an `InterleaveExec`, with an input whose
+/// partitioning is still the one [`SeriesSetExec`] declares. That
+/// declaration names the right key but not DataFusion's hash, so partition
+/// i of the store is not partition i of anything DataFusion hashed, nor of
+/// another store's. Aggregates only need a key in one partition and are
+/// fine; a join matches partitions by index and would silently miss rows,
+/// and DataFusion turns a `UnionExec` into an `InterleaveExec` whenever
+/// every child declares the same partitioning
+/// (`enforce_distribution.rs:1458-1485`, `union.rs:664-676`), which is true
+/// of two selectors over the same store: it would then zip partition i of
+/// one scan with partition i of the other and hand a downstream Sorted
+/// consumer the same label set twice.
 pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineError> {
     let refuse = |why: &str| {
         EngineError::Query(format!(
@@ -210,18 +217,14 @@ pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineE
     let mut stack = vec![plan];
     while let Some(node) = stack.pop() {
         stack.extend(node.children());
-        if joins_by_partition(node)
-            && node.children().into_iter().any(|input| {
-                reaches(input, &|n| n.is::<SeriesSetExec>(), &|n| {
-                    n.is::<ProjectionExec>()
-                        || n.is::<CooperativeExec>()
-                        || selector_aggregate(n).is_some()
-                })
-            })
-        {
+        if joins_by_partition(node) && node.children().into_iter().any(trusts_store_partitioning) {
             return Err(refuse(
                 "a partitioned join relies on the store's partitioning",
             ));
+        }
+        if node.is::<InterleaveExec>() && node.children().into_iter().any(trusts_store_partitioning)
+        {
+            return Err(refuse("an interleave relies on the store's partitioning"));
         }
         if let Some(sort) = node.downcast_ref::<SortExec>() {
             if sort.expr().iter().any(|e| is_labels(e.expr.as_ref())) {
@@ -284,6 +287,42 @@ fn joins_by_partition(node: &Arc<dyn ExecutionPlan>) -> bool {
 fn is_labels(expr: &dyn datafusion::physical_expr::PhysicalExpr) -> bool {
     expr.downcast_ref::<Column>()
         .is_some_and(|c| c.name() == LABELS)
+}
+
+/// Whether `node` still carries [`SeriesSetExec`]'s declared partitioning
+/// through nothing but projections, cooperative yields, a selector
+/// aggregate, or a single-child node DataFusion reports as leaving its
+/// child's `output_partitioning()` unchanged — `FilterExec`,
+/// `GlobalLimitExec`, `LocalLimitExec` and `CoalesceBatchesExec` among
+/// them. Shared by the join guard and the interleave guard: one trusting
+/// side is enough to refuse either, because DataFusion would hash only the
+/// other side to match it.
+fn trusts_store_partitioning(node: &Arc<dyn ExecutionPlan>) -> bool {
+    reaches(node, &|n| n.is::<SeriesSetExec>(), &|n| {
+        n.is::<ProjectionExec>()
+            || n.is::<CooperativeExec>()
+            || selector_aggregate(n).is_some()
+            || passes_partitioning_through(n)
+    })
+}
+
+/// Whether `node` has exactly one child and reports the same
+/// `output_partitioning()` as that child, so a Hash(labels, n) declared
+/// below it reaches above it unchanged. A positive rule on
+/// `output_partitioning()` instead of naming node types: DataFusion
+/// guarantees the property, not the list, and an allowlist only grows as
+/// more pass-through operators turn up. Excludes `RepartitionExec`: its
+/// whole purpose is to declare new partitioning, and `Partitioning::Hash`
+/// equality does not distinguish a genuine re-hash of the same width from
+/// a passthrough of the declaration this guard exists to catch.
+fn passes_partitioning_through(node: &Arc<dyn ExecutionPlan>) -> bool {
+    if node.is::<RepartitionExec>() {
+        return false;
+    }
+    match node.children().as_slice() {
+        [child] => node.properties().partitioning == child.properties().partitioning,
+        _ => false,
+    }
 }
 
 /// Whether `node`, or the single-child chain below it through `through`,
