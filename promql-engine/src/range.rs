@@ -297,16 +297,19 @@ impl Sweep {
     }
 
     /// Sample `i` joins the window's end; `lo` is its start, so a pair
-    /// arrives with `i` only once its left half is inside.
-    fn enter(&mut self, i: usize, lo: usize, vs: &[f64]) {
+    /// arrives with `i` only once its left half is inside. `vs` holds
+    /// ordinals from `base` on: the tracked indices stay absolute so that
+    /// trimming the buffer's front never has to rewrite them.
+    fn enter(&mut self, i: usize, lo: usize, base: usize, vs: &[f64]) {
+        let at = |j: usize| vs[j - base];
         match self {
             Sweep::Counter { resets, .. } => {
-                if i > lo && vs[i] < vs[i - 1] {
+                if i > lo && at(i) < at(i - 1) {
                     resets.push_back(i - 1);
                 }
             }
             Sweep::Extremum { candidates, max } => {
-                if vs[i].is_nan() {
+                if at(i).is_nan() {
                     return;
                 }
                 // A strict comparison keeps the earliest of equal
@@ -314,9 +317,9 @@ impl Sweep {
                 // and the only way `-0.0` against `0.0` agrees.
                 while let Some(&back) = candidates.back() {
                     let beaten = if *max {
-                        vs[back] < vs[i]
+                        at(back) < at(i)
                     } else {
-                        vs[back] > vs[i]
+                        at(back) > at(i)
                     };
                     if !beaten {
                         break;
@@ -447,7 +450,7 @@ pub(crate) fn range_function(
                 // empty.
                 hi = hi.max(lo);
                 while hi < ts.len() && ts[hi] <= range_end {
-                    sweep.enter(hi, lo, vs);
+                    sweep.enter(hi, lo, 0, vs);
                     hi += 1;
                 }
                 if let Some(v) = sweep.value(&slice(lo, hi, range_end), lo) {
