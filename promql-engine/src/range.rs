@@ -1,40 +1,38 @@
-//! Range-vector functions as one DataFusion scalar function:
-//! `promql_range_function(samples, 'rate', start, end, step, range, offset, at)`.
+//! Range-vector functions as one DataFusion grouped aggregate function:
+//! `promql_range_function(samples, 'rate', start, end, step, range, offset, at)`
+//! grouped by `labels`.
 //!
 //! A range function is the vector selector's shape with a window instead
-//! of a lookback: one series' slice in, that series' values on the step
-//! grid out, DataFusion parallel over rows. The function name is a
-//! literal argument, like every parameter, so one registration serves all
-//! of them and the plan says which it is.
+//! of a lookback, so it runs in the selector's accumulator, `EvalSeries`,
+//! with `advance_range` as the walk: one series' chunk rows in, that
+//! series' values on the step grid out. The function name is a literal
+//! argument, like every parameter, so one registration serves all of them
+//! and the plan says which it is.
 //!
 //! Semantics are `matrixIterSlice`, `extrapolatedRate`, `instantValue`
 //! and the `*_over_time` functions in Prometheus's `promql/functions.go`
 //! and `engine.go`. Floats only; native histograms are a later slice.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use datafusion::arrow::array::builder::BooleanBufferBuilder;
-use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, ListArray, StructArray,
-    TimestampMillisecondArray,
-};
-use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::filter;
-use datafusion::arrow::datatypes::{
-    DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
-};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{plan_err, ScalarValue};
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
+use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
-    lit, ColumnarValue, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility,
+    lit, Accumulator, AggregateUDF, AggregateUDFImpl, Expr, GroupsAccumulator, Signature,
+    Volatility,
 };
+use datafusion::physical_expr::expressions::Literal;
+use datafusion::physical_expr::PhysicalExpr;
 
-use crate::buffer::BufferedSeriesIterator;
+use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::math;
 use crate::params::{step_count, Params};
-use crate::selector::{int_arg, is_stale};
+use crate::selector::{empty_samples, EvalSeries};
 use crate::series;
 
 pub const NAME: &str = "promql_range_function";
@@ -371,97 +369,6 @@ impl Sweep {
     }
 }
 
-/// Evaluate one series on the step grid.
-///
-/// `ts`/`vs` are one series' samples, ascending and already free of
-/// StaleNaN entries, which `apply` filters once over the whole batch.
-/// `sweep` is `None` for the functions that refold the window per step;
-/// where it is `Some` it must already be [`Sweep::reset`] for this
-/// series. `emit` receives `(step_timestamp, value)` in step order.
-pub(crate) fn range_function(
-    func: Func,
-    ts: &[i64],
-    vs: &[f64],
-    p: &Params,
-    sweep: Option<&mut Sweep>,
-    mut emit: impl FnMut(i64, f64),
-) {
-    debug_assert_eq!(ts.len(), vs.len());
-    if p.step_ms <= 0 || p.end_ms < p.start_ms || p.window_ms <= 0 {
-        return;
-    }
-
-    let slice = |lo: usize, hi: usize, range_end: i64| -> Window<'_> {
-        Window {
-            ts: &ts[lo..hi],
-            vs: &vs[lo..hi],
-            range_start: range_end - p.window_ms,
-            range_end,
-            range_ms: p.window_ms,
-        }
-    };
-
-    // `@` pins the window; evaluate once and repeat across the grid.
-    if let Some(at) = p.at_ms {
-        let range_end = at - p.offset_ms;
-        let lo = ts.partition_point(|t| *t <= range_end - p.window_ms);
-        let hi = ts.partition_point(|t| *t <= range_end);
-        if let Some(v) = evaluate(func, &slice(lo, hi, range_end)) {
-            for step in p.steps() {
-                emit(step, v);
-            }
-        }
-        return;
-    }
-
-    // Both window edges only move forward with the step, so a sweep sees
-    // every sample enter once and leave once. The two loops are one
-    // `match` above the step loop rather than a branch inside it, so the
-    // refolding path pays neither the calls nor the dispatch in them.
-    let (mut lo, mut hi) = (0usize, 0usize);
-    match sweep {
-        None => {
-            for step in p.steps() {
-                let range_end = step - p.offset_ms;
-                let range_start = range_end - p.window_ms;
-                while lo < ts.len() && ts[lo] <= range_start {
-                    lo += 1;
-                }
-                hi = hi.max(lo);
-                while hi < ts.len() && ts[hi] <= range_end {
-                    hi += 1;
-                }
-                if let Some(v) = evaluate(func, &slice(lo, hi, range_end)) {
-                    emit(step, v);
-                }
-            }
-        }
-        Some(sweep) => {
-            for step in p.steps() {
-                let range_end = step - p.offset_ms;
-                let range_start = range_end - p.window_ms;
-                while lo < ts.len() && ts[lo] <= range_start {
-                    if lo < hi {
-                        sweep.leave(lo);
-                    }
-                    lo += 1;
-                }
-                // A gap wider than the window leaves `hi` behind `lo`;
-                // the samples it skips never entered, and the state is
-                // empty.
-                hi = hi.max(lo);
-                while hi < ts.len() && ts[hi] <= range_end {
-                    sweep.enter(hi, lo, 0, vs);
-                    hi += 1;
-                }
-                if let Some(v) = sweep.value(&slice(lo, hi, range_end), lo) {
-                    emit(step, v);
-                }
-            }
-        }
-    }
-}
-
 /// Evaluate the steps of `it`'s open series that are ready.
 ///
 /// Without `done`, a step is ready once its window's end is at or before
@@ -601,19 +508,21 @@ pub struct RangeFunction {
 
 impl Default for RangeFunction {
     fn default() -> Self {
+        let mut args = vec![series::samples_type(), DataType::Utf8];
+        args.extend(std::iter::repeat_n(DataType::Int64, 6));
         Self {
-            signature: Signature::any(8, Volatility::Immutable),
+            signature: Signature::exact(args, Volatility::Immutable),
         }
     }
 }
 
-pub fn udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(RangeFunction::default())
+pub fn udaf() -> AggregateUDF {
+    AggregateUDF::new_from_impl(RangeFunction::default())
 }
 
 /// `promql_range_function(samples, '<func>', start, end, step, range, offset, at)`.
 pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
-    udf().call(vec![
+    udaf().call(vec![
         samples,
         lit(func.as_str()),
         lit(p.start_ms),
@@ -621,14 +530,33 @@ pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
         lit(p.step_ms),
         lit(p.window_ms),
         lit(p.offset_ms),
-        match p.at_ms {
-            Some(at) => lit(at),
-            None => lit(ScalarValue::Int64(None)),
-        },
+        lit(ScalarValue::Int64(p.at_ms)),
     ])
 }
 
-impl ScalarUDFImpl for RangeFunction {
+/// The function name and the grid, read off a planned call's literals.
+/// Every error names this function: the grid literals are read by a
+/// helper shared with the selector, whose own message cannot say which
+/// of the two it was reading for.
+fn read_args(exprs: &[Arc<dyn PhysicalExpr>]) -> Result<(Func, Params)> {
+    let name = exprs
+        .get(1)
+        .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
+        .map(Literal::value);
+    let func = match name {
+        Some(ScalarValue::Utf8(Some(name))) => match Func::parse(name) {
+            Some(func) => func,
+            None => return plan_err!("{NAME}: unknown function {name}"),
+        },
+        other => {
+            return plan_err!("{NAME}: the function name must be a Utf8 literal, got {other:?}")
+        }
+    };
+    let params = Params::from_literals(exprs, 2).map_err(|e| e.context(NAME))?;
+    Ok((func, params))
+}
+
+impl AggregateUDFImpl for RangeFunction {
     fn name(&self) -> &str {
         NAME
     }
@@ -637,6 +565,8 @@ impl ScalarUDFImpl for RangeFunction {
         &self.signature
     }
 
+    /// Same shape out as in. The check here is what makes a mistyped
+    /// samples column a plan error rather than a downcast panic.
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         if arg_types.first() != Some(&series::samples_type()) {
             return plan_err!(
@@ -645,178 +575,56 @@ impl ScalarUDFImpl for RangeFunction {
                 arg_types.first()
             );
         }
-        if arg_types.get(1) != Some(&DataType::Utf8) {
-            return plan_err!("{NAME}: second argument must be the function name as Utf8");
-        }
-        for (i, t) in arg_types.iter().enumerate().skip(2) {
-            if !matches!(t, DataType::Int64 | DataType::Null) {
-                return plan_err!("{NAME}: argument {i} must be Int64, got {t}");
-            }
-        }
         Ok(series::samples_type())
     }
 
-    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        let types: Vec<DataType> = args
-            .arg_fields
-            .iter()
-            .map(|f| f.data_type().clone())
-            .collect();
-        let data_type = self.return_type(&types)?;
-        // A null row maps to a null row, so nullability mirrors the input.
-        let nullable = args.arg_fields[0].is_nullable();
-        Ok(Arc::new(Field::new(NAME, data_type, nullable)))
+    /// Every series yields a list, possibly empty; never NULL, so the
+    /// output is the canonical shape it came in as.
+    fn is_nullable(&self) -> bool {
+        false
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let samples: ArrayRef = match &args.args[0] {
-            ColumnarValue::Array(a) => Arc::clone(a),
-            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
-        };
-        let func = match &args.args[1] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) => {
-                Func::parse(name).ok_or_else(|| {
-                    DataFusionError::Execution(format!("{NAME}: unknown function {name}"))
-                })?
-            }
-            other => {
-                return Err(DataFusionError::Execution(format!(
-                    "{NAME}: function name must be a string literal, got {:?}",
-                    other.data_type()
-                )))
-            }
-        };
-        let need = |i: usize, what: &str| -> Result<i64> {
-            int_arg(&args, i, NAME)?.ok_or_else(|| {
-                DataFusionError::Execution(format!("{NAME}: {what} must not be NULL"))
-            })
-        };
-        let p = Params {
-            start_ms: need(2, "start")?,
-            end_ms: need(3, "end")?,
-            step_ms: need(4, "step")?,
-            window_ms: need(5, "range")?,
-            offset_ms: need(6, "offset")?,
-            at_ms: int_arg(&args, 7, NAME)?,
-        };
-        Ok(ColumnarValue::Array(Arc::new(apply(
-            func,
-            samples.as_list::<i32>(),
-            &p,
-        ))))
-    }
-}
-
-/// Run the kernel over every row of a samples column.
-///
-/// Staleness markers are not samples (`matrixIterSlice` skips them). They
-/// are filtered here, once over the whole child struct, rather than in
-/// `range_function`, which would have to copy a vector per stale row.
-pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
-    let raw_offsets = samples.offsets();
-    // A sliced `ListArray` shares its child and offsets verbatim with the
-    // unsliced original, so `raw_offsets[0]` may be non-zero and the
-    // child may hold elements outside every row. Restrict to the range
-    // the offsets actually cover before masking and filtering it.
-    let first = raw_offsets[0] as usize;
-    let last = raw_offsets[samples.len()] as usize;
-    let child = samples.values().as_struct().slice(first, last - first);
-    let vs_col = child
-        .column_by_name(series::VALUE)
-        .expect("validated by return_type")
-        .as_primitive::<Float64Type>();
-
-    // A batch with no staleness marker at all, the common case, never
-    // needs a mask; the cheap slice scan decides that before paying for
-    // one bit per sample.
-    let any_stale = vs_col.values().iter().any(|v| is_stale(*v));
-
-    let (child, offsets): (StructArray, Vec<i32>) = if any_stale {
-        let mut keep_buf = BooleanBufferBuilder::new(vs_col.len());
-        for v in vs_col.values() {
-            keep_buf.append(!is_stale(*v));
-        }
-        let keep = BooleanArray::new(keep_buf.finish(), None);
-        let filtered = filter(&child, &keep).expect("mask length matches child length");
-        let mut kept_offsets = Vec::with_capacity(samples.len() + 1);
-        kept_offsets.push(0i32);
-        let mut kept = 0i32;
-        for row in 0..samples.len() {
-            let (a, b) = (
-                raw_offsets[row] as usize - first,
-                raw_offsets[row + 1] as usize - first,
-            );
-            kept += keep.slice(a, b - a).true_count() as i32;
-            kept_offsets.push(kept);
-        }
-        (filtered.as_struct().clone(), kept_offsets)
-    } else {
-        let rebased: Vec<i32> = (0..=samples.len())
-            .map(|row| raw_offsets[row] as usize as i32 - first as i32)
-            .collect();
-        (child, rebased)
-    };
-
-    let ts: &[i64] = child
-        .column_by_name(series::TIMESTAMP)
-        .expect("validated by return_type")
-        .as_primitive::<TimestampMillisecondType>()
-        .values();
-    let vs: &[f64] = child
-        .column_by_name(series::VALUE)
-        .expect("validated by return_type")
-        .as_primitive::<Float64Type>()
-        .values();
-
-    // A starting size, not a ceiling: one window can serve many steps.
-    let mut out_ts: Vec<i64> = Vec::with_capacity(ts.len());
-    let mut out_vs: Vec<f64> = Vec::with_capacity(ts.len());
-    let mut out_offsets: Vec<i32> = Vec::with_capacity(samples.len() + 1);
-    out_offsets.push(0);
-    let mut sweep = Sweep::new(func);
-    for row in 0..samples.len() {
-        // A null row is an absent series, not an empty one, and its
-        // offsets may still span samples.
-        if !samples.is_null(row) {
-            if let Some(sweep) = sweep.as_mut() {
-                sweep.reset();
-            }
-            let (a, b) = (offsets[row] as usize, offsets[row + 1] as usize);
-            range_function(func, &ts[a..b], &vs[a..b], p, sweep.as_mut(), |t, v| {
-                out_ts.push(t);
-                out_vs.push(v);
-            });
-        }
-        out_offsets.push(out_ts.len() as i32);
+    /// Without a group key there is no series to fold rows into.
+    fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        plan_err!("{NAME} must be grouped by labels")
     }
 
-    let entries = StructArray::new(
-        series::sample_fields(),
-        vec![
-            Arc::new(TimestampMillisecondArray::from(out_ts)),
-            Arc::new(Float64Array::from(out_vs)),
-        ],
-        None,
-    );
-    ListArray::new(
-        series::sample_item(),
-        OffsetBuffer::new(out_offsets.into()),
-        Arc::new(entries),
-        // One output row per input row, in order, so the input's
-        // validity is the output's.
-        samples.nulls().cloned(),
-    )
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        Ok(vec![Arc::new(Field::new(
+            format_state_name(args.name, "samples"),
+            series::samples_type(),
+            false,
+        ))])
+    }
+
+    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+        true
+    }
+
+    /// `DISTINCT` would deduplicate chunk rows, which is the overlap rule's
+    /// job; answering without it would be silently different.
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        if args.is_distinct {
+            return plan_err!("{NAME}: DISTINCT is not supported");
+        }
+        let (func, params) = read_args(args.exprs)?;
+        Ok(Box::new(EvalSeries::new(Kernel::Range(func), params)))
+    }
+
+    fn default_value(&self, _data_type: &DataType) -> Result<ScalarValue> {
+        Ok(empty_samples())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::Kernel;
     use crate::selector::{is_stale, STALE_NAN_BITS};
     use crate::series::SamplesBuilder;
     use datafusion::arrow::array::AsArray;
-    use datafusion::arrow::buffer::NullBuffer;
-    use datafusion::common::config::ConfigOptions;
 
     const S: i64 = 1000;
     const M: i64 = 60 * S;
@@ -1272,152 +1080,30 @@ mod tests {
         }
     }
 
-    /// Three one-sample rows; the middle is null but still spans a sample.
-    fn with_a_null_row() -> ListArray {
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![0, 0, 0])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-            None,
-        );
-        ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, 1, 2, 3].into()),
-            Arc::new(entries),
-            Some(NullBuffer::from(vec![true, false, true])),
-        )
-    }
-
-    #[test]
-    fn a_null_row_yields_a_null_row() {
-        let out = apply(
-            Func::CountOverTime,
-            &with_a_null_row(),
-            &Params {
-                start_ms: 0,
-                end_ms: 0,
-                ..at_5m()
-            },
-        );
-        assert_eq!(out.len(), 3);
-        assert_eq!(out.null_count(), 1);
-        assert!(!out.is_null(0) && out.is_null(1) && !out.is_null(2));
-        // The sample the null row spans stays out of the output.
-        assert_eq!(out.offsets().to_vec(), vec![0, 1, 1, 2]);
-    }
-
-    /// A sliced `ListArray` shares its child and offsets verbatim with
-    /// the original: the first offset is not zero, and the child still
-    /// holds the dropped row's samples, including a stale one. The mask
-    /// and the recomputed offsets must line up against that shared
-    /// child, not against a zero-based view of it.
-    #[test]
-    fn a_stale_marker_in_a_dropped_row_does_not_shift_a_sliced_rows_offsets() {
-        let stale = f64::from_bits(STALE_NAN_BITS);
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![0, 0, 30 * S])),
-                Arc::new(Float64Array::from(vec![stale, 1.0, 2.0])),
-            ],
-            None,
-        );
-        // Row 0: one stale sample. Row 1: two clean samples.
-        let two_rows = ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, 1, 3].into()),
-            Arc::new(entries),
-            None,
-        );
-        let sliced = two_rows.slice(1, 1);
-
-        let p = Params {
-            start_ms: 30 * S,
-            end_ms: 30 * S,
-            window_ms: M,
-            ..at_5m()
-        };
-        let from_sliced = apply(Func::CountOverTime, &sliced, &p);
-
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![0, 30 * S])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0])),
-            ],
-            None,
-        );
-        let one_row = ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, 2].into()),
-            Arc::new(entries),
-            None,
-        );
-        let from_unsliced = apply(Func::CountOverTime, &one_row, &p);
-
-        assert_eq!(
-            from_sliced.offsets().to_vec(),
-            from_unsliced.offsets().to_vec()
-        );
-        let sliced_values = from_sliced.values().as_struct();
-        let unsliced_values = from_unsliced.values().as_struct();
-        assert_eq!(
-            sliced_values
-                .column_by_name(series::VALUE)
-                .unwrap()
-                .as_primitive::<Float64Type>()
-                .values(),
-            unsliced_values
-                .column_by_name(series::VALUE)
-                .unwrap()
-                .as_primitive::<Float64Type>()
-                .values()
-        );
-        // Both count the window's two samples.
-        assert_eq!(
-            from_unsliced
-                .values()
-                .as_struct()
-                .column_by_name(series::VALUE)
-                .unwrap()
-                .as_primitive::<Float64Type>()
-                .value(0),
-            2.0
-        );
-    }
-
-    /// `int_arg` is shared with the vector selector.
+    /// The grid literals are read by a helper shared with the vector
+    /// selector, so the name has to be added on the way out.
     #[test]
     fn an_argument_error_names_the_range_function() {
-        let args = vec![
-            ColumnarValue::Array(Arc::new(with_a_null_row())),
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some("rate".into()))),
+        let lit = |v: ScalarValue| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>;
+        let exprs = vec![
+            lit(ScalarValue::Null),
+            lit(ScalarValue::Utf8(Some("rate".into()))),
             // `start`, which is not an Int64 literal.
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some("noon".into()))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(30 * S))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(5 * M))),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
-            ColumnarValue::Scalar(ScalarValue::Int64(None)),
+            lit(ScalarValue::Utf8(Some("noon".into()))),
+            lit(ScalarValue::Int64(Some(0))),
+            lit(ScalarValue::Int64(Some(30 * S))),
+            lit(ScalarValue::Int64(Some(5 * M))),
+            lit(ScalarValue::Int64(Some(0))),
+            lit(ScalarValue::Int64(None)),
         ];
-        let arg_fields = args
-            .iter()
-            .enumerate()
-            .map(|(i, a)| Arc::new(Field::new(format!("arg{i}"), a.data_type(), true)) as FieldRef)
-            .collect();
-        let err = RangeFunction::default()
-            .invoke_with_args(ScalarFunctionArgs {
-                args,
-                arg_fields,
-                number_rows: 3,
-                return_field: Arc::new(Field::new(NAME, series::samples_type(), false)),
-                config_options: Arc::new(ConfigOptions::default()),
-            })
-            .unwrap_err()
-            .to_string();
+        let err = read_args(&exprs).unwrap_err().to_string();
         assert!(err.contains(NAME), "{err}");
         assert!(!err.contains(crate::selector::NAME), "{err}");
+
+        let mut unknown = exprs;
+        unknown[1] = lit(ScalarValue::Utf8(Some("rote".into())));
+        unknown[2] = lit(ScalarValue::Int64(Some(0)));
+        let err = read_args(&unknown).unwrap_err().to_string();
+        assert!(err.contains(NAME) && err.contains("rote"), "{err}");
     }
 }

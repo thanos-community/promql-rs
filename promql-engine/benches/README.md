@@ -38,8 +38,8 @@ and `MEMORY_HEAP_DIR` makes it write a pprof heap profile per case:
 
 ```sh
 MEMORY_HEAP_DIR=/tmp/heap cargo bench -p promql-engine --features heap-profile \
-  --bench memory -- streamed/30d_1000/one_row_x1/selector
-go tool pprof -sample_index=inuse_space -top -cum /tmp/heap/streamed_30d_1000_one_row_x1_selector.pb
+  --bench memory -- streamed/30d_1000/chunk120_x360/selector
+go tool pprof -sample_index=inuse_space -top -cum /tmp/heap/streamed_30d_1000_chunk120_x360_selector.pb
 ```
 
 Run one case per process; the doc comment in `memory.rs` says why.
