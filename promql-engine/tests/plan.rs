@@ -65,12 +65,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{JoinType, NullEquality};
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::expressions::{lit, Column, UnKnownColumn};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
 use promql_engine::engine::check_selector_plans;
 use promql_engine::series::{encode, label_names_of};
@@ -163,16 +169,20 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     // The renderer borrows the plan, so it cannot be the tail expression.
     let logical = plan.display_indent().to_string();
     // The engine's own physical plan, not one lowered here, so the text is
-    // what the engine runs. It does not depend on the core count: the
-    // engine's flags keep DataFusion from repartitioning below the
-    // selector, which is the only place target partitions would show.
+    // what the engine runs.
     let physical = case.physical.as_ref().map(|_| {
         let exec = rt
             .block_on(engine.physical_plan_async(&source, query, range))
             .expect("the plan lowers");
         // The renderer borrows the plan, so it cannot be the tail expression.
         let rendered = displayable(exec.as_ref()).indent(true).to_string();
-        rendered
+        // A shuffle above the selector is as wide as the session's
+        // target_partitions, DataFusion's default of one per core.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        rendered.replace(
+            &format!("], {cores}), input_partitions="),
+            "], target_partitions), input_partitions=",
+        )
     });
     (logical, physical)
 }
@@ -408,5 +418,176 @@ fn prometheus_ordered_input_is_rejected() {
     match result {
         Err(EngineError::Source(_)) => {}
         other => panic!("expected a source order error, got {other:?}"),
+    }
+}
+
+/// Hash(labels) from SeriesSetExec must not survive the projection that
+/// computes the group key above the range function: the key is a new
+/// expression, and an upper aggregate that believed its input already
+/// hash-partitioned by it would skip the shuffle and answer a group once
+/// per store partition.
+#[test]
+fn the_label_projection_drops_the_hash_partitioning() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
+        .chunked(150_000)
+        .partitions(4);
+    let plan = physical_plan(&source, "sum by (pod) (rate(x[5m]))");
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    // The ProjectionExec that feeds the upper Partial, right above the
+    // range function's aggregate.
+    let mut node = &plan;
+    while !node.children()[0]
+        .downcast_ref::<AggregateExec>()
+        .is_some_and(|agg| {
+            agg.aggr_expr()
+                .iter()
+                .any(|e| e.fun().name() == range::NAME)
+        })
+    {
+        node = node.children()[0];
+    }
+    let projection = node;
+    assert!(projection.is::<ProjectionExec>(), "{shown}");
+    assert_eq!(
+        projection.children()[0]
+            .properties()
+            .partitioning
+            .to_string(),
+        "Hash([labels@0], 4)",
+        "{shown}"
+    );
+    // It still prints as Hash([labels@0], 4): Partitioning::project turns an
+    // expression the projection does not carry into an UnKnownColumn named
+    // after it. That placeholder equals nothing, itself included, so nothing
+    // above can find a requirement satisfied by it.
+    let Partitioning::Hash(exprs, 4) = &projection.properties().partitioning else {
+        panic!("{shown}");
+    };
+    assert!(exprs[0].is::<UnKnownColumn>(), "{exprs:?}\n{shown}");
+}
+
+/// `x` joined with itself partition by partition: the planner cannot
+/// produce this yet, binary operators are unsupported, but nothing stops
+/// DataFusion from trusting SeriesSetExec's Hash(labels) once they are.
+/// A hash repartition on each side replaces that trust with DataFusion's
+/// own hash, and is accepted.
+#[test]
+fn a_partitioned_join_over_the_store_partitioning_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let join = |wrap: &dyn Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>| {
+        let (left, right) = (
+            wrap(physical_plan(&source, "x")),
+            wrap(physical_plan(&source, "x")),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("labels", &left.schema()).unwrap()) as _,
+            Arc::new(Column::new_with_schema("labels", &right.schema()).unwrap()) as _,
+        )];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+        plan
+    };
+    let trusted = join(&|input| input);
+    let shown = displayable(trusted.as_ref()).indent(true).to_string();
+    match check_selector_plans(&trusted) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
+    }
+    let rehashed = join(&|input| {
+        let labels = Arc::new(Column::new_with_schema("labels", &input.schema()).unwrap());
+        Arc::new(RepartitionExec::try_new(input, Partitioning::Hash(vec![labels], 4)).unwrap())
+    });
+    check_selector_plans(&rehashed).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// `x or x` partition by partition: DataFusion turns a `UnionExec` into an
+/// `InterleaveExec` whenever every child declares the same partitioning
+/// (`enforce_distribution.rs:1458-1485`, `union.rs:664-676`), and two
+/// selectors over the same store both declare `Hash([labels], n)`. The
+/// interleave would then zip partition i of one scan with partition i of
+/// the other, handing a Sorted consumer above it the same label set twice.
+#[test]
+fn an_interleave_over_the_store_partitioning_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let inputs = vec![physical_plan(&source, "x"), physical_plan(&source, "x")];
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(inputs).unwrap());
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    match check_selector_plans(&plan) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
+    }
+}
+
+/// A plain `UnionExec` does not pair partitions by index — each child keeps
+/// contributing its own partitions — so coalescing both children first,
+/// which DataFusion cannot interleave because it no longer sees a shared
+/// Hash partitioning, must stay accepted.
+#[test]
+fn a_union_over_coalesced_children_is_accepted() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let inputs = vec![
+        Arc::new(CoalescePartitionsExec::new(physical_plan(&source, "x")))
+            as Arc<dyn ExecutionPlan>,
+        Arc::new(CoalescePartitionsExec::new(physical_plan(&source, "x")))
+            as Arc<dyn ExecutionPlan>,
+    ];
+    let plan = UnionExec::try_new(inputs).unwrap();
+    assert!(
+        plan.is::<UnionExec>(),
+        "{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+    check_selector_plans(&plan).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// `x` joined with itself, partitioned, with a `FilterExec` between each
+/// side and the selector: `FilterExec` reports the same
+/// `output_partitioning()` as its input (`filter.rs`'s
+/// `compute_properties`), so `Hash([labels], n)` reaches the join
+/// unchanged and the join must still be refused.
+#[test]
+fn a_partitioned_join_over_a_filter_over_the_store_partitioning_is_refused() {
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let filtered = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+        Arc::new(FilterExec::try_new(lit(true), input).unwrap())
+    };
+    let (left, right) = (
+        filtered(physical_plan(&source, "x")),
+        filtered(physical_plan(&source, "x")),
+    );
+    let on = vec![(
+        Arc::new(Column::new_with_schema("labels", &left.schema()).unwrap()) as _,
+        Arc::new(Column::new_with_schema("labels", &right.schema()).unwrap()) as _,
+    )];
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap(),
+    );
+    let shown = displayable(plan.as_ref()).indent(true).to_string();
+    match check_selector_plans(&plan) {
+        Err(EngineError::Query(_)) => {}
+        other => panic!("expected the plan refused, got {other:?}:\n{shown}"),
     }
 }

@@ -9,8 +9,11 @@
 //! descriptions, and compares the two: any difference is a bug in how the
 //! selector and range aggregates carry a series across rows.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use datafusion::prelude::SessionContext;
+use promql_engine::source::SeriesSetExec;
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series};
 use promql_parser::SeriesDescription;
 
@@ -70,7 +73,18 @@ fn assert_same_as_unchunked(q: &str, range: RangeQuery) {
 
 /// [`assert_same_as_unchunked`] for any source built from [`descriptions`].
 fn assert_same_on(source: &MemorySeriesSource, q: &str, range: RangeQuery) {
-    let mut expected = query(plain().as_ref(), q, range);
+    assert_same_between(plain().as_ref(), source, q, range);
+}
+
+/// `q` on `source` against `q` on `reference`, the same data laid out
+/// differently.
+fn assert_same_between(
+    reference: &MemorySeriesSource,
+    source: &MemorySeriesSource,
+    q: &str,
+    range: RangeQuery,
+) {
+    let mut expected = query(reference, q, range);
     let mut actual = query(source, q, range);
     expected.sort_by_key(key);
     actual.sort_by_key(key);
@@ -139,8 +153,9 @@ fn binary_op_matching_the_selector_with_itself() {
     assert_same_as_unchunked("x + x", RangeQuery::new(300_000, 300_000, 30_000));
 }
 
-/// Four partitions put the selector under a Partial and a Final aggregate
-/// with a merge between them, a shape one partition never plans.
+/// Four partitions run the selector as one SinglePartitioned aggregate per
+/// partition and leave the plan in four partitions, a shape one partition
+/// never plans.
 #[test]
 fn chunks_over_four_partitions() {
     let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
@@ -244,6 +259,126 @@ fn partitions_match_unpartitioned() {
             ] {
                 assert_same_on(&source, q, multi_step());
             }
+        }
+    }
+}
+
+/// Which `pod` values each store partition holds, read from the plan the
+/// engine runs so the layout is the one the aggregates see.
+fn pods_per_partition(source: &MemorySeriesSource) -> Vec<BTreeSet<String>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let engine = Engine::new();
+    let plan = rt
+        .block_on(engine.physical_plan_async(source, "x", &multi_step()))
+        .unwrap();
+    let mut node = &plan;
+    while !node.is::<SeriesSetExec>() {
+        node = node.children()[0];
+    }
+    let ctx = SessionContext::new();
+    (0..node.properties().partitioning.partition_count())
+        .map(|p| {
+            let stream = node.execute(p, ctx.task_ctx()).unwrap();
+            let batches = rt
+                .block_on(datafusion::physical_plan::common::collect(stream))
+                .unwrap();
+            promql_engine::series::decode(&batches)
+                .unwrap()
+                .iter()
+                .filter_map(|s| {
+                    s.labels()
+                        .find(|(n, _)| *n == "pod")
+                        .map(|(_, v)| v.to_string())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The rate aggregate runs SinglePartitioned per store partition; a sum by
+/// a label that every partition holds must then meet its partial sums
+/// across partitions, which only the shuffle above the lower aggregate
+/// does. Were Hash(labels) to leak through the label projection, the
+/// upper aggregate would skip it and answer each group once per partition.
+#[test]
+fn a_group_spanning_every_partition_matches_unpartitioned() {
+    let lines: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .enumerate()
+        .flat_map(|(k, pod)| {
+            (0..32).map(move |i| format!(r#"x{{pod="{pod}", i="{i}"}} {}+{}x19"#, k + 1, i % 5 + 1))
+        })
+        .collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let descriptions = load(&lines);
+    let reference = MemorySeriesSource::from_descriptions(&descriptions, 30.0);
+    for n in [4, 7] {
+        let source = MemorySeriesSource::from_descriptions(&descriptions, 30.0)
+            .chunked(CHUNK_MS)
+            .partitions(n);
+        let layout = pods_per_partition(&source);
+        assert_eq!(layout.len(), n);
+        for (p, pods) in layout.iter().enumerate() {
+            assert_eq!(pods.len(), 3, "partition {p} of {n} holds only {pods:?}");
+        }
+        for q in [
+            "sum by (pod) (rate(x[5m]))",
+            "count by (pod) (x)",
+            "max by (pod) (count_over_time(x[10m]))",
+            "sum(rate(x[5m]))",
+        ] {
+            assert_same_between(&reference, &source, q, multi_step());
+        }
+    }
+}
+
+/// Prometheus sorts a range query's matrix by label set before returning
+/// it, and partitions finish in no particular order. `app` and `zone`
+/// sort around the `i` series by name, but around them the other way in
+/// the struct's field-by-field order, where an absent label is `""`.
+#[test]
+fn series_come_back_in_label_set_order() {
+    let mut lines: Vec<String> = (0..40)
+        .map(|i| {
+            format!(
+                r#"x{{pod="{}", i="{i}"}} 1+{}x19"#,
+                ["a", "b", "c"][i % 3],
+                i % 5 + 1
+            )
+        })
+        .collect();
+    lines.push(r#"x{zone="z"} 1+1x19"#.into());
+    lines.push(r#"x{app="q"} 1+1x19"#.into());
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let descriptions = load(&lines);
+    // Samples as bits, so a row that came back under the wrong label set,
+    // or lost or doubled a point in the reorder, fails here too.
+    type Row = (Vec<(String, String)>, Vec<i64>, Vec<u64>);
+    let label_sets = |series: &[Series]| -> Vec<Row> {
+        series
+            .iter()
+            .map(|s| {
+                (
+                    s.labels().map(|(n, v)| (n.into(), v.into())).collect(),
+                    s.timestamps().to_vec(),
+                    s.values().iter().map(|v| v.to_bits()).collect(),
+                )
+            })
+            .collect()
+    };
+    let unpartitioned = MemorySeriesSource::from_descriptions(&descriptions, 30.0);
+    for q in ["x", "rate(x[5m])", "sum by (pod) (rate(x[5m]))"] {
+        let want = label_sets(&query(&unpartitioned, q, multi_step()));
+        let names: Vec<_> = want.iter().map(|r| &r.0).collect();
+        assert!(names.is_sorted(), "{q}: {names:?}");
+        for n in [4, 7] {
+            let source = MemorySeriesSource::from_descriptions(&descriptions, 30.0)
+                .chunked(CHUNK_MS)
+                .partitions(n);
+            let got = label_sets(&query(&source, q, multi_step()));
+            assert_eq!(got, want, "{q} over {n} partitions");
         }
     }
 }
