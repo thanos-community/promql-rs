@@ -31,8 +31,9 @@ use datafusion::logical_expr::{
     Signature, Volatility,
 };
 
+use crate::buffer::BufferedSeriesIterator;
 use crate::math;
-use crate::params::Params;
+use crate::params::{step_count, Params};
 use crate::selector::{int_arg, is_stale};
 use crate::series;
 
@@ -271,14 +272,14 @@ pub(crate) enum Sweep {
 impl Sweep {
     /// Between series, so that one `Sweep` can be hoisted above a row
     /// loop and keep the `VecDeque`s' capacity.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         match self {
             Sweep::Counter { resets, .. } => resets.clear(),
             Sweep::Extremum { candidates, .. } => candidates.clear(),
         }
     }
 
-    fn new(func: Func) -> Option<Sweep> {
+    pub(crate) fn new(func: Func) -> Option<Sweep> {
         Some(match func {
             Func::Rate | Func::Increase => Sweep::Counter {
                 resets: VecDeque::new(),
@@ -297,16 +298,19 @@ impl Sweep {
     }
 
     /// Sample `i` joins the window's end; `lo` is its start, so a pair
-    /// arrives with `i` only once its left half is inside.
-    fn enter(&mut self, i: usize, lo: usize, vs: &[f64]) {
+    /// arrives with `i` only once its left half is inside. `vs` holds
+    /// ordinals from `base` on: the tracked indices stay absolute so that
+    /// trimming the buffer's front never has to rewrite them.
+    fn enter(&mut self, i: usize, lo: usize, base: usize, vs: &[f64]) {
+        let at = |j: usize| vs[j - base];
         match self {
             Sweep::Counter { resets, .. } => {
-                if i > lo && vs[i] < vs[i - 1] {
+                if i > lo && at(i) < at(i - 1) {
                     resets.push_back(i - 1);
                 }
             }
             Sweep::Extremum { candidates, max } => {
-                if vs[i].is_nan() {
+                if at(i).is_nan() {
                     return;
                 }
                 // A strict comparison keeps the earliest of equal
@@ -314,9 +318,9 @@ impl Sweep {
                 // and the only way `-0.0` against `0.0` agrees.
                 while let Some(&back) = candidates.back() {
                     let beaten = if *max {
-                        vs[back] < vs[i]
+                        at(back) < at(i)
                     } else {
-                        vs[back] > vs[i]
+                        at(back) > at(i)
                     };
                     if !beaten {
                         break;
@@ -447,7 +451,7 @@ pub(crate) fn range_function(
                 // empty.
                 hi = hi.max(lo);
                 while hi < ts.len() && ts[hi] <= range_end {
-                    sweep.enter(hi, lo, vs);
+                    sweep.enter(hi, lo, 0, vs);
                     hi += 1;
                 }
                 if let Some(v) = sweep.value(&slice(lo, hi, range_end), lo) {
@@ -456,6 +460,137 @@ pub(crate) fn range_function(
             }
         }
     }
+}
+
+/// Evaluate the steps of `it`'s open series that are ready.
+///
+/// Without `done`, a step is ready once its window's end is at or before
+/// `last_t`: the samples still to come are all later, so they cannot
+/// land in it. With `done` there are no samples to come, and every step
+/// left is ready. Evaluating as the chunks arrive, rather than at close,
+/// is what lets the buffer drop everything below `lo` between chunks.
+///
+/// `ts`/`vs` are the series' samples from ordinal `it.base` on and must
+/// already be free of StaleNaN entries, and a `Sweep`, if any, must have
+/// seen only this series. `emit` receives `(step_timestamp, value)` in
+/// step order, each step at most once.
+pub(crate) fn advance_range(
+    it: &mut BufferedSeriesIterator,
+    ts: &[i64],
+    vs: &[f64],
+    func: Func,
+    done: bool,
+    mut emit: impl FnMut(i64, f64),
+) {
+    let BufferedSeriesIterator {
+        sweep,
+        params: p,
+        base,
+        lo,
+        hi,
+        next_step,
+        last_t,
+        ..
+    } = it;
+    debug_assert_eq!(ts.len(), vs.len());
+    let steps = step_count(p.start_ms, p.end_ms, p.step_ms);
+    if p.window_ms <= 0 || *next_step >= steps {
+        return;
+    }
+    // A window ending after this may still gain a sample.
+    let ready = match (done, *last_t) {
+        (true, _) => i64::MAX,
+        (false, Some(t)) => t,
+        (false, None) => return,
+    };
+    let base = *base;
+    // Indices relative to the slices.
+    let window = |l: usize, h: usize, range_end: i64| Window {
+        ts: &ts[l..h],
+        vs: &vs[l..h],
+        range_start: range_end - p.window_ms,
+        range_end,
+        range_ms: p.window_ms,
+    };
+
+    // `@` pins the window: it is evaluated once, when it is ready, and
+    // repeated across the whole grid.
+    if let Some(at) = p.at_ms {
+        let range_end = at - p.offset_ms;
+        if range_end > ready {
+            return;
+        }
+        let l = ts.partition_point(|t| *t <= range_end - p.window_ms);
+        let h = ts.partition_point(|t| *t <= range_end);
+        if let Some(v) = evaluate(func, &window(l, h, range_end)) {
+            for step in p.steps() {
+                emit(step, v);
+            }
+        }
+        *next_step = steps;
+        return;
+    }
+
+    // Both window edges only move forward with the step, so a sweep sees
+    // every sample enter once and leave once, across chunks too. The two
+    // loops are one `match` above the step loop rather than a branch
+    // inside it, so the refolding path pays neither the calls nor the
+    // dispatch in them. As in `advance_selector`, the cursor lives in
+    // locals relative to the slice and the step moves by addition, which
+    // may wrap past the last step, unread; a sweep's indices stay absolute.
+    let (mut l, mut h, mut next) = (*lo - base, *hi - base, *next_step);
+    let mut step = (i128::from(p.start_ms) + next * i128::from(p.step_ms)) as i64;
+    match sweep {
+        None => {
+            while next < steps {
+                let range_end = step - p.offset_ms;
+                if range_end > ready {
+                    break;
+                }
+                let range_start = range_end - p.window_ms;
+                while l < ts.len() && ts[l] <= range_start {
+                    l += 1;
+                }
+                h = h.max(l);
+                while h < ts.len() && ts[h] <= range_end {
+                    h += 1;
+                }
+                if let Some(v) = evaluate(func, &window(l, h, range_end)) {
+                    emit(step, v);
+                }
+                next += 1;
+                step = step.wrapping_add(p.step_ms);
+            }
+        }
+        Some(sweep) => {
+            while next < steps {
+                let range_end = step - p.offset_ms;
+                if range_end > ready {
+                    break;
+                }
+                let range_start = range_end - p.window_ms;
+                while l < ts.len() && ts[l] <= range_start {
+                    if l < h {
+                        sweep.leave(base + l);
+                    }
+                    l += 1;
+                }
+                // A gap wider than the window leaves `h` behind `l`; the
+                // samples it skips never entered, and the state is empty.
+                h = h.max(l);
+                while h < ts.len() && ts[h] <= range_end {
+                    sweep.enter(base + h, base + l, base, vs);
+                    h += 1;
+                }
+                if let Some(v) = sweep.value(&window(l, h, range_end), base + l) {
+                    emit(step, v);
+                }
+                next += 1;
+                step = step.wrapping_add(p.step_ms);
+            }
+        }
+    }
+    (*lo, *hi, *next_step) = (base + l, base + h, next);
 }
 
 /// The DataFusion function. Stateless: every parameter is an argument.
@@ -676,45 +811,25 @@ pub fn apply(func: Func, samples: &ListArray, p: &Params) -> ListArray {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::selector::STALE_NAN_BITS;
+    use crate::buffer::Kernel;
+    use crate::selector::{is_stale, STALE_NAN_BITS};
+    use crate::series::SamplesBuilder;
+    use datafusion::arrow::array::AsArray;
     use datafusion::arrow::buffer::NullBuffer;
     use datafusion::common::config::ConfigOptions;
 
     const S: i64 = 1000;
     const M: i64 = 60 * S;
 
-    /// Routes through `apply` (a one-row samples column) rather than
-    /// calling `range_function` directly, so the staleness filter, which
-    /// lives in `apply` now, is exercised by every test that uses `run`.
+    /// One series in one chunk, pushed and closed.
     fn run(func: Func, ts: &[i64], vs: &[f64], p: Params) -> Vec<(i64, f64)> {
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(ts.to_vec())),
-                Arc::new(Float64Array::from(vs.to_vec())),
-            ],
-            None,
-        );
-        let samples = ListArray::new(
-            series::sample_item(),
-            OffsetBuffer::new(vec![0, ts.len() as i32].into()),
-            Arc::new(entries),
-            None,
-        );
-        let out = apply(func, &samples, &p);
-        let row = out.value(0);
-        let row = row.as_struct();
-        let out_ts = row
-            .column_by_name(series::TIMESTAMP)
-            .unwrap()
-            .as_primitive::<TimestampMillisecondType>()
-            .values();
-        let out_vs = row
-            .column_by_name(series::VALUE)
-            .unwrap()
-            .as_primitive::<Float64Type>()
-            .values();
-        out_ts.iter().copied().zip(out_vs.iter().copied()).collect()
+        let mut it = BufferedSeriesIterator::new(Kernel::Range(func), p);
+        let mut out = SamplesBuilder::default();
+        it.push(ts, vs, &mut out);
+        it.close(&mut out);
+        let row = out.take_all().value(0);
+        let (ts, vs) = series::sample_slices(row.as_struct());
+        ts.iter().copied().zip(vs.iter().copied()).collect()
     }
 
     /// One step at 5m over a 5m window.
@@ -894,7 +1009,7 @@ mod tests {
         assert_eq!(out, vec![(0, 10.0), (30 * S, 10.0), (M, 10.0)]);
     }
 
-    /// Every function, because both branches of `range_function` are
+    /// Every function, because both branches of `advance_range` are
     /// sliding walks that carry `lo`/`hi` across steps: the swept one
     /// carries kernel state too, the other only the bounds. `fresh`
     /// recomputes both bounds per step with `partition_point`, so it
@@ -1061,6 +1176,97 @@ mod tests {
                         a.1,
                         b.1
                     );
+                }
+            }
+        }
+    }
+
+    /// Feeds `ts`/`vs` through the cursor `k` samples at a time, as if
+    /// `base` samples had already been trimmed off the front, and trims
+    /// below `lo` after every chunk the way `BufferedSeriesIterator::push`
+    /// does, so that every ordinal the sweep holds is shifted off its
+    /// buffer index.
+    fn cursor(
+        func: Func,
+        ts: &[i64],
+        vs: &[f64],
+        p: Params,
+        base: usize,
+        k: usize,
+    ) -> Vec<(i64, f64)> {
+        let mut it = BufferedSeriesIterator::new(Kernel::Range(func), p);
+        (it.base, it.lo, it.hi) = (base, base, base);
+        let mut out = Vec::new();
+        for (cts, cvs) in ts.chunks(k).zip(vs.chunks(k)) {
+            for (t, v) in cts.iter().zip(cvs) {
+                if !is_stale(*v) {
+                    it.ts.push(*t);
+                    it.vs.push(*v);
+                }
+            }
+            it.last_t = cts.last().copied();
+            let (bts, bvs) = (it.ts.clone(), it.vs.clone());
+            advance_range(&mut it, &bts, &bvs, func, false, |t, v| out.push((t, v)));
+            let dead = it.lo - it.base;
+            it.ts.drain(..dead);
+            it.vs.drain(..dead);
+            it.base += dead;
+        }
+        let (bts, bvs) = (it.ts.clone(), it.vs.clone());
+        advance_range(&mut it, &bts, &bvs, func, true, |t, v| out.push((t, v)));
+        out
+    }
+
+    #[test]
+    fn advance_range_matches_one_chunk_across_a_base_shift() {
+        let (ts, vs) = a_rough_series();
+        let plain = Params {
+            start_ms: 0,
+            end_ms: 20 * M,
+            step_ms: 15 * S,
+            window_ms: 2 * M,
+            offset_ms: 45 * S,
+            at_ms: None,
+        };
+        let params = [
+            plain,
+            Params {
+                offset_ms: 0,
+                ..plain
+            },
+            Params {
+                at_ms: Some(5 * M),
+                ..plain
+            },
+            Params {
+                at_ms: Some(17 * M),
+                ..plain
+            },
+        ];
+        for p in params {
+            for func in ALL {
+                let expected = run(func, &ts, &vs, p);
+                for base in [1, 7, 1000] {
+                    for k in [1, 2, 3, 5, ts.len()] {
+                        let got = cursor(func, &ts, &vs, p, base, k);
+                        let name = func.as_str();
+                        assert_eq!(
+                            got.len(),
+                            expected.len(),
+                            "{name} base={base} k={k} p={p:?}"
+                        );
+                        for (a, b) in got.iter().zip(&expected) {
+                            assert_eq!(a.0, b.0, "{name} base={base} k={k} p={p:?}");
+                            assert_eq!(
+                                a.1.to_bits(),
+                                b.1.to_bits(),
+                                "{name} base={base} k={k} p={p:?} at {}: {} vs {}",
+                                a.0,
+                                a.1,
+                                b.1
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -596,6 +596,123 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     .map_err(|e| e.to_string())
 }
 
+/// The timestamp and value children of a samples list's entries. Callers
+/// hold a column whose type the signature or [`validate`] already checked.
+pub(crate) fn sample_slices(s: &StructArray) -> (&[i64], &[f64]) {
+    let ts = s
+        .column_by_name(TIMESTAMP)
+        .expect("a canonical samples entry")
+        .as_primitive::<TimestampMillisecondType>()
+        .values();
+    let vs = s
+        .column_by_name(VALUE)
+        .expect("a canonical samples entry")
+        .as_primitive::<Float64Type>()
+        .values();
+    (ts, vs)
+}
+
+/// Rows of a samples column under construction. Arrow in, Arrow out: the
+/// buffers are those of the canonical samples column, handed over without
+/// a copy, so a kernel writes its output once.
+///
+/// The row after the last finished one is open: samples pushed since, not
+/// yet visible to [`take_first`](Self::take_first).
+#[derive(Debug)]
+pub(crate) struct SamplesBuilder {
+    ts: Vec<i64>,
+    vs: Vec<f64>,
+    offsets: Vec<i32>,
+}
+
+impl Default for SamplesBuilder {
+    fn default() -> Self {
+        Self {
+            ts: Vec::new(),
+            vs: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+}
+
+impl SamplesBuilder {
+    pub(crate) fn reserve(&mut self, samples: usize) {
+        self.ts.reserve(samples);
+        self.vs.reserve(samples);
+    }
+
+    pub(crate) fn push(&mut self, t: i64, v: f64) {
+        self.ts.push(t);
+        self.vs.push(v);
+    }
+
+    /// Past `i32::MAX` samples the offsets cannot say where a row ends, and
+    /// a wrapped offset would hand DataFusion a corrupt list.
+    pub(crate) fn finish_row(&mut self) {
+        let end = i32::try_from(self.ts.len()).expect("more than i32::MAX samples in one column");
+        self.offsets.push(end);
+    }
+
+    /// Rows finished and not yet taken.
+    pub(crate) fn rows(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    /// Splits the first n finished rows off as the canonical samples ListArray.
+    ///
+    /// The head keeps the vectors' allocations and becomes the Arrow
+    /// buffers; what is copied is the tail, the rows after `n` plus the
+    /// open one, which in Sorted mode is a single series.
+    ///
+    /// `split_off` leaves the head's capacity exactly as it was before the
+    /// split: `reserve`'s room for the still-open series behind it, which
+    /// an emit hands to Arrow uncounted otherwise. Only shrunk past a 2x
+    /// slack, so the one head that is genuinely most of the buffer (an
+    /// `EmitTo::All` with nothing left open) skips a copy of the whole
+    /// thing for a percent-scale reservation remainder.
+    pub(crate) fn take_first(&mut self, n: usize) -> ListArray {
+        let end = self.offsets[n];
+        let ts = self.ts.split_off(end as usize);
+        let vs = self.vs.split_off(end as usize);
+        let mut ts = std::mem::replace(&mut self.ts, ts);
+        let mut vs = std::mem::replace(&mut self.vs, vs);
+        if ts.capacity() > ts.len().saturating_mul(2) {
+            ts.shrink_to_fit();
+        }
+        if vs.capacity() > vs.len().saturating_mul(2) {
+            vs.shrink_to_fit();
+        }
+        let rest: Vec<i32> = self.offsets[n..].iter().map(|o| o - end).collect();
+        let mut offsets = std::mem::replace(&mut self.offsets, rest);
+        offsets.truncate(n + 1);
+        ListArray::new(
+            sample_item(),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(StructArray::new(
+                sample_fields(),
+                vec![
+                    Arc::new(TimestampMillisecondArray::from(ts)),
+                    Arc::new(Float64Array::from(vs)),
+                ],
+                None,
+            )),
+            None,
+        )
+    }
+
+    /// Every finished row. An open row stays behind.
+    pub(crate) fn take_all(&mut self) -> ListArray {
+        self.take_first(self.rows())
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.ts.capacity() * std::mem::size_of::<i64>()
+            + self.vs.capacity() * std::mem::size_of::<f64>()
+            + self.offsets.capacity() * std::mem::size_of::<i32>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,5 +954,63 @@ mod tests {
             Field::new("x", DataType::Int64, false),
         ]);
         assert!(validate(&extra).unwrap_err().contains("exactly"));
+    }
+
+    fn builder_rows(list: &ListArray) -> Vec<Vec<(i64, f64)>> {
+        (0..list.len())
+            .map(|r| {
+                let row = list.value(r);
+                let (ts, vs) = sample_slices(row.as_struct());
+                ts.iter().copied().zip(vs.iter().copied()).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn take_first_leaves_later_rows_and_the_open_one() {
+        let mut b = SamplesBuilder::default();
+        b.push(0, 1.0);
+        b.finish_row();
+        b.finish_row();
+        b.push(10, 2.0);
+        b.push(20, 3.0);
+        b.finish_row();
+        b.push(30, 4.0);
+
+        let first = b.take_first(2);
+        assert_eq!(first.data_type(), &samples_type());
+        assert_eq!(builder_rows(&first), vec![vec![(0, 1.0)], vec![]]);
+
+        b.finish_row();
+        assert_eq!(
+            builder_rows(&b.take_all()),
+            vec![vec![(10, 2.0), (20, 3.0)], vec![(30, 4.0)]]
+        );
+        assert_eq!(b.take_all().len(), 0);
+    }
+
+    /// The head split off by `take_first` must not carry the open series'
+    /// reservation: an emit that hands a small row to Arrow while a large
+    /// grid is still reserved behind it must not report the grid's size.
+    #[test]
+    fn take_first_does_not_emit_the_open_series_reservation() {
+        let mut b = SamplesBuilder::default();
+        b.reserve(100_000);
+        b.push(0, 1.0);
+        b.finish_row();
+        b.push(10, 2.0); // the open row, still being grown
+
+        let first = b.take_first(1);
+        let row = first.value(0);
+        let (ts, vs) = sample_slices(row.as_struct());
+        assert_eq!(ts.len(), 1);
+        assert_eq!(vs.len(), 1);
+        assert!(
+            first.get_array_memory_size() < 4096,
+            "emitted row of {} sample(s) reports {} bytes, still counting the open \
+             series' reservation",
+            ts.len(),
+            first.get_array_memory_size()
+        );
     }
 }
