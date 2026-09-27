@@ -38,7 +38,7 @@ aggregation must hold is held. Our engine takes the property from Prometheus
 and the proxy, and its form from DataFusion. **The unit of materialisation is
 the window, never the series.**
 
-## Chunk rows, and why the plan shape follows from them
+## Blocks, and why the plan shape follows from them
 
 Each selector gets one select, and the store answers it with one row per
 chunk of one series, cut into blocks of its own layout that every row
@@ -165,7 +165,7 @@ block answers those steps. The bound is groups × steps per block, four
 for a 2 h block at a 30-minute step, where holding every step of the range
 would be groups × 1,441 for 30 days at that step; the result row a range aggregate
 hands up per series is one block's steps long.
-[`engine-chunks.md`](engine-chunks.md#4-an-aggregate-across-a-block-edge)
+[`engine-blocks.md`](engine-blocks.md#4-an-aggregate-across-a-block-edge)
 walks one edge with numbers.
 
 The instant selector is the degenerate case. For each step it wants the last
