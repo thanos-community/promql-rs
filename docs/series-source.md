@@ -12,11 +12,11 @@ this document proposes both:
 1. **The trait a store implements.** `SeriesSource`, one method: a select
    the engine issues once per selector over the whole query range.
 2. **The Arrow shape its data comes back in.** Blocks of the store's own
-   layout, every row stamped with its block, and inside a block one row per
-   chunk of one series, either label-sorted with the rows of a series
+   layout, every series stamped with its block, and inside a block one series
+   entry per chunk, either label-sorted with the chunks of one label set
    consecutive, or keyed by an opaque series id the store provides. A
    `RecordBatch` in this shape is a *series batch*, and its boundaries mean
-   nothing: a series' rows may be split across any number of
+   nothing: a series' chunks may be split across any number of
    RecordBatches.
 
 Everything PromQL, lookback, staleness, the steps, `offset`, `@`,
@@ -70,11 +70,11 @@ no PromQL to honour it.
 its own time units: a TSDB store its block ranges, a columnar store
 partitioned by hour its hours, a store that keeps whole series one block,
 and an adapter over a label-sorted wire protocol the windows it chooses to
-ask in, since the protocol forces one request per window. Every row
+ask in, since the protocol forces one request per window. Every series
 carries its block's `block_start` and `block_end`, see *The series batch*.
 Blocks ascend by `block_start`, do not overlap, and are contiguous over the
 select's window ends, from `start_ms + window_ms` to `end_ms`, so the first
-block's reach-back covers the widened start. A block's rows for a series
+block's reach-back covers the widened start. A block's chunks of a series
 hold every sample the store has for it in `[block_start − window_ms,
 block_end)` within the select's range; the block answers the steps of the
 query whose window end, `t − offset` or the `@` time, lies in
@@ -123,35 +123,35 @@ block included; label names that only turn up during execution are not
 supported.
 
 **Four obligations.** `series::validate` checks only the schema; the
-ordering is checked per row, see *Violations*.
+ordering is checked per series, see *Violations*.
 
-1. *Filter.* Every series matches every matcher. A row may carry samples
-   outside the range, see *Order*, but a row whose whole span misses it
+1. *Filter.* Every series matches every matcher. A series may carry samples
+   outside the range, see *Order*, but a series whose whole span misses it
    should not be sent. The store prunes those on the chunk min and max time
    it already keeps, as Thanos's `LoadSeriesForTime` (`pkg/store/bucket.go`)
    and Prometheus's chunk metadata filter (`tsdb/querier.go:559-565`) do,
    so the engine needs no column for it.
-2. *Rows.* A row holds one chunk of exactly one series and at least
+2. *Series.* A series holds one chunk of exactly one label set and at least
    one sample, samples ascending by timestamp.
-3. *Order.* Stated over a partition's stream of rows, never over a
+3. *Order.* Stated over a partition's stream of series, never over a
    batch. A series may end mid-batch or span any number of RecordBatches;
    nothing requires it to be whole in one, because the engine does not look
-   rows up but folds them as they arrive. All of a block's rows come
-   before the next block's first row, and inside a block rows come in one
+   chunks up but folds them as they arrive. All of a block's series come
+   before the next block's first series, and inside a block series come in one
    of two modes. In **sorted mode**:
    - series sorted by their label set;
-   - rows of one series consecutive and never crossing a partition: the
-     first row with another label set closes the series for the block, and
-     no later row of the block may carry it.
+   - the chunks of one label set consecutive and never crossing a partition:
+     the first series with another label set closes the open one for the
+     block, and no later series of the block may carry its labels.
 
-   In **keyed mode**, every row carries a `series_id`, see *The series
-   batch*, and rows of one series may come in any order relative to other
-   series' rows in the block, so the store need not sort by labels at all;
-   they still never cross a partition. In both modes rows of one series
+   In **keyed mode**, every series carries a `series_id`, see *The series
+   batch*, and the chunks of one label set may come in any order relative to other
+   series in the block, so the store need not sort by labels at all;
+   they still never cross a partition. In both modes the chunks of one label set
    ascend by first sample timestamp within a block, and the lookback
    and the steps a block answers are the same.
 
-   A row may be a whole chunk that straddles either end of the range, as
+   A series may hold a whole chunk that straddles either end of the range, as
    `rpc.proto:37-38` allows. A sample at or after `block_end` falls in no
    window of a step the block answers, and neither does one before
    `block_start − window_ms`, so the engine neither clips nor checks a
@@ -164,49 +164,49 @@ ordering is checked per row, see *Violations*.
    streamed it means that no more data will be sent for previous one.
    Series has to be sorted." A `Series` request narrowed to one block and
    its reach-back answers that block as it stands. The time order of a
-   series' rows is ours: the Store API has "no
+   series' chunks is ours: the Store API has "no
    requirements on chunk sorting" (`rpc.proto:34`) and its proxy sorts
    chunks itself (`pkg/store/proxy_merge.go:180-182`), so a store adapted
-   from it sorts each series' chunk metas before emitting rows, touching
+   from it sorts each series' chunk metas before emitting series, touching
    metas, not samples.
 4. *Handed over in that order.* The store's obligation stops at emitting
-   rows in this order. It picks the mode by its schema: a plan whose schema
+   series in this order. It picks the mode by its schema: a plan whose schema
    carries `series_id` is in keyed mode, one without it in sorted mode, and
    the engine declares the scan to match, the output ordering
    `(block_start, labels, first sample timestamp)` and hash partitioning on
    `labels`, the full label set, for sorted mode, the ordering
    `block_start` and hash partitioning on `series_id` for keyed mode. It
-   checks the declaration against what actually arrives row by row, and
+   checks the declaration against what actually arrives series by series, and
    refuses a sorted-mode plan that loses the ordering, because sorted
    mode's memory bound rests on DataFusion being able to prove it, see
    [`engine.md`](engine.md).
 
 **Violations.** The engine never sorts or buffers to repair order. It always
-checks, one label comparison per row, batch boundaries included. In sorted
-mode it compares with the previous row of the block: labels non-decreasing
+checks, one label comparison per series, batch boundaries included. In sorted
+mode it compares with the previous series of the block: labels non-decreasing
 within a block of a partition's stream, which also catches a closed series
-reappearing. In keyed mode it compares with the labels the row's
+reappearing. In keyed mode it compares with the labels the series'
 `series_id` was first seen with in the block, so an id collision or a store
 that reuses an id cannot merge two series. In both, first sample timestamp
-is non-decreasing within a series and block, `block_start` and `block_end`
+is non-decreasing across a label set's chunks within a block, `block_start` and `block_end`
 are constant within a block, and blocks are non-decreasing and
-non-overlapping across the rows of a partition. A violation is a query
+non-overlapping across the series of a partition. A violation is a query
 error, where upstream the same mistake is a silent wrong result. An empty
-row, though forbidden, is skipped.
+series, though forbidden, is skipped.
 
-**Overlap.** Adjacent rows of one series may overlap in time, which is
+**Overlap.** Adjacent chunks of one series may overlap in time, which is
 normal once one series' chunks arrive from several files or compaction
 levels of the store. The engine skips samples at or before the last
-timestamp it has already seen for that series, so the first row wins. Each
+timestamp it has already seen for that series, so the first chunk wins. Each
 block starts from nothing, since its reach-back repeats samples the block
 before held. That is Thanos's `chunkSeriesIterator`, which does the same
 with `Seek(lastT + 1)` (`pkg/query/iter.go:277-281`). Prometheus's block
-merge keeps the union instead; this document follows first-row-wins,
+merge keeps the union instead; this document follows first-chunk-wins,
 settled the same way in [`engine.md`](engine.md#ordering-integrity)'s
 *Overlap*.
 
 A store that keeps whole series is not asked to change anything beyond the
-two block columns. It stamps the range as one block and sends one row per
+two block columns. It stamps the range as one block and sends one chunk per
 series, which is the one-block, one-chunk case of this contract.
 
 Matcher semantics are Prometheus's: a label a series lacks compares as
@@ -226,20 +226,21 @@ block_end    Timestamp(ms)                  to here, exclusive; both constant ov
 series_id    UInt64 | FixedSizeBinary(n)    optional; present only in keyed mode
 ```
 
-One row is one chunk of one series in one block. Nothing is nullable.
+One series is one Arrow row: a label set and one chunk of its samples in one
+block. Nothing is nullable.
 `block_start` and `block_end` may be plain or run-end encoded, the store's
-choice; at one row per chunk either costs next to nothing.
+choice; at one Arrow row per chunk either costs next to nothing.
 
 A series is identified by its label set: one value per label name, and
 the set never changes for the life of the series. Three series that
-differ only in `pod` are three rows, each with its complete label set and
-its own samples. A batch is many such rows side by side and nothing more:
-rows share only the schema and the union of their label names. Two rows with
-the same label set in one block are two chunks of that series. In sorted
+differ only in `pod` are three Arrow rows, each with its complete label set and
+its own samples. A batch is many such series side by side and nothing more:
+they share only the schema and the union of their label names. Two series with
+the same label set in one block are two chunks of that label set. In sorted
 mode they must be consecutive in the partition's stream, whether or not a
 batch boundary falls between them, and the same label set reappearing in
 the block after another one has started is refused; in keyed mode they
-carry one `series_id` and other series' rows may lie between them.
+carry one `series_id` and other series may lie between them.
 Merging series by the labels that survive an aggregation is an operator
 above this shape, not part of it.
 
@@ -247,7 +248,7 @@ The `series_id` does not replace the label set as the identity. The engine
 compares it for equality and hashes its bytes, and never interprets it; how
 and when the store computes it is the store's business. The contract asks
 only that within one store, and therefore within one block, one id maps to
-one label set and one label set to one id. The engine buckets rows by the id
+one label set and one label set to one id. The engine buckets series by the id
 and confirms each by its labels, as Prometheus's head does with its
 `seriesHashmap`, which checks every hash hit with `labels.Equal` (prom
 `tsdb/head.go:2332-2362`), and not as its PromQL engine does when it trusts a
@@ -255,28 +256,28 @@ bare `metric.Hash()` in vector matching (prom `promql/engine.go:3371-3381`).
 An id computed at ingestion can be finer than a PromQL series when it also
 hashes, say, a unit or an instrumentation scope; such a store merges those
 to one id per label set before emitting. Two ids with one label set
-otherwise leave the selector as two rows with one label set, and the
+otherwise leave the selector as two output series with one label set, and the
 engine refuses the block: caught by the selector's own label-set
 uniqueness check at the block edge, or by the output check of
 [`engine.md`](engine.md#the-correctness-net) otherwise.
 
 | Choice | Why |
 |---|---|
-| A row is a chunk of one series, not a sample | Every PromQL operator works on one series' samples in order: lookback, staleness, `rate`, counter resets. With rows as samples, the first thing each operator does is find the series again. With rows as chunks, a chunk is a zero-copy slice, a series folds from its rows in arrival order, consecutive in sorted mode, and parallelism over partitions needs no shuffle because no series crosses one. The regrouping has to happen somewhere; once, in the store that knows its own series boundaries and emits chunks as it keeps them, beats once per operator. |
-| Rows of a series may span batches | The store is not asked to size batches around series: it cuts them where its scan or memory budget says, and a series continues into the next batch. The engine carries only window buffers across a batch boundary, the one open series' per partition in sorted mode, every series of the block in keyed mode, so its memory does not depend on where batches end. |
+| A series holds one chunk, not one sample | Every PromQL operator works on one series' samples in order: lookback, staleness, `rate`, counter resets. With one sample per Arrow row, the first thing each operator does is find the series again. With one chunk per series, a chunk is a zero-copy slice, a label set folds from its chunks in arrival order, consecutive in sorted mode, and parallelism over partitions needs no shuffle because no series crosses one. The regrouping has to happen somewhere; once, in the store that knows its own series boundaries and emits chunks as it keeps them, beats once per operator. |
+| A series' chunks may span batches | The store is not asked to size batches around series: it cuts them where its scan or memory budget says, and a series continues into the next batch. The engine carries only window buffers across a batch boundary, the one open series' per partition in sorted mode, every series of the block in keyed mode, so its memory does not depend on where batches end. |
 | An optional fixed-width `series_id` | TSDB blocks and the Store API deliver label order and carry no id on any read path: Prometheus's `storage.Series` exposes only labels (prom `storage/interface.go:633-636`), and Thanos's `storepb.Series` carries labels and chunks, whose per-chunk `hash` is a content checksum (thanos `pkg/store/storepb/types.proto:23-37`). A store that computes a fingerprint at ingestion, as a columnar store could, has an id for free and label order only at the cost of a sort per block. So the column is optional and its presence is the mode. `UInt64` or `FixedSizeBinary(n)`, whichever the store already keeps, because a fixed width compares and hashes without offsets and a 16-byte hash fits as well as a 64-bit one. |
 | Labels are a struct with a field per name | The schema is the union of the selection's label names, so `by (route)` is a column reference and DataFusion's own grouping, sorting and `EXPLAIN` understand it. Fields are sorted so two producers build one schema. |
 | An absent label is `""`, not NULL | That is PromQL's semantics, and non-nullable children remove the `get_field`-under-a-NULL-parent trap: there is no NULL parent to read a phantom value through. |
 | `Utf8View` at the leaf | One 16-byte view per label per series, values up to 12 bytes inline, equality decided from length and prefix before any buffer is read. It is what DataFusion's Parquet reader hands over, and the only string type with DataFusion's group-by fast path. A dictionary would encode nothing within a series, where each value appears once, and the engine cannot use batch-level keys: DataFusion hydrates them at the first group-by. |
 | Samples are one list of structs | One offsets buffer, so a timestamp and its value cannot drift apart. Equal lengths and positional alignment are structure, not a promise two parallel lists would have to keep. |
 | Milliseconds, `Float64` | Prometheus's units. `Float64` carries StaleNaN as the exact bit pattern `0x7ff0_0000_0000_0002`; nothing may cast through `f64::NAN`. |
-| `List`, not `LargeList` | i32 offsets cap the samples in one batch at 2³¹ − 1, about 2.1 billion. Even a whole-series row scraped every 5 s reaches that only after roughly 340 years, and after 68 years at 1 s; a series of many rows may be split across batches anyway, and a batch is bounded by the store's batch size far below the cap. `encode` errors rather than overflowing. |
-| Block columns, but no time-bound columns and no step | Samples ascend within a row, so the first and last sample timestamps are `timestamp[offsets[i]]` and `timestamp[offsets[i+1] - 1]`, two O(1) reads. A row that cannot reach the first step is still skipped without walking its samples, which is what Prometheus cannot do when it decodes through a chunk to find out (`tsdb/querier.go:779-791`). Columns carrying the same two values would be a second sort key that can disagree with the data. The block cannot be read off the data: the lookback puts samples before `block_start` into the block's rows, so no sample says where the block begins, and the engine needs `block_end` before any series closes in the block. So both edges travel on every row. The step stays the engine's. |
+| `List`, not `LargeList` | i32 offsets cap the samples in one batch at 2³¹ − 1, about 2.1 billion. Even a whole series in one chunk, scraped every 5 s, reaches that only after roughly 340 years, and after 68 years at 1 s; a series of many chunks may be split across batches anyway, and a batch is bounded by the store's batch size far below the cap. `encode` errors rather than overflowing. |
+| Block columns, but no time-bound columns and no step | Samples ascend within a series, so the first and last sample timestamps are `timestamp[offsets[i]]` and `timestamp[offsets[i+1] - 1]`, two O(1) reads. A series that cannot reach the first step is still skipped without walking its samples, which is what Prometheus cannot do when it decodes through a chunk to find out (`tsdb/querier.go:779-791`). Columns carrying the same two values would be a second sort key that can disagree with the data. The block cannot be read off the data: the lookback puts samples before `block_start` into the block's series, so no sample says where the block begins, and the engine needs `block_end` before any series closes in the block. So both edges travel on every series. The step stays the engine's. |
 
 **In code.** `series.rs` is the one definition of the shape. `encode`
-exists for stores that hold whole series as rows, and refuses two rows with
+exists for stores that hold each series whole in one chunk, and refuses two series with
 one label set because it cannot tell a second chunk from a duplicate; a
-store that sends several rows per series, or already has Arrow,
+store that sends several chunks per series, or already has Arrow,
 builds the batch itself and needs only `validate`.
 
 ## Implementing it
@@ -285,22 +286,22 @@ builds the batch itself and needs only `validate`.
 implementation: the plainest store that can satisfy it, built to promise
 exactly what the contract requires and nothing more, so the differential
 and promqltest suites have a store to hold every other implementation
-against. It defaults to one block and one row per series, but the tests
+against. It defaults to one block and one chunk per series, but the tests
 also cut it into blocks, realistic chunks and one sample per chunk, so
-every kernel runs across row and block edges the same way a real store's
+every kernel runs across chunk and block edges the same way a real store's
 output would force it to.
 
 **A columnar store** (Parquet, a lakehouse). Push the matchers into the
 scan as predicates and the range into row-group or chunk pruning. If the
 store keeps a sample per row, a group-by over the label columns with an
 ordered `array_agg` produces the shape for one block. If it already keeps
-chunks of one series per row, it emits them as they are, sorted by
+one chunk of one series per row, it emits them as they are, sorted by
 `(labels, first sample timestamp)`, and concatenates nothing. A columnar
 store partitioned by hour could declare its hours as blocks, sort one hour
 by labels and time and emit it as a block, which bounds its sort by an hour
 instead of the range. A store that keeps an ingestion-time series id beside
 its rows skips that sort: it emits the hour as it lies, in keyed mode, with
-each series' rows ascending by time. Either way the store does the
+each series' chunks ascending by time. Either way the store does the
 regrouping, because it knows its own series boundaries and the engine does
 not.
 
@@ -309,8 +310,8 @@ window-end domain `[start_ms + window_ms, end_ms]` into blocks and request
 each block widened back by `window_ms`. Group the reply's chunks by series
 and build one `Series` per series and block from all of that series'
 chunks, sorted by first sample timestamp where the protocol does not
-promise it, never one `Series` per chunk, since `encode` refuses two rows
-with one label set; then `encode`, stamping the block's edges on its rows.
+promise it, never one `Series` per chunk, since `encode` refuses two series
+with one label set; then `encode`, stamping the block's edges on every series.
 
 **Streaming.** A plan may yield several batches, cut wherever suits the
 store, even inside a series. They must share one schema, so the store has
@@ -327,8 +328,8 @@ is deferred on purpose, not forgotten.
   kernel would have to branch on it. That is a stacked change once the
   float path matches Prometheus. The shape leaves room: a third,
   per-sample nullable field in the sample struct, or a separate list
-  column, both keep one row per chunk.
-- **A series crossing partitions.** A series' rows stream across batches,
+  column, both keep one Arrow row per chunk.
+- **A series crossing partitions.** A series' chunks stream across batches,
   but never across DataFusion partitions: that would turn the selector into a
   distributed merge, and the hash partitioning in the fourth obligation exists
   to keep it out.

@@ -380,7 +380,7 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
      Times are the section 4 fixture's, so the picture and the step-through agree. -->
 <section class="overview" id="overview" aria-label="Overview">
   <div class="ov-scroll">
-  <svg id="ov-svg" viewBox="0 0 920 258" role="img" aria-label="A query range cut by the store into two blocks, each shading its reach-back before block_start; inside block 1 the rows of two series in label order are folded one series at a time into one partial per step, and the partials leave at the block's edge">
+  <svg id="ov-svg" viewBox="0 0 920 258" role="img" aria-label="A query range cut by the store into two blocks, each shading its reach-back before block_start; inside block 1 two series in label order are folded one at a time into one partial per step, and the partials leave at the block's edge">
     <defs>
       <pattern id="ov-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
         <rect class="hatch-bg" width="6" height="6"/>
@@ -456,7 +456,7 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
       <circle class="dot-b" cx="519" cy="180.5" r="2"/>
       <text x="532" y="161.5">1st  x{pod="a"}</text>
       <text x="532" y="183.5">2nd  x{pod="b"}</text>
-      <text x="70" y="162">rows, one chunk each, in label order</text>
+      <text x="70" y="162">series, one chunk each, in label order</text>
     </a>
 
     <a href="#3-the-fold">
@@ -473,15 +473,15 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
       <text x="454" y="225" text-anchor="end">sum: one partial per step of the block</text>
       <path class="flow" d="M540 221.5H600" marker-end="url(#ov-arr)"/>
       <text class="acc" x="606" y="213">emitted at the block's edge,</text>
-      <text class="acc" x="606" y="224.5">when block 2's first row arrives;</text>
+      <text class="acc" x="606" y="224.5">when block 2's first series arrives;</text>
       <text class="acc" x="606" y="236">nothing per series crosses it</text>
     </a>
   </svg>
   </div>
   <ul class="ov-caps">
-    <li><b>The store cuts time.</b> Every row names its block, and each block reaches back by the window, so it answers its own steps alone.</li>
-    <li><b>A block is folded one series at a time.</b> Rows come in label order; <code>rate</code> holds one series' window buffer and drops it at the next label set.</li>
-    <li><b>The edge is when steps leave.</b> <code>sum</code> holds one partial per step of the open block and emits them once the block's last row has passed.</li>
+    <li><b>The store cuts time.</b> Every series names its block, and each block reaches back by the window, so it answers its own steps alone.</li>
+    <li><b>A block is folded one series at a time.</b> Series come in label order. <code>rate</code> holds one label set's window buffer and drops it at the next label set.</li>
+    <li><b>The edge is when steps leave.</b> <code>sum</code> holds one partial per step of the open block and emits them once the block's last series has passed.</li>
   </ul>
 </section>
 
@@ -489,24 +489,24 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
 <h2>Before you read</h2>
 <dl class="glossary">
   <dt>Block</dt>
-  <dd>The store's unit of time, such as a TSDB block, named on every row by <code>block_start</code> and <code>block_end</code>. It holds every sample that the windows of its steps reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.</dd>
+  <dd>The store's unit of time, such as a TSDB block, named on every series by <code>block_start</code> and <code>block_end</code>. It holds every sample that the windows of its steps reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.</dd>
   <dt>Batch (<code>RecordBatch</code>)</dt>
-  <dd>The rows the store sends together. The store may cut a block into batches anywhere, even between two rows of one series. It is the unit of transport.</dd>
-  <dt>Row</dt>
-  <dd>One chunk of one series in one block, with <code>labels</code>, <code>samples</code>, and the two block columns. A series with several chunks spans several rows, consecutive in sorted mode and tagged with a <code>series_id</code> in keyed mode. It is the unit the engine folds.</dd>
+  <dd>The series the store sends together. The store may cut a block into batches anywhere, even between two chunks of one series. It is the unit of transport.</dd>
+  <dt>Series</dt>
+  <dd>One series' labels and one chunk of its samples, with the two block columns, stored as one Arrow row. A series with several chunks arrives once per chunk, consecutive in sorted mode and tagged with a <code>series_id</code> in keyed mode. How many chunks a label set becomes in a block is the store's call: a TSDB-backed store sends one per chunk it keeps, a remote store may merge what it receives into one. It is the unit the engine folds.</dd>
   <dt>Chunk</dt>
-  <dd>A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim it, so a row may reach past a block edge or overlap the next row of its series. It is the store's unit of storage.</dd>
+  <dd>A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim it, so a series may reach past a block edge or overlap the next chunk of the same label set. It is the store's unit of storage.</dd>
 </dl>
-<p>One <code>select</code> yields blocks, a block arrives as batches, a batch holds rows, and a row holds one chunk's samples.</p>
+<p>One <code>select</code> yields blocks, a block arrives as batches, a batch holds series, and a series holds one chunk's samples.</p>
 </section>
 
-<p class="lede">A store cuts its answer into blocks along its own time units. It streams each block as rows, one per chunk of a series, in <code>RecordBatch</code>es it may cut anywhere. Inside a block, how are two rows of a series aligned so that <code>rate</code> can reach the last value of one and the first value of the next?</p>
+<p class="lede">A store cuts its answer into blocks along its own time units. It streams each block as series in <code>RecordBatch</code>es it may cut anywhere, and a series with several chunks arrives once per chunk. Inside a block, how are two chunks of one series aligned so that <code>rate</code> can reach the last value of one and the first value of the next?</p>
 
 <div class="query-banner">
-  <code>rate(x[5m])</code> &nbsp;&middot;&nbsp; step 30&thinsp;s &nbsp;&middot;&nbsp; 420&thinsp;s &rarr; 600&thinsp;s &nbsp;&middot;&nbsp; two batches, three rows, two series
+  <code>rate(x[5m])</code> &nbsp;&middot;&nbsp; step 30&thinsp;s &nbsp;&middot;&nbsp; 420&thinsp;s &rarr; 600&thinsp;s &nbsp;&middot;&nbsp; two batches, two series, three chunks
 </div>
 
-<p><b>They are not aligned, and need not be.</b> The two rows of <code>x</code> are ranges in two different <code>RecordBatch</code>es, read in arrival order. When the engine reads the second, the series' <b>window buffer</b> already holds copies of the first row's samples that a later window reaches. Alignment is a question only if the operator works on whole series. A grouped aggregate folds a block, not a series.</p>
+<p><b>They are not aligned, and need not be.</b> <code>x</code>'s two chunks are ranges in two different <code>RecordBatch</code>es, read in arrival order. When the engine reads the second, the <b>window buffer</b> of <code>x</code> already holds copies of the first chunk's samples that a later window reaches. Alignment is a question only if the operator needs all chunks of a label set at once. A grouped aggregate folds a block, not a label set.</p>
 
 <nav class="toc">
   <a href="#glossary">Before you read</a>
@@ -527,7 +527,7 @@ samples      List&lt;Struct&lt;timestamp: Timestamp(Millisecond), value: Float64
 block_start  Timestamp(Millisecond)
 block_end    Timestamp(Millisecond)</code></pre>
 
-<p>One row is one chunk of one series in one block the store cut its answer into. <code>block_start</code> and <code>block_end</code> name that block on every row. The fixture is one block, so the two columns are the same on every row and stay out of view until <a href="#4-an-aggregate-across-a-block-edge">section 4</a>. Its three rows come in two batches. Batch A holds the first row of series <code>x</code>. Batch B holds the second, then one row of series <code>y</code>, which closes <code>x</code>. The counter resets inside B.0, from 16 to 3.</p>
+<p>One series is one Arrow row: a label set and one chunk of its samples, in one block the store cut its answer into. <code>block_start</code> and <code>block_end</code> name that block on every series. The fixture is one block, so the two columns are the same on every series and stay out of view until <a href="#4-an-aggregate-across-a-block-edge">section 4</a>. <code>x</code> arrives twice and <code>y</code> once, in two batches. Batch A holds <code>x</code>'s first chunk. Batch B holds <code>x</code>'s second chunk, then the one chunk of <code>y</code>, which closes <code>x</code>. The counter resets inside B.0, from 16 to 3.</p>
 
 <pre class="codeblock layout"><code>batch A
 row  labels.__name__  samples                  first / last sample timestamp, derived
@@ -555,26 +555,26 @@ row  labels.__name__  samples                  first / last sample timestamp, de
 <h2 id="2-batches-carry-no-meaning"><span class="num">2</span>Batches carry no meaning</h2>
 
 <div class="stage-card">
-<p><b>A store may split a series' rows across any number of <code>RecordBatch</code>es.</b> A series may end mid-batch or span several, and <code>x</code> here does both. The engine never gathers a series' rows for <code>rate</code>. It folds rows in arrival order into one window buffer. A series closes when a row with another label set arrives or the block's last row has passed. In sorted mode, the engine carries only the window buffer of the one open series per partition across a batch boundary. In keyed mode, it carries every series of the block.</p>
+<p><b>A store may split a series' chunks across any number of <code>RecordBatch</code>es.</b> A series may end mid-batch or span several, and <code>x</code> here does both. The engine never gathers a series' chunks for <code>rate</code>. It folds the chunks in arrival order into one window buffer. The engine closes a series when one with another label set arrives, or when the block's last series has passed. In sorted mode, the engine carries only the window buffer of the one open series per partition across a batch boundary. In keyed mode, it carries every series of the block.</p>
 </div>
 
-<p>What crosses from A.0 to B.0 is a copy of the samples a later window reaches, never a reference into batch A's buffers. The fold does not notice the batch boundary. <a href="engine.md#memory">docs/engine.md</a> explains why the engine never joins a series' rows into one.</p>
+<p>What crosses from A.0 to B.0 is a copy of the samples a later window reaches, never a reference into batch A's buffers. The fold does not notice the batch boundary. <a href="engine.md#memory">docs/engine.md</a> explains why the engine never joins a series' chunks into one.</p>
 
-<p>B.1 closes <code>x</code> only because the store keeps a series' rows consecutive and label-sorted within a block, a contract in <a href="engine.md#ordering-integrity">docs/engine.md</a>. That order is sorted mode, which the fold here shows. In keyed mode, each row finds its series' buffer by <code>series_id</code> instead of by adjacency. Nothing else in the fold changes.</p>
+<p>B.1 closes <code>x</code> only because the store keeps a series' chunks consecutive and the series label-sorted within a block, a contract in <a href="engine.md#ordering-integrity">docs/engine.md</a>. That order is sorted mode, which the fold here shows. In keyed mode, each series finds its label set's buffer by <code>series_id</code> instead of by adjacency. Nothing else in the fold changes.</p>
 
-<p>The engine checks the contract on every row, with one label comparison and three cheaper checks:</p>
+<p>The engine checks the contract on every series, with one label comparison and three cheaper checks:</p>
 <ul>
-  <li>Labels compare against the previous row in sorted mode, or the id's stored labels in keyed mode.</li>
-  <li>The first sample timestamp never decreases within a series.</li>
+  <li>Labels compare against the previous series in sorted mode, or the id's stored labels in keyed mode.</li>
+  <li>The first sample timestamp never decreases across the chunks of one label set.</li>
   <li><code>block_start</code> and <code>block_end</code> stay constant within a block.</li>
-  <li>Blocks ascend and never overlap from one row to the next.</li>
+  <li>Blocks ascend and never overlap from one series to the next.</li>
 </ul>
 
 <p>A violation becomes a query error rather than a silently wrong result. The samples need no edge check, because a sample past either edge falls in no window the block answers.</p>
 
 <h2 id="3-the-fold"><span class="num">3</span>The fold</h2>
 
-<p><code>rate(x[5m])</code> runs seven steps, from t&nbsp;=&nbsp;420&thinsp;s to t&nbsp;=&nbsp;600&thinsp;s at step 30&thinsp;s. Each step's answer is a function of its <b>lane</b>, the samples in its window <code>(t_step &minus; 300&thinsp;s, t_step]</code>. The lanes are the semantics, not <code>rate</code>'s data structure. <code>rate</code> keeps no lane per step. It copies each row into one window buffer per open series, after Prometheus's <code>BufferedSeriesIterator</code> in <code>storage/buffer.go</code>. It answers a step as soon as its window cannot change any more, and trims from the front what no later window reaches (<a href="engine.md#kernel-state">docs/engine.md</a>). A state per step would pay for every sample once per window it falls in: ten times here, twenty for <code>[5m]</code> at 15&thinsp;s.</p>
+<p><code>rate(x[5m])</code> runs seven steps, from t&nbsp;=&nbsp;420&thinsp;s to t&nbsp;=&nbsp;600&thinsp;s at step 30&thinsp;s. Each step's answer is a function of its <b>lane</b>, the samples in its window <code>(t_step &minus; 300&thinsp;s, t_step]</code>. The lanes are the semantics, not <code>rate</code>'s data structure. <code>rate</code> keeps no lane per step. It copies each chunk into one window buffer per open series, after Prometheus's <code>BufferedSeriesIterator</code> in <code>storage/buffer.go</code>. It answers a step as soon as its window cannot change any more, and trims from the front what no later window reaches (<a href="engine.md#kernel-state">docs/engine.md</a>). A state per step would pay for every sample once per window it falls in: ten times here, twenty for <code>[5m]</code> at 15&thinsp;s.</p>
 
 <p>The aggregate above <code>rate</code> does keep one partial per group and step, for the steps of the block being read. <a href="#4-an-aggregate-across-a-block-edge">Section 4</a> shows what bounds them.</p>
 
@@ -599,7 +599,7 @@ row  labels.__name__  samples                  first / last sample timestamp, de
 </table>
 </div>
 
-<p><code>rate</code> copies B.0 into the same buffer, after A.0's five samples, and references nothing of batch A. Only the buffer connects the row's first sample, the first thing read from batch B, to A.0. The row ends at 600&thinsp;s, so <code>rate</code> answers all six open lanes during the push:</p>
+<p><code>rate</code> copies B.0 into the same buffer, after A.0's five samples, and references nothing of batch A. Only the buffer connects the chunk's first sample, the first thing read from batch B, to A.0. The chunk ends at 600&thinsp;s, so <code>rate</code> answers all six open lanes during the push:</p>
 
 <div class="tablewrap">
 <table class="wide">
@@ -630,7 +630,7 @@ row  labels.__name__  samples                  first / last sample timestamp, de
   <li>Block 2, from <code>block_start</code> 480&thinsp;s to <code>block_end</code> 720&thinsp;s, answers 480&thinsp;s to 600&thinsp;s.</li>
 </ul>
 
-<p>The engine selects once, from 120&thinsp;s to 600&thinsp;s with <code>window_ms</code> 300&thinsp;s. The store reaches back by that window at each block. Block 1's rows hold samples from 120&thinsp;s to 479&thinsp;s, and block 2's from 180&thinsp;s to 600&thinsp;s. All of block 1's rows come before block 2's.</p>
+<p>The engine selects once, from 120&thinsp;s to 600&thinsp;s with <code>window_ms</code> 300&thinsp;s. The store reaches back by that window at each block. Block 1's series hold samples from 120&thinsp;s to 479&thinsp;s, and block 2's from 180&thinsp;s to 600&thinsp;s. All of block 1's series come before block 2's.</p>
 
 <pre class="codeblock layout"><code>block  labels.pod  samples                     first / last sample timestamp
   1    "a"         300 330 … 420 450    (6)    300 / 450
@@ -638,9 +638,9 @@ row  labels.__name__  samples                  first / last sample timestamp, de
   2    "a"         300 330 … 570 600   (11)    300 / 600    reach-back 300–450
   2    "b"         180 210 … 570 600   (15)    180 / 600    reach-back 180–450</code></pre>
 
-<p>The fixture's chunks happen to end and begin exactly at these edges. <code>a</code>'s block-1 row ends at 450&thinsp;s, and <code>b</code>'s block-2 row begins at 180&thinsp;s, its reach-back start. The store never trims a row to a block edge, because trimming would mean decoding the chunk (<a href="series-source.md#what-the-trait-requires">docs/series-source.md</a>).</p>
+<p>The fixture's chunks happen to end and begin exactly at these edges. <code>a</code>'s block-1 chunk ends at 450&thinsp;s, and <code>b</code>'s block-2 chunk begins at 180&thinsp;s, its reach-back start. The store never trims a series to a block edge, because trimming would mean decoding the chunk (<a href="series-source.md#what-the-trait-requires">docs/series-source.md</a>).</p>
 
-<p>Suppose block 1's two rows come in one batch. The batch spans 150&thinsp;s to 450&thinsp;s, and that does not matter. <code>sum</code> never sees samples, only the step values <code>rate</code> emits, each keyed by its step. <code>sum</code> has no current step, so a batch cannot arrive early or late. The rows feed whichever windows they fall in.</p>
+<p>Suppose block 1's two series come in one batch. The batch spans 150&thinsp;s to 450&thinsp;s, and that does not matter. <code>sum</code> never sees samples, only the step values <code>rate</code> emits, each keyed by its step. <code>sum</code> has no current step, so a batch cannot arrive early or late. The series feed whichever windows they fall in.</p>
 
 <section id="fold" class="anim" aria-label="Step-through of section 4">
   <div class="anim-bar">
@@ -652,12 +652,12 @@ row  labels.__name__  samples                  first / last sample timestamp, de
     <span class="anim-now" id="fold-now"></span>
   </div>
   <div class="anim-scroll">
-    <svg id="fold-svg" viewBox="0 0 900 352" role="img" aria-label="Four rows of two series in two blocks, arriving in two RecordBatches, folded one series at a time into seven step windows; sum emits a block's steps when the block's last row has passed"></svg>
+    <svg id="fold-svg" viewBox="0 0 900 352" role="img" aria-label="Two series, each with one chunk in each of two blocks, arriving in two RecordBatches, folded one series at a time into seven step windows; sum emits a block's steps when the block's last series has passed"></svg>
   </div>
   <p class="anim-cap" id="fold-cap"></p>
 
   <h3 class="insp-h" id="inspector">The same step, as Arrow holds it</h3>
-  <p class="insp-lede">Top, the two input <code>RecordBatch</code>es, each with its label and block columns and its own <code>samples</code> list: an offsets buffer over two flat child buffers. The batch edge falls inside block 2 on purpose. Below, what outlives a row: the open series' window buffer, copied out of its batch, and <code>sum</code>'s partials for the open block, then what <code>sum</code> has emitted.</p>
+  <p class="insp-lede">Top, the two input <code>RecordBatch</code>es, each with its label and block columns and its own <code>samples</code> list: an offsets buffer over two flat child buffers. The batch edge falls inside block 2 on purpose. Below, what outlives a chunk: the open series' window buffer, copied out of its batch, and <code>sum</code>'s partials for the open block, then what <code>sum</code> has emitted.</p>
   <div class="anim-scroll">
     <svg id="arrow-svg" viewBox="0 0 900 328" role="img" aria-label="Two Arrow RecordBatches, each an offsets buffer over its own child buffers, above the open series' window buffer, sum's partials for the open block, and sum's output"></svg>
   </div>
@@ -677,9 +677,9 @@ row  labels.__name__  samples                  first / last sample timestamp, de
   </div>
 </section>
 
-<p><code>rate</code> folds <code>a</code>'s block-1 row first. The row ends at 450&thinsp;s, so <code>a</code>'s steps at 420&thinsp;s and 450&thinsp;s, the only ones block 1 answers, are final. They leave with the rates of section 5, and <code>sum</code> adds them into the partials for 420&thinsp;s and 450&thinsp;s. <code>b</code>'s row then closes <code>a</code> before <code>rate</code> reads any of <code>b</code>'s samples, and <code>rate</code> drops <code>a</code>'s window buffer.</p>
+<p><code>rate</code> folds <code>a</code>'s block-1 chunk first. The chunk ends at 450&thinsp;s, so <code>a</code>'s steps at 420&thinsp;s and 450&thinsp;s, the only ones block 1 answers, are final. They leave with the rates of section 5, and <code>sum</code> adds them into the partials for 420&thinsp;s and 450&thinsp;s. <code>b</code> then closes <code>a</code> before <code>rate</code> reads any of <code>b</code>'s samples, and <code>rate</code> drops <code>a</code>'s window buffer.</p>
 
-<p><code>b</code>'s two steps are final at 450&thinsp;s too, at 10&nbsp;/&nbsp;300&thinsp;s = 0.0333333333 each. Each window holds ten samples, so nine increments. A first value of 10 or more keeps the zero clip from biting, so <code>rate</code> extrapolates by 10/9. Block 2's first row then arrives with <code>block_start</code> 480&thinsp;s, so block 1's last row has passed, and so have its steps. <code>sum</code> emits 420&thinsp;s and 450&thinsp;s and drops their partials.</p>
+<p><code>b</code>'s two steps are final at 450&thinsp;s too, at 10&nbsp;/&nbsp;300&thinsp;s = 0.0333333333 each. Each window holds ten samples, so nine increments. A first value of 10 or more keeps the zero clip from biting, so <code>rate</code> extrapolates by 10/9. Block 2's first series then arrives with <code>block_start</code> 480&thinsp;s, so block 1's last series has passed, and so have its steps. <code>sum</code> emits 420&thinsp;s and 450&thinsp;s and drops their partials.</p>
 
 <div class="tablewrap">
 <table class="wide">
@@ -694,7 +694,7 @@ row  labels.__name__  samples                  first / last sample timestamp, de
 
 <p>A store that hands over whole chunks could send <code>a</code>'s B.0 to block 1 unchanged, with samples up to 600&thinsp;s. Block 1 answers no step past 450&thinsp;s, so the samples from 480&thinsp;s fall in no window it evaluates, and nothing is clipped.</p>
 
-<p>Block 2 starts every series from an empty buffer. <code>a</code>'s samples from 300&thinsp;s to 450&thinsp;s are the block's reach-back. They fill the windows from 480&thinsp;s onward and answer no step, not even 450&thinsp;s, which block 1 answered. <code>a</code>'s row ends at 600&thinsp;s, so all five steps of block 2 are final during the push:</p>
+<p>Block 2 starts every series from an empty buffer. <code>a</code>'s samples from 300&thinsp;s to 450&thinsp;s are the block's reach-back. They fill the windows from 480&thinsp;s onward and answer no step, not even 450&thinsp;s, which block 1 answered. <code>a</code>'s chunk ends at 600&thinsp;s, so all five steps of block 2 are final during the push:</p>
 
 <div class="tablewrap">
 <table>
@@ -709,13 +709,13 @@ row  labels.__name__  samples                  first / last sample timestamp, de
 </table>
 </div>
 
-<p><code>a</code>'s rates match section 5's to the last digit, because the window at 480&thinsp;s, <code>(180&thinsp;s, 480&thinsp;s]</code>, lies wholly inside what block 2's rows hold. <code>rate</code> reads <code>b</code>'s sample at 180&thinsp;s, but it falls in no window, because each window is open at its start.</p>
+<p><code>a</code>'s rates match section 5's to the last digit, because the window at 480&thinsp;s, <code>(180&thinsp;s, 480&thinsp;s]</code>, lies wholly inside what block 2's series hold. <code>rate</code> reads <code>b</code>'s sample at 180&thinsp;s, but it falls in no window, because each window is open at its start.</p>
 
-<p>Nothing per series crossed the edge. For <code>sum</code>, nothing crossed at all, because <code>sum</code> emitted block 1's partials before <code>rate</code> folded block 2's first row. <code>sum</code> never held partials for more than one block's steps: five here, four for a 2&thinsp;h block at a 30-minute step. <code>rate</code> never held more than one series' buffer. With several partitions, each keeps its own partials for the block. The block's final <code>sum</code> adds them once every partition has passed the block. It knows that point because its group key leads with <code>block_start</code> and the repartition beneath the Final preserves block order (<a href="engine.md#ordering-integrity">docs/engine.md</a>).</p>
+<p>Nothing per series crossed the edge. For <code>sum</code>, nothing crossed at all, because <code>sum</code> emitted block 1's partials before <code>rate</code> folded block 2's first series. <code>sum</code> never held partials for more than one block's steps: five here, four for a 2&thinsp;h block at a 30-minute step. <code>rate</code> never held more than one series' buffer. With several partitions, each keeps its own partials for the block. The block's final <code>sum</code> adds them once every partition has passed the block. It knows that point because its group key leads with <code>block_start</code> and the repartition beneath the Final preserves block order (<a href="engine.md#ordering-integrity">docs/engine.md</a>).</p>
 
 <h2 id="5-finalising"><span class="num">5</span>Finalising</h2>
 <div class="stage-card">
-<p>Each lane went through Prometheus's <code>extrapolatedRate</code> when <code>rate</code> answered it: t&nbsp;=&nbsp;420&thinsp;s during A.0's push, the rest during B.0's. B.1 belongs to series <code>y</code>, so for <code>x</code> it only closes the output row, which DataFusion sees from then on. For the lane at t&nbsp;=&nbsp;600&thinsp;s, spelled out once:</p>
+<p>Each lane went through Prometheus's <code>extrapolatedRate</code> when <code>rate</code> answered it: t&nbsp;=&nbsp;420&thinsp;s during A.0's push, the rest during B.0's. B.1 belongs to series <code>y</code>, so for <code>x</code> it only closes the output series, which DataFusion sees from then on. For the lane at t&nbsp;=&nbsp;600&thinsp;s, spelled out once:</p>
 
 <pre class="codeblock"><code>result             = last_v - first_v + reset_sum = 6 - 11 + 16 = 11
 sampled_interval   = 600 - 330                                  = 270 s
@@ -750,9 +750,9 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
 <h2 id="6-overlapping-chunks"><span class="num">6</span>Overlapping chunks</h2>
 
-<p>When a series' chunks arrive from several files or compaction levels, adjacent rows of that series in one block may overlap in time. The engine remembers the last timestamp it copied for each series and skips any sample at or before it. The first row therefore wins, as in Thanos's <code>chunkSeriesIterator</code>. Prometheus's union differs only for interleaved timestamps (<a href="engine.md#ordering-integrity">docs/engine.md</a>).</p>
+<p>When a series' chunks arrive from several files or compaction levels, adjacent chunks of that series in one block may overlap in time. The engine remembers the last timestamp it copied for each series and skips any sample at or before it. The first chunk therefore wins, as in Thanos's <code>chunkSeriesIterator</code>. Prometheus's union differs only for interleaved timestamps (<a href="engine.md#ordering-integrity">docs/engine.md</a>).</p>
 
-<p>A stale marker claims its timestamp too, before <code>rate</code> filters the marker out of the buffer. A sample at the same timestamp in the second row therefore does not replace a marker in the first. The skip matters even for an exact duplicate, which moves neither endpoint and fakes no reset but would raise <code>count</code>. A higher <code>count</code> shortens the average interval, which can push <code>duration_to_start</code> through a clamp it would otherwise miss.</p>
+<p>A stale marker claims its timestamp too, before <code>rate</code> filters the marker out of the buffer. A sample at the same timestamp in the second chunk therefore does not replace a marker in the first. The skip matters even for an exact duplicate, which moves neither endpoint and fakes no reset but would raise <code>count</code>. A higher <code>count</code> shortens the average interval, which can push <code>duration_to_start</code> through a clamp it would otherwise miss.</p>
 
 <h2 id="7-functions-that-need-every-sample-in-the-window"><span class="num">7</span>Functions that need every sample in the window</h2>
 
@@ -788,8 +788,8 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
   /* ---- fixture: section 4. Seconds throughout; the engine counts
      milliseconds, and nothing on this page turns on the difference. Two
-     blocks the store declares, four rows, two series. The rows come in
-     two RecordBatches cut inside block 2 on purpose: the block edge (before
+     blocks the store declares and two series, each with one chunk per block.
+     The chunks come in two RecordBatches cut inside block 2 on purpose: the block edge (before
      2·a) and the batch edge (before 2·b) fall in different places, and only
      the first is an event for sum. ---- */
   var RANGE = 300, STEP = 30;
@@ -822,7 +822,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
     {name:"D", rows:[
       {name:"2·b", series:"b", block:1, s:samples("b", 180, 600)}]}
   ];
-  // rows in arrival order; each batch keeps its own offsets and child buffers,
+  // series in arrival order, one per chunk. Each batch keeps its own offsets and child buffers,
   // both starting again at 0, because nothing in batch D may point into batch C
   var ROWS = [];
   BATCHES.forEach(function(b, bi){
@@ -874,10 +874,10 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
   }
 
   /* ---- frames ----
-     The engine pushes a whole row at once; the page slows each push to one
+     The engine pushes a whole chunk at once. The page slows each push to one
      frame per step it makes final, so the partials can be watched filling.
-     Between rows: "close" when the label set changes inside a block, "edge"
-     when a row of the next block arrives, "end" when the stream does. */
+     Between series: "close" when the label set changes inside a block, "edge"
+     when a series of the next block arrives, "end" when the stream does. */
   var EV = [{k:"src", row:0}];
   ROWS.forEach(function(r, ri){
     if (ri > 0)
@@ -950,10 +950,10 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
   function fmt(v){ return v == null ? "--" : String(Math.round(v * 1e10) / 1e10); }
   function visible(h, bi){ return bi < h.batches; }
-  // a batch is released once a later batch has arrived: every row in it is folded
+  // a batch is released once a later batch has arrived: every series in it is folded
   function released(h, bi){ return bi < h.batches - 1; }
   function has(arr, v){ return arr.indexOf(v) >= 0; }
-  // the earliest step of the open row's block not yet answered for it; what lies at or
+  // the earliest step of the open series' block not yet answered for it; what lies at or
   // before its window start is reached by no later window of the block
   function reachFrom(h){
     if (h.open < 0) return Infinity;
@@ -962,7 +962,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
     return Infinity;
   }
 
-  /* =====================  pipeline: rows over a time axis  ===================== */
+  /* =====================  pipeline: series over a time axis  ===================== */
   var X0 = 196, T0 = 110, PX = 1.34;
   function X(t){ return X0 + (t - T0) * PX; }
   var T_MAX = 620;
@@ -1019,7 +1019,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
     rowG.push(g);
     var bl = BLOCKS[r.block], t0 = r.s[0][0], t1 = r.s[r.s.length - 1][0], y = ROW_Y[ri];
     mk("rect", {"class":"rowbox", x:X(t0) - 9, y:y, width:X(t1) - X(t0) + 18, height:ROW_H, rx:4}, g);
-    // the row's reach-back: samples that feed this block's windows and answer none of its steps
+    // the series' reach-back: samples that feed this block's windows and answer none of its steps
     if (t0 < bl.start)
       mk("rect", {"class":"reach", x:X(t0) - 9, y:y, width:X(bl.start) - X(t0) + 9, height:ROW_H,
                   rx:4, opacity:0.55}, g);
@@ -1071,7 +1071,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
   /* =====================  Arrow buffer inspector  =====================
      Driven by the same frame index. Top: the two input RecordBatches, each its
      label and block columns plus the samples list as offsets over two flat
-     child buffers of its own. Bottom: what outlives a row, the open series'
+     child buffers of its own. Bottom: what outlives a chunk, the open series'
      window buffer, copied out of its batch, and sum's partials for the open
      block. Only the bottom half outlives a batch, and only sum's partials
      outlive a series. */
@@ -1242,10 +1242,10 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
   function say(e, h){
     var r, s;
     if (e.k === "src"){
-      return "<b>Batch C arrives.</b> Its first row, 1&middot;a, names block 1, " + c("block_start") +
+      return "<b>Batch C arrives.</b> Its first series, 1&middot;a, names block 1, " + c("block_start") +
         " 240&thinsp;s and " + c("block_end") + " 480&thinsp;s, so before any sample is read the engine knows " +
         "the block answers 420&thinsp;s and 450&thinsp;s and nothing else. " + c("sum") + " opens one partial for each; " +
-        "the other five steps belong to a block the stream has not reached. The engine pushes a row whole; " +
+        "the other five steps belong to a block the stream has not reached. The engine pushes a chunk whole; " +
         "the frames below slow each push to one step at a time.";
     }
     if (e.k === "push"){
@@ -1285,12 +1285,12 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
       return s;
     }
     if (e.k === "edge"){
-      return "<b>Block edge.</b> 2&middot;a carries " + c("block_start") + " 480&thinsp;s, so block 1's last row has passed. " +
+      return "<b>Block edge.</b> 2&middot;a carries " + c("block_start") + " 480&thinsp;s, so block 1's last series has passed. " +
         c('x{pod="b"}') + " closes as the block's last series, and " + c("sum") + " emits " + stepList(h.emitted) +
         " and drops their partials: no other block answers those steps. Nothing per series crosses; block 2 opens " +
         "five partials, and every series starts from an empty buffer. The batch did not end here.";
     }
-    return "<b>End of stream.</b> " + c('x{pod="b"}') + " closes, block 2's last row has passed, and " + c("sum") +
+    return "<b>End of stream.</b> " + c('x{pod="b"}') + " closes, block 2's last series has passed, and " + c("sum") +
       " emits " + stepList(h.emitted) + ". " + c("sum") + " never held partials for more than one block's steps, five here, and " +
       c("rate") + " never more than one series' buffer.";
   }
@@ -1299,12 +1299,12 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
       var r = ROWS[e.row], b = BATCHES[r.batch], lo = r.base + e.from, hi = r.base + e.to;
       return "Reading cells <b>" + lo + "</b> to <b>" + (hi - 1) + "</b> of batch " + b.name + "'s child buffers, inside the slice " +
         c("[" + r.base + ", " + (r.base + r.s.length) + ")") + " its offsets delimit. They are copied into the window buffer below, " +
-        "not held as a slice, so the batch can go once its rows are folded. Greyed buffer cells are reached by no later window of the block.";
+        "not held as a slice, so the batch can go once its series are folded. Greyed buffer cells are reached by no later window of the block.";
     }
     if (e.k === "src")
-      return "Batch C holds three rows over two blocks, with offsets " + c("[" + BATCHES[0].offs.join(", ") + "]") +
+      return "Batch C holds three Arrow rows over two blocks, with offsets " + c("[" + BATCHES[0].offs.join(", ") + "]") +
         ". " + c("block_start") + " and " + c("block_end") + " are plain columns, constant within a block; the engine reads them off the " +
-        "first row and checks the rest against them.";
+        "first series and checks the rest against them.";
     if (e.k === "close" && e.arrives)
       return "Batch D brings its own columns and its own offsets " + c("[" + BATCHES[1].offs.join(", ") + "]") +
         ", indexed from 0 again. Nothing in it points back at batch C, and nothing needs to: " + c("sum") +
@@ -1381,7 +1381,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
       curTxt.textContent = ROWS[h.open].series + " last_ts " + lastT + " s";
     }
     cls(gEdgeTxt, "gone", e.k !== "edge" && e.k !== "end");
-    if (e.k === "edge") edgeTxt.textContent = "block 1's last row has passed: 420 s, 450 s leave";
+    if (e.k === "edge") edgeTxt.textContent = "block 1's last series has passed: 420 s, 450 s leave";
     if (e.k === "end") edgeTxt.textContent = "end of stream: 480 s to 600 s leave";
     if (e.k === "edge" || e.k === "end") cls(gCur, "gone", true);
 

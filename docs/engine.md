@@ -41,23 +41,23 @@ the window, never the series.**
 ## Blocks, and why the plan shape follows from them
 
 Each selector gets one select, and the store cuts its answer into blocks
-of its own layout that every row declares. A block's rows are chunks of
-series, label-sorted with rows of a series consecutive, or keyed by a
+of its own layout that every series declares. A block holds series, one per
+chunk, label-sorted with the chunks of one label set consecutive, or keyed by a
 store-provided series id. That contract is
 `series-source.md`'s; what matters here is that it forbids the engine from
 ever seeing a whole series at once, and therefore forbids an operator that
 wants one.
 
 A scalar UDF over the `samples` list cannot be a range function under it. A
-scalar UDF is handed one row and must produce that row's answer, so a scalar
-`rate` is correct only if the row already holds every sample of the window,
-which is only true if the store concatenated the series first: an unbounded
+scalar UDF is handed one series and must produce that series' answer, so a scalar
+`rate` is correct only if the series already holds every sample of the window,
+which is only true if the store concatenated the label set's chunks first: an unbounded
 copy pushed into every store to satisfy a signature, the memory problem the
 contract exists to avoid.
 
 The selector and the range functions are therefore **grouped aggregate UDFs
 over the series of a block**, `(block_start, labels)` in sorted mode and
-`(block_start, series_id)` in keyed mode. An aggregate sees rows of one
+`(block_start, series_id)` in keyed mode. An aggregate sees the series of one
 group in sequence and keeps state between them, which is exactly a
 chunk-crossing iterator written as DataFusion. The query's plan is then one
 `TableScan` per selector over the store's plan for that selector
@@ -71,17 +71,17 @@ answers.
 over the whole query range, its start widened by the window and both ends
 moved by the offset as Prometheus widens its select hints, and passes the
 window as `SelectHints.window_ms`. The store cuts its answer into blocks of
-its own layout and stamps every row with its block's `block_start`
+its own layout and stamps every series with its block's `block_start`
 and `block_end`, reaching back by the window at each
 ([`series-source.md`](series-source.md#what-the-trait-requires)). A block
 answers the steps of the query whose window end, `t − offset` or the `@`
 time, lies in `[block_start, block_end)`; its samples before `block_start`
-feed windows only. The engine learns a block's edges from its first row,
+feed windows only. The engine learns a block's edges from the first series it reads,
 before any series closes in it, so a series that closes inside a block evaluates
 all its steps for the block at once, and nothing per series survives the
 block. An aggregate above holds one partial per group and step of the
-block and emits when the block's last row has passed, at the next block's
-first row or the end of the stream, and block results concatenate with no
+block and emits when the block's last series has passed, at the next block's
+first series or the end of the stream, and block results concatenate with no
 merge between them. Every partition of one store cuts the same edges, the
 store's obligation and trivially kept, since the blocks are its layout. Two
 selectors may see different edges, from different stores or through
@@ -92,26 +92,26 @@ block of each side.
 In sorted mode the scan declares its output ordered by the group key, and
 DataFusion runs that lower `AggregateExec` in `InputOrderMode::Sorted`
 (`datafusion-physical-plan-54.1.0/src/aggregates/mod.rs:815-823`,
-`order/full.rs:80-92`): a group is emitted the moment a row with a different
+`order/full.rs:80-92`): a group is emitted the moment a series with a different
 key arrives, and only the open group is held. In keyed mode the scan
 declares only `block_start` ordered, and the same aggregate runs as a hash
 aggregate keyed by `(block_start, series_id)` in
 `InputOrderMode::PartiallySorted`, every series of the block open until the
-block's last row has passed. The choice between them is the plan's, made
+block's last series has passed. The choice between them is the plan's, made
 from the scan's schema, not a mapping trait every operator implements.
 Losing a declared ordering between scan and selector would turn a
 sorted-mode plan into a hash aggregate over labels, which is why *Ordering
 integrity* refuses it.
 
-**Batch boundaries mean nothing.** A store may split a series' rows
+**Batch boundaries mean nothing.** A store may split a series' chunks
 across any number of RecordBatches, ending it mid-batch or spreading it over
-several. The engine never gathers or looks up the rows a `rate` window
-needs: it folds rows into their series' window buffer in arrival order. In
-sorted mode it closes the series at the first row with another label set,
-in keyed mode when the block's last row has passed, as it does for the last
-series of a block in sorted mode. There is no lookup, no join and no
+several. The engine never gathers or looks up the chunks a `rate` window
+needs: it folds each chunk into its label set's window buffer in arrival order. In
+sorted mode it closes a series when one with another label set arrives,
+in keyed mode when the block's last series has passed, as it does for the last
+label set of a block in sorted mode. There is no lookup, no join and no
 buffered batch. A whole-series store sending the range as one block, one
-row per series, is the one-block, one-chunk case.
+chunk per series, is the one-block, one-chunk case.
 
 ## Kernel state
 
@@ -131,16 +131,16 @@ per open series is **one window buffer**, `BufferedSeriesIterator`
 (`buffer.rs`), after Prometheus's `storage.BufferedSeriesIterator`
 (`storage/buffer.go:26-36`), and it serves every function alike.
 
-What a later step still reads of a pushed row is copied into the
+What a later step still reads of a pushed chunk is copied into the
 buffer, not held as a slice of its batch: a retained slice pins the batch's
 child buffers, other series' samples included, and every kernel indexes one
-contiguous slice. Usually only a row's tail need be copied; a full copy is
+contiguous slice. Usually only a chunk's tail need be copied; a full copy is
 forced when `@`'s pinned window needs trimming, or when a stale marker must
 survive the copy, since a range function must not see one in place. A step is
 evaluated the moment its window cannot change any more, when its end is at
 or before the last timestamp pushed, rather than at series close, and when
 the series closes every step of the block still open is evaluated, since
-the block's end came with its first row. Only the block's own steps are
+the block's end came with its first series. Only the block's own steps are
 evaluated, so the reach-back before its start feeds windows and never
 answers one. The buffer
 then drops what no later window reaches, once that is at least half of it,
@@ -160,11 +160,11 @@ buffer already sorted by time.
 **Above the selector.** `rate` keeps no lane per step: a step's value leaves
 the moment it is final. Operators above the selector do hold state, and the
 block bounds it. `sum by (…)` keeps one partial per group and step of the
-block, and emits them when the block's last row has passed, since no other
+block, and emits them when the block's last series has passed, since no other
 block answers those steps. The bound is groups × steps per block, four
 for a 2 h block at a 30-minute step, where holding every step of the range
-would be groups × 1,441 for 30 days at that step; the result row a range aggregate
-hands up per series is one block's steps long.
+would be groups × 1,441 for 30 days at that step; the output series a range aggregate
+hands up is one block's steps long.
 [`engine-blocks.md`](engine-blocks.md#4-an-aggregate-across-a-block-edge)
 walks one edge with numbers.
 
@@ -173,12 +173,12 @@ sample at or before the step within the lookback delta, and a stale marker
 that is that sample hides the series, so the selector keeps markers the
 range functions filter on copy. `offset` and `@` shift the window back in
 time, which is why the first step of a fold can still be looking for a
-sample that lives in an earlier row. A step's window ends at `t − offset`,
+sample that lives in an earlier chunk. A step's window ends at `t − offset`,
 or at the `@` time, and that end decides which block answers the step. Under
 `@` every step shares one pinned window, so one block answers every step:
 what falls outside the window is dropped on copy and the one answer is
 repeated across the steps. That, and overlap between adjacent chunks, is why
-rows must be folded in the order they arrive and can never be folded
+a label set's chunks must be folded in the order they arrive and can never be folded
 independently and combined.
 
 ## Memory
@@ -187,7 +187,7 @@ The bound is **O(series in flight × window)** in the selector, and series in
 flight is one per partition in sorted mode, plus **O(groups × steps per
 block)** in an aggregate above it. In sorted mode nothing in the engine is
 proportional to the number of series, a series' length, its number of
-chunks, or how its rows fall across batches: at a batch boundary the finished
+chunks, or how its chunks fall across batches: at a batch boundary the finished
 RecordBatch is released entirely and only the open series' window buffer
 survives, and at a block edge nothing per series survives. Keyed mode keeps
 every series of the block in flight, each with its window buffer and one
@@ -197,21 +197,21 @@ series at 15 s in a one-hour block and 384 MB at 100k
 `[assumed 16 B samples]` before that per-series term, which varies per
 query. The block edge still drops all of it.
 
-The engine copies samples, but only a window's worth: each row's samples
+The engine copies samples, but only a window's worth: each chunk's samples
 enter the buffer once and leave it when no step reads them. That is the
 price of releasing batches, and it replaces the pass the range kernels pay
 anyway to drop stale markers. What it avoids is `arrow::compute::concat`
-over a series' rows, which copies the series; a copy of a window is cheap,
+over a series' chunks, which copies the series; a copy of a window is cheap,
 a concat of a series is the cost the contract refuses to push into the store.
 
-The offsets pay for themselves here. Samples ascend within a row, so its
-first sample timestamp is `timestamp[offsets[i]]` and its last sample
+The offsets pay for themselves here. Samples ascend within a series, so the
+first sample timestamp of Arrow row i is `timestamp[offsets[i]]` and its last sample
 timestamp is `timestamp[offsets[i+1] - 1]`, two O(1) reads into the child
-buffer. A row whose last sample timestamp is before the first step's window
+buffer. A series whose last sample timestamp is before the first step's window
 is skipped without walking its samples, where Prometheus decodes through the
-chunk to find out (`tsdb/querier.go:779-791`). The one row to guard is an
+chunk to find out (`tsdb/querier.go:779-791`). The one series to guard is an
 empty one, `offsets[i] == offsets[i+1]`, where both reads land outside the
-row. The contract forbids it; the engine skips one anyway, since it has
+series. The contract forbids it; the engine skips one anyway, since it has
 nothing to fold.
 
 ## Ordering integrity
@@ -231,18 +231,18 @@ misbehaving store makes a series come out twice, unreported.
 inherited guarantees. Inside each block the store delivers one of two
 modes, keyed mode when its schema carries a `series_id` column and sorted
 mode otherwise ([`series-source.md`](series-source.md#what-the-trait-requires)): in sorted
-mode series are sorted by their label set within a block and rows of one
-series are consecutive; in keyed mode every row carries the store's opaque
-`series_id` and rows of one series may lie in any order relative to other
-series of the block. In both modes every row carries its block's edges,
-blocks come in order, rows of one series never cross a partition and ascend
+mode series are sorted by their label set within a block and the chunks of one
+label set are consecutive; in keyed mode every series carries the store's opaque
+`series_id` and the chunks of one label set may lie in any order relative to other
+series of the block. In both modes every series carries its block's edges,
+blocks come in order, the chunks of one label set never cross a partition and ascend
 by first sample timestamp within a block, batches may be cut anywhere, and
 the lookback and the steps a block answers are the same. Sorted mode needs
 label order and consecutiveness to close a group at the next key: the first
-foreign row closes it without the engine knowing where batches end. Without
-the time order the overlap rule drops an earlier row's samples. A store
+foreign series closes it without the engine knowing where batches end. Without
+the time order the overlap rule drops an earlier chunk's samples. A store
 adapted from the Store API sorts each series' chunk metas before emitting
-rows, as the proxy does, touching metas, not samples. The store learns the
+series, as the proxy does, touching metas, not samples. The store learns the
 lookback from `SelectHints.window_ms` and includes it at every block it
 cuts; where it finds those samples across its own files is its business.
 
@@ -271,19 +271,19 @@ the block bounds it: its hash aggregate holds every series of one block and
 drops them at the edge, where over a whole-range stream it would hold every
 series with every step of the range until the stream ended.
 
-**Checks.** The engine never sorts or buffers rows to repair order; that is
+**Checks.** The engine never sorts or buffers series to repair order; that is
 the concatenation problem again. It always checks, one label comparison per
-row. In sorted mode that is labels non-decreasing against the previous row
-of the block in a partition's stream, which also catches a closed series
-reappearing. In keyed mode the row's labels must equal those its `series_id`
+series. In sorted mode that is labels non-decreasing against the previous series
+of the block in a partition's stream, which also catches a closed label set
+reappearing. In keyed mode the series' labels must equal those its `series_id`
 bucket was opened with, as Prometheus's head confirms every `seriesHashmap`
 hit with `labels.Equal` (prom `tsdb/head.go:2332-2362`) rather than trusting
 a bare hash the way its PromQL engine's vector matching does (prom
 `promql/engine.go:3371-3381`); a mismatch is an id collision or a store bug.
-In both, first sample timestamp is non-decreasing within a series and block.
+In both, first sample timestamp is non-decreasing across a label set's chunks within a block.
 The block columns are checked too: `block_start` and `block_end` constant
 within a block, and blocks non-decreasing and non-overlapping across the
-rows of a partition. A sample past either edge needs no check, since it
+series of a partition. A sample past either edge needs no check, since it
 falls in no window the block answers. A violation is a query error. In keyed
 mode the selector also checks label-set uniqueness across its groups when
 the block ends, hashing each group's labels into a set on labels the group
@@ -291,8 +291,8 @@ table already holds; a duplicate means two ids for one label set, and the
 block is refused. `reject_same_labelset` misses `sum(rate(x[5m]))` over a
 split series because the labels do not survive the aggregation, as *The
 correctness net* below states. The engine also refuses a sorted-mode plan
-that loses the declared `labels` ordering, and any plan that keeps a series
-from staying whole in one partition, which `CoalescePartitionsExec` and
+that loses the declared `labels` ordering, and any plan that keeps a label set's chunks
+from staying together in one partition, which `CoalescePartitionsExec` and
 `RepartitionExec` without `preserve_order` do between scan and selector.
 
 **Session flags.** In sorted mode `SeriesSetExec` declares `Hash([labels],
@@ -302,7 +302,7 @@ first sample timestamp)` inside each; in keyed mode it declares
 aggregate is planned as a hash aggregate on `(block_start, series_id)`, each
 group holding the labels it was opened with for the check and the output.
 That group table is keyed mode's whole memory shape: every series of the
-block, its window buffer and one block's steps, and a probe per row. The
+block, its window buffer and one block's steps, and a probe per series. The
 hash is what DataFusion means by the contract's "never crossing a
 partition", and it is exactly what the selector aggregate needs. With
 `repartition_aggregations` on, DataFusion finds that requirement already met
@@ -335,14 +335,14 @@ Parallelism below the selector is the store's partition count and
 `SelectHints.shard`, never `target_partitions`.
 
 **Output order.** Results leave block by block, in block order, and inside
-a block the plan's partitions finish in any order. A series' row carries
-one block's steps ascending, so a series seen in 360 blocks leaves as 360
+a block the plan's partitions finish in any order. A series leaves each block as one
+Arrow row with that block's steps ascending, so a series seen in 360 blocks leaves as 360
 rows. Prometheus sorts a range query's matrix before returning it (prom
 `promql/engine.go`, `sort.Sort(mat)`), and so does the engine, once, over
-finished rows: by labels, then block, re-cut into slices of the collected
-batches so that no sample is copied and a series' rows lie adjacent, steps
+the finished output rows: by labels, then block, re-cut into slices of the collected
+batches so that no sample is copied and a label set's output rows lie adjacent, steps
 ascending. The price is batch count, about one per series and block, and
-each row's labels: at 88 B per row, `rate(x[5m])` over 10k series and 30
+each output row's labels: at 88 B per row, `rate(x[5m])` over 10k series and 30
 days at 2 h blocks carries up to 317 MB of labels beside 231 MB of samples
 at a 30-minute step, an estimate from the same query shapes above. The order is
 `labels.Compare` over the labels a series has. The `labels` struct's own
@@ -370,7 +370,7 @@ turns a key the projection does not carry into an `UnKnownColumn`, which
 equals nothing, itself included.
 
 **Overlap.** One series' chunks may arrive from several files or
-compaction levels of a store and overlap in time. The first row wins: the
+compaction levels of a store and overlap in time. The first chunk wins: the
 engine skips samples at or before the last timestamp seen for the series in
 the block, as Thanos's `chunkSeriesIterator` does (thanos
 `pkg/query/iter.go:277-281`). Each block starts afresh, because its
@@ -379,7 +379,7 @@ union and drops only duplicate timestamps (prom `storage/merge.go:653-656`).
 The two agree on exact duplicates and differ only for interleaved
 timestamps. A stale marker claims its timestamp like any sample, before the
 range functions filter it out, because a store's merge drops repeated
-timestamps before PromQL sees staleness: a marker in the first row must not
+timestamps before PromQL sees staleness: a marker in the first chunk must not
 let a real sample at the same timestamp through from the second.
 
 ## The correctness net
@@ -387,20 +387,20 @@ let a real sample at the same timestamp through from the second.
 `labelset::reject_same_labelset` (`labelset.rs`) runs on each block's
 output, where a label set may appear once; across blocks the same label set
 is the same series continuing. It only sees a split series whose labels
-survived to the output; the per-row checks in *Ordering integrity* are what
+survived to the output; the per-series checks in *Ordering integrity* are what
 catch it before an aggregation hides it. In keyed mode, two ids with one
 label set are caught earlier still, by the selector's own label-set
 uniqueness check at the block edge (*Ordering integrity*, *Checks*), which
-the per-row label confirmation cannot see on its own, since each id's
+the per-series label confirmation cannot see on its own, since each id's
 bucket agrees with itself.
 
 Above it, the test suites run the same corpus against three source modes:
-whole series in one row, realistic chunks, and one sample per chunk. The
-third is the adversarial case, where every fold crosses a row boundary and
+each series whole in one chunk, realistic chunks, and one sample per chunk. The
+third is the adversarial case, where every fold crosses a chunk boundary and
 carry-over is exercised on every sample. All three must reach identical
 promqltest gate counts, and each must also run cut into blocks, so every
 step whose window straddles a block edge is answered from the lookback. A
-kernel that is only correct when it sees a whole window in one row fails the
+kernel that is only correct when it sees a whole window in one chunk fails the
 third mode immediately.
 
 ## Non-goals for this stage
