@@ -73,8 +73,10 @@ and an adapter over a label-sorted wire protocol the windows it chooses to
 ask in, since the protocol forces one request per window. Every series
 carries its block's `block_start` and `block_end`, see *The series batch*.
 Blocks ascend by `block_start`, do not overlap, and are contiguous over the
-select's window ends, from `start_ms + window_ms` to `end_ms`, so the first
-block's reach-back covers the widened start. A block's chunks of a series
+select's window ends, from `start_ms + window_ms` to `end_ms` inclusive, so
+the first block's reach-back covers the widened start and the last block's
+`block_end` lies past `end_ms`, since `block_end` is exclusive. A block's
+chunks of a series
 hold every sample the store has for it in `[block_start − window_ms,
 block_end)` within the select's range; the block answers the steps of the
 query whose window end, `t − offset` or the `@` time, lies in
