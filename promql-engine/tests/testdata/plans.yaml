@@ -166,3 +166,29 @@ tests:
             AggregateExec: mode=Partial, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
               SeriesSetExec
                 DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
+
+  - name: instant selector over blocks and chunks
+    description: >
+      The store cuts the select into 200s blocks on top of 150s chunks,
+      so a label set arrives in several blocks and each block in several
+      chunks: the data ends at 570s, so the first block, reaching back
+      from 600s by the lookback, holds two chunks per series, the second
+      one, and the two after it nothing. The plan is the one-block
+      case's: the block is a group key the store fills, and the number of
+      batches is all that grows.
+    chunked_ms: 150000
+    blocks_ms: 200000
+    load:
+      - x{pod="a"} 1+1x19
+      - x{pod="b"} 2+3x19
+    query: |
+      x
+    plan: |
+      Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
+        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
+          TableScan: selector_0
+    physical: |
+      ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
+        AggregateExec: mode=Single, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+          SeriesSetExec
+            DataSourceExec: partitions=1, partition_sizes=[6]

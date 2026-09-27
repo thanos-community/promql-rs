@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use promql_engine::series::decode;
+use promql_engine::series::{coalesce, decode};
 use promql_engine::{MemorySeriesSource, RangeQuery};
 
 use crate::result::{Engine, EngineError, LoadedSeries, Point, QueryResult, Series};
@@ -30,6 +30,8 @@ pub enum SourceMode {
     Plain,
     /// [`MemorySeriesSource::chunked`].
     Chunked(i64),
+    /// [`MemorySeriesSource::blocks`].
+    Blocks(i64),
     /// [`MemorySeriesSource::partitions`].
     Partitions(usize),
 }
@@ -38,9 +40,11 @@ impl SourceMode {
     /// The variable [`DataFusionEngine::new`] reads the mode from.
     pub const VAR: &'static str = "PROMQL_CONFORMANCE_SOURCE";
 
-    /// `plain`, `chunked[=<ms>]` or `partitions[=<n>]`. Bare `chunked` is
-    /// one sample per row, so every window of the corpus crosses rows;
-    /// bare `partitions` is four.
+    /// `plain`, `chunked[=<ms>]`, `blocks[=<ms>]` or `partitions[=<n>]`.
+    /// Bare `chunked` is one sample per chunk, so every window of the
+    /// corpus crosses chunks; bare `blocks` is one minute, the step most
+    /// of the corpus evaluates at, so most steps open a block; bare
+    /// `partitions` is four.
     pub fn parse(s: &str) -> Result<Self, String> {
         let (mode, arg) = match s.split_once('=') {
             Some((mode, arg)) => (mode, Some(arg)),
@@ -48,7 +52,7 @@ impl SourceMode {
         };
         let bad = || {
             format!(
-                "{}={s:?}: expected plain, chunked[=<ms>] or partitions[=<n>]",
+                "{}={s:?}: expected plain, chunked[=<ms>], blocks[=<ms>] or partitions[=<n>]",
                 Self::VAR
             )
         };
@@ -60,6 +64,13 @@ impl SourceMode {
                 .ok()
                 .filter(|ms| *ms >= 0)
                 .map(Self::Chunked)
+                .ok_or_else(bad),
+            ("blocks", None) => Ok(Self::Blocks(60_000)),
+            ("blocks", Some(ms)) => ms
+                .parse()
+                .ok()
+                .filter(|ms| *ms > 0)
+                .map(Self::Blocks)
                 .ok_or_else(bad),
             ("partitions", None) => Ok(Self::Partitions(4)),
             ("partitions", Some(n)) => n
@@ -76,6 +87,7 @@ impl SourceMode {
         match self {
             Self::Plain => source,
             Self::Chunked(ms) => source.chunked(ms),
+            Self::Blocks(ms) => source.blocks(ms),
             Self::Partitions(n) => source.partitions(n),
         }
     }
@@ -178,8 +190,11 @@ impl Engine for DataFusionEngine {
         let range = RangeQuery::new(start_ms, end_ms, step_ms);
         match self.inner.range_query(&source, query, &range) {
             Ok(batches) => {
-                let decoded =
-                    decode(&batches).map_err(|e| EngineError::Other(format!("decoding: {e}")))?;
+                // Upstream's matrix has one series per label set; the
+                // engine's rows have one per label set and block.
+                let decoded = decode(&batches)
+                    .and_then(coalesce)
+                    .map_err(|e| EngineError::Other(format!("decoding: {e}")))?;
                 Ok(QueryResult::Matrix(
                     decoded
                         .iter()
@@ -296,6 +311,11 @@ mod tests {
             SourceMode::parse("chunked=150000"),
             Ok(SourceMode::Chunked(150_000))
         );
+        assert_eq!(SourceMode::parse("blocks"), Ok(SourceMode::Blocks(60_000)));
+        assert_eq!(
+            SourceMode::parse("blocks=150000"),
+            Ok(SourceMode::Blocks(150_000))
+        );
         assert_eq!(
             SourceMode::parse("partitions"),
             Ok(SourceMode::Partitions(4))
@@ -342,6 +362,8 @@ mod tests {
         for mode in [
             SourceMode::Chunked(0),
             SourceMode::Chunked(150_000),
+            SourceMode::Blocks(30_000),
+            SourceMode::Blocks(200_000),
             SourceMode::Partitions(4),
         ] {
             assert_eq!(run(mode), plain, "{mode:?}");

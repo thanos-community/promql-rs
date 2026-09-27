@@ -1,13 +1,16 @@
-//! A `SeriesSource` that hands the engine one series as several rows, one
-//! per time chunk, must get the same answer as one that hands it one row.
+//! A `SeriesSource` that hands the engine one label set as several chunks,
+//! and in several blocks, must get the same answer as one that hands it
+//! one series.
 //!
 //! `MemorySeriesSource::chunked` is the test mode (see its doc in
 //! `memory.rs`) that splits each selected series' samples into consecutive
-//! rows of at most `CHUNK_MS` span before handing them to the plan, series
-//! order then time order preserved. Every test here runs the same query
-//! against a chunked and an unchunked source built from the same
-//! descriptions, and compares the two: any difference is a bug in how the
-//! selector and range aggregates carry a series across rows.
+//! chunks of at most `CHUNK_MS` span before handing them to the plan,
+//! series order then time order preserved; `MemorySeriesSource::blocks`
+//! cuts the select into blocks of `BLOCK_MS` on top. Every test here runs
+//! the same query against a chunked, a blocked and a plain source built
+//! from the same descriptions, and compares them: any difference is a bug
+//! in how the selector and range aggregates carry a series across chunks,
+//! or in how a block is cut to the steps it answers.
 
 use std::sync::Arc;
 
@@ -18,6 +21,11 @@ use promql_parser::SeriesDescription;
 /// lookback, always straddles at least one chunk boundary: 20 samples at
 /// 30s apart span 570s, so 150s chunks give each series ~4 chunks.
 const CHUNK_MS: i64 = 150_000;
+
+/// Not a multiple of the step or the chunk, so block edges fall between
+/// steps and inside chunks, and every window of a 5m/10m query straddles
+/// one: the reach-back, not the block's own samples, answers most steps.
+const BLOCK_MS: i64 = 200_000;
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
     lines
@@ -47,12 +55,23 @@ fn chunked() -> Arc<MemorySeriesSource> {
     )
 }
 
+/// Blocks on top of chunks, still one chunk per batch.
+fn blocked() -> Arc<MemorySeriesSource> {
+    Arc::new(
+        MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
+            .chunked(CHUNK_MS)
+            .blocks(BLOCK_MS)
+            .rows_per_batch(1),
+    )
+}
+
+/// The result as Prometheus's matrix: a label set's blocks joined.
 fn query(source: &MemorySeriesSource, q: &str, range: RangeQuery) -> Vec<Series> {
     let batches = Engine::blocking()
         .unwrap()
         .range_query(source, q, &range)
         .unwrap_or_else(|e| panic!("{q}: {e}"));
-    promql_engine::series::decode(&batches).unwrap()
+    promql_engine::series::coalesce(promql_engine::series::decode(&batches).unwrap()).unwrap()
 }
 
 fn key(s: &Series) -> String {
@@ -62,10 +81,11 @@ fn key(s: &Series) -> String {
         .join(",")
 }
 
-/// Compare a chunked run against the same query on the unchunked source:
-/// same series (by label set), same timestamps, same values.
+/// Compare a chunked and a blocked run against the same query on the
+/// plain source: same series (by label set), same timestamps, same values.
 fn assert_same_as_unchunked(q: &str, range: RangeQuery) {
     assert_same_on(chunked().as_ref(), q, range);
+    assert_same_on(blocked().as_ref(), q, range);
 }
 
 /// [`assert_same_as_unchunked`] for any source built from [`descriptions`].
@@ -215,24 +235,56 @@ fn one_sample_per_row() {
     }
 }
 
+/// Block spans at, below and off the step: one block per step, one per
+/// two steps, and edges that fall between steps, so some blocks answer
+/// no step and only carry reach-back. `30_000` is the step itself, so
+/// every step is the first of its block and every window is reach-back.
+#[test]
+fn blocks_of_every_span() {
+    for block_ms in [30_000, 60_000, 45_000, 130_000, 3_600_000] {
+        let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0).blocks(block_ms);
+        for q in [
+            "x",
+            "rate(x[5m])",
+            "sum(x)",
+            "sum by (pod) (rate(x[5m]))",
+            "count_over_time(x[10m])",
+            "irate(x[1m])",
+            "max_over_time(x[5m] offset 1m)",
+            "x @ 300",
+            "rate(x[5m] @ 450 offset 30s)",
+        ] {
+            assert_same_on(&source, q, multi_step());
+        }
+    }
+}
+
 /// Partition counts below, at and above the number of series, alone and
-/// under chunking: a series lands whole in one partition either way. Rows
-/// one to a batch, three, which puts a batch boundary inside a series and
-/// two series in one batch, and packed as a store packs them.
+/// under chunking and blocks: a series lands whole in one partition
+/// either way. Rows one to a batch, three, which puts a batch boundary
+/// inside a series and two series in one batch, and packed as a store
+/// packs them.
 #[test]
 fn partitions_match_unpartitioned() {
     for n in [1, 2, 4, 7] {
-        for (chunk_ms, rows) in [
-            (None, 8192),
-            (Some(0), 1),
-            (Some(0), 3),
-            (Some(CHUNK_MS), 1),
-            (Some(CHUNK_MS), 3),
-            (Some(CHUNK_MS), 8192),
+        for (chunk_ms, block_ms, rows) in [
+            (None, None, 8192),
+            (Some(0), None, 1),
+            (Some(0), None, 3),
+            (Some(CHUNK_MS), None, 1),
+            (Some(CHUNK_MS), None, 3),
+            (Some(CHUNK_MS), None, 8192),
+            (None, Some(BLOCK_MS), 8192),
+            (Some(0), Some(BLOCK_MS), 3),
+            (Some(CHUNK_MS), Some(BLOCK_MS), 1),
+            (Some(CHUNK_MS), Some(BLOCK_MS), 8192),
         ] {
             let mut source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0);
             if let Some(ms) = chunk_ms {
                 source = source.chunked(ms);
+            }
+            if let Some(ms) = block_ms {
+                source = source.blocks(ms);
             }
             let source = source.rows_per_batch(rows).partitions(n);
             for q in [

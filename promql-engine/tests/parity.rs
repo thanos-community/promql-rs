@@ -88,7 +88,9 @@ fn run(source: &MemorySeriesSource, case: &Case) -> Vec<Series> {
         .unwrap()
         .range_query(source, &case.query, &range)
         .unwrap_or_else(|e| panic!("{}: {}: {e}", case.name, case.query));
-    promql_engine::series::decode(&batches).unwrap()
+    // The corpus is one series per label set; a blocked source answers
+    // in several rows per label set, joined here.
+    promql_engine::series::coalesce(promql_engine::series::decode(&batches).unwrap()).unwrap()
 }
 
 /// `expected` and `actual` must agree on the set of series, and per
@@ -209,6 +211,34 @@ fn replay_against_partitions() {
     for case in &corpus.cases {
         let actual = run(&source, case);
         assert_matches_recorded(case, actual);
+    }
+}
+
+/// `blocks(k)` for `k` in `{one interval, 150s, 1h}`: at one interval
+/// every step is the first of its block, so every window is answered from
+/// reach-back alone; at 1h most cases sit in one block with an edge or
+/// none. Then blocks over one-sample chunks in four partitions, the shape
+/// a sharded chunked store with fixed block ranges hands over.
+#[test]
+fn replay_against_blocks() {
+    let corpus = load_corpus();
+    let interval_ms = (corpus.interval_secs * 1000.0).round() as i64;
+    let stored = || {
+        MemorySeriesSource::from_descriptions(&descriptions(&corpus.series), corpus.interval_secs)
+    };
+    for block_ms in [interval_ms, 150_000, 3_600_000] {
+        let source = stored().blocks(block_ms);
+        for case in &corpus.cases {
+            assert_matches_recorded(case, run(&source, case));
+        }
+    }
+    let source = stored()
+        .blocks(150_000)
+        .chunked(0)
+        .rows_per_batch(3)
+        .partitions(4);
+    for case in &corpus.cases {
+        assert_matches_recorded(case, run(&source, case));
     }
 }
 

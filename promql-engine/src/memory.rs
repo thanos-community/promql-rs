@@ -12,9 +12,10 @@
 //! read `select` below.
 //!
 //! One block per select is the smallest correct answer, and the one this
-//! store gives: the block runs over the whole window-end domain, so every
-//! series of the selection folds once, exactly as a store that never
-//! heard of blocks would have it.
+//! store gives by default: the block runs over the whole window-end
+//! domain, so every series of the selection folds once, exactly as a
+//! store that never heard of blocks would have it. [`MemorySeriesSource::blocks`]
+//! is the test mode that cuts like a store with fixed block ranges.
 //!
 //! The shape of that `select` is the part worth copying, not the fact
 //! that the data happens to sit in memory: a mask per matcher over a
@@ -36,7 +37,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, AsArray, ListArray, RecordBatch, UInt32Array};
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::compute::{filter_record_batch, take, take_record_batch};
+use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
 use datafusion::arrow::datatypes::TimestampMillisecondType;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::Session;
@@ -49,8 +50,8 @@ use crate::matcher::{mask_all, CompiledMatcher};
 #[cfg(test)]
 use crate::series::decode;
 use crate::series::{
-    clip, drop_unused_labels, encode, label_names_of, sample_item, with_block, Block, Series,
-    BLOCK_END, BLOCK_START, LABELS, SAMPLES, TIMESTAMP,
+    clip, drop_empty, drop_unused_labels, encode, label_names_of, sample_item, with_block, Block,
+    Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES, TIMESTAMP,
 };
 use crate::source::{SelectHints, SeriesSource};
 
@@ -61,6 +62,8 @@ pub struct MemorySeriesSource {
     batch: RecordBatch,
     /// Test mode: see [`Self::chunked`].
     chunk_ms: Option<i64>,
+    /// Test mode: see [`Self::blocks`].
+    block_ms: Option<i64>,
     /// Test mode: see [`Self::partitions`].
     partitions: usize,
     /// See [`Self::rows_per_batch`].
@@ -95,16 +98,34 @@ impl MemorySeriesSource {
         Ok(Self {
             batch: sort_by_labels(&batch).map_err(|e| e.to_string())?,
             chunk_ms: None,
+            block_ms: None,
             partitions: 1,
             rows_per_batch: ROWS_PER_BATCH,
         })
     }
 
-    /// Test mode: hand every selected series over as consecutive rows of
-    /// at most `chunk_ms` span, the way a chunked store does. Series order
-    /// and time order are kept. `0` gives one sample per row.
+    /// Test mode: hand every selected label set over as consecutive
+    /// chunks of at most `chunk_ms` span, the way a chunked store does.
+    /// Series order and time order are kept. `0` gives one sample per
+    /// chunk.
     pub fn chunked(mut self, chunk_ms: i64) -> Self {
         self.chunk_ms = Some(chunk_ms);
+        self
+    }
+
+    /// Test mode: cut the select's window-end domain at multiples of
+    /// `block_ms`, the way a store with fixed block ranges does, rather
+    /// than answering in one block. Each block's series hold the samples
+    /// its windows reach, so a label set with samples in several blocks
+    /// is handed over once per block, and one whose samples no window of
+    /// a block reaches is absent from that block. Edges fall wherever the
+    /// multiples do, between two steps included, so a block may answer
+    /// no step at all. Combines with [`Self::chunked`] and
+    /// [`Self::partitions`], which cut inside each block; a batch may
+    /// still straddle a block edge.
+    pub fn blocks(mut self, block_ms: i64) -> Self {
+        assert!(block_ms > 0, "a block spans at least a millisecond");
+        self.block_ms = Some(block_ms);
         self
     }
 
@@ -220,27 +241,47 @@ impl SeriesSource for MemorySeriesSource {
         let mask = mask_all(&compiled, labels.as_struct())?;
         let selected = filter_record_batch(&self.batch, &mask)?;
         let selected = drop_unused_labels(&selected).map_err(DataFusionError::Execution)?;
-        let selected =
-            clip(&selected, hints.start_ms, hints.end_ms).map_err(DataFusionError::Execution)?;
 
-        // Obligation 2, blocks: one over the whole window-end domain,
-        // `[start_ms + window_ms, end_ms]`, its end exclusive.
-        let block = Block {
-            start_ms: hints.start_ms.saturating_add(hints.window_ms),
-            end_ms: hints.end_ms.saturating_add(1),
-        };
-        let selected = with_block(&selected, block).map_err(DataFusionError::Execution)?;
+        // Obligation 2, blocks: by default one over the whole window-end
+        // domain, `[start_ms + window_ms, end_ms]`, its end exclusive.
+        let blocks = match self.block_ms {
+            Some(block_ms) => cut_into_blocks(&selected, &hints, block_ms),
+            None => {
+                let block = Block {
+                    start_ms: hints.start_ms.saturating_add(hints.window_ms),
+                    end_ms: hints.end_ms.saturating_add(1),
+                };
+                clip(&selected, hints.start_ms, hints.end_ms)
+                    .and_then(|clipped| with_block(&clipped, block))
+                    .map(|one| vec![one])
+            }
+        }
+        .map_err(DataFusionError::Execution)?;
 
         // Obligations 3 and 4, partition and order, come for free: the
         // stored batch already holds one series per label set in struct
         // order with its samples ascending, and neither step here, nor the
-        // partitioning below, reorders anything within a partition.
+        // partitioning below, reorders anything within a partition. Blocks
+        // ascend because they were cut in order, and each block hashes its
+        // series to the same partition as every other.
         let schema = selected.schema();
-        let partitions = partition_by_labels(&selected, self.partitions)?
+        let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); self.partitions];
+        for block in &blocks {
+            for (p, part) in partition_by_labels(block, self.partitions)?
+                .into_iter()
+                .enumerate()
+            {
+                partitions[p].push(part);
+            }
+        }
+        let partitions = partitions
             .iter()
-            .map(|part| match self.chunk_ms {
-                Some(chunk_ms) => split_into_chunks(part, chunk_ms, self.rows_per_batch),
-                None => Ok(slice_rows(part, self.rows_per_batch)),
+            .map(|parts| {
+                let part = concat_batches(&schema, parts)?;
+                match self.chunk_ms {
+                    Some(chunk_ms) => split_into_chunks(&part, chunk_ms, self.rows_per_batch),
+                    None => Ok(slice_rows(&part, self.rows_per_batch)),
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
@@ -258,6 +299,41 @@ fn sort_by_labels(batch: &RecordBatch) -> Result<RecordBatch> {
     let mut order: Vec<u32> = (0..batch.num_rows() as u32).collect();
     order.sort_unstable_by_key(|&i| rows.row(i as usize));
     Ok(take_record_batch(batch, &UInt32Array::from(order))?)
+}
+
+/// Test mode: the select's window-end domain `[start_ms + window_ms,
+/// end_ms]` cut at multiples of `block_ms`, the first block starting at
+/// the domain's start so its reach-back is exactly the widened range.
+/// Each block holds every series with a sample in `[block_start -
+/// window_ms, block_end)` within the range, clipped to that, and no
+/// other. Cut in `i128` so a domain ending at the end of time still
+/// terminates; a block end past `i64::MAX` is clamped, which only loses
+/// the window end at `i64::MAX` itself.
+fn cut_into_blocks(
+    batch: &RecordBatch,
+    hints: &SelectHints,
+    block_ms: i64,
+) -> std::result::Result<Vec<RecordBatch>, String> {
+    let (lo, hi) = (
+        i128::from(hints.start_ms) + i128::from(hints.window_ms),
+        i128::from(hints.end_ms),
+    );
+    let block_ms = i128::from(block_ms);
+    let mut out = Vec::new();
+    let mut start = lo;
+    while start <= hi {
+        let end = (start.div_euclid(block_ms) + 1) * block_ms;
+        let block = Block {
+            start_ms: start as i64,
+            end_ms: end.min(i128::from(i64::MAX)) as i64,
+        };
+        let reach_lo = (start - i128::from(hints.window_ms)).max(i128::from(hints.start_ms));
+        let reach_hi = (end - 1).min(hi);
+        let reach = clip(batch, reach_lo as i64, reach_hi as i64)?;
+        out.push(drop_empty(&with_block(&reach, block)?));
+        start = end;
+    }
+    Ok(out)
 }
 
 /// `n` batches holding `batch`'s rows by a hash of their label set, each
@@ -703,6 +779,100 @@ mod tests {
         let whole = batches(stored().rows_per_batch(5)).await;
         assert_eq!(sizes(&whole), [5, 5, 5, 1]);
         assert_eq!(samples(&whole), samples(&batches(stored()).await));
+    }
+
+    /// Blocks cut at multiples of the block span from the first window
+    /// end, each reaching back by the window and holding only the series
+    /// that have a sample in that reach.
+    #[tokio::test]
+    async fn blocks_cut_the_window_end_domain_and_reach_back() {
+        let ctx = SessionContext::new();
+        let plan = source()
+            .blocks(40_000)
+            .select(
+                &ctx.state(),
+                &[matcher("__name__", MatchOp::Equal, "http_requests_total")],
+                SelectHints {
+                    window_ms: 30_000,
+                    ..SelectHints::range(0, 90_000)
+                },
+            )
+            .await
+            .unwrap();
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let mut rows: Vec<(Block, String, Vec<i64>)> = Vec::new();
+        for b in &batches {
+            for (row, s) in crate::series::decode(std::slice::from_ref(b))
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                rows.push((
+                    crate::series::block_of(b, row),
+                    s.label("pod").to_string(),
+                    s.timestamps().to_vec(),
+                ));
+            }
+        }
+        let block = |start_ms, end_ms| Block { start_ms, end_ms };
+        assert_eq!(
+            rows,
+            [
+                (block(30_000, 40_000), "envoy-1".into(), vec![0, 30_000]),
+                (block(30_000, 40_000), "envoy-2".into(), vec![0, 30_000]),
+                (
+                    block(40_000, 80_000),
+                    "envoy-1".into(),
+                    vec![30_000, 60_000]
+                ),
+                (
+                    block(40_000, 80_000),
+                    "envoy-2".into(),
+                    vec![30_000, 60_000]
+                ),
+                (
+                    block(80_000, 120_000),
+                    "envoy-1".into(),
+                    vec![60_000, 90_000]
+                ),
+                (
+                    block(80_000, 120_000),
+                    "envoy-2".into(),
+                    vec![60_000, 90_000]
+                ),
+            ]
+        );
+
+        // A block none of whose windows reach a series leaves it out: the
+        // data ends at 90s, so the block from 120s still reaches its last
+        // sample and the two after it hold nothing rather than an empty
+        // series.
+        let plan = source()
+            .blocks(40_000)
+            .select(
+                &ctx.state(),
+                &[matcher("pod", MatchOp::Equal, "envoy-1")],
+                SelectHints {
+                    window_ms: 30_000,
+                    ..SelectHints::range(0, 200_000)
+                },
+            )
+            .await
+            .unwrap();
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let blocks: Vec<Block> = batches
+            .iter()
+            .flat_map(|b| (0..b.num_rows()).map(|r| crate::series::block_of(b, r)))
+            .collect();
+        assert_eq!(
+            blocks,
+            [
+                block(30_000, 40_000),
+                block(40_000, 80_000),
+                block(80_000, 120_000),
+                block(120_000, 160_000),
+            ]
+        );
     }
 
     #[tokio::test]

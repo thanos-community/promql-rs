@@ -554,6 +554,44 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, String> {
     Ok(out)
 }
 
+/// [`decode`]'s series with each label set's blocks joined into one
+/// series, for a caller that wants Prometheus's matrix rather than the
+/// engine's rows. The result is sorted by label set then block, so the
+/// blocks of a label set are consecutive and in time order, and joining
+/// them is one concat per label set. Timestamps stay strictly ascending
+/// because blocks do not overlap and a block answers each step once.
+pub fn coalesce(series: Vec<Series>) -> Result<Vec<Series>, String> {
+    let mut out: Vec<Series> = Vec::with_capacity(series.len());
+    let mut run: Vec<Series> = Vec::new();
+    let flush = |run: &mut Vec<Series>, out: &mut Vec<Series>| -> Result<(), String> {
+        match run.len() {
+            0 => {}
+            1 => out.push(run.pop().expect("one")),
+            _ => {
+                let parts: Vec<&dyn Array> = run.iter().map(|s| &s.samples as &dyn Array).collect();
+                let samples = concat(&parts)
+                    .map_err(|e| e.to_string())?
+                    .as_struct()
+                    .clone();
+                out.push(Series {
+                    labels: run[0].labels.clone(),
+                    samples,
+                });
+                run.clear();
+            }
+        }
+        Ok(())
+    };
+    for s in series {
+        if run.last().is_some_and(|last| !last.labels().eq(s.labels())) {
+            flush(&mut run, &mut out)?;
+        }
+        run.push(s);
+    }
+    flush(&mut run, &mut out)?;
+    Ok(out)
+}
+
 /// A canonical batch with every empty-samples row removed.
 ///
 /// Pulled out of [`decode`] so the engine's public API can hand back
@@ -855,6 +893,35 @@ mod tests {
     fn series(labels: &[(&str, &str)], samples: &[(i64, f64)]) -> Series {
         let (ts, vs) = samples.iter().copied().unzip();
         Series::new(labels, ts, vs).unwrap()
+    }
+
+    /// Consecutive series of one label set join; a label set that comes
+    /// back later is another series, since only the result's order says
+    /// which rows are one label set's blocks.
+    #[test]
+    fn coalesce_joins_consecutive_blocks_of_a_label_set() {
+        let a = |samples: &[(i64, f64)]| series(&[("__name__", "a")], samples);
+        let b = |samples: &[(i64, f64)]| series(&[("__name__", "b")], samples);
+        let joined = coalesce(vec![
+            a(&[(0, 1.0)]),
+            a(&[(1, 2.0), (2, 3.0)]),
+            b(&[(0, 5.0)]),
+            a(&[(3, 4.0)]),
+        ])
+        .unwrap();
+        let shown: Vec<(&str, &[i64], &[f64])> = joined
+            .iter()
+            .map(|s| (s.label("__name__"), s.timestamps(), s.values()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("a", &[0, 1, 2][..], &[1.0, 2.0, 3.0][..]),
+                ("b", &[0][..], &[5.0][..]),
+                ("a", &[3][..], &[4.0][..]),
+            ]
+        );
+        assert!(coalesce(Vec::new()).unwrap().is_empty());
     }
 
     #[test]

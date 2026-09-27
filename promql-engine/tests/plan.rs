@@ -107,8 +107,10 @@ struct Case {
     /// Pinned only where the text does not depend on the machine.
     physical: Option<String>,
     /// [`MemorySeriesSource::chunked`]: the store hands each series over
-    /// as rows of at most this span, which only the physical plan shows.
+    /// as chunks of at most this span, which only the physical plan shows.
     chunked_ms: Option<i64>,
+    /// [`MemorySeriesSource::blocks`].
+    blocks_ms: Option<i64>,
     /// [`MemorySeriesSource::partitions`].
     partitions: Option<usize>,
 }
@@ -127,7 +129,7 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
             // Chunking is the one thing that turns the sample count into
             // plan shape, as the number of batches the store hands over.
             assert!(
-                desc.values.len() == 1 || case.chunked_ms.is_some(),
+                desc.values.len() == 1 || case.chunked_ms.is_some() || case.blocks_ms.is_some(),
                 "case {:?}: series {l:?} has {} samples; an unchunked plan case carries \
                  exactly one, because nothing but the label set reaches the planner",
                 case.name,
@@ -142,6 +144,9 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     // as the batch count under SeriesSetExec.
     if let Some(ms) = case.chunked_ms {
         source = source.chunked(ms).rows_per_batch(1);
+    }
+    if let Some(ms) = case.blocks_ms {
+        source = source.blocks(ms);
     }
     if let Some(n) = case.partitions {
         source = source.partitions(n);
