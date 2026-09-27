@@ -26,7 +26,7 @@ pub struct DataFusionEngine {
 /// own series, one row each, never reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceMode {
-    /// One row per series, one partition.
+    /// One series per label set, one partition.
     Plain,
     /// [`MemorySeriesSource::chunked`].
     Chunked(i64),

@@ -39,7 +39,7 @@ pub struct Shape {
     pub series: usize,
     pub samples: usize,
     pub scrape_ms: i64,
-    /// Samples per row; `None` is one row per series.
+    /// Samples per chunk; `None` is one chunk per label set.
     pub chunk: Option<usize>,
     pub rows_per_batch: usize,
 }

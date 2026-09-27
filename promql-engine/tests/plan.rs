@@ -140,7 +140,7 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
         .collect();
     // The interval only spaces samples out, and no sample is ever read.
     let mut source = MemorySeriesSource::from_descriptions(&series, 30.0);
-    // One chunk row per batch: the cases show a series crossing batches
+    // One chunk per batch: the cases show a label set crossing batches
     // as the batch count under SeriesSetExec.
     if let Some(ms) = case.chunked_ms {
         source = source.chunked(ms).rows_per_batch(1);

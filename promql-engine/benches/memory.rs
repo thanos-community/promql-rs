@@ -104,7 +104,7 @@ fn wide_range() -> RangeQuery {
     RangeQuery::new(end - 60 * MINUTE_MS, end, 30_000)
 }
 
-/// One row per series, as `MemorySeriesSource` stores them.
+/// Whole series, one per label set, as `MemorySeriesSource` stores them.
 fn memory(series: usize, samples: usize, scrape_ms: i64) -> Arc<dyn SeriesSource> {
     let all = (0..series)
         .map(|i| {

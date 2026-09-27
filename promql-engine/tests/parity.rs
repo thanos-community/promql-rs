@@ -157,8 +157,8 @@ fn replay_against_unchunked() {
 }
 
 /// `chunked(k)` for `k` in `{0, one interval, 150s, 1h}`, against the
-/// same recorded corpus. `0` is one sample per row, so every window
-/// crosses a row boundary.
+/// same recorded corpus. `0` is one sample per chunk, so every window
+/// crosses a chunk boundary.
 #[test]
 fn replay_against_chunked() {
     let corpus = load_corpus();
@@ -178,7 +178,7 @@ fn replay_against_chunked() {
     }
 }
 
-/// One row per batch, on top of `chunked(0)`'s one sample per row: every
+/// One chunk per batch, on top of `chunked(0)`'s one sample per chunk: every
 /// step lands in its own batch. Packing to `ROWS_PER_BATCH` (8192) leaves
 /// the whole corpus in one batch at 150s and 1h chunks, so without this
 /// the per-batch emit, the re-reserve of the still-open series and

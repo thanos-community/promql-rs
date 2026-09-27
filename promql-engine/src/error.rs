@@ -25,9 +25,9 @@ pub enum EngineError {
     #[error("series source schema: {0}")]
     Schema(String),
 
-    /// A store broke the order it promised: rows of a series not
-    /// consecutive, series not label-sorted, or a series' first sample
-    /// timestamps going backwards. Found while executing, so it reaches
+    /// A store broke the order it promised: a label set's chunks not
+    /// consecutive, series not label-sorted, blocks out of order, or a
+    /// label set's first sample timestamps going backwards. Found while executing, so it reaches
     /// the caller through DataFusion, and is unwrapped from it again.
     #[error("series source order: {0}")]
     Source(String),

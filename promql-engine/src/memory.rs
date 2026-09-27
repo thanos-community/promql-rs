@@ -129,8 +129,8 @@ impl MemorySeriesSource {
         self
     }
 
-    /// Hand rows over at most `n` to a `RecordBatch`, chunk rows or whole
-    /// series, a series free to straddle two batches. The default is
+    /// Hand rows over at most `n` to a `RecordBatch`, chunks or whole
+    /// series, a label set free to straddle two batches. The default is
     /// DataFusion's batch size, what a store fills; `1` makes every row
     /// cross a batch boundary, which is what a test of carrying a series
     /// across batches wants. A bench at one row per batch measures
@@ -367,14 +367,14 @@ fn slice_rows(batch: &RecordBatch, n: usize) -> Vec<RecordBatch> {
         .collect()
 }
 
-/// Test mode: turn one canonical batch (one row per series) into chunk
-/// rows of at most `chunk_ms` span, packed at most `rows_per_batch` to a
-/// batch. Series order is preserved, and within a series so is time order,
+/// Test mode: turn one canonical batch (one series per label set) into
+/// chunks of at most `chunk_ms` span, packed at most `rows_per_batch` to a
+/// batch. Label set order is preserved, and within a label set so is time order,
 /// so the result is what a chunked `SeriesSource` would hand over for the
 /// same selection.
 ///
-/// A series' chunks are consecutive ranges of the samples child, and the
-/// series are too, so a batch of chunk rows is one slice of that child
+/// A label set's chunks are consecutive ranges of the samples child, and
+/// the label sets are too, so a batch of chunks is one slice of that child
 /// under new offsets: the samples are never copied, only the label rows.
 fn split_into_chunks(
     batch: &RecordBatch,
@@ -670,9 +670,9 @@ mod tests {
         );
     }
 
-    /// Every series lands whole in one partition, its chunk rows in time
+    /// Every label set lands whole in one partition, its chunks in time
     /// order, and the partitions together hold exactly the unpartitioned
-    /// rows, each partition itself in struct order.
+    /// series, each partition itself in struct order.
     #[tokio::test]
     async fn partitions_keep_each_series_whole_and_ordered() {
         let many: Vec<Series> = (0..16)

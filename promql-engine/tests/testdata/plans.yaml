@@ -21,7 +21,7 @@ tests:
   - name: instant selector
     description: >
       The selector is an aggregate grouped by the whole labels struct, so
-      a series split over several chunk rows is one group. The labels pass
+      a label set split over several chunks is one group. The labels pass
       through untouched: an instant selector keeps every label it was
       given, __name__ included.
     load:
@@ -119,12 +119,12 @@ tests:
         Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(300000), Int64(NULL)) AS samples]]
           TableScan: selector_0
 
-  - name: instant selector over chunk rows
+  - name: instant selector over chunks
     description: >
-      The store hands each series over as several chunk rows, each its own
+      The store hands each label set over as several chunks, each its own
       batch, which only the physical plan shows as the number of batches
-      under SeriesSetExec. The logical plan is the one-row case's: a
-      series split over chunk rows is still one group of the Sorted
+      under SeriesSetExec. The logical plan is the whole-series case's: a
+      label set split over chunks is still one group of the Sorted
       aggregate.
     chunked_ms: 150000
     load:
@@ -142,7 +142,7 @@ tests:
           SeriesSetExec
             DataSourceExec: partitions=1, partition_sizes=[4]
 
-  - name: range function over chunk rows in four partitions
+  - name: range function over chunks in four partitions
     description: >
       Four store partitions, each series whole in one of them and chunked
       within it. Each partition's Partial folds its own series Sorted and

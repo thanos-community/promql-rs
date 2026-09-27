@@ -50,7 +50,7 @@ pub struct Engine {
 impl Engine {
     /// An engine for async callers. Use the `*_async` methods.
     pub fn new() -> Self {
-        // The first two would let one series' chunk rows reach the selector
+        // The first two would let one label set's chunks reach the selector
         // aggregate from more than one partition, which then folds half a
         // series in each: round-robin repartitioning inserts itself under a
         // partial aggregate, and a scan split by byte range cuts through a
@@ -182,7 +182,7 @@ impl Engine {
 /// [`SeriesSetExec`] through nothing but projections and cooperative
 /// yields; and a Final aggregate, Sorted, over such a Partial through an
 /// order-preserving merge or hash repartition. Anything that deals rows
-/// out anew below the Partial — round-robin, a hash split of chunk rows —
+/// out anew below the Partial — round-robin, a hash split of chunks —
 /// can put one series in two partitions, each of which folds half of it.
 ///
 /// A sort on a `labels` column is refused wherever it sits: Arrow cannot

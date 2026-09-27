@@ -45,7 +45,7 @@ fn plain() -> Arc<MemorySeriesSource> {
     Arc::new(MemorySeriesSource::from_descriptions(&descriptions(), 30.0))
 }
 
-/// One chunk row per batch, so every chunk boundary is a batch boundary
+/// One chunk per batch, so every chunk boundary is a batch boundary
 /// too, the harder case for carrying a series.
 fn chunked() -> Arc<MemorySeriesSource> {
     Arc::new(
@@ -217,7 +217,7 @@ fn every_query_over_many_steps() {
     }
 }
 
-/// `chunked(0)`: one sample per row, so every window crosses rows.
+/// `chunked(0)`: one sample per chunk, so every window crosses chunks.
 #[test]
 fn one_sample_per_row() {
     let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
