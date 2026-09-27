@@ -1,12 +1,12 @@
-//! One series' samples as they cross chunk rows: Prometheus's
-//! `storage.BufferedSeriesIterator` (`storage/buffer.go`), fed row by row
-//! instead of pulling from a chunk iterator.
+//! One series' samples as its chunks arrive: Prometheus's
+//! `storage.BufferedSeriesIterator` (`storage/buffer.go`), fed chunk by
+//! chunk instead of pulling from a chunk iterator.
 //!
-//! What a later chunk row's steps still read is copied into one contiguous
+//! What a later step still reads of a pushed chunk is copied into one contiguous
 //! buffer rather than kept as a slice of its batch. A retained slice would
 //! pin the whole batch's child buffers, other series' samples included, and
 //! every kernel indexes one contiguous slice; the copy replaces the
-//! staleness filter the range kernel pays anyway. A row that arrives with
+//! staleness filter the range kernel pays anyway. A chunk that arrives with
 //! the buffer empty is walked where it lies and only its tail is copied,
 //! unless it needs `@`'s pinned window trimmed or a range kernel would
 //! otherwise see a stale marker — either sends it through the buffer
@@ -14,8 +14,13 @@
 //!
 //! Steps are evaluated as soon as their window can no longer change, not at
 //! series close. Otherwise the buffer would hold the whole series, which is
-//! 172,800 samples for a 30-day range at 15 s; evaluated eagerly it holds a
-//! window. The output row is still only visible once the series closes.
+//! 172,800 samples for a store that sends 30 days at 15 s as one block;
+//! evaluated eagerly it holds a window. The output row is still only
+//! visible once the series closes.
+//!
+//! Blocks are the caller's: `params` is the grid of the steps one block
+//! answers, and `close` at the block edge leaves nothing of the series
+//! behind, so the reach-back a block repeats is folded afresh.
 
 use crate::aggregate::MAX_STEPS;
 use crate::params::{step_count, Params};
@@ -66,7 +71,7 @@ impl BufferedSeriesIterator {
         }
     }
 
-    /// Folds one chunk row. Evaluates into `out`'s open row every step whose
+    /// Folds one chunk. Evaluates into `out`'s open row every step whose
     /// window can no longer change, then trims the buffer below `lo`.
     ///
     /// Chunks of one series must ascend by first timestamp; `SeriesSetExec`
@@ -196,10 +201,10 @@ impl BufferedSeriesIterator {
 
     /// Copies the chunk's samples that can still matter.
     ///
-    /// The first row wins an overlap, as in Thanos's `chunkSeriesIterator`:
+    /// The first chunk wins an overlap, as in Thanos's `chunkSeriesIterator`:
     /// a sample at or before `last_t` is dropped. A stale marker claims its
     /// timestamp before the range kernel filters it out, the way a store's
-    /// merge dedups before PromQL sees staleness.
+    /// merge drops repeated timestamps before PromQL sees staleness.
     fn append(&mut self, ts: &[i64], vs: &[f64]) {
         let from = self
             .last_t
@@ -456,7 +461,7 @@ mod tests {
         }
     }
 
-    /// A 30-day series is one row from a store that does not chunk it, so
+    /// A 30-day series is one chunk from a store that keeps whole series, so
     /// the buffer must not take a copy of a chunk to walk it.
     #[test]
     fn a_chunk_is_walked_in_place_and_only_its_tail_copied() {
@@ -490,7 +495,7 @@ mod tests {
         }
     }
 
-    // Range kernels and the chunk_ms sweep: whatever the cut points, a series
+    // Range kernels and the chunk size sweep: whatever the cut points, a series
     // must answer bit for bit what it answers as one chunk.
 
     const S: i64 = 1000;
@@ -734,9 +739,9 @@ mod tests {
         assert!((increase[0].1 - 10.0).abs() < 1e-9, "{increase:?}");
     }
 
-    /// A.0 and B.0 of docs/engine-chunks.md §1, and the seven rates of §4.
+    /// A.0 and B.0 of docs/engine-blocks.md §1, and the seven rates of §5.
     #[test]
-    fn the_engine_chunks_fixture() {
+    fn the_engine_blocks_fixture() {
         let p = Params {
             start_ms: 420 * S,
             end_ms: 600 * S,
@@ -782,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn overlap_keeps_the_first_row() {
+    fn overlap_keeps_the_first_chunk() {
         let p = Params {
             start_ms: 3 * M,
             end_ms: 3 * M,
@@ -791,7 +796,7 @@ mod tests {
             offset_ms: 0,
             at_ms: None,
         };
-        // Interleaved: the union would be six samples, the first row keeps
+        // Interleaved: the union would be six samples, the first chunk keeps
         // its three and only 150s of the second survives.
         let chunks: [(&[i64], &[f64]); 2] = [
             (&[0, 60 * S, 120 * S], &[1.0, 2.0, 3.0]),
@@ -807,7 +812,7 @@ mod tests {
         );
 
         // A stale marker is not a sample, but it still claims its timestamp:
-        // the second row's 120s is a duplicate, not a value.
+        // the second chunk's 120s is a duplicate, not a value.
         let stale = f64::from_bits(STALE_NAN_BITS);
         let chunks: [(&[i64], &[f64]); 2] = [
             (&[0, 60 * S, 120 * S], &[1.0, 2.0, stale]),

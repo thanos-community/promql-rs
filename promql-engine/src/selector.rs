@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_splits_select_what_one_row_selects() {
+    fn chunk_splits_select_what_one_chunk_selects() {
         let (ts, vs) = a_rough_series();
         for p in grids() {
             let expected = run(&ts, &vs, p);

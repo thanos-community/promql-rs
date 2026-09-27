@@ -29,7 +29,8 @@
 //! store hands over would then be a type mismatch.
 
 pub mod aggregate;
-// Wired into the selector and range aggregates by chunk-rows-engine.
+// Wired into the selector and range aggregates by the engine change above
+// this one in the stack.
 #[allow(dead_code)]
 mod buffer;
 pub mod engine;

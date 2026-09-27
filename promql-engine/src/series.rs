@@ -662,7 +662,7 @@ impl SamplesBuilder {
     ///
     /// The head keeps the vectors' allocations and becomes the Arrow
     /// buffers; what is copied is the tail, the rows after `n` plus the
-    /// open one, which in Sorted mode is a single series.
+    /// open one, which in sorted mode is a single series.
     ///
     /// `split_off` leaves the head's capacity exactly as it was before the
     /// split: `reserve`'s room for the still-open series behind it, which
