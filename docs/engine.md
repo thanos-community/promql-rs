@@ -40,10 +40,10 @@ the window, never the series.**
 
 ## Blocks, and why the plan shape follows from them
 
-Each selector gets one select, and the store answers it with one row per
-chunk of one series, cut into blocks of its own layout that every row
-declares; inside a block series are label-sorted with rows of a series
-consecutive, or keyed by a store-provided series id. That contract is
+Each selector gets one select, and the store cuts its answer into blocks
+of its own layout that every row declares. A block's rows are chunks of
+series, label-sorted with rows of a series consecutive, or keyed by a
+store-provided series id. That contract is
 `series-source.md`'s; what matters here is that it forbids the engine from
 ever seeing a whole series at once, and therefore forbids an operator that
 wants one.
@@ -71,9 +71,9 @@ answers.
 over the whole query range, its start widened by the window and both ends
 moved by the offset as Prometheus widens its select hints, and passes the
 window as `SelectHints.window_ms`. The store cuts its answer into blocks of
-its own layout and stamps every chunk row with its block's `block_start`
+its own layout and stamps every row with its block's `block_start`
 and `block_end`, reaching back by the window at each
-([`series-source.md`](series-source.md#the-seriessource-trait)). A block
+([`series-source.md`](series-source.md#what-the-trait-requires)). A block
 answers the steps of the query whose window end, `t − offset` or the `@`
 time, lies in `[block_start, block_end)`; its samples before `block_start`
 feed windows only. The engine learns a block's edges from its first row,
@@ -103,9 +103,9 @@ Losing a declared ordering between scan and selector would turn a
 sorted-mode plan into a hash aggregate over labels, which is why *Ordering
 integrity* refuses it.
 
-**Batch boundaries mean nothing.** A store may split a series' chunk rows
+**Batch boundaries mean nothing.** A store may split a series' rows
 across any number of RecordBatches, ending it mid-batch or spreading it over
-several. The engine never gathers or looks up the chunks a `rate` window
+several. The engine never gathers or looks up the rows a `rate` window
 needs: it folds rows into their series' window buffer in arrival order. In
 sorted mode it closes the series at the first row with another label set,
 in keyed mode when the block's last row has passed, as it does for the last
@@ -131,7 +131,7 @@ per open series is **one window buffer**, `BufferedSeriesIterator`
 (`buffer.rs`), after Prometheus's `storage.BufferedSeriesIterator`
 (`storage/buffer.go:26-36`), and it serves every function alike.
 
-What a later step still reads of a pushed chunk row is copied into the
+What a later step still reads of a pushed row is copied into the
 buffer, not held as a slice of its batch: a retained slice pins the batch's
 child buffers, other series' samples included, and every kernel indexes one
 contiguous slice. Usually only a row's tail need be copied; a full copy is
@@ -230,7 +230,7 @@ misbehaving store makes a series come out twice, unreported.
 **Contract.** The properties are therefore requirements on the store, not
 inherited guarantees. Inside each block the store delivers one of two
 modes, keyed mode when its schema carries a `series_id` column and sorted
-mode otherwise ([`series-source.md`](series-source.md#order)): in sorted
+mode otherwise ([`series-source.md`](series-source.md#what-the-trait-requires)): in sorted
 mode series are sorted by their label set within a block and rows of one
 series are consecutive; in keyed mode every row carries the store's opaque
 `series_id` and rows of one series may lie in any order relative to other

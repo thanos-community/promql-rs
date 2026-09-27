@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Engine Blocks</title>
+<title>How rate walks a block and crosses its edge</title>
 <style>
 :root{
   --bg:#f2f4f5;
@@ -366,7 +366,7 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
 
 <main>
 
-<h1>How <code>rate</code> crosses a chunk boundary</h1>
+<h1>How <code>rate</code> walks a block and crosses its edge</h1>
 <p class="byline">promql-engine internals &middot; companion to <a class="fl" href="engine.md">docs/engine.md</a> and <a class="fl" href="series-source.md">docs/series-source.md</a> &middot; illustrates <a class="fl" href="engine-blocks.md">docs/engine-blocks.md</a></p>
 
 <!-- The overview is the whole approach in one picture: time cut into blocks by the store,
@@ -450,7 +450,7 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
       <circle class="dot-b" cx="519" cy="180.5" r="2"/>
       <text x="532" y="161.5">1st  x{pod="a"}</text>
       <text x="532" y="183.5">2nd  x{pod="b"}</text>
-      <text x="70" y="162">chunk rows, in label order</text>
+      <text x="70" y="162">rows, one chunk each, in label order</text>
     </a>
 
     <a href="#3-the-fold">
@@ -479,13 +479,13 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
   </ul>
 </section>
 
-<p class="lede">If a store streams one Arrow row per chunk, and may cut its <code>RecordBatch</code>es anywhere, how are two chunks aligned so that <code>rate</code> can reach the last value of one and the first value of the next?</p>
+<p class="lede">A store cuts its answer into blocks along its own time units and streams each block as rows, one per chunk of a series, in <code>RecordBatch</code>es it may cut anywhere. Inside a block, how are two rows of a series aligned so that <code>rate</code> can reach the last value of one and the first value of the next?</p>
 
 <div class="query-banner">
   <code>rate(x[5m])</code> &nbsp;&middot;&nbsp; step 30&thinsp;s &nbsp;&middot;&nbsp; 420&thinsp;s &rarr; 600&thinsp;s &nbsp;&middot;&nbsp; two batches, three rows, two series
 </div>
 
-<p><b>They are not aligned.</b> The two chunk rows of <code>x</code> are ranges in two different <code>RecordBatch</code>es, read in arrival order, and the samples of the first that a later window still reaches are already copied into the series' <b>window buffer</b> when the second is read. Alignment is only a question if the operator works on whole series. A grouped aggregate does not.</p>
+<p><b>They are not aligned, and need not be.</b> The two rows of <code>x</code> are ranges in two different <code>RecordBatch</code>es, read in arrival order, and the samples of the first that a later window still reaches are already copied into the series' <b>window buffer</b> when the second is read. Alignment is only a question if the operator works on whole series. A grouped aggregate folds a block, not a series.</p>
 
 <nav class="toc">
   <a href="#1-the-shape-everything-happens-in">1 The shape</a>
@@ -505,7 +505,7 @@ samples      List&lt;Struct&lt;timestamp: Timestamp(Millisecond), value: Float64
 block_start  Timestamp(Millisecond)
 block_end    Timestamp(Millisecond)</code></pre>
 
-<p>One row is one chunk of one series in one block the store cut its answer into, and <code>block_start</code> and <code>block_end</code> name that block on every row. The fixture is one block, so the two columns are the same on every row and stay out of view until <a href="#4-an-aggregate-across-a-block-edge">section 4</a>. The fixture is three rows in two batches: batch A holds the first chunk of series <code>x</code>; batch B holds its second chunk, then one chunk of series <code>y</code>, which is what closes <code>x</code>. The counter resets inside B.0, from 16 to 3.</p>
+<p>One row is one chunk of one series in one block the store cut its answer into, and <code>block_start</code> and <code>block_end</code> name that block on every row. The fixture is one block, so the two columns are the same on every row and stay out of view until <a href="#4-an-aggregate-across-a-block-edge">section 4</a>. The fixture is three rows in two batches: batch A holds the first row of series <code>x</code>; batch B holds its second, then one row of series <code>y</code>, which is what closes <code>x</code>. The counter resets inside B.0, from 16 to 3.</p>
 
 <pre class="codeblock layout"><code>batch A
 row  labels.__name__  samples                  first / last sample timestamp, derived
@@ -533,16 +533,16 @@ row  labels.__name__  samples                  first / last sample timestamp, de
 <h2 id="2-batches-carry-no-meaning"><span class="num">2</span>Batches carry no meaning</h2>
 
 <div class="stage-card">
-<p><b>A store may split a series' chunk rows across any number of <code>RecordBatch</code>es.</b> A series may end mid-batch or span several; <code>x</code> here does both. The engine never gathers a series' chunks for <code>rate</code>: it folds rows in arrival order into one window buffer, closes a series when a row with another label set arrives or the block's last row has passed, and carries across a batch boundary only the window buffer of the one open series per partition in sorted mode; in keyed mode it carries every series of the block.</p>
+<p><b>A store may split a series' rows across any number of <code>RecordBatch</code>es.</b> A series may end mid-batch or span several; <code>x</code> here does both. The engine never gathers a series' rows for <code>rate</code>: it folds rows in arrival order into one window buffer, closes a series when a row with another label set arrives or the block's last row has passed, and carries across a batch boundary only the window buffer of the one open series per partition in sorted mode; in keyed mode it carries every series of the block.</p>
 </div>
 
-<p>What crosses from A.0 to B.0 is a copy of the samples a later window reaches, never a reference into batch A's buffers, and the batch boundary is not an event the fold notices. Why the engine never joins chunk rows into one is in <a href="engine.md#memory">docs/engine.md</a>.</p>
+<p>What crosses from A.0 to B.0 is a copy of the samples a later window reaches, never a reference into batch A's buffers, and the batch boundary is not an event the fold notices. Why the engine never joins a series' rows into one is in <a href="engine.md#memory">docs/engine.md</a>.</p>
 
-<p>That B.1 closes <code>x</code> holds only because the store keeps a series' rows consecutive and label-sorted within a block, a contract in <a href="engine.md#ordering-integrity">docs/engine.md</a>. That is the sorted mode the fold here shows; in keyed mode each row finds its series' buffer by <code>series_id</code> instead of by adjacency, and nothing else in the fold changes. The engine checks it on every row: one label comparison per row, labels non-decreasing between adjacent rows of a block, and cheaper checks beside it, first sample timestamp non-decreasing within a series, <code>block_start</code> and <code>block_end</code> constant within a block, and blocks ascending and non-overlapping from one row to the next, turning a violation into a query error rather than a silently wrong result. The samples need no edge check: a sample past either edge falls in no window the block answers.</p>
+<p>That B.1 closes <code>x</code> holds only because the store keeps a series' rows consecutive and label-sorted within a block, a contract in <a href="engine.md#ordering-integrity">docs/engine.md</a>. That is the sorted mode the fold here shows; in keyed mode each row finds its series' buffer by <code>series_id</code> instead of by adjacency, and nothing else in the fold changes. The engine checks it on every row: one label comparison per row, against the previous row in sorted mode or the id's stored labels in keyed mode, and cheaper checks beside it, first sample timestamp non-decreasing within a series, <code>block_start</code> and <code>block_end</code> constant within a block, and blocks ascending and non-overlapping from one row to the next, turning a violation into a query error rather than a silently wrong result. The samples need no edge check: a sample past either edge falls in no window the block answers.</p>
 
 <h2 id="3-the-fold"><span class="num">3</span>The fold</h2>
 
-<p><code>rate(x[5m])</code> from t&nbsp;=&nbsp;420&thinsp;s to t&nbsp;=&nbsp;600&thinsp;s at step 30&thinsp;s. Seven steps, and each step's answer is a function of its <b>lane</b>, the samples in its window <code>(t_step &minus; 300&thinsp;s, t_step]</code>. The lanes are the semantics, not <code>rate</code>'s data structure: <code>rate</code> keeps no lane per step. It copies each chunk row into one buffer per open series, <code>BufferedSeriesIterator</code> after Prometheus's <code>storage/buffer.go</code>, answers a step as soon as its window cannot change any more, and trims from the front what no later window reaches (<a href="engine.md#kernel-state">docs/engine.md</a>). A state per step would pay every sample once per window it falls in, ten times here, twenty for <code>[5m]</code> at 15&thinsp;s. The aggregate above <code>rate</code> does keep one partial per group and step, for the steps of the block being read; <a href="#4-an-aggregate-across-a-block-edge">section 4</a> shows what bounds it.</p>
+<p><code>rate(x[5m])</code> from t&nbsp;=&nbsp;420&thinsp;s to t&nbsp;=&nbsp;600&thinsp;s at step 30&thinsp;s. Seven steps, and each step's answer is a function of its <b>lane</b>, the samples in its window <code>(t_step &minus; 300&thinsp;s, t_step]</code>. The lanes are the semantics, not <code>rate</code>'s data structure: <code>rate</code> keeps no lane per step. It copies each row into one buffer per open series, <code>BufferedSeriesIterator</code> after Prometheus's <code>storage/buffer.go</code>, answers a step as soon as its window cannot change any more, and trims from the front what no later window reaches (<a href="engine.md#kernel-state">docs/engine.md</a>). A state per step would pay every sample once per window it falls in, ten times here, twenty for <code>[5m]</code> at 15&thinsp;s. The aggregate above <code>rate</code> does keep one partial per group and step, for the steps of the block being read; <a href="#4-an-aggregate-across-a-block-edge">section 4</a> shows what bounds it.</p>
 
 <p>What <code>extrapolatedRate</code> needs from a lane is small: its first and last sample, the count, and <code>reset_sum</code>, the values lost to counter resets. The engine reads the endpoints and the count off the lane's slice of the buffer, and carries the resets from step to step in <code>Sweep::Counter</code>, as ordinals into the buffer, so a step costs the samples entering and leaving the window. A running <code>reset_sum</code> would not save the resets: when a reset leaves the window its value has to come out of the sum, so it is stored either way, and a float that is added to and subtracted from drifts besides (<code>range.rs:254-256</code>). What the resets cost is bounded by the resets inside one window, not by its samples. thanos promql-engine's <a href="https://github.com/thanos-io/promql-engine/blob/main/ringbuffer/rate.go"><code>ringbuffer/rate.go</code></a> makes the same choice, keeping every reset in the window as the pair of values either side of the drop. promql-engine uses that buffer only when the range overlaps five or fewer steps (<code>ringbuffer/overtime.go</code>); <code>[5m]</code> at 15&thinsp;s overlaps twenty and falls back to <code>generic.go</code>, which keeps every sample (<a href="#7-functions-that-need-every-sample-in-the-window">section 7</a>). The tables below are those numbers per lane.</p>
 
@@ -596,7 +596,7 @@ row  labels.__name__  samples                  first / last sample timestamp, de
   2    "a"         300 330 … 570 600   (11)    300 / 600    reach-back 300–450
   2    "b"         180 210 … 570 600   (15)    180 / 600    reach-back 180–450</code></pre>
 
-<p>The fixture's chunks happen to end and begin exactly at these edges: <code>a</code>'s block-1 row ends at 450&thinsp;s, and <code>b</code>'s block-2 row begins at 180&thinsp;s, its reach-back start; no row here is trimmed to a block edge, since the store never decodes a chunk to trim it (<a href="series-source.md#the-seriessource-trait">docs/series-source.md</a>).</p>
+<p>The fixture's chunks happen to end and begin exactly at these edges: <code>a</code>'s block-1 row ends at 450&thinsp;s, and <code>b</code>'s block-2 row begins at 180&thinsp;s, its reach-back start; no row here is trimmed to a block edge, since the store never decodes a chunk to trim it (<a href="series-source.md#what-the-trait-requires">docs/series-source.md</a>).</p>
 
 <p>Say block 1's two rows come in one batch. Its rows span 150&thinsp;s to 450&thinsp;s, and that does not matter: <code>sum</code> never sees samples, only the step values <code>rate</code> emits, each keyed by its step, so there is no current step for a batch to be early or late for. The rows feed whichever windows they fall in.</p>
 
@@ -610,7 +610,7 @@ row  labels.__name__  samples                  first / last sample timestamp, de
     <span class="anim-now" id="fold-now"></span>
   </div>
   <div class="anim-scroll">
-    <svg id="fold-svg" viewBox="0 0 900 352" role="img" aria-label="Four chunk rows of two series in two blocks, arriving in two RecordBatches, folded one series at a time into seven step windows; sum emits a block's steps when the block's last row has passed"></svg>
+    <svg id="fold-svg" viewBox="0 0 900 352" role="img" aria-label="Four rows of two series in two blocks, arriving in two RecordBatches, folded one series at a time into seven step windows; sum emits a block's steps when the block's last row has passed"></svg>
   </div>
   <p class="anim-cap" id="fold-cap"></p>
 
@@ -704,7 +704,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
 <h2 id="6-overlapping-chunks"><span class="num">6</span>Overlapping chunks</h2>
 
-<p>Adjacent chunk rows of a series in one block may overlap in time, when its chunks arrive from several files or compaction levels. The engine remembers the last timestamp it copied for each series and skips any sample at or before it, so the first row wins, as in Thanos's <code>chunkSeriesIterator</code>; Prometheus's union differs only for interleaved timestamps (<a href="engine.md#ordering-integrity">docs/engine.md</a>). A stale marker claims its timestamp too, before <code>rate</code> filters it out of the buffer, so a marker in the first row is not replaced by a sample at the same timestamp in the second. The skip matters even for an exact duplicate, which moves neither endpoint and fakes no reset but would raise <code>count</code>, shortening the average interval, which can push <code>duration_to_start</code> through a clamp it would otherwise miss.</p>
+<p>Adjacent rows of a series in one block may overlap in time, when its chunks arrive from several files or compaction levels. The engine remembers the last timestamp it copied for each series and skips any sample at or before it, so the first row wins, as in Thanos's <code>chunkSeriesIterator</code>; Prometheus's union differs only for interleaved timestamps (<a href="engine.md#ordering-integrity">docs/engine.md</a>). A stale marker claims its timestamp too, before <code>rate</code> filters it out of the buffer, so a marker in the first row is not replaced by a sample at the same timestamp in the second. The skip matters even for an exact duplicate, which moves neither endpoint and fakes no reset but would raise <code>count</code>, shortening the average interval, which can push <code>duration_to_start</code> through a clamp it would otherwise miss.</p>
 
 <h2 id="7-functions-that-need-every-sample-in-the-window"><span class="num">7</span>Functions that need every sample in the window</h2>
 
@@ -740,7 +740,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 
   /* ---- fixture: section 4. Seconds throughout; the engine counts
      milliseconds, and nothing on this page turns on the difference. Two
-     blocks the store declares, four chunk rows, two series. The rows come in
+     blocks the store declares, four rows, two series. The rows come in
      two RecordBatches cut inside block 2 on purpose: the block edge (before
      2·a) and the batch edge (before 2·b) fall in different places, and only
      the first is an event for sum. ---- */
