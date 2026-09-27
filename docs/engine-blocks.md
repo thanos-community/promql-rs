@@ -1,6 +1,6 @@
 # How `rate` walks a block and crosses its edge
 
-promql-engine internals · companion to [engine.md](engine.md) and [series-source.md](series-source.md) · [illustrated version](engine-blocks.html), sections 1 to 7, with an overview of blocks, a step-through of section 4 across the block edge, and the Arrow buffer inspector
+promql-engine internals · companion to [engine.md](engine.md) and [series-source.md](series-source.md) · [illustrated version](engine-blocks.html) of this walkthrough, with an overview of blocks, a step-through of the block edge and the Arrow buffer inspector
 
 A store cuts its answer into blocks along its own time units. It streams each block as series in `RecordBatch`es it may cut anywhere, and a series with several chunks arrives once per chunk. Inside a block, how are two chunks of one series aligned so that `rate` can reach the last value of one and the first value of the next?
 
