@@ -1,13 +1,27 @@
 //! The canonical series shape: what a store hands the engine, and what
 //! every operator hands the next.
 //!
-//! One row is one series. Its labels sit in a struct with a field per
-//! label name, its samples in a list of `(timestamp, value)` structs:
+//! One row is one series: a label set, one chunk of its samples, and
+//! the block the store cut it into. The labels sit in a struct with a
+//! field per label name, the samples in a list of `(timestamp, value)`
+//! structs, and the block is two timestamps:
 //!
 //! ```text
-//! labels   Struct<{name}: Utf8View, …>   fields sorted by name
-//! samples  List<Struct<timestamp: Timestamp(ms), value: Float64>>
+//! labels       Struct<{name}: Utf8View, …>   fields sorted by name
+//! samples      List<Struct<timestamp: Timestamp(ms), value: Float64>>
+//! block_start  Timestamp(ms)                 window ends the block answers, from here
+//! block_end    Timestamp(ms)                 to here, exclusive
 //! ```
+//!
+//! A store cuts its answer into blocks along its own time units and
+//! stamps every series with its block, constant over the block. A block
+//! answers the steps whose window end lies in `[block_start, block_end)`
+//! and its series hold every sample those windows reach, so nothing per
+//! series has to survive a block edge; `docs/series-source.md` is the
+//! contract. A store that keeps whole series stamps the whole select as
+//! one block. The columns are plain timestamps rather than run-end
+//! encoded because the fold groups on them, and DataFusion's group
+//! values do not take a run-end array.
 //!
 //! Label values are `Utf8View`, one 16-byte view per label per series with
 //! values up to 12 bytes inline. Within one series a value appears exactly
@@ -20,9 +34,11 @@
 //! the set never changes. A batch is many such series side by side and
 //! nothing more. Each row keeps its own complete label set and its own
 //! samples; rows share only the schema, the union of their label names.
-//! Two rows with one label set would be one series split in two, which
-//! [`encode`] refuses. Merging series by the labels that survive an
-//! aggregation is an operator above this shape, not part of it.
+//! A label set with several chunks in a block arrives once per chunk;
+//! [`encode`] is for a store that holds each series whole, so it refuses
+//! two series with one label set, unable to tell a second chunk from a
+//! duplicate. Merging series by the labels that survive an aggregation is
+//! an operator above this shape, not part of it.
 //!
 //! Nothing is nullable. An absent label is `""`, as it is in PromQL, so
 //! there is no NULL parent to read a phantom child through. Timestamps
@@ -30,14 +46,17 @@
 //! structs rather than two aligned lists means one offsets buffer, so a
 //! timestamp and its value cannot drift apart by construction.
 //!
-//! A [`Series`] is one row of it, held as its two column values. A store
-//! puts rows together with [`encode`], the engine reads them back with
-//! [`decode`], and every consumer checks the shape through [`validate`],
-//! so there is exactly one definition of the shape in code, here.
+//! A [`Series`] is one row of it, held as its label set and samples. A
+//! store puts rows together with [`encode`], the engine reads them back
+//! with [`decode`], and every consumer checks the shape through
+//! [`validate`], so there is exactly one definition of the shape in
+//! code, here.
 //!
 //! The same shape comes out of every operator: an instant vector over a
 //! range query is again one row per series with a list of samples, now at
-//! step timestamps. That is what lets operators stack.
+//! step timestamps, in the block that answered them. That is what lets
+//! operators stack, and why a label set seen in several blocks leaves as
+//! several rows.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -60,6 +79,8 @@ pub const LABELS: &str = "labels";
 pub const SAMPLES: &str = "samples";
 pub const TIMESTAMP: &str = "timestamp";
 pub const VALUE: &str = "value";
+pub const BLOCK_START: &str = "block_start";
+pub const BLOCK_END: &str = "block_end";
 /// Arrow's conventional name for a list's element field.
 pub const LIST_ITEM: &str = "item";
 
@@ -112,7 +133,61 @@ pub fn schema(label_names: &[String]) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new(LABELS, labels_type(label_names), false),
         Field::new(SAMPLES, samples_type(), false),
+        Field::new(BLOCK_START, timestamp_type(), false),
+        Field::new(BLOCK_END, timestamp_type(), false),
     ]))
+}
+
+/// The block a series belongs to: it answers the steps whose window end
+/// lies in `[start_ms, end_ms)`, and holds every sample those windows
+/// reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Block {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+impl Block {
+    /// The two block columns for `rows` series of this block.
+    pub fn columns(&self, rows: usize) -> [ArrayRef; 2] {
+        [
+            Arc::new(TimestampMillisecondArray::from(vec![self.start_ms; rows])),
+            Arc::new(TimestampMillisecondArray::from(vec![self.end_ms; rows])),
+        ]
+    }
+}
+
+/// `batch` with its block columns set to `block`, for a store that cuts
+/// a batch it already holds into blocks.
+pub fn with_block(batch: &RecordBatch, block: Block) -> Result<RecordBatch, String> {
+    let [start, end] = block.columns(batch.num_rows());
+    let columns: Vec<ArrayRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(f, c)| match f.name().as_str() {
+            BLOCK_START => Arc::clone(&start),
+            BLOCK_END => Arc::clone(&end),
+            _ => Arc::clone(c),
+        })
+        .collect();
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| e.to_string())
+}
+
+/// The block of row `row` of a canonical batch.
+pub fn block_of(batch: &RecordBatch, row: usize) -> Block {
+    let at = |name: &str| {
+        batch
+            .column_by_name(name)
+            .expect("canonical")
+            .as_primitive::<TimestampMillisecondType>()
+            .value(row)
+    };
+    Block {
+        start_ms: at(BLOCK_START),
+        end_ms: at(BLOCK_END),
+    }
 }
 
 /// Check a schema against the canonical shape, naming the first thing
@@ -123,15 +198,12 @@ pub fn schema(label_names: &[String]) -> SchemaRef {
 /// inside a kernel with a downcast panic, far from the code that produced
 /// the batch.
 pub fn validate(schema: &Schema) -> Result<(), String> {
-    if schema.fields().len() != 2 {
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    if names != [LABELS, SAMPLES, BLOCK_START, BLOCK_END] {
         return Err(format!(
-            "expected exactly the columns `{LABELS}` and `{SAMPLES}`, got {}",
-            schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "expected exactly the columns `{LABELS}`, `{SAMPLES}`, `{BLOCK_START}` and \
+             `{BLOCK_END}`, in that order, got {}",
+            names.join(", ")
         ));
     }
 
@@ -183,6 +255,19 @@ pub fn validate(schema: &Schema) -> Result<(), String> {
             samples_type()
         ));
     }
+    for name in [BLOCK_START, BLOCK_END] {
+        let field = schema.field_with_name(name).expect("checked above");
+        if field.is_nullable() {
+            return Err(format!("`{name}` must not be nullable"));
+        }
+        if field.data_type() != &timestamp_type() {
+            return Err(format!(
+                "`{name}` is {}, expected {}",
+                field.data_type(),
+                timestamp_type()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -200,7 +285,10 @@ pub fn label_names(schema: &Schema) -> Vec<String> {
 /// Prometheus's `promql.Series`, the pair `Metric` and `Floats`, in
 /// Arrow. Immutable, because a different label set is a different series.
 /// This is the row-at-a-time view that tests and [`decode`] hand back; a
-/// store holds a whole batch and works on it with kernels instead.
+/// store holds a whole batch and works on it with kernels instead. The
+/// block is not part of it: a whole series is one block's worth by
+/// definition, and a result decoded from several blocks is several of
+/// these per label set, one per block.
 #[derive(Debug, Clone)]
 pub struct Series {
     /// One row: one field per label name, names sorted, values strings.
@@ -330,16 +418,18 @@ pub fn label_names_of(series: &[Series]) -> Vec<String> {
     names
 }
 
-/// One batch, one row per series, in the schema for `names`.
+/// One batch, one row per series, in the schema for `names`, every row
+/// in `block`.
 ///
-/// The names are a parameter rather than derived here because a store
-/// that streams several batches for one scan must give them all the same
-/// schema. A series lacking one of the names gets `""`; a series carrying
-/// a label outside them is an error, since silently dropping a label
-/// would merge two series into one. Two series with the same label set
-/// are an error too: a series is its label set, so that is one series
-/// split in two.
-pub fn encode(names: &[String], series: &[Series]) -> Result<RecordBatch, String> {
+/// For a store that holds each series whole: the one-block, one-chunk
+/// case of the contract. The names are a parameter rather than derived
+/// here because a store that streams several batches for one scan must
+/// give them all the same schema. A series lacking one of the names gets
+/// `""`; a series carrying a label outside them is an error, since
+/// silently dropping a label would merge two series into one. Two series
+/// with the same label set are an error too: with whole series this
+/// cannot be a second chunk, so it is one series split in two.
+pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<RecordBatch, String> {
     let mut names = names.to_vec();
     names.sort();
     names.dedup();
@@ -427,11 +517,16 @@ pub fn encode(names: &[String], series: &[Series]) -> Result<RecordBatch, String
         entries,
         None,
     );
-    RecordBatch::try_new(schema(&names), vec![Arc::new(labels), Arc::new(samples)])
-        .map_err(|e| e.to_string())
+    let [block_start, block_end] = block.columns(series.len());
+    RecordBatch::try_new(
+        schema(&names),
+        vec![Arc::new(labels), Arc::new(samples), block_start, block_end],
+    )
+    .map_err(|e| e.to_string())
 }
 
-/// The rows of canonical batches, as zero-copy slices.
+/// The rows of canonical batches, as zero-copy slices, one [`Series`]
+/// per row: a label set that arrived in several blocks is several.
 ///
 /// Series with no samples are dropped here rather than filtered in the
 /// plan, because the plan-side filter would sit above the projection that
@@ -515,14 +610,48 @@ pub fn drop_unused_labels(batch: &RecordBatch) -> Result<RecordBatch, String> {
             None,
         ))
     };
-    RecordBatch::try_new(
-        schema(&names),
-        vec![
-            kept,
-            Arc::clone(batch.column_by_name(SAMPLES).expect("canonical")),
-        ],
+    replace_column(
+        batch,
+        LABELS,
+        Field::new(LABELS, labels_type(&names), false),
+        kept,
     )
-    .map_err(|e| e.to_string())
+}
+
+/// `batch` with the column `name` swapped for `column`, typed `field`;
+/// the other columns, the block's included, stay as they are.
+fn replace_column(
+    batch: &RecordBatch,
+    name: &str,
+    field: Field,
+    column: ArrayRef,
+) -> Result<RecordBatch, String> {
+    let fields: Vec<FieldRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == name {
+                Arc::new(field.clone())
+            } else {
+                Arc::clone(f)
+            }
+        })
+        .collect();
+    let columns: Vec<ArrayRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(f, c)| {
+            if f.name() == name {
+                Arc::clone(&column)
+            } else {
+                Arc::clone(c)
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| e.to_string())
 }
 
 /// Keep only the samples in `[start_ms, end_ms]`.
@@ -586,14 +715,12 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
         entries,
         None,
     );
-    RecordBatch::try_new(
-        batch.schema(),
-        vec![
-            Arc::clone(batch.column_by_name(LABELS).expect("canonical")),
-            Arc::new(samples),
-        ],
+    replace_column(
+        batch,
+        SAMPLES,
+        Field::new(SAMPLES, samples_type(), false),
+        Arc::new(samples),
     )
-    .map_err(|e| e.to_string())
 }
 
 /// The timestamp and value children of a samples list's entries. Callers
@@ -713,6 +840,14 @@ impl SamplesBuilder {
     }
 }
 
+/// One block over everything, the shape a whole-series store hands over;
+/// the block every test fixture outside a block test sits in.
+#[cfg(test)]
+pub(crate) const ONE_BLOCK: Block = Block {
+    start_ms: 0,
+    end_ms: i64::MAX,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,7 +872,7 @@ mod tests {
         ];
         let names = label_names_of(&all);
         assert_eq!(names, vec!["__name__", "pod"]);
-        let batch = encode(&names, &all).unwrap();
+        let batch = encode(&names, &all, ONE_BLOCK).unwrap();
         assert_eq!(batch.num_rows(), 3);
         validate(&batch.schema()).unwrap();
         assert_eq!(label_names(&batch.schema()), vec!["__name__", "pod"]);
@@ -787,7 +922,7 @@ mod tests {
             );
         }
 
-        let batch = encode(&label_names_of(&all), &all).unwrap();
+        let batch = encode(&label_names_of(&all), &all, ONE_BLOCK).unwrap();
         assert_eq!(batch.num_rows(), 3);
         let decoded = decode(&[batch]).unwrap();
         assert_eq!(decoded.len(), 3);
@@ -809,27 +944,27 @@ mod tests {
             series(&[("a", "1")], &[(0, 1.0)]),
             series(&[("a", "1")], &[(5, 2.0)]),
         ];
-        let err = encode(&label_names_of(&twice), &twice).unwrap_err();
+        let err = encode(&label_names_of(&twice), &twice, ONE_BLOCK).unwrap_err();
         assert!(err.contains(r#"a="1""#), "{err}");
 
         // The empty label set is a label set too.
         let bare = [series(&[], &[(0, 1.0)]), series(&[], &[(1, 1.0)])];
-        assert!(encode(&[], &bare).is_err());
+        assert!(encode(&[], &bare, ONE_BLOCK).is_err());
     }
 
     #[test]
     fn a_label_outside_the_schema_is_rejected() {
-        let err = encode(&["a".to_string()], &[series(&[("b", "x")], &[])]).unwrap_err();
+        let err = encode(&["a".to_string()], &[series(&[("b", "x")], &[])], ONE_BLOCK).unwrap_err();
         assert!(err.contains("`b`"), "{err}");
     }
 
     #[test]
     fn no_labels_at_all_is_a_valid_shape() {
-        let batch = encode(&[], &[series(&[], &[(1, 1.0)])]).unwrap();
+        let batch = encode(&[], &[series(&[], &[(1, 1.0)])], ONE_BLOCK).unwrap();
         validate(&batch.schema()).unwrap();
         assert_eq!(decode(&[batch]).unwrap().len(), 1);
 
-        let empty = encode(&[], &[]).unwrap();
+        let empty = encode(&[], &[], ONE_BLOCK).unwrap();
         validate(&empty.schema()).unwrap();
         assert_eq!(empty.num_rows(), 0);
     }
@@ -864,7 +999,12 @@ mod tests {
             series(&[("__name__", "up")], &[(1000, 3.0), (2000, 4.0)]),
         ];
         // `pod` is in the schema, but no row below carries it.
-        let batch = encode(&["__name__".to_string(), "pod".to_string()], &all[1..]).unwrap();
+        let batch = encode(
+            &["__name__".to_string(), "pod".to_string()],
+            &all[1..],
+            ONE_BLOCK,
+        )
+        .unwrap();
 
         let narrowed = drop_unused_labels(&batch).unwrap();
         validate(&narrowed.schema()).unwrap();
@@ -885,10 +1025,20 @@ mod tests {
         let ok = schema(&["a".to_string()]);
         validate(&ok).unwrap();
 
-        let nullable = Schema::new(vec![
+        let block = |nullable: bool| {
+            vec![
+                Field::new(BLOCK_START, timestamp_type(), nullable),
+                Field::new(BLOCK_END, timestamp_type(), nullable),
+            ]
+        };
+        let with_block = |labels: Field, samples: Field| {
+            Schema::new([vec![labels, samples], block(false)].concat())
+        };
+
+        let nullable = with_block(
             Field::new(LABELS, labels_type(&["a".to_string()]), true),
             Field::new(SAMPLES, samples_type(), false),
-        ]);
+        );
         assert!(validate(&nullable).unwrap_err().contains("nullable"));
 
         let ns_item = Arc::new(Field::new(
@@ -903,23 +1053,23 @@ mod tests {
             ])),
             false,
         ));
-        let nanos = Schema::new(vec![
+        let nanos = with_block(
             Field::new(LABELS, labels_type(&[]), false),
             Field::new(SAMPLES, DataType::List(ns_item), false),
-        ]);
+        );
         assert!(validate(&nanos).unwrap_err().contains("expected"));
 
-        let plain = Schema::new(vec![
+        let plain = with_block(
             Field::new(
                 LABELS,
                 DataType::Struct(Fields::from(vec![Field::new("a", DataType::Utf8, false)])),
                 false,
             ),
             Field::new(SAMPLES, samples_type(), false),
-        ]);
+        );
         assert!(validate(&plain).unwrap_err().contains("expected Utf8View"));
 
-        let dictionary = Schema::new(vec![
+        let dictionary = with_block(
             Field::new(
                 LABELS,
                 DataType::Struct(Fields::from(vec![Field::new(
@@ -930,12 +1080,12 @@ mod tests {
                 false,
             ),
             Field::new(SAMPLES, samples_type(), false),
-        ]);
+        );
         assert!(validate(&dictionary)
             .unwrap_err()
             .contains("expected Utf8View"));
 
-        let unsorted = Schema::new(vec![
+        let unsorted = with_block(
             Field::new(
                 LABELS,
                 DataType::Struct(Fields::from(vec![
@@ -945,15 +1095,75 @@ mod tests {
                 false,
             ),
             Field::new(SAMPLES, samples_type(), false),
-        ]);
+        );
         assert!(validate(&unsorted).unwrap_err().contains("sorted"));
 
-        let extra = Schema::new(vec![
-            Field::new(LABELS, labels_type(&[]), false),
-            Field::new(SAMPLES, samples_type(), false),
-            Field::new("x", DataType::Int64, false),
-        ]);
+        let bare = || {
+            vec![
+                Field::new(LABELS, labels_type(&[]), false),
+                Field::new(SAMPLES, samples_type(), false),
+            ]
+        };
+        let without_block = Schema::new(bare());
+        assert!(validate(&without_block).unwrap_err().contains("exactly"));
+
+        let extra = Schema::new(
+            [
+                bare(),
+                block(false),
+                vec![Field::new("x", DataType::Int64, false)],
+            ]
+            .concat(),
+        );
         assert!(validate(&extra).unwrap_err().contains("exactly"));
+
+        let nullable_block = Schema::new([bare(), block(true)].concat());
+        assert!(validate(&nullable_block)
+            .unwrap_err()
+            .contains("must not be nullable"));
+
+        let seconds = Schema::new(
+            [
+                bare(),
+                vec![
+                    Field::new(
+                        BLOCK_START,
+                        DataType::Timestamp(TimeUnit::Second, None),
+                        false,
+                    ),
+                    Field::new(BLOCK_END, timestamp_type(), false),
+                ],
+            ]
+            .concat(),
+        );
+        assert!(validate(&seconds).unwrap_err().contains("expected"));
+    }
+
+    /// The block columns travel with the rows through the store helpers
+    /// and come back off the batch as they went in.
+    #[test]
+    fn a_block_is_stamped_on_every_row_and_read_back() {
+        let all = [
+            series(&[("pod", "a")], &[(0, 1.0), (1000, 2.0)]),
+            series(&[("pod", "b")], &[(0, 3.0)]),
+        ];
+        let block = Block {
+            start_ms: 500,
+            end_ms: 2000,
+        };
+        let batch = encode(&label_names_of(&all), &all, block).unwrap();
+        validate(&batch.schema()).unwrap();
+        assert_eq!(block_of(&batch, 0), block);
+        assert_eq!(block_of(&batch, 1), block);
+
+        let later = Block {
+            start_ms: 2000,
+            end_ms: 3000,
+        };
+        let restamped = with_block(&clip(&batch, 1000, 1000).unwrap(), later).unwrap();
+        validate(&restamped.schema()).unwrap();
+        assert_eq!(block_of(&restamped, 1), later);
+        assert_eq!(decode(&[restamped]).unwrap().len(), 1);
     }
 
     fn builder_rows(list: &ListArray) -> Vec<Vec<(i64, f64)>> {

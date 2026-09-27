@@ -73,7 +73,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
 use promql_engine::engine::check_selector_plans;
-use promql_engine::series::{encode, label_names_of};
+use promql_engine::series::{encode, label_names_of, Block};
 use promql_engine::{
     range, selector, Engine, EngineError, MemorySeriesSource, RangeQuery, SelectHints, Series,
     SeriesSource,
@@ -378,13 +378,17 @@ impl SeriesSource for PrometheusOrdered {
         &self,
         _state: &dyn Session,
         _matchers: &[LabelMatcher],
-        _hints: SelectHints,
+        hints: SelectHints,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let series = vec![
             Series::new(&[("__name__", "x"), ("a", "1")], vec![300_000], vec![1.0]).unwrap(),
             Series::new(&[("__name__", "x"), ("b", "1")], vec![300_000], vec![2.0]).unwrap(),
         ];
-        let batch = encode(&label_names_of(&series), &series).unwrap();
+        let block = Block {
+            start_ms: hints.start_ms + hints.window_ms,
+            end_ms: hints.end_ms + 1,
+        };
+        let batch = encode(&label_names_of(&series), &series, block).unwrap();
         let schema = batch.schema();
         Ok(MemorySourceConfig::try_new_exec(
             &[vec![batch]],

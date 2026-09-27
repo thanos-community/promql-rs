@@ -1,14 +1,20 @@
 //! An in-memory [`SeriesSource`], and the reference implementation of a
-//! store's three obligations.
+//! store's obligations.
 //!
 //! It exists for tests, the conformance suite seeds it from the corpus's
 //! `load` blocks, but it is also the executable statement of what a real
 //! store has to do: apply the matchers with [`crate::matcher`]'s
-//! semantics, keep only samples inside the range, hand over each series'
-//! rows consecutively, series in struct order and samples in timestamp
-//! order, in the canonical schema. A
+//! semantics, keep only samples inside the range, cut the range into
+//! blocks and stamp every series with its block, hand over each series'
+//! chunks consecutively, blocks ascending, series in struct order within
+//! a block and samples in timestamp order, in the canonical schema. A
 //! store implementer who wants to know "what exactly am I promising" can
 //! read `select` below.
+//!
+//! One block per select is the smallest correct answer, and the one this
+//! store gives: the block runs over the whole window-end domain, so every
+//! series of the selection folds once, exactly as a store that never
+//! heard of blocks would have it.
 //!
 //! The shape of that `select` is the part worth copying, not the fact
 //! that the data happens to sit in memory: a mask per matcher over a
@@ -43,8 +49,8 @@ use crate::matcher::{mask_all, CompiledMatcher};
 #[cfg(test)]
 use crate::series::decode;
 use crate::series::{
-    clip, drop_unused_labels, encode, label_names_of, sample_item, Series, LABELS, SAMPLES,
-    TIMESTAMP,
+    clip, drop_unused_labels, encode, label_names_of, sample_item, with_block, Block, Series,
+    BLOCK_END, BLOCK_START, LABELS, SAMPLES, TIMESTAMP,
 };
 use crate::source::{SelectHints, SeriesSource};
 
@@ -65,6 +71,12 @@ pub struct MemorySeriesSource {
 /// through DataFusion hands over.
 const ROWS_PER_BATCH: usize = 8192;
 
+/// The block stamped on the stored batch, which no select hands out.
+const WHOLE: Block = Block {
+    start_ms: i64::MIN,
+    end_ms: i64::MAX,
+};
+
 impl Default for MemorySeriesSource {
     fn default() -> Self {
         Self::unique(Vec::new())
@@ -76,9 +88,10 @@ impl MemorySeriesSource {
     /// from. Each [`Series`] was checked when it was built, so the only
     /// thing left to reject is two of them sharing a label set: that is
     /// one series split in two, and it is caught here rather than on
-    /// every query.
+    /// every query. The block stamped here is a placeholder; `select`
+    /// replaces it with the block of the select.
     pub fn try_new(series: Vec<Series>) -> std::result::Result<Self, String> {
-        let batch = encode(&label_names_of(&series), &series)?;
+        let batch = encode(&label_names_of(&series), &series, WHOLE)?;
         Ok(Self {
             batch: sort_by_labels(&batch).map_err(|e| e.to_string())?,
             chunk_ms: None,
@@ -210,9 +223,17 @@ impl SeriesSource for MemorySeriesSource {
         let selected =
             clip(&selected, hints.start_ms, hints.end_ms).map_err(DataFusionError::Execution)?;
 
-        // Obligations 2 and 3, partition and order, come for free: the
-        // stored batch already holds one row per series in struct order
-        // with its samples ascending, and neither step here, nor the
+        // Obligation 2, blocks: one over the whole window-end domain,
+        // `[start_ms + window_ms, end_ms]`, its end exclusive.
+        let block = Block {
+            start_ms: hints.start_ms.saturating_add(hints.window_ms),
+            end_ms: hints.end_ms.saturating_add(1),
+        };
+        let selected = with_block(&selected, block).map_err(DataFusionError::Execution)?;
+
+        // Obligations 3 and 4, partition and order, come for free: the
+        // stored batch already holds one series per label set in struct
+        // order with its samples ascending, and neither step here, nor the
         // partitioning below, reorders anything within a partition.
         let schema = selected.schema();
         let partitions = partition_by_labels(&selected, self.partitions)?
@@ -330,10 +351,22 @@ fn split_into_chunks(
                 .slice(first as usize, (bounds[rows.len()] - first) as usize),
             None,
         );
-        let label_rows = take(labels, &UInt32Array::from(rows.to_vec()), None)?;
+        let indices = UInt32Array::from(rows.to_vec());
+        let column = |name: &str| {
+            take(
+                batch.column_by_name(name).expect("canonical"),
+                &indices,
+                None,
+            )
+        };
         out.push(RecordBatch::try_new(
             batch.schema(),
-            vec![label_rows, Arc::new(list)],
+            vec![
+                take(labels, &indices, None)?,
+                Arc::new(list),
+                column(BLOCK_START)?,
+                column(BLOCK_END)?,
+            ],
         )?);
     }
     Ok(out)

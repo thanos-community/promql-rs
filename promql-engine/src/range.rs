@@ -1,11 +1,12 @@
 //! Range-vector functions as one DataFusion grouped aggregate function:
-//! `promql_range_function(samples, 'rate', start, end, step, range, offset, at)`
-//! grouped by `labels`.
+//! `promql_range_function(samples, block_start, block_end, 'rate', start,
+//! end, step, range, offset, at)` grouped by the block and `labels`.
 //!
 //! A range function is the vector selector's shape with a window instead
 //! of a lookback, so it runs in the selector's accumulator, `EvalSeries`,
-//! with `advance_range` as the walk: one series' chunk rows in, that
-//! series' values on the step grid out. The function name is a literal
+//! with `advance_range` as the walk: one label set's chunks of one block
+//! in, that series' values on the steps the block answers out. The
+//! function name is a literal
 //! argument, like every parameter, so one registration serves all of them
 //! and the plan says which it is.
 //!
@@ -508,7 +509,12 @@ pub struct RangeFunction {
 
 impl Default for RangeFunction {
     fn default() -> Self {
-        let mut args = vec![series::samples_type(), DataType::Utf8];
+        let mut args = vec![
+            series::samples_type(),
+            series::timestamp_type(),
+            series::timestamp_type(),
+            DataType::Utf8,
+        ];
         args.extend(std::iter::repeat_n(DataType::Int64, 6));
         Self {
             signature: Signature::exact(args, Volatility::Immutable),
@@ -520,10 +526,14 @@ pub fn udaf() -> AggregateUDF {
     AggregateUDF::new_from_impl(RangeFunction::default())
 }
 
-/// `promql_range_function(samples, '<func>', start, end, step, range, offset, at)`.
-pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
+/// `promql_range_function(samples, block_start, block_end, '<func>',
+/// start, end, step, range, offset, at)`. The block columns are arguments
+/// as well as group keys for the reason `selector.rs` gives.
+pub fn call(samples: Expr, block_start: Expr, block_end: Expr, func: Func, p: &Params) -> Expr {
     udaf().call(vec![
         samples,
+        block_start,
+        block_end,
         lit(func.as_str()),
         lit(p.start_ms),
         lit(p.end_ms),
@@ -540,7 +550,7 @@ pub fn call(samples: Expr, func: Func, p: &Params) -> Expr {
 /// of the two it was reading for.
 fn read_args(exprs: &[Arc<dyn PhysicalExpr>]) -> Result<(Func, Params)> {
     let name = exprs
-        .get(1)
+        .get(3)
         .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
         .map(Literal::value);
     let func = match name {
@@ -552,7 +562,7 @@ fn read_args(exprs: &[Arc<dyn PhysicalExpr>]) -> Result<(Func, Params)> {
             return plan_err!("{NAME}: the function name must be a Utf8 literal, got {other:?}")
         }
     };
-    let params = Params::from_literals(exprs, 2).map_err(|e| e.context(NAME))?;
+    let params = Params::from_literals(exprs, 4).map_err(|e| e.context(NAME))?;
     Ok((func, params))
 }
 
@@ -584,9 +594,9 @@ impl AggregateUDFImpl for RangeFunction {
         false
     }
 
-    /// Without a group key there is no series to fold rows into.
+    /// Without a group key there is no series to fold chunks into.
     fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        plan_err!("{NAME} must be grouped by labels")
+        plan_err!("{NAME} must be grouped by the block and labels")
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -601,7 +611,7 @@ impl AggregateUDFImpl for RangeFunction {
         true
     }
 
-    /// `DISTINCT` would deduplicate chunk rows, which is the overlap rule's
+    /// `DISTINCT` would deduplicate chunks, which is the overlap rule's
     /// job; answering without it would be silently different.
     fn create_groups_accumulator(
         &self,
@@ -1087,6 +1097,8 @@ mod tests {
         let lit = |v: ScalarValue| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>;
         let exprs = vec![
             lit(ScalarValue::Null),
+            lit(ScalarValue::Null),
+            lit(ScalarValue::Null),
             lit(ScalarValue::Utf8(Some("rate".into()))),
             // `start`, which is not an Int64 literal.
             lit(ScalarValue::Utf8(Some("noon".into()))),
@@ -1101,8 +1113,8 @@ mod tests {
         assert!(!err.contains(crate::selector::NAME), "{err}");
 
         let mut unknown = exprs;
-        unknown[1] = lit(ScalarValue::Utf8(Some("rote".into())));
-        unknown[2] = lit(ScalarValue::Int64(Some(0)));
+        unknown[3] = lit(ScalarValue::Utf8(Some("rote".into())));
+        unknown[4] = lit(ScalarValue::Int64(Some(0)));
         let err = read_args(&unknown).unwrap_err().to_string();
         assert!(err.contains(NAME) && err.contains("rote"), "{err}");
     }

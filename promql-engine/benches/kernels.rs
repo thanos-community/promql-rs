@@ -29,7 +29,7 @@ use promql_engine::math::{self, FlagLane, Welford};
 use promql_engine::params::Params;
 use promql_engine::range::{self, Func};
 use promql_engine::selector::{self, STALE_NAN_BITS};
-use promql_engine::series::{self, Series};
+use promql_engine::series::{self, Block, Series};
 
 #[path = "support/pprof.rs"]
 mod profiler;
@@ -43,6 +43,12 @@ const STEP_MS: i64 = 30_000;
 const FIVE_MINUTES_MS: i64 = 5 * 60_000;
 /// Series lengths the per-series kernels are measured at.
 const LENGTHS: [usize; 2] = [1_000, 16_000];
+/// The one block every bench fixture sits in: the kernels are measured
+/// over whole series, the block edge is the planner's concern.
+const WHOLE: Block = Block {
+    start_ms: i64::MIN,
+    end_ms: i64::MAX,
+};
 
 /// A counter scraped every `SCRAPE_MS`, rising by a value that varies
 /// per sample and resetting every 1000 samples, like a restarting pod.
@@ -119,7 +125,7 @@ fn samples_of(all: &[(Vec<i64>, Vec<f64>)]) -> ArrayRef {
             Series::new(&labels, ts.clone(), vs.clone()).unwrap()
         })
         .collect();
-    let batch = series::encode(&series::label_names_of(&series), &series).unwrap();
+    let batch = series::encode(&series::label_names_of(&series), &series, WHOLE).unwrap();
     Arc::clone(batch.column_by_name(series::SAMPLES).unwrap())
 }
 
@@ -250,16 +256,23 @@ fn eval_series(
         ScalarValue::Int64(Some(p.offset_ms)),
         ScalarValue::Int64(p.at_ms),
     ]);
-    let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new(series::SAMPLES, 0))];
-    exprs.extend(
-        args.into_iter()
-            .map(|v| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>),
-    );
-    let schema = Schema::new(vec![Field::new(
-        series::SAMPLES,
-        series::samples_type(),
-        false,
-    )]);
+    let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+        Arc::new(Column::new(series::SAMPLES, 0)),
+        Arc::new(Column::new(series::BLOCK_START, 1)),
+        Arc::new(Column::new(series::BLOCK_END, 2)),
+    ];
+    // The function name sits between the block and the grid literals.
+    let mut args = args.into_iter();
+    if func.is_some() {
+        exprs.push(Arc::new(Literal::new(args.next().unwrap())));
+    }
+    // Every series folds in one block, so the block columns are literals.
+    exprs.extend(args.map(|v| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>));
+    let schema = Schema::new(vec![
+        Field::new(series::SAMPLES, series::samples_type(), false),
+        Field::new(series::BLOCK_START, series::timestamp_type(), false),
+        Field::new(series::BLOCK_END, series::timestamp_type(), false),
+    ]);
     let fields: Vec<FieldRef> = exprs
         .iter()
         .map(|e| e.return_field(&schema).unwrap())
@@ -277,7 +290,8 @@ fn eval_series(
             expr_fields: &fields,
         })
         .unwrap();
-    acc.update_batch(std::slice::from_ref(samples), groups, None, total)
+    let [start, end] = WHOLE.columns(samples.len());
+    acc.update_batch(&[Arc::clone(samples), start, end], groups, None, total)
         .unwrap();
     acc.evaluate(EmitTo::All).unwrap()
 }
@@ -323,7 +337,7 @@ fn selector_eval_series(c: &mut Criterion) {
 fn selector_apply(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
     let all = labelled(k, n);
-    let batch = series::encode(&series::label_names_of(&all), &all).unwrap();
+    let batch = series::encode(&series::label_names_of(&all), &all, WHOLE).unwrap();
     let samples = Arc::clone(batch.column_by_name(series::SAMPLES).unwrap());
     let groups: Vec<usize> = (0..k).collect();
     let udaf = selector::udaf();
@@ -370,7 +384,7 @@ fn range_function(c: &mut Criterion) {
 fn range_apply(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
     let all = labelled(k, n);
-    let batch = series::encode(&series::label_names_of(&all), &all).unwrap();
+    let batch = series::encode(&series::label_names_of(&all), &all, WHOLE).unwrap();
     let samples = Arc::clone(batch.column_by_name(series::SAMPLES).unwrap());
     let groups: Vec<usize> = (0..k).collect();
     let udaf = range::udaf();
@@ -460,11 +474,11 @@ fn series_encode_decode(c: &mut Criterion) {
     let (k, n) = (1_000usize, 1_000usize);
     let all = labelled(k, n);
     let names = series::label_names_of(&all);
-    let batch = series::encode(&names, &all).unwrap();
+    let batch = series::encode(&names, &all, WHOLE).unwrap();
     let mut g = c.benchmark_group("series");
     g.throughput(Throughput::Elements((k * n) as u64));
     g.bench_function(BenchmarkId::new("encode", format!("{k}x{n}")), |b| {
-        b.iter(|| series::encode(&names, black_box(&all)).unwrap())
+        b.iter(|| series::encode(&names, black_box(&all), WHOLE).unwrap())
     });
     g.bench_function(BenchmarkId::new("decode", format!("{k}x{n}")), |b| {
         b.iter(|| series::decode(std::slice::from_ref(black_box(&batch))).unwrap())
