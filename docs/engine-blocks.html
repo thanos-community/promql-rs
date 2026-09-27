@@ -137,11 +137,11 @@ code{
 }
 .byline{color:var(--text-faint); font-size:.85rem; margin-top:.15rem;}
 
-#glossary h2{margin-top:1.6rem;}
+#glossary h2{margin-top:1.4rem;}
 dl.glossary{margin:.4rem 0 .8rem; max-width:70ch;}
 dl.glossary dt{font-weight:600; margin-top:.75rem;}
 dl.glossary dt code{font-weight:500;}
-dl.glossary dd{margin:.15rem 0 0 1.1rem; color:var(--text-dim);}
+dl.glossary dd{margin:.15rem 0 0 1.1rem; color:var(--text-dim); font-size:.92rem;}
 
 .query-banner{
   margin-top:1.4rem;
@@ -375,21 +375,6 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
 <h1>How <code>rate</code> walks a block and crosses its edge</h1>
 <p class="byline">promql-engine internals &middot; companion to <a class="fl" href="engine.md">docs/engine.md</a> and <a class="fl" href="series-source.md">docs/series-source.md</a> &middot; illustrates <a class="fl" href="engine-blocks.md">docs/engine-blocks.md</a></p>
 
-<section id="glossary" aria-label="Before you read">
-<h2>Before you read</h2>
-<dl class="glossary">
-  <dt>Block</dt>
-  <dd>The store's unit of time, such as a TSDB block or an hour partition of a columnar store. The store cuts its answer to one <code>select</code> into blocks, sends them in ascending time order, and stamps every row with <code>block_start</code> and <code>block_end</code>. A block answers the steps in <code>[block_start, block_end)</code> and holds every sample their windows reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.</dd>
-  <dt>Batch (<code>RecordBatch</code>)</dt>
-  <dd>The rows the store sends together. The store may cut a block into batches anywhere, even between two rows of one series, and the engine gives a batch boundary no meaning. It is the unit of transport.</dd>
-  <dt>Row</dt>
-  <dd>One chunk of one series in one block. It has a <code>labels</code> struct, a <code>samples</code> list, and the two block columns. A series with several chunks in a block spans several rows. In sorted mode those rows are consecutive, and in keyed mode they carry a <code>series_id</code>. It is the unit the engine folds.</dd>
-  <dt>Chunk</dt>
-  <dd>A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim or join it, so a row may reach past a block edge or overlap the series' next row. It is the store's unit of storage.</dd>
-</dl>
-<p>One <code>select</code> yields blocks, a block arrives as batches, a batch holds rows, and a row holds one chunk's samples.</p>
-</section>
-
 <!-- The overview is the whole approach in one picture: time cut into blocks by the store,
      one series folded at a time inside a block, steps leaving at the block's edge.
      Times are the section 4 fixture's, so the picture and the step-through agree. -->
@@ -498,6 +483,21 @@ table.lanes td.out{color:var(--ok); font-weight:600;}
     <li><b>A block is folded one series at a time.</b> Rows come in label order; <code>rate</code> holds one series' window buffer and drops it at the next label set.</li>
     <li><b>The edge is when steps leave.</b> <code>sum</code> holds one partial per step of the open block and emits them once the block's last row has passed.</li>
   </ul>
+</section>
+
+<section id="glossary" aria-label="Before you read">
+<h2>Before you read</h2>
+<dl class="glossary">
+  <dt>Block</dt>
+  <dd>The store's unit of time, such as a TSDB block, named on every row by <code>block_start</code> and <code>block_end</code>. It holds every sample that the windows of its steps reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.</dd>
+  <dt>Batch (<code>RecordBatch</code>)</dt>
+  <dd>The rows the store sends together. The store may cut a block into batches anywhere, even between two rows of one series. It is the unit of transport.</dd>
+  <dt>Row</dt>
+  <dd>One chunk of one series in one block, with <code>labels</code>, <code>samples</code>, and the two block columns. A series with several chunks spans several rows, consecutive in sorted mode and tagged with a <code>series_id</code> in keyed mode. It is the unit the engine folds.</dd>
+  <dt>Chunk</dt>
+  <dd>A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim it, so a row may reach past a block edge or overlap the next row of its series. It is the store's unit of storage.</dd>
+</dl>
+<p>One <code>select</code> yields blocks, a block arrives as batches, a batch holds rows, and a row holds one chunk's samples.</p>
 </section>
 
 <p class="lede">A store cuts its answer into blocks along its own time units. It streams each block as rows, one per chunk of a series, in <code>RecordBatch</code>es it may cut anywhere. Inside a block, how are two rows of a series aligned so that <code>rate</code> can reach the last value of one and the first value of the next?</p>

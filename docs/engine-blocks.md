@@ -2,20 +2,20 @@
 
 promql-engine internals · companion to [engine.md](engine.md) and [series-source.md](series-source.md) · [illustrated version](engine-blocks.html), sections 1 to 7, with an overview of blocks, a step-through of section 4 across the block edge, and the Arrow buffer inspector
 
-## Before you read
-
-- **Block.** The store's unit of time, such as a TSDB block or an hour partition of a columnar store. The store cuts its answer to one `select` into blocks, sends them in ascending time order, and stamps every row with `block_start` and `block_end`. A block answers the steps in `[block_start, block_end)` and holds every sample their windows reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.
-- **Batch (`RecordBatch`).** The rows the store sends together. The store may cut a block into batches anywhere, even between two rows of one series, and the engine gives a batch boundary no meaning. It is the unit of transport.
-- **Row.** One chunk of one series in one block. It has a `labels` struct, a `samples` list, and the two block columns. A series with several chunks in a block spans several rows. In sorted mode those rows are consecutive, and in keyed mode they carry a `series_id`. It is the unit the engine folds.
-- **Chunk.** A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim or join it, so a row may reach past a block edge or overlap the series' next row. It is the store's unit of storage.
-
-One `select` yields blocks, a block arrives as batches, a batch holds rows, and a row holds one chunk's samples.
-
 A store cuts its answer into blocks along its own time units. It streams each block as rows, one per chunk of a series, in `RecordBatch`es it may cut anywhere. Inside a block, how are two rows of a series aligned so that `rate` can reach the last value of one and the first value of the next?
 
 `rate(x[5m])` · step 30 s · 420 s → 600 s · two batches, three rows, two series
 
 **They are not aligned, and need not be.** The two rows of `x` are ranges in two different `RecordBatch`es, read in arrival order. When the engine reads the second, the series' **window buffer** already holds copies of the first row's samples that a later window reaches. Alignment is a question only if the operator works on whole series. A grouped aggregate folds a block, not a series.
+
+## Before you read
+
+- **Block.** The store's unit of time, such as a TSDB block, named on every row by `block_start` and `block_end`. It holds every sample that the windows of its steps reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.
+- **Batch (`RecordBatch`).** The rows the store sends together. The store may cut a block into batches anywhere, even between two rows of one series. It is the unit of transport.
+- **Row.** One chunk of one series in one block, with `labels`, `samples`, and the two block columns. A series with several chunks spans several rows, consecutive in sorted mode and tagged with a `series_id` in keyed mode. It is the unit the engine folds.
+- **Chunk.** A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim it, so a row may reach past a block edge or overlap the next row of its series. It is the store's unit of storage.
+
+One `select` yields blocks, a block arrives as batches, a batch holds rows, and a row holds one chunk's samples.
 
 ## 1. The shape everything happens in
 
