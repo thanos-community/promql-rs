@@ -619,7 +619,7 @@ rate               = 12.2222222 / 300                           = 0.0407407407</
 <p><b>Functions that need every sample.</b> <code>quantile_over_time</code> and functions like it keep no running state. They refold the lane's slice of the same buffer at each step (<a href="engine-blocks.md#7-functions-that-need-every-sample-in-the-window">docs/engine-blocks.md</a>).</p>
 
 <div class="footnote" id="notes">
-<p><b>Notes on the numbers.</b> The fold and <code>extrapolatedRate</code> run in this page, term for term after Prometheus's <code>promql/functions.go</code>. The engine checks itself against the same rates in <code>the_engine_chunks_fixture</code> in <code>buffer.rs</code>.</p>
+<p><b>Notes on the numbers.</b> The fold and <code>extrapolatedRate</code> run in this page, term for term after Prometheus's <code>promql/functions.go</code>. The engine checks itself against the same rates in <code>the_engine_blocks_fixture</code> in <code>buffer.rs</code>.</p>
 </div>
 
 </main>
