@@ -5,26 +5,34 @@
 //! ported; the rest of `time.go` (the `Time` type, JSON/YAML marshaling)
 //! has no PromQL-parsing caller here.
 //!
-//! Stored as nanoseconds (`i64`), not milliseconds, because Go's overflow
-//! check runs in nanosecond units (`unitMap`'s multipliers are
+//! Wraps `chrono::TimeDelta` rather than a bare `i64` nanosecond count:
+//! `TimeDelta` already carries the accumulator, the arithmetic and the
+//! `Send + Sync + Copy` newtype semantics this type needs, and chrono is
+//! already in the dependency tree via arrow/DataFusion. `TimeDelta`'s own
+//! range is wider than Go's (it stores seconds and sub-second nanos
+//! separately, so it can hold millisecond-scale durations `i64` nanos
+//! cannot), so every constructor here still enforces Go's boundary,
+//! ±(1<<63−1) nanoseconds — the same bound `model.ParseDuration`'s
+//! overflow check compares against (`unitMap`'s multipliers are
 //! `time.Duration` values, and the accumulator is compared against
-//! `1<<63-1` nanoseconds). A millisecond-denominated accumulator would
-//! reject and accept a different set of large durations than upstream
-//! does (e.g. `294y` overflows in ns but not in ms), so nanoseconds is
-//! the only representation that reproduces Go's rejection boundary.
+//! `1<<63-1` nanoseconds). Letting a `TimeDelta` outside that range in
+//! would make [`Duration::as_nanos_i64`] lossy for a value this port
+//! itself could never have produced by parsing.
 
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration as StdDuration;
 
+use chrono::TimeDelta;
 use thiserror::Error;
 
-/// Port of `model.Duration` (`type Duration time.Duration`). Wraps a
-/// count of nanoseconds; negative values only arise via
-/// [`Duration::parse_allow_negative`], mirroring
-/// `model.ParseDurationAllowNegative`.
+/// Port of `model.Duration` (`type Duration time.Duration`). Every
+/// constructor enforces Go's range, ±(1<<63−1) nanoseconds, even though
+/// the wrapped `TimeDelta` could hold more (see the module doc comment);
+/// negative values only arise via [`Duration::parse_allow_negative`],
+/// mirroring `model.ParseDurationAllowNegative`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Duration(i64);
+pub struct Duration(TimeDelta);
 
 /// Port of the error strings `model.ParseDuration` returns. Upstream
 /// returns plain `fmt.Errorf`/`errors.New` values; we keep the same
@@ -42,20 +50,20 @@ pub enum ParseDurationError {
     OutOfRange,
 }
 
-/// One entry of Go's `unitMap`: `pos` orders units from biggest (1) to
-/// smallest (7) so parsing can reject out-of-order units (`1m1h`), and
+/// One entry of a unit table: `pos` orders units from biggest to
+/// smallest so parsing can reject out-of-order units (`1m1h`), and
 /// `mult_nanos` is the unit's length in nanoseconds.
 struct UnitInfo {
     pos: u8,
     mult_nanos: u64,
 }
 
-/// Port of `unitMap`. Units must appear in strictly descending
-/// significance (`pos` strictly increasing as the scan moves through the
-/// string) — this is what makes `1m1h` an error instead of silently
-/// meaning "1 minute + 1 hour": without the order check, a typo like
-/// swapping `h` and `m` would parse instead of failing.
-fn unit_info(unit: &str) -> Option<UnitInfo> {
+/// Port of `unitMap`, restricted to the units `model.ParseDuration`
+/// itself accepts (`y w d h m s ms`). `Duration::parse` — and so the
+/// PromQL grammar, which calls it — uses only this table: upstream's
+/// parser rejects `rate(x[5us])` the same way, and matching that means
+/// not accepting a finer unit here that Go's grammar never had.
+fn unit_info_basic(unit: &str) -> Option<UnitInfo> {
     Some(match unit {
         "ms" => UnitInfo { pos: 7, mult_nanos: 1_000_000 },
         "s" => UnitInfo { pos: 6, mult_nanos: 1_000_000_000 },
@@ -68,50 +76,82 @@ fn unit_info(unit: &str) -> Option<UnitInfo> {
     })
 }
 
-fn is_digit(b: u8) -> bool {
-    b.is_ascii_digit()
+/// Port of Go's full `time.ParseDuration` `unitMap`: `unit_info_basic`'s
+/// table plus the sub-millisecond units and their accepted spellings
+/// (`us`, the U+00B5 MICRO SIGN and U+03BC GREEK SMALL LETTER MU
+/// spellings of `µs`/`μs`, and `ns`). `Duration::parse_nanos` uses this
+/// table for `Display`'s round trip and for callers that need
+/// nanosecond-precision input (never the PromQL grammar — see
+/// `unit_info_basic`).
+fn unit_info_nanos(unit: &str) -> Option<UnitInfo> {
+    match unit {
+        "us" | "µs" | "μs" => Some(UnitInfo { pos: 8, mult_nanos: 1_000 }),
+        "ns" => Some(UnitInfo { pos: 9, mult_nanos: 1 }),
+        _ => unit_info_basic(unit),
+    }
+}
+
+fn is_digit(c: char) -> bool {
+    c.is_ascii_digit()
 }
 
 impl Duration {
-    /// Port of `model.ParseDuration`. Assumes a year is always 365d, a
-    /// week always 7d, a day always 24h. Negative durations are not
-    /// supported here (see [`Duration::parse_allow_negative`]).
-    pub fn parse(s: &str) -> Result<Duration, ParseDurationError> {
+    /// Shared scanner behind [`Duration::parse`] and
+    /// [`Duration::parse_nanos`]: one unit table parameterizes the same
+    /// digit/unit walk so the two entry points can't drift on the rules
+    /// (descending significance, each unit at most once, digits only,
+    /// bare `0`, empty rejected, overflow rejected). Iterates by `char`,
+    /// not by byte, because the nanosecond table's `µs`/`μs` spellings
+    /// are multi-byte UTF-8 — indexing by byte offset the way a
+    /// byte-only scanner would risks splitting one of those units mid
+    /// character.
+    fn parse_with(
+        s: &str,
+        unit_info: fn(&str) -> Option<UnitInfo>,
+    ) -> Result<Duration, ParseDurationError> {
         match s {
             // Allow 0 without a unit.
-            "0" => return Ok(Duration(0)),
+            "0" => return Ok(Duration(TimeDelta::zero())),
             "" => return Err(ParseDurationError::Empty),
             _ => {}
         }
 
         let orig = s;
-        let bytes = s.as_bytes();
-        let mut i = 0usize;
+        let mut chars = s.char_indices().peekable();
         let mut dur: u64 = 0;
         let mut last_unit_pos: u8 = 0;
 
-        while i < bytes.len() {
-            if !is_digit(bytes[i]) {
+        while let Some(&(num_start, c)) = chars.peek() {
+            if !is_digit(c) {
                 return Err(ParseDurationError::NotADuration(orig.to_string()));
             }
             // Consume [0-9]*.
-            let num_start = i;
-            while i < bytes.len() && is_digit(bytes[i]) {
-                i += 1;
+            let mut num_end = num_start;
+            while let Some(&(idx, c)) = chars.peek() {
+                if !is_digit(c) {
+                    break;
+                }
+                num_end = idx + c.len_utf8();
+                chars.next();
             }
-            let v: u64 = s[num_start..i]
+            let v: u64 = s[num_start..num_end]
                 .parse()
                 .map_err(|_| ParseDurationError::NotADuration(orig.to_string()))?;
 
             // Consume the unit: everything up to the next digit.
-            let unit_start = i;
-            while i < bytes.len() && !is_digit(bytes[i]) {
-                i += 1;
+            let unit_start = num_end;
+            let mut unit_end = unit_start;
+            while let Some(&(idx, c)) = chars.peek() {
+                if is_digit(c) {
+                    break;
+                }
+                unit_end = idx + c.len_utf8();
+                chars.next();
             }
-            if i == unit_start {
+            if unit_end == unit_start {
                 return Err(ParseDurationError::NotADuration(orig.to_string()));
             }
-            let unit = &s[unit_start..i];
+            let unit = &s[unit_start..unit_end];
             let info = unit_info(unit).ok_or_else(|| ParseDurationError::UnknownUnit {
                 unit: unit.to_string(),
                 orig: orig.to_string(),
@@ -134,7 +174,26 @@ impl Duration {
             }
         }
 
-        Ok(Duration(dur as i64))
+        Ok(Duration(TimeDelta::nanoseconds(dur as i64)))
+    }
+
+    /// Port of `model.ParseDuration`. Assumes a year is always 365d, a
+    /// week always 7d, a day always 24h. Negative durations are not
+    /// supported here (see [`Duration::parse_allow_negative`]). Units
+    /// stop at `ms`, matching upstream's grammar — see
+    /// `unit_info_basic`.
+    pub fn parse(s: &str) -> Result<Duration, ParseDurationError> {
+        Self::parse_with(s, unit_info_basic)
+    }
+
+    /// Same grammar and rules as [`Duration::parse`], extended below
+    /// `ms` with `us`/`µs`/`μs` and `ns` — the spellings Go's
+    /// `time.ParseDuration` accepts beyond `model.ParseDuration`'s more
+    /// restricted table. Not used by the PromQL grammar (see
+    /// `unit_info_basic`); it exists so [`Duration::to_string`]'s
+    /// sub-millisecond output round-trips through parsing.
+    pub fn parse_nanos(s: &str) -> Result<Duration, ParseDurationError> {
+        Self::parse_with(s, unit_info_nanos)
     }
 
     /// Port of `model.ParseDurationAllowNegative`.
@@ -145,26 +204,40 @@ impl Duration {
         }
     }
 
-    /// Nanoseconds, the type's internal unit (see the module doc comment
-    /// for why nanoseconds and not milliseconds).
+    /// Nanoseconds (see the module doc comment for why the range this can
+    /// return is narrower than `TimeDelta`'s own). Every constructor in
+    /// this module keeps the wrapped `TimeDelta` inside Go's
+    /// ±(1<<63−1)-nanosecond range, so `num_nanoseconds` returning `None`
+    /// here would mean an invariant this module itself broke.
     pub fn as_nanos_i64(&self) -> i64 {
         self.0
+            .num_nanoseconds()
+            .expect("Duration invariant: value always fits Go's i64-nanosecond range")
     }
 
-    /// Milliseconds, truncating any sub-millisecond remainder. `String()`
-    /// itself only ever operates at ms resolution or coarser (the
-    /// smallest parseable unit is `ms`), so this loses nothing a duration
-    /// produced by [`Duration::parse`] carries.
+    /// Milliseconds, truncating any sub-millisecond remainder — lossy for
+    /// a `Duration` built via [`Duration::parse_nanos`] (or a converted
+    /// `TimeDelta`) that carries a genuine sub-ms remainder; a `Duration`
+    /// produced by [`Duration::parse`] never has one, since `ms` is its
+    /// smallest unit.
     pub fn as_millis(&self) -> i64 {
-        self.0 / 1_000_000
+        self.as_nanos_i64() / 1_000_000
     }
 
     /// The inverse of [`Duration::as_millis`], for a caller that only has
     /// a raw millisecond count — the engine's UDF arguments are `i64`
     /// milliseconds, not a `Duration`, and this is how their planner
-    /// renderer turns one back into `5m` instead of `300000`.
-    pub fn from_millis(ms: i64) -> Duration {
-        Duration(ms * 1_000_000)
+    /// renderer turns one back into `5m` instead of `300000`. Fallible for
+    /// the same reason every other constructor here is: an `i64`
+    /// millisecond count can name a span outside Go's ±(1<<63−1)-
+    /// nanosecond range (`ms * 1_000_000` overflowing `i64` nanoseconds),
+    /// and this input is reachable straight from a query's step/lookback/
+    /// window/offset literals (`promql-engine/src/explain.rs`), not just
+    /// from a trusted internal caller, so it must reject rather than
+    /// panic or silently wrap.
+    pub fn from_millis(ms: i64) -> Result<Duration, ParseDurationError> {
+        let td = TimeDelta::try_milliseconds(ms).ok_or(ParseDurationError::OutOfRange)?;
+        Duration::try_from(td)
     }
 
     /// Port of `time.Duration.Seconds()`, the unit `promql-parser`'s
@@ -178,8 +251,9 @@ impl Duration {
     /// float bit pattern means matching its arithmetic, not just its
     /// intent.
     pub fn as_secs_f64(&self) -> f64 {
-        let sec = self.0 / 1_000_000_000;
-        let nsec = self.0 % 1_000_000_000;
+        let nanos = self.as_nanos_i64();
+        let sec = nanos / 1_000_000_000;
+        let nsec = nanos % 1_000_000_000;
         sec as f64 + nsec as f64 / 1_000_000_000.0
     }
 }
@@ -197,19 +271,32 @@ impl fmt::Display for Duration {
     /// remainder divides exactly — upstream's comment: "it is often
     /// easier to read 90d than 12w6d" — so `90d` stays `90d`, not folded
     /// into weeks.
+    ///
+    /// Go's `String()` never sees below `ms` because `time.Duration`'s
+    /// own textual round trip lives in `unitMap`'s minimum, `ms`; this
+    /// port's `Duration` can hold true nanoseconds (via
+    /// [`Duration::parse_nanos`] or a converted `TimeDelta`), so
+    /// truncating at `ms` here the way Go does would print two different
+    /// `Duration` values — `1ms` and `1ms500ns` — identically. Instead,
+    /// once the ms-and-above digits are emitted the same way Go would,
+    /// any sub-ms remainder continues in `us`/`ns`, non-zero units only,
+    /// so a value that Go's `unitMap` never has to represent still
+    /// prints losslessly and round-trips through [`Duration::parse_nanos`].
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut ms = self.0 / 1_000_000;
+        let total_nanos = self.as_nanos_i64();
 
-        if ms == 0 {
+        if total_nanos == 0 {
             return write!(f, "0s");
         }
 
-        let sign = if ms < 0 {
-            ms = -ms;
-            "-"
-        } else {
-            ""
-        };
+        let neg = total_nanos < 0;
+        // Safe: `total_nanos != i64::MIN`, since Go's range excludes it
+        // (the invariant `as_nanos_i64` documents).
+        let total_nanos_abs = total_nanos.unsigned_abs();
+        let mut ms = (total_nanos_abs / 1_000_000) as i64;
+        let sub_ms_nanos = total_nanos_abs % 1_000_000;
+
+        let sign = if neg { "-" } else { "" };
 
         let mut out = String::new();
         // `exact`: only emit this unit if it divides the remainder with
@@ -234,7 +321,49 @@ impl fmt::Display for Duration {
         emit("s", 1000, false, &mut ms);
         emit("ms", 1, false, &mut ms);
 
+        if sub_ms_nanos > 0 {
+            let us = sub_ms_nanos / 1_000;
+            let ns = sub_ms_nanos % 1_000;
+            if us > 0 {
+                out.push_str(&us.to_string());
+                out.push_str("us");
+            }
+            if ns > 0 {
+                out.push_str(&ns.to_string());
+                out.push_str("ns");
+            }
+        }
+
         write!(f, "{sign}{out}")
+    }
+}
+
+impl From<Duration> for TimeDelta {
+    fn from(d: Duration) -> Self {
+        d.0
+    }
+}
+
+impl TryFrom<TimeDelta> for Duration {
+    type Error = ParseDurationError;
+
+    /// A `TimeDelta` outside Go's ±(1<<63−1)-nanosecond range is
+    /// rejected rather than silently clamped or truncated — see the
+    /// module doc comment. `num_nanoseconds` already returns `None`
+    /// exactly at that boundary (it overflows `i64` at `i64::MAX + 1`
+    /// nanoseconds and `TimeDelta` is otherwise symmetric), except for
+    /// `i64::MIN`: that fits in `i64` and is a valid `time.Duration` in
+    /// Go, but it is one magnitude past what `ParseDurationAllowNegative`
+    /// (the only Go path that ever produces a negative `Duration`) can
+    /// reach — it negates a magnitude `ParseDuration` already bounded to
+    /// `i64::MAX` — so no value this port constructs by parsing is ever
+    /// `i64::MIN`, and this rejects it explicitly rather than accept a
+    /// `TimeDelta` no parse path could hand back.
+    fn try_from(td: TimeDelta) -> Result<Self, Self::Error> {
+        match td.num_nanoseconds() {
+            Some(n) if n != i64::MIN => Ok(Duration(td)),
+            _ => Err(ParseDurationError::OutOfRange),
+        }
     }
 }
 
@@ -244,7 +373,7 @@ impl TryFrom<Duration> for StdDuration {
     /// `std::time::Duration` has no sign; a negative `Duration` (only
     /// reachable via `parse_allow_negative`) does not fit.
     fn try_from(d: Duration) -> Result<Self, Self::Error> {
-        let nanos: u64 = u64::try_from(d.0)?;
+        let nanos: u64 = u64::try_from(d.as_nanos_i64())?;
         Ok(StdDuration::from_nanos(nanos))
     }
 }
@@ -254,10 +383,12 @@ impl TryFrom<StdDuration> for Duration {
 
     /// `std::time::Duration` can exceed `i64` nanoseconds (its range goes
     /// to ~584 years); this rejects what doesn't fit rather than
-    /// silently truncating.
+    /// silently truncating. `i64::try_from` succeeding is exactly Go's
+    /// positive bound (`i64::MAX` nanoseconds), so no separate range
+    /// check is needed here the way [`TryFrom<TimeDelta>`] needs one.
     fn try_from(d: StdDuration) -> Result<Self, Self::Error> {
         let nanos = i64::try_from(d.as_nanos())?;
-        Ok(Duration(nanos))
+        Ok(Duration(TimeDelta::nanoseconds(nanos)))
     }
 }
 
@@ -388,9 +519,24 @@ mod tests {
 
     #[test]
     fn from_millis_round_trips_through_as_millis() {
-        assert_eq!(Duration::from_millis(300_000).to_string(), "5m");
-        assert_eq!(Duration::from_millis(90_000).to_string(), "1m30s");
-        assert_eq!(Duration::from_millis(300_000).as_millis(), 300_000);
+        assert_eq!(Duration::from_millis(300_000).unwrap().to_string(), "5m");
+        assert_eq!(Duration::from_millis(90_000).unwrap().to_string(), "1m30s");
+        assert_eq!(Duration::from_millis(300_000).unwrap().as_millis(), 300_000);
+    }
+
+    /// `from_millis` takes a raw `i64` millisecond count straight from a
+    /// query's step/lookback/window/offset literals (see its doc
+    /// comment), so it must reject what falls outside Go's ±(1<<63−1)-
+    /// nanosecond range instead of panicking (`i64::MIN`, inside
+    /// `TimeDelta::try_milliseconds` itself) or building a `Duration`
+    /// whose `as_nanos_i64` would then panic on its own invariant
+    /// (`i64::MAX` milliseconds, which is in range for `TimeDelta` but
+    /// overflows `i64` nanoseconds).
+    #[test]
+    fn from_millis_rejects_out_of_range() {
+        assert!(Duration::from_millis(i64::MIN).is_err());
+        assert!(Duration::from_millis(i64::MAX).is_err());
+        assert!(Duration::from_millis(9_223_372_036_854).is_ok());
     }
 
     #[test]
@@ -413,5 +559,115 @@ mod tests {
         assert_ne!(go_way, undivided, "test input must actually exercise the rounding difference");
         assert_eq!(d.as_secs_f64(), go_way);
         assert_eq!(d.as_secs_f64(), 1.1179999999999999);
+    }
+
+    /// Port of Go's `time.ParseDuration`'s sub-millisecond unit table
+    /// (`unitMap` in `time/format.go`), which `model.ParseDuration` does
+    /// not expose — see [`Duration::parse_nanos`].
+    #[test]
+    fn parse_nanos_units() {
+        let cases: &[(&str, i64)] = &[
+            ("1ms500us", 1_500_000),
+            ("1us", 1_000),
+            ("1µs", 1_000),
+            ("1μs", 1_000),
+            ("1ns", 1),
+            ("1s1ns", 1_000_000_001),
+            ("0", 0),
+        ];
+        for &(input, want_nanos) in cases {
+            let d = Duration::parse_nanos(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(d.as_nanos_i64(), want_nanos, "{input}");
+        }
+    }
+
+    /// `1ns1us` breaks the descending-significance rule (ns is smaller
+    /// than us but appears first); `1us1us` repeats a unit. Both are
+    /// errors under the same ordering check `parse_bad_duration` proves
+    /// for the basic table.
+    #[test]
+    fn parse_nanos_rejects_bad_order_and_repeats() {
+        assert!(Duration::parse_nanos("1ns1us").is_err());
+        assert!(Duration::parse_nanos("1us1us").is_err());
+    }
+
+    /// `model.ParseDuration`'s grammar stops at `ms`; the PromQL parser
+    /// calls `Duration::parse`, never `parse_nanos`, so a query duration
+    /// literal with `us` or `ns` is rejected exactly as upstream rejects
+    /// it (see `unit_info_basic`).
+    #[test]
+    fn parse_rejects_sub_millisecond_units() {
+        for c in ["5us", "5ns", "1000000ns"] {
+            assert!(Duration::parse(c).is_err(), "expected error for {c:?}");
+        }
+    }
+
+    /// [`Duration::to_string`]'s sub-millisecond continuation (see its
+    /// doc comment): `1ms500us` and `1ns` exercise the `us`/`ns` tail,
+    /// `1s1ns` exercises a whole-second value with a bare nanosecond
+    /// remainder, and `1500ms` proves the ms-and-above rendering is
+    /// unchanged from Go's.
+    #[test]
+    fn display_sub_millisecond_remainder() {
+        assert_eq!(Duration::parse_nanos("1ms500us").unwrap().to_string(), "1ms500us");
+        assert_eq!(Duration::parse_nanos("1ns").unwrap().to_string(), "1ns");
+        assert_eq!(Duration::parse_nanos("1s1ns").unwrap().to_string(), "1s1ns");
+        assert_eq!(Duration::from_millis(1500).unwrap().to_string(), "1s500ms");
+    }
+
+    /// `Duration::parse_nanos(d.to_string())` must recover `d` exactly,
+    /// for both the basic (ms-and-above) and nanosecond-extended
+    /// vocabularies — `Display` only ever emits units both tables
+    /// recognize.
+    #[test]
+    fn round_trip_parse_nanos_format() {
+        // Basic-table cases, built with `parse_allow_negative` (signed).
+        let basic = [
+            "0s", "324ms", "3s", "5m", "1h", "4d", "4d1h", "2w", "3w", "23d1h", "10y",
+            "-3s", "-23d1h",
+        ];
+        // Nanosecond-table-only cases (unsigned; `parse_nanos` has no
+        // negative variant).
+        let nanos = ["1ms500us", "1ns", "1s1ns", "1s500ms"];
+
+        for c in basic {
+            let d = Duration::parse_allow_negative(c).unwrap_or_else(|e| panic!("{c}: {e}"));
+            let formatted = d.to_string();
+            // `parse_nanos` has no sign handling of its own (only
+            // `parse_allow_negative` does, and it stays on the basic
+            // table); strip the sign here the same way that wrapper does.
+            let (neg, unsigned) = match formatted.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, formatted.as_str()),
+            };
+            let mut d2 = Duration::parse_nanos(unsigned).unwrap_or_else(|e| panic!("{formatted}: {e}"));
+            if neg {
+                d2 = Duration(-TimeDelta::from(d2));
+            }
+            assert_eq!(d2, d, "round trip for {c:?} -> {formatted:?}");
+        }
+        for c in nanos {
+            let d = Duration::parse_nanos(c).unwrap_or_else(|e| panic!("{c}: {e}"));
+            let formatted = d.to_string();
+            let d2 = Duration::parse_nanos(&formatted).unwrap_or_else(|e| panic!("{formatted}: {e}"));
+            assert_eq!(d2, d, "round trip for {c:?} -> {formatted:?}");
+        }
+    }
+
+    #[test]
+    fn time_delta_conversions() {
+        let d = Duration::parse("1h30m").unwrap();
+        let td: TimeDelta = d.into();
+        assert_eq!(td, TimeDelta::seconds(5400));
+        let back = Duration::try_from(td).unwrap();
+        assert_eq!(back, d);
+
+        let neg = Duration::parse_allow_negative("-1h").unwrap();
+        let neg_td: TimeDelta = neg.into();
+        assert_eq!(Duration::try_from(neg_td).unwrap(), neg);
+
+        // Beyond Go's i64-nanosecond range: `TimeDelta::MAX` is bounded
+        // by `i64::MAX` *milliseconds*, far past `i64::MAX` nanoseconds.
+        assert!(Duration::try_from(TimeDelta::MAX).is_err());
     }
 }

@@ -305,12 +305,12 @@ fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
     let lookback = require_i64(&args[4])?;
     let offset = require_i64(&args[5])?;
     let at = optional_i64(&args[6])?;
-    push_offset_and_at(&mut samples, offset, at);
+    push_offset_and_at(&mut samples, offset, at)?;
 
     Some(format!(
         "vector_selector({samples}, {start}..{end} step {}, lookback {})",
-        Duration::from_millis(step),
-        Duration::from_millis(lookback)
+        Duration::from_millis(step).ok()?,
+        Duration::from_millis(lookback).ok()?
     ))
 }
 
@@ -333,24 +333,29 @@ fn render_range_function(args: &[Expr], single_scan: bool) -> Option<String> {
     let offset = require_i64(&args[6])?;
     let at = optional_i64(&args[7])?;
 
-    let mut column = format!("{samples}[{}]", Duration::from_millis(window));
-    push_offset_and_at(&mut column, offset, at);
+    let mut column = format!("{samples}[{}]", Duration::from_millis(window).ok()?);
+    push_offset_and_at(&mut column, offset, at)?;
 
     Some(format!(
         "{func}({column}, {start}..{end} step {})",
-        Duration::from_millis(step)
+        Duration::from_millis(step).ok()?
     ))
 }
 
 /// Appends PromQL's own selector-modifier suffix — `offset` before `@`,
 /// each only when present — directly onto the column text they modify.
-fn push_offset_and_at(s: &mut String, offset: i64, at: Option<i64>) {
+/// `None` when `offset`'s millisecond count is out of Go's `Duration`
+/// range, same fallthrough rule as every other recogniser here: the
+/// caller falls back to DataFusion's own text for the whole expression
+/// rather than rendering a partial line.
+fn push_offset_and_at(s: &mut String, offset: i64, at: Option<i64>) -> Option<()> {
     if offset != 0 {
-        s.push_str(&format!(" offset {}", Duration::from_millis(offset)));
+        s.push_str(&format!(" offset {}", Duration::from_millis(offset).ok()?));
     }
     if let Some(at) = at {
         s.push_str(&format!(" @ {at}"));
     }
+    Some(())
 }
 
 /// `promql_labels('a', <a>, 'b', <b>, …)` as `labels{a, b}`, or `labels{a:
@@ -452,7 +457,7 @@ fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option
     let step = require_i64(&args[4])?;
     Some(format!(
         "{op}({samples}, {start}..{end} step {})",
-        Duration::from_millis(step)
+        Duration::from_millis(step).ok()?
     ))
 }
 
@@ -513,7 +518,7 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
         keys.push(key);
     }
 
-    let step_text = Duration::from_millis(step);
+    let step_text = Duration::from_millis(step).ok()?;
     Some(if keys.is_empty() {
         format!("Aggregate: {op}({samples}, {start}..{end} step {step_text})")
     } else {
@@ -587,9 +592,9 @@ mod tests {
 
     #[test]
     fn duration_renders_like_go_string() {
-        assert_eq!(Duration::from_millis(300_000).to_string(), "5m");
-        assert_eq!(Duration::from_millis(90_000).to_string(), "1m30s");
-        assert_eq!(Duration::from_millis(0).to_string(), "0s");
+        assert_eq!(Duration::from_millis(300_000).unwrap().to_string(), "5m");
+        assert_eq!(Duration::from_millis(90_000).unwrap().to_string(), "1m30s");
+        assert_eq!(Duration::from_millis(0).unwrap().to_string(), "0s");
     }
 
     #[test]
@@ -632,6 +637,19 @@ mod tests {
             render_expr(&call, true),
             "rate(samples[5m] offset 1h @ 900000, 600000..1200000 step 30s)"
         );
+    }
+
+    /// A step outside Go's ±(1<<63−1)-nanosecond range (`i64::MAX`
+    /// milliseconds overflows `i64` nanoseconds) makes `Duration::from_millis`
+    /// return `Err`; `render_range_function` propagates that as `None` via
+    /// `?`, and `render_expr` falls through to DataFusion's own rendering
+    /// of the call, same as any other shape this module doesn't recognize.
+    #[test]
+    fn range_function_with_unrenderable_step_falls_through_to_datafusion() {
+        let mut p = params(0, None);
+        p.step_ms = i64::MAX;
+        let call = range::call(col("samples"), col(series::BLOCK_START), col(series::BLOCK_END), range::Func::Rate, &p);
+        assert_eq!(render_expr(&call, true), call.to_string());
     }
 
     #[test]

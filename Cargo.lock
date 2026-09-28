@@ -3090,6 +3090,7 @@ dependencies = [
 name = "promql-common"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "thiserror 2.0.21",
 ]
 

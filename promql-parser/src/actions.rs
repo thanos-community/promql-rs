@@ -1047,3 +1047,18 @@ fn unquote_string(raw: &str) -> Result<String, ()> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_duration_seconds` delegates to `Duration::parse`, which
+    /// stops at `ms` (see `promql_common::model::time`'s `unit_info_basic`
+    /// doc comment) — the PromQL grammar has never had a sub-millisecond
+    /// duration unit, so `rate(x[5us])` is rejected the same way upstream
+    /// rejects it.
+    #[test]
+    fn duration_literal_rejects_sub_millisecond_unit() {
+        assert!(parse_duration_seconds("5us").is_err());
+    }
+}

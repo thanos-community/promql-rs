@@ -10,4 +10,5 @@ description = "Structural hand-port of prometheus/common's model package"
 path = "src/lib.rs"
 
 [dependencies]
+chrono = { workspace = true }
 thiserror = { workspace = true }
