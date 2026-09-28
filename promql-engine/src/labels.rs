@@ -211,8 +211,9 @@ pub fn group_keys(input: &[String], grouping: &[String], without: bool) -> Vec<S
 const GROUP_PREFIX: &str = "__group__";
 
 /// The DataFusion column name a group key is aliased to. Shared by
-/// [`group_exprs`] and [`regroup`] so the two cannot drift apart.
-fn group_alias(key: &str) -> String {
+/// [`group_exprs`], [`regroup`] and `explain.rs`'s `Aggregate` shorthand
+/// so none of the three can drift apart.
+pub(crate) fn group_alias(key: &str) -> String {
     format!("{GROUP_PREFIX}{key}")
 }
 

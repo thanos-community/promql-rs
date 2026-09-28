@@ -572,22 +572,12 @@ fn parse_range(file: &str, line: usize, from: &str, to: &str, step: &str) -> Res
 
 /// A promqltest time offset, in milliseconds from the epoch.
 ///
-/// Upstream uses `model.ParseDuration`, which accepts a bare `0` with no
-/// unit — and the corpus leans on that, in `eval instant at 0` and
-/// `eval range from 0`. Our [`promql_parser::parse_duration_seconds`]
-/// serves the PromQL grammar, where a unit is mandatory, so the bare
-/// case is handled here rather than by loosening a parser that is right
-/// as it stands.
-///
-/// The remaining difference is that we are *laxer* than upstream: it
-/// rejects `1.5h` and out-of-order units like `30m1h`. Accepting more
-/// than upstream cannot make a vendored file parse wrongly, only make a
-/// malformed one we never see parse at all.
+/// Upstream uses `model.ParseDuration`, and `promql_parser::parse_duration_seconds`
+/// is the same grammar via `promql_common::model::Duration`, so no local special
+/// cases: a bare `0` (`eval instant at 0`) parses because Go accepts it, and `1.5h`
+/// or `30m1h` fail because Go rejects them.
 fn duration_ms(raw: &str) -> Option<i64> {
     let raw = raw.trim();
-    if raw == "0" {
-        return Some(0);
-    }
     promql_parser::parse_duration_seconds(raw)
         .ok()
         .map(|secs| (secs * 1000.0).round() as i64)

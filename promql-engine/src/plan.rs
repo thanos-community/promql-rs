@@ -187,7 +187,8 @@ impl Planner<'_> {
     ) -> Result<(LogicalPlanBuilder, Vec<String>), EngineError> {
         reject_unsupported_modifiers(vs)?;
         let table =
-            SelectorTable::try_new(self.state, self.source, &effective_matchers(vs), hints).await?;
+            SelectorTable::try_new(self.state, self.source, &vs.name, &effective_matchers(vs), hints)
+                .await?;
         let label_names = table.label_names();
         let index = self.selectors;
         self.selectors += 1;

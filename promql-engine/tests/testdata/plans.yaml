@@ -294,3 +294,48 @@ tests:
         AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
           SeriesSetExec
             DataSourceExec: partitions=1, partition_sizes=[6]
+
+  - name: range function with an offset of an hour
+    description: >
+      offset is PromQL's own selector modifier and prints attached to the
+      column it modifies, inside the call's parentheses rather than as a
+      trailing argument.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      rate(http_requests_total[5m] offset 1h)
+    plan: |
+      Projection: labels{job, pod}, rate(samples[5m] offset 1h, 600000..1200000 step 30s)
+        TableScan: http_requests_total
+
+  - name: without resolves to the remaining keys at plan time
+    description: >
+      The planner turns without (pod) into by over whatever labels are
+      left, so the plan only ever holds a by clause: this pins that
+      sum by (job) is what without (pod) actually plans to, not a
+      without-shaped node the renderer would need to reconstruct.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      sum without (pod) (rate(http_requests_total[5m]))
+    plan: |
+      Projection: labels{job: __group__job}
+        Aggregate: sum by (job) (samples, 600000..1200000 step 30s)
+          Projection: labels{job, pod}, rate(samples[5m], 600000..1200000 step 30s)
+            TableScan: http_requests_total
+
+  - name: an at modifier on a range function
+    description: >
+      @ takes seconds in PromQL but the plan carries milliseconds, so the
+      pin shows the raw resolved timestamp the plan holds rather than the
+      query's own units.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      rate(http_requests_total[5m] @ 900)
+    plan: |
+      Projection: labels{job, pod}, rate(samples[5m] @ 900000, 600000..1200000 step 30s)
+        TableScan: http_requests_total

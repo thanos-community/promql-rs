@@ -7,6 +7,8 @@
 //! to Rust's `snake_case`. A non-trivial field-name change would cost us
 //! diff review against future upstream.
 
+use std::fmt;
+
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
 
@@ -41,6 +43,18 @@ impl MatchOp {
     }
 }
 
+/// Port of `labels.MatchType.String()`.
+impl fmt::Display for MatchOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            MatchOp::Equal => "=",
+            MatchOp::NotEqual => "!=",
+            MatchOp::RegexEqual => "=~",
+            MatchOp::RegexNotEqual => "!~",
+        })
+    }
+}
+
 /// Single label matcher from a `{…}` selector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabelMatcher {
@@ -48,6 +62,116 @@ pub struct LabelMatcher {
     pub op: MatchOp,
     pub value: String,
     pub pos_range: PositionRange,
+}
+
+/// Port of `labels.Matcher.String()`: `name<op>"value"`, `name` quoted
+/// with Go's `%q` when it isn't a bare identifier (`shouldQuoteName`
+/// upstream) — a name matcher's own name is never quoted in practice
+/// (the parser only accepts identifiers there), but a defensive port
+/// stays correct if that ever changes.
+impl fmt::Display for LabelMatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if should_quote_name(&self.name) {
+            write!(f, "{}", go_quote(&self.name))?;
+        } else {
+            f.write_str(&self.name)?;
+        }
+        write!(f, "{}{}", self.op, go_quote(&self.value))
+    }
+}
+
+/// Port of `Matcher.shouldQuoteName`: a bare name is `[A-Za-z_][A-Za-z0-9_]*`.
+fn should_quote_name(name: &str) -> bool {
+    let mut chars = name.char_indices();
+    match chars.next() {
+        Some((_, c)) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return true,
+    }
+    for (i, c) in chars {
+        if c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Port of Go's `strconv.AppendQuote`, the quoting `%q` and
+/// `Matcher.String()` use: a `"`-delimited string, `appendEscapedRune`
+/// (`strconv/quote.go`) run over every rune.
+fn go_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        append_escaped_rune(&mut out, c);
+    }
+    out.push('"');
+    out
+}
+
+/// Port of `appendEscapedRune`, the double-quote case (`quote == '"'`,
+/// `ASCIIonly` and `graphicOnly` both false — the only call
+/// `Quote`/`AppendQuote` ever make). Go's own control-character names
+/// (`\a`, `\b`, `\f`, `\v`) come before the generic `\xNN`/`\uNNNN`/
+/// `\UNNNNNNNN` fallback, in the same order, since `\n`, `\r`, `\t` and
+/// `\x07` (BEL) all have a named form that would otherwise be shadowed
+/// by the generic one below.
+fn append_escaped_rune(out: &mut String, r: char) {
+    if r == '"' || r == '\\' {
+        out.push('\\');
+        out.push(r);
+        return;
+    }
+    if is_go_print(r) {
+        out.push(r);
+        return;
+    }
+    match r {
+        '\u{07}' => out.push_str("\\a"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0c}' => out.push_str("\\f"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{0b}' => out.push_str("\\v"),
+        _ => {
+            let cp = r as u32;
+            if cp < 0x20 || r == '\u{7f}' {
+                out.push_str(&format!("\\x{cp:02x}"));
+            } else if cp < 0x10000 {
+                out.push_str(&format!("\\u{cp:04x}"));
+            } else {
+                out.push_str(&format!("\\U{cp:08x}"));
+            }
+        }
+    }
+}
+
+/// Port of `unicode.IsPrint` as `appendEscapedRune` uses it: ASCII space
+/// through `~` prints raw; above ASCII, Go prints everything except the
+/// control (Cc), format (Cf), private-use (Co), surrogate (Cs) and
+/// unassigned (Cn) categories, and every separator (Zs/Zl/Zp) but the
+/// plain ASCII space already handled above.
+///
+/// `char::is_control` covers Cc (which is what makes U+0085 escape, the
+/// test below). `char::is_whitespace` is a proxy for the Zs/Zl/Zp
+/// carve-out — it is the Unicode `White_Space` property, not exactly
+/// "separator", but it is exactly the separators this engine's label
+/// values are ever built from (space, NBSP, line/paragraph separator),
+/// and it costs nothing else since none of the plain-space or control
+/// runes it also matches reach this branch.
+///
+/// Cf/Co/Cn are not excluded: doing that needs full Unicode category
+/// tables, which the standard library does not expose and this crate
+/// pulls in no dependency for. Per AGENTS.md, Go wins on a float
+/// disagreement; here the stated divergence is that a format, private-
+/// use or unassigned code point in a label value prints raw where Go
+/// would escape it, rather than silently claiming to match `IsPrint`.
+fn is_go_print(r: char) -> bool {
+    if r.is_ascii() {
+        return (' '..='~').contains(&r);
+    }
+    !(r.is_control() || r.is_whitespace())
 }
 
 /// One point of a series description's value sequence. Mirrors
@@ -334,5 +458,48 @@ impl DurationExpr {
             start: self.start_pos,
             end: self.end_pos,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each case checked against `strconv.Quote` itself (`go run` on the
+    /// pinned Go toolchain), not against a hand-derived expectation.
+    #[test]
+    fn go_quote_matches_go_strconv_quote() {
+        let cases: &[(&str, &str)] = &[
+            ("a\"b", "\"a\\\"b\""),
+            ("a\\b", "\"a\\\\b\""),
+            ("\n", "\"\\n\""),
+            ("\u{07}", "\"\\a\""),  // BEL, named \a, not \x07
+            ("\u{7f}", "\"\\x7f\""),
+            ("\u{85}", "\"\\u0085\""), // NEL, a Cc control above ASCII
+            ("\u{a0}", "\"\\u00a0\""), // NBSP, Zs
+            ("\u{2028}", "\"\\u2028\""), // LINE SEPARATOR, Zl
+            ("ü", "\"ü\""),         // printable non-ASCII: stays raw
+        ];
+        for (input, want) in cases {
+            assert_eq!(&go_quote(input), want, "go_quote({input:?})");
+        }
+    }
+
+    #[test]
+    fn label_matcher_display_matches_go_matcher_string() {
+        let m = |name: &str, op, value: &str| LabelMatcher {
+            name: name.to_string(),
+            op,
+            value: value.to_string(),
+            pos_range: PositionRange::default(),
+        };
+        assert_eq!(
+            m("job", MatchOp::Equal, "api").to_string(),
+            r#"job="api""#
+        );
+        assert_eq!(
+            m("job", MatchOp::RegexEqual, "a|b").to_string(),
+            r#"job=~"a|b""#
+        );
     }
 }

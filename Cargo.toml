@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "promql-common",
     "promql-conformance",
     "promql-engine",
     "promql-parser",

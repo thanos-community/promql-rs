@@ -5,7 +5,10 @@
 //! pruning labels, an aggregation that loses its grouping expression, a
 //! literal that stops being folded in. Rendering the `LogicalPlan` and
 //! comparing it to an expected text makes that visible as a reviewable
-//! diff instead.
+//! diff instead. The rendering is `promql_engine::explain_plan`, not
+//! `LogicalPlan::display_indent()`: see `src/explain.rs` for why a plan
+//! pin needs its own reader-facing text and what makes that text safe to
+//! trust.
 //!
 //! The expectations are descriptive, not normative: a deliberate planner
 //! change updates the YAML, and that diff is the review. The corpus is
@@ -171,8 +174,7 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     let plan = rt
         .block_on(engine.plan_async(&source, query, range))
         .expect("the query plans");
-    // The renderer borrows the plan, so it cannot be the tail expression.
-    let logical = plan.display_indent().to_string();
+    let logical = promql_engine::explain_plan(&plan);
     // The engine's own physical plan, not one lowered here, so the text is
     // what the engine runs.
     let physical = case.physical.as_ref().map(|_| {

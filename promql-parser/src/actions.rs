@@ -990,55 +990,18 @@ fn parse_number_literal(raw: &str) -> Result<f64, ()> {
 }
 
 /// Parse a PromQL duration literal (`30s`, `1h30m`, `500ms`) into
-/// seconds. Mirrors upstream's `model.ParseDuration`.
+/// seconds. Delegates the grammar to `promql_common::model::Duration`,
+/// the hand-port of upstream's `model.ParseDuration` — one duration
+/// grammar for the whole workspace instead of a second, subtly different
+/// one living here.
 ///
 /// Public because promqltest scripts carry durations of their own, in
 /// `load <interval>` directives and in eval ranges, and those are the
 /// same literals. A second implementation would drift.
 pub fn parse_duration_seconds(raw: &str) -> Result<f64, ()> {
-    let mut total = 0f64;
-    let mut chars = raw.chars().peekable();
-    let mut had_any = false;
-    while chars.peek().is_some() {
-        let mut num = String::new();
-        while let Some(&c) = chars.peek() {
-            if c.is_ascii_digit() || c == '.' {
-                num.push(c);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if num.is_empty() {
-            return Err(());
-        }
-        let n: f64 = num.parse().map_err(|_| ())?;
-        let mut unit = String::new();
-        while let Some(&c) = chars.peek() {
-            if c.is_ascii_alphabetic() {
-                unit.push(c);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        let multiplier = match unit.as_str() {
-            "ms" => 1e-3,
-            "s" => 1.0,
-            "m" => 60.0,
-            "h" => 3600.0,
-            "d" => 86400.0,
-            "w" => 604_800.0,
-            "y" => 31_536_000.0,
-            _ => return Err(()),
-        };
-        total += n * multiplier;
-        had_any = true;
-    }
-    if !had_any {
-        return Err(());
-    }
-    Ok(total)
+    promql_common::model::Duration::parse(raw)
+        .map(|d| d.as_secs_f64())
+        .map_err(|_| ())
 }
 
 fn unquote_string(raw: &str) -> Result<String, ()> {
