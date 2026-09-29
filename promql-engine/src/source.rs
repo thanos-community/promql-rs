@@ -62,7 +62,7 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics,
 };
 use futures::{Stream, StreamExt};
 use promql_parser::ast::LabelMatcher;
@@ -279,14 +279,26 @@ impl SeriesSetExec {
     /// `input` must have a schema that passed [`series::validate`].
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
         let schema = input.schema();
-        let column = |name: &str| {
-            let column = Column::new(name, schema.index_of(name).expect("a canonical schema"));
-            PhysicalSortExpr::new_default(Arc::new(column))
+        let column = |name: &str| -> Arc<dyn PhysicalExpr> {
+            Arc::new(Column::new(
+                name,
+                schema.index_of(name).expect("a canonical schema"),
+            ))
         };
-        let ordering = [column(BLOCK_START), column(BLOCK_END), column(LABELS)];
+        let labels = column(LABELS);
+        let ordering = [column(BLOCK_START), column(BLOCK_END), Arc::clone(&labels)]
+            .map(PhysicalSortExpr::new_default);
         let eq = EquivalenceProperties::new_with_orderings(schema, [ordering]);
+        // Every label set whole in one partition is hash partitioning on
+        // `labels` in DataFusion's sense. The selector groups by
+        // (block_start, block_end, labels), which Hash(labels) satisfies as
+        // a subset, so it needs no shuffle and plans SinglePartitioned. The
+        // store's hash is not DataFusion's; see docs for which operators
+        // that fools.
+        let n = input.properties().partitioning.partition_count();
         let properties = PlanProperties::clone(input.properties())
             .with_eq_properties(eq)
+            .with_partitioning(Partitioning::Hash(vec![labels], n))
             .into();
         Self { input, properties }
     }
