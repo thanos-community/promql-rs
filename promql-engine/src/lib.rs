@@ -33,6 +33,7 @@ pub mod aggregate;
 mod buffer;
 pub mod engine;
 pub mod error;
+pub mod explain;
 pub mod labels;
 mod labelset;
 pub mod matcher;
@@ -47,6 +48,7 @@ pub mod source;
 
 pub use engine::{Engine, RangeQuery};
 pub use error::EngineError;
+pub use explain::render as explain_plan;
 pub use memory::MemorySeriesSource;
 pub use series::Series;
 pub use source::{Grouping, SelectHints, SelectorTable, SeriesSource, Shard};

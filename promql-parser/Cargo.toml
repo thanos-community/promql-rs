@@ -15,6 +15,7 @@ bench = false
 lrpar = { workspace = true }
 lrlex = { workspace = true }
 cfgrammar = { workspace = true }
+promql-common = { path = "../promql-common" }
 thiserror = { workspace = true }
 
 [build-dependencies]

@@ -1,0 +1,1370 @@
+//! A readable `Display` for a planned [`LogicalPlan`], for pinning in
+//! `promql-engine/tests/testdata/plans.yaml`.
+//!
+//! `LogicalPlan::display_indent()` prints every node exactly, but this
+//! engine's own scalar and aggregate functions carry their PromQL
+//! parameters as a flat, untyped argument list —
+//! `promql_range_function(samples, block_start, block_end, 'rate', 600000,
+//! 1200000, 30000, 300000, 0, NULL)` — which is what DataFusion's UDFs
+//! give it to work with, not what a reviewer diffing a plan pin wants to
+//! read. This module
+//! recognises the shapes this engine's own planner builds
+//! ([`crate::selector`], [`crate::range`], [`crate::labels`],
+//! [`crate::aggregate`], `get_field`, and a scan over a
+//! [`SelectorTable`]) and prints them as `rate(samples[5m],
+//! 600000..1200000 step 30s)` instead, reading like PromQL wherever
+//! PromQL has syntax for it.
+//!
+//! # Fallthrough is what makes this safe to pin
+//!
+//! Nothing here changes what is planned or executed; it only chooses how
+//! to print an already-built `LogicalPlan`. Recognising a shape is
+//! therefore never load-bearing: any node kind this module does not
+//! special-case renders as `LogicalPlan::display()` would, any expression
+//! it does not recognise renders as `Expr`'s own `Display` would, and a
+//! recognised call with the wrong argument count or a non-literal where a
+//! literal is expected falls back the same way rather than guessing or
+//! panicking. A planner change that adds a new function, a new argument
+//! or a new node kind cannot make this module print something wrong; at
+//! worst it prints the unrecognised shape verbatim, which is what
+//! `display_indent()` always did.
+
+use datafusion::common::{Column, ScalarValue};
+use datafusion::datasource::source_as_provider;
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
+use datafusion::logical_expr::{
+    Aggregate, Expr, Filter, LogicalPlan, Projection, Sort, SortExpr, TableScan,
+};
+use promql_common::model::Duration;
+use promql_parser::ast::LabelMatcher;
+
+use crate::matcher::METRIC_NAME;
+use crate::source::SelectorTable;
+use crate::{aggregate, labels, range, selector, series};
+
+/// Renders `plan` the way `plans.yaml` pins it. See the module doc
+/// comment for what "readable" means and why it is safe to pin.
+pub fn render(plan: &LogicalPlan) -> String {
+    let single_scan = count_table_scans(plan) == 1;
+    let mut out = String::new();
+    render_node(plan, 0, single_scan, &mut out);
+    out
+}
+
+fn count_table_scans(plan: &LogicalPlan) -> usize {
+    let here = usize::from(matches!(plan, LogicalPlan::TableScan(_)));
+    here + plan
+        .inputs()
+        .iter()
+        .map(|p| count_table_scans(p))
+        .sum::<usize>()
+}
+
+fn render_node(plan: &LogicalPlan, indent: usize, single_scan: bool, out: &mut String) {
+    if indent > 0 {
+        out.push('\n');
+    }
+    out.push_str(&" ".repeat(indent * 2));
+    out.push_str(&render_line(plan, single_scan));
+    for input in plan.inputs() {
+        render_node(input, indent + 1, single_scan, out);
+    }
+}
+
+/// One node's own line, stock DataFusion's format string
+/// (`Projection: a, b`, `Aggregate: groupBy=[[...]], aggr=[[...]]`,
+/// `Filter: ...`, `Sort: ...`, `TableScan: name`) with only the
+/// expressions inside re-rendered — except `TableScan` over a
+/// [`SelectorTable`], whose line is its selector text, prefixed by the
+/// table name only when the plan has several scans, so a qualified
+/// column elsewhere has a name to point at.
+fn render_line(plan: &LogicalPlan, single_scan: bool) -> String {
+    match plan {
+        LogicalPlan::Projection(p) => render_projection(p, single_scan),
+        LogicalPlan::Filter(Filter { predicate, .. }) => {
+            format!("Filter: {}", render_expr(predicate, single_scan))
+        }
+        LogicalPlan::Aggregate(a) => render_aggregate_node(a, single_scan).unwrap_or_else(|| {
+            let group: Vec<_> = a
+                .group_expr
+                .iter()
+                .map(|e| render_expr(e, single_scan))
+                .collect();
+            let aggr: Vec<_> = a
+                .aggr_expr
+                .iter()
+                .map(|e| render_expr(e, single_scan))
+                .collect();
+            format!(
+                "Aggregate: groupBy=[[{}]], aggr=[[{}]]",
+                group.join(", "),
+                aggr.join(", ")
+            )
+        }),
+        LogicalPlan::Sort(Sort { expr, fetch, .. }) => {
+            let mut s = String::from("Sort: ");
+            for (i, e) in expr.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&render_sort_expr(e, single_scan));
+            }
+            if let Some(n) = fetch {
+                s.push_str(&format!(", fetch={n}"));
+            }
+            s
+        }
+        LogicalPlan::TableScan(ts) => render_table_scan(ts, plan, single_scan),
+        // Any other node kind (Join, Limit, Window, Distinct, …): stock
+        // DataFusion text, unmodified. None of this engine's planner
+        // output reaches them today, and recognising a new kind is opt-in
+        // here, not required for this to stay correct.
+        other => other.display().to_string(),
+    }
+}
+
+/// Every series batch in this engine carries exactly four columns,
+/// `labels, samples, block_start, block_end` in that order
+/// (`series::LABELS`/`SAMPLES`/`BLOCK_START`/`BLOCK_END` are the schema's
+/// own names for them, not this module's choice) — so a `Projection`
+/// whose *output* schema is those four fields in that order is restating
+/// an invariant the reader already knows, and its pass-through columns
+/// and self-aliases are noise on top of it. This checks `plan.schema()`,
+/// not the expression list itself: an expression can be aliased to
+/// `labels` without being a bare `labels` column (a rebuilt struct, say),
+/// and only the output name is what the guard cares about.
+///
+/// Anything else — a fifth column, the four out of order, missing one of
+/// them, or a shape this schema check can't see — prints every
+/// expression with its alias: that fallthrough is what keeps a
+/// projection that breaks the four-column invariant visible in a pin
+/// instead of silently going short-form.
+fn render_projection(p: &Projection, single_scan: bool) -> String {
+    if is_canonical_series_schema(&p.schema) {
+        let parts: Vec<_> = p
+            .expr
+            .iter()
+            .filter_map(|e| render_short_projection_expr(e, single_scan))
+            .collect();
+        // Every field was a pass-through: this is an identity projection,
+        // and printing `Projection:` with nothing after it would hide
+        // that from a reviewer reading the pin. Falling through to the
+        // stock form below is what keeps it visible.
+        if !parts.is_empty() {
+            return format!("Projection: {}", parts.join(", "));
+        }
+    }
+    let rendered: Vec<_> = p.expr.iter().map(|e| render_expr(e, single_scan)).collect();
+    format!("Projection: {}", rendered.join(", "))
+}
+
+fn is_canonical_series_schema(schema: &datafusion::common::DFSchema) -> bool {
+    let fields = schema.fields();
+    fields.len() == 4
+        && fields[0].name() == series::LABELS
+        && fields[1].name() == series::SAMPLES
+        && fields[2].name() == series::BLOCK_START
+        && fields[3].name() == series::BLOCK_END
+}
+
+/// `None` for a pass-through reference to its own output name — a bare
+/// `labels`/`samples`/`block_start`/`block_end` column, or one aliased
+/// right back to the name it already has — since the schema already says
+/// that's what it is. `Some` for anything else, rendered without the `AS
+/// labels`/`AS samples`/… alias the four-column guard already established
+/// as this expression's position in the schema.
+fn render_short_projection_expr(e: &Expr, single_scan: bool) -> Option<String> {
+    match e {
+        Expr::Column(_) => None,
+        Expr::Alias(a) => match a.expr.as_ref() {
+            Expr::Column(c) if c.name == a.name => None,
+            inner => Some(render_expr(inner, single_scan)),
+        },
+        other => Some(render_expr(other, single_scan)),
+    }
+}
+
+fn render_sort_expr(e: &SortExpr, single_scan: bool) -> String {
+    let mut s = render_expr(&e.expr, single_scan);
+    s.push_str(if e.asc { " ASC" } else { " DESC" });
+    s.push_str(if e.nulls_first {
+        " NULLS FIRST"
+    } else {
+        " NULLS LAST"
+    });
+    s
+}
+
+/// A `TableScan` over a [`SelectorTable`] prints as its PromQL selector,
+/// `http_requests_total{job="api"}`, in place of the table name; anything
+/// else (a table this engine did not plan, or one carrying a pushed-down
+/// projection/filter/fetch this module does not special-case) prints
+/// exactly as `LogicalPlan::display()` would.
+///
+/// The scan's own name (`selector_0`) is only what a qualified column
+/// elsewhere in the plan points back at — see [`render_column`] — so with
+/// one scan in the whole plan it is dropped; with several it is kept as a
+/// prefix so a reader can still match a `TableScan` to its qualifier.
+fn render_table_scan(ts: &TableScan, plan: &LogicalPlan, single_scan: bool) -> String {
+    if ts.projection.is_some() || !ts.filters.is_empty() || ts.fetch.is_some() {
+        return plan.display().to_string();
+    }
+    let selector = source_as_provider(&ts.source).ok().and_then(|p| {
+        // `TableProvider: Any`; trait-object upcasting (stable since
+        // Rust 1.86) gets from `&dyn TableProvider` to `&dyn Any` without
+        // a provider-side `as_any` accessor.
+        let any: &dyn std::any::Any = p.as_ref();
+        any.downcast_ref::<SelectorTable>()
+            .map(|st| render_selector(st.name(), st.matchers()))
+    });
+    match selector {
+        Some(selector) if single_scan => format!("TableScan: {selector}"),
+        Some(selector) => format!("TableScan: {} {selector}", ts.table_name),
+        None => format!("TableScan: {}", ts.table_name),
+    }
+}
+
+/// Port of Go `VectorSelector.String()` (`promql/parser/printer.go`),
+/// restricted to what a `TableScan` actually keeps: the name and the
+/// matchers. Upstream's skip condition is on the matcher's own value
+/// equalling `node.Name`, not on `__name__` equality alone — so
+/// `{__name__="foo"}` (no bare metric name; `node.Name == ""`) keeps its
+/// `__name__` matcher in braces instead of being folded into a bare
+/// prefix, and two `__name__` matchers on the same selector both stay in
+/// braces since at most one can equal the name. The offset/`@`/anchored/
+/// smoothed suffixes upstream also prints have no matcher to hang off, so
+/// they are left to whatever else pins a selector's modifiers.
+fn render_selector(name: &str, matchers: &[LabelMatcher]) -> String {
+    use promql_parser::ast::MatchOp;
+
+    let mut rest = Vec::new();
+    for m in matchers {
+        if m.name == METRIC_NAME && m.op == MatchOp::Equal && m.value == name && !m.value.is_empty()
+        {
+            continue;
+        }
+        rest.push(m.to_string());
+    }
+    rest.sort();
+
+    let mut out = name.to_string();
+    if !rest.is_empty() {
+        out.push('{');
+        out.push_str(&rest.join(","));
+        out.push('}');
+    }
+    out
+}
+
+/// One expression, recursively. Anything not recognised — a node this
+/// engine never plans, or a recognised call whose shape does not match
+/// (wrong argument count, a non-literal where a literal is required) —
+/// falls back to `Expr`'s own `Display`, verbatim and un-recursed: that is
+/// what makes an unrecognised shape safe rather than silently wrong.
+fn render_expr(e: &Expr, single_scan: bool) -> String {
+    match e {
+        Expr::Alias(a) => format!("{} AS {}", render_expr(&a.expr, single_scan), a.name),
+        Expr::Column(c) => render_column(c, single_scan),
+        Expr::ScalarFunction(f) => {
+            render_scalar_function(f, single_scan).unwrap_or_else(|| e.to_string())
+        }
+        Expr::AggregateFunction(f) => {
+            render_aggregate_function(f, single_scan).unwrap_or_else(|| e.to_string())
+        }
+        _ => e.to_string(),
+    }
+}
+
+/// Bare (`labels`) when the plan scans exactly one table, qualified
+/// (`selector_0.labels`) otherwise — with two scans the qualifier is the
+/// only thing telling the sides apart, so it cannot be dropped there.
+fn render_column(c: &Column, single_scan: bool) -> String {
+    if single_scan && c.relation.is_some() {
+        c.name.clone()
+    } else {
+        c.to_string()
+    }
+}
+
+fn render_scalar_function(f: &ScalarFunction, single_scan: bool) -> Option<String> {
+    match f.name() {
+        labels::NAME => render_labels(&f.args, single_scan),
+        "get_field" => render_get_field(&f.args, single_scan),
+        _ => None,
+    }
+}
+
+/// A bare column named `name`, any qualifier: what `block_start`/
+/// `block_end` look like as a selector/range/`Aggregate`-node group-key
+/// argument. `per block`/`per series per block` is what a reader is told
+/// instead, so this is also the check that lets that phrase stand in for
+/// the argument rather than silently dropping a different expression that
+/// happens to sit in the same slot.
+fn is_block_column(e: &Expr, name: &str) -> bool {
+    matches!(e, Expr::Column(c) if c.name == name)
+}
+
+/// `promql_vector_selector(samples, block_start, block_end, start, end,
+/// step, lookback, offset, at)` as `vector_selector(samples[ offset
+/// OFFSET][ @ N], START..END step STEP, lookback LOOKBACK)` — PromQL has
+/// no syntax for the evaluation range, so that stays a trailing argument
+/// on every call, but `offset` and `@` are PromQL's own selector
+/// modifiers and take PromQL's own order and spelling, attached to the
+/// column they modify rather than tacked onto the end. The block
+/// arguments never print: a caller only reaches this once it already
+/// knows to say `per block` for them (see [`render_aggregate_node`]), and
+/// requiring them to actually be the block columns is what keeps this
+/// call from omitting some other expression that merely sits in that
+/// slot.
+///
+/// The `@` value is `Params::at_ms`, the millisecond timestamp
+/// `plan.rs`'s `resolve_at` already resolved it to, printed raw rather
+/// than through `Duration`'s formatting: it names a point in time, not a
+/// span.
+fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
+    if args.len() != 9 {
+        return None;
+    }
+    if !is_block_column(&args[1], series::BLOCK_START)
+        || !is_block_column(&args[2], series::BLOCK_END)
+    {
+        return None;
+    }
+    let mut samples = render_expr(&args[0], single_scan);
+    let start = require_i64(&args[3])?;
+    let end = require_i64(&args[4])?;
+    let step = require_i64(&args[5])?;
+    let lookback = require_i64(&args[6])?;
+    let offset = require_i64(&args[7])?;
+    let at = optional_i64(&args[8])?;
+    push_offset_and_at(&mut samples, offset, at)?;
+
+    Some(format!(
+        "vector_selector({samples}, {start}..{end} step {}, lookback {})",
+        Duration::from_millis(step).ok()?,
+        Duration::from_millis(lookback).ok()?
+    ))
+}
+
+/// `promql_range_function(samples, block_start, block_end, '<func>',
+/// start, end, step, range, offset, at)` as `<func>(samples[WINDOW][
+/// offset OFFSET][ @ N], START..END step STEP)`. The window goes in
+/// brackets after the column, like a PromQL range selector; see
+/// [`render_vector_selector`] for why `offset`/`@` sit there too, why the
+/// evaluation range stays a trailing argument, and why the block
+/// arguments never print.
+fn render_range_function(args: &[Expr], single_scan: bool) -> Option<String> {
+    if args.len() != 10 {
+        return None;
+    }
+    if !is_block_column(&args[1], series::BLOCK_START)
+        || !is_block_column(&args[2], series::BLOCK_END)
+    {
+        return None;
+    }
+    let samples = render_expr(&args[0], single_scan);
+    let func = utf8_literal(&args[3])?;
+    let start = require_i64(&args[4])?;
+    let end = require_i64(&args[5])?;
+    let step = require_i64(&args[6])?;
+    let window = require_i64(&args[7])?;
+    let offset = require_i64(&args[8])?;
+    let at = optional_i64(&args[9])?;
+
+    let mut column = format!("{samples}[{}]", Duration::from_millis(window).ok()?);
+    push_offset_and_at(&mut column, offset, at)?;
+
+    Some(format!(
+        "{func}({column}, {start}..{end} step {})",
+        Duration::from_millis(step).ok()?
+    ))
+}
+
+/// Appends PromQL's own selector-modifier suffix — `offset` before `@`,
+/// each only when present — directly onto the column text they modify.
+/// `None` when `offset`'s millisecond count is out of Go's `Duration`
+/// range, same fallthrough rule as every other recogniser here: the
+/// caller falls back to DataFusion's own text for the whole expression
+/// rather than rendering a partial line.
+fn push_offset_and_at(s: &mut String, offset: i64, at: Option<i64>) -> Option<()> {
+    if offset != 0 {
+        s.push_str(&format!(" offset {}", Duration::from_millis(offset).ok()?));
+    }
+    if let Some(at) = at {
+        s.push_str(&format!(" @ {at}"));
+    }
+    Some(())
+}
+
+/// `promql_labels('a', <a>, 'b', <b>, …)` as `labels{a, b}`, or `labels{a:
+/// <expr>}` for a pair whose value is not `get_field(<labels column>,
+/// 'a')` — the shape [`crate::labels::regroup`] produces for a group key
+/// read back out of an `Aggregate`'s own output column instead of an
+/// input struct.
+///
+/// The struct's own prefix word is not hardcoded to `"labels"`: a pair
+/// eligible for the bare-key shorthand carries its `get_field` base's
+/// own rendering (bare `labels`, or `selector_1.labels` with two scans),
+/// and that becomes the prefix for the whole call. Two scans is exactly
+/// where dropping the qualifier would make `job` from one scan
+/// indistinguishable from `job` off another, so the shorthand only
+/// applies once a base is established and every further shorthand-
+/// eligible pair matches it; a pair whose base doesn't match — a
+/// different scan, or not the labels column at all — falls back to
+/// `name: <rendered value>` instead of being silently elided.
+fn render_labels(args: &[Expr], single_scan: bool) -> Option<String> {
+    if !args.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut prefix = None;
+    let mut fields = Vec::with_capacity(args.len() / 2);
+    for pair in args.chunks(2) {
+        let name = utf8_literal(&pair[0])?;
+        fields.push(render_label_field(name, &pair[1], single_scan, &mut prefix));
+    }
+    Some(format!(
+        "{}{{{}}}",
+        prefix.unwrap_or_else(|| series::LABELS.to_string()),
+        fields.join(", ")
+    ))
+}
+
+/// The base of a `get_field` call, rendered, but only when that base is
+/// actually the canonical `labels` column — not just any struct — since
+/// that is the one column the bare-key shorthand is entitled to elide.
+fn labels_column_text(base: &Expr, single_scan: bool) -> Option<String> {
+    match base {
+        Expr::Column(c) if c.name == series::LABELS => Some(render_column(c, single_scan)),
+        _ => None,
+    }
+}
+
+fn render_label_field(
+    name: &str,
+    value: &Expr,
+    single_scan: bool,
+    prefix: &mut Option<String>,
+) -> String {
+    if let Expr::ScalarFunction(f) = value {
+        if f.name() == "get_field" && f.args.len() == 2 && utf8_literal(&f.args[1]) == Some(name) {
+            if let Some(base) = labels_column_text(&f.args[0], single_scan) {
+                match prefix {
+                    Some(p) if *p == base => return name.to_string(),
+                    None => {
+                        *prefix = Some(base);
+                        return name.to_string();
+                    }
+                    Some(_) => {} // a different base: not the same struct, don't elide
+                }
+            }
+        }
+    }
+    format!("{name}: {}", render_expr(value, single_scan))
+}
+
+/// `get_field(labels, 'job')` as `labels.job`.
+fn render_get_field(args: &[Expr], single_scan: bool) -> Option<String> {
+    if args.len() != 2 {
+        return None;
+    }
+    let key = utf8_literal(&args[1])?;
+    Some(format!("{}.{key}", render_expr(&args[0], single_scan)))
+}
+
+/// Every aggregate function this engine plans — `promql_vector_selector`,
+/// `promql_range_function`, `promql_aggregate` — takes only positional
+/// literal/column arguments, so `DISTINCT`, a `FILTER` clause or an
+/// `ORDER BY` are metadata a plan step of this engine's own never sets;
+/// falling through when one is present, instead of ignoring it, is what
+/// keeps a later change that starts setting them from being silently
+/// misrendered.
+fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option<String> {
+    let p = &f.params;
+    if p.distinct || p.filter.is_some() || !p.order_by.is_empty() || p.null_treatment.is_some() {
+        return None;
+    }
+    match f.func.name() {
+        selector::NAME => render_vector_selector(&p.args, single_scan),
+        range::NAME => render_range_function(&p.args, single_scan),
+        aggregate::NAME => render_aggregate_call(&p.args, single_scan),
+        _ => None,
+    }
+}
+
+/// `promql_aggregate(samples, '<op>', start, end, step)` as
+/// `<op>(samples, START..END step STEP)`. No `topk`/`quantile` parameter:
+/// `plan.rs`'s `aggregate` rejects an aggregation with a parameter as
+/// unsupported before planning reaches here, so the call has exactly
+/// these five positional arguments.
+fn render_aggregate_call(args: &[Expr], single_scan: bool) -> Option<String> {
+    if args.len() != 5 {
+        return None;
+    }
+    let samples = render_expr(&args[0], single_scan);
+    let op = utf8_literal(&args[1])?;
+    let start = require_i64(&args[2])?;
+    let end = require_i64(&args[3])?;
+    let step = require_i64(&args[4])?;
+    Some(format!(
+        "{op}({samples}, {start}..{end} step {})",
+        Duration::from_millis(step).ok()?
+    ))
+}
+
+/// An `Aggregate` node whose shape is exactly what `plan.rs` builds for a
+/// selector, a range function or a PromQL aggregation over a block-and-
+/// label-set grouping: one aggregate expression aliased `samples`, group
+/// keys led by `block_start, block_end` (`plan.rs`'s `series_keys`/
+/// `aggregate` both put the block first, so each group leaves when its
+/// block does), then either the whole `labels` column over
+/// `promql_vector_selector`/`promql_range_function` (`per series per
+/// block`: each group is one series' chunks in one block) or zero or more
+/// [`labels::group_exprs`] keys over `promql_aggregate` (`per block`: a
+/// PromQL aggregate has no series left to speak of, only blocks),
+/// PromQL's own `by`/`without` syntax (`without` never appears: `plan.rs`
+/// already resolves it to the `by` keys that remain, per
+/// [`labels::group_keys`]).
+///
+/// `None` on anything else — wrong key count or order, a key that isn't
+/// the shape [`labels::group_alias`] or the bare `labels` column
+/// establishes, a call whose own block arguments (see
+/// [`render_vector_selector`]/[`render_range_function`]) aren't columns
+/// named `block_start`/`block_end` — so the caller's stock
+/// `groupBy=[[…]], aggr=[[…]]` line is what a shape this does not expect
+/// falls back to, same as every other recogniser here. The planner always
+/// passes the grouped block columns as these arguments, so a plain name
+/// check is enough to tell a call built by this engine from one that
+/// merely takes the same slots; there is nothing here to compare the
+/// group's own qualifier against.
+fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
+    if agg.aggr_expr.len() != 1 {
+        return None;
+    }
+    let Expr::Alias(alias) = &agg.aggr_expr[0] else {
+        return None;
+    };
+    if alias.name != series::SAMPLES {
+        return None;
+    }
+    let Expr::AggregateFunction(f) = alias.expr.as_ref() else {
+        return None;
+    };
+    let p = &f.params;
+    if p.distinct || p.filter.is_some() || !p.order_by.is_empty() || p.null_treatment.is_some() {
+        return None;
+    }
+
+    let [first, second, rest @ ..] = agg.group_expr.as_slice() else {
+        return None;
+    };
+    if !is_block_column(first, series::BLOCK_START) || !is_block_column(second, series::BLOCK_END) {
+        return None;
+    }
+
+    match f.func.name() {
+        selector::NAME | range::NAME => {
+            let [key] = rest else { return None };
+            if !matches!(key, Expr::Column(c) if c.name == series::LABELS) {
+                return None;
+            }
+            let call = if f.func.name() == selector::NAME {
+                render_vector_selector(&p.args, single_scan)?
+            } else {
+                render_range_function(&p.args, single_scan)?
+            };
+            Some(format!("Aggregate: {call} per series per block"))
+        }
+        aggregate::NAME => {
+            let args = &p.args;
+            if args.len() != 5 {
+                return None;
+            }
+            let samples = render_expr(&args[0], single_scan);
+            let op = utf8_literal(&args[1])?;
+            let start = require_i64(&args[2])?;
+            let end = require_i64(&args[3])?;
+            let step = require_i64(&args[4])?;
+
+            let mut keys = Vec::with_capacity(rest.len());
+            for e in rest {
+                let Expr::Alias(a) = e else { return None };
+                let Expr::ScalarFunction(gf) = a.expr.as_ref() else {
+                    return None;
+                };
+                if gf.name() != "get_field" || gf.args.len() != 2 {
+                    return None;
+                }
+                labels_column_text(&gf.args[0], single_scan)?;
+                let key = utf8_literal(&gf.args[1])?;
+                if a.name != labels::group_alias(key) {
+                    return None;
+                }
+                keys.push(key);
+            }
+
+            let step_text = Duration::from_millis(step).ok()?;
+            Some(if keys.is_empty() {
+                format!("Aggregate: {op}({samples}, {start}..{end} step {step_text}) per block")
+            } else {
+                format!(
+                    "Aggregate: {op} by ({}) ({samples}, {start}..{end} step {step_text}) per block",
+                    keys.join(", ")
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A literal, non-`NULL` `Int64` — every timestamp/duration argument in
+/// this engine's calls except the trailing `@` one, which is
+/// `NULL`-shaped when absent (see [`optional_i64`]).
+fn require_i64(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Literal(ScalarValue::Int64(Some(n)), _) => Some(*n),
+        _ => None,
+    }
+}
+
+/// A literal `Int64`, `NULL` meaning "absent" (the `@` modifier when the
+/// query has none). `None` only when the argument is not even a literal
+/// `Int64` at all, which is the actual fallthrough signal.
+fn optional_i64(e: &Expr) -> Option<Option<i64>> {
+    match e {
+        Expr::Literal(ScalarValue::Int64(v), _) => Some(*v),
+        _ => None,
+    }
+}
+
+fn utf8_literal(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s.as_str()),
+        Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::datasource::provider_as_source;
+    use datafusion::logical_expr::{col, lit, LogicalPlanBuilder, LogicalTableSource};
+    use promql_parser::ast::MatchOp;
+    use promql_parser::posrange::PositionRange;
+
+    use super::*;
+    use crate::params::Params;
+    use crate::series::SAMPLES;
+
+    fn matcher(name: &str, op: MatchOp, value: &str) -> LabelMatcher {
+        LabelMatcher {
+            name: name.to_string(),
+            op,
+            value: value.to_string(),
+            pos_range: PositionRange::default(),
+        }
+    }
+
+    fn params(offset_ms: i64, at_ms: Option<i64>) -> Params {
+        Params {
+            start_ms: 600_000,
+            end_ms: 1_200_000,
+            step_ms: 30_000,
+            window_ms: 300_000,
+            offset_ms,
+            at_ms,
+        }
+    }
+
+    #[test]
+    fn duration_renders_like_go_string() {
+        assert_eq!(Duration::from_millis(300_000).unwrap().to_string(), "5m");
+        assert_eq!(Duration::from_millis(90_000).unwrap().to_string(), "1m30s");
+        assert_eq!(Duration::from_millis(0).unwrap().to_string(), "0s");
+    }
+
+    #[test]
+    fn vector_selector_with_neither_offset_nor_at() {
+        let call = selector::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            &params(0, None),
+        );
+        assert_eq!(
+            render_expr(&call, true),
+            "vector_selector(samples, 600000..1200000 step 30s, lookback 5m)"
+        );
+    }
+
+    #[test]
+    fn vector_selector_with_offset_and_at() {
+        let call = selector::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            &params(3_600_000, Some(900_000)),
+        );
+        assert_eq!(
+            render_expr(&call, true),
+            "vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m)"
+        );
+    }
+
+    #[test]
+    fn range_function_renders_its_name_and_window() {
+        let call = range::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            range::Func::Rate,
+            &params(0, None),
+        );
+        assert_eq!(
+            render_expr(&call, true),
+            "rate(samples[5m], 600000..1200000 step 30s)"
+        );
+    }
+
+    #[test]
+    fn range_function_with_offset_and_at() {
+        let call = range::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            range::Func::Rate,
+            &params(3_600_000, Some(900_000)),
+        );
+        assert_eq!(
+            render_expr(&call, true),
+            "rate(samples[5m] offset 1h @ 900000, 600000..1200000 step 30s)"
+        );
+    }
+
+    /// A step outside Go's ±(1<<63−1)-nanosecond range (`i64::MAX`
+    /// milliseconds overflows `i64` nanoseconds) makes `Duration::from_millis`
+    /// return `Err`; `render_range_function` propagates that as `None` via
+    /// `?`, and `render_expr` falls through to DataFusion's own rendering
+    /// of the call, same as any other shape this module doesn't recognize.
+    #[test]
+    fn range_function_with_unrenderable_step_falls_through_to_datafusion() {
+        let mut p = params(0, None);
+        p.step_ms = i64::MAX;
+        let call = range::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            range::Func::Rate,
+            &p,
+        );
+        assert_eq!(render_expr(&call, true), call.to_string());
+    }
+
+    #[test]
+    fn aggregate_renders_its_op() {
+        let call = aggregate::call(
+            col("samples"),
+            aggregate::Op::Sum,
+            600_000,
+            1_200_000,
+            30_000,
+        );
+        assert_eq!(
+            render_expr(&call, true),
+            "sum(samples, 600000..1200000 step 30s)"
+        );
+    }
+
+    /// An `Aggregate` node shaped exactly as `plan.rs`'s `aggregate`
+    /// builds it, over a two-label source, for `keys` group columns led
+    /// by the block.
+    fn aggregate_node(keys: &[String]) -> LogicalPlan {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string(),
+            "pod".to_string(),
+        ])));
+        let mut group = vec![col(series::BLOCK_START), col(series::BLOCK_END)];
+        group.extend(labels::group_exprs(keys));
+        LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                group,
+                vec![
+                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias(SAMPLES),
+                ],
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn aggregate_node_by_one_key_reads_like_promql() {
+        let plan = aggregate_node(&["job".to_string()]);
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block"
+        );
+    }
+
+    #[test]
+    fn aggregate_node_with_no_group_keys_omits_the_by_clause() {
+        let plan = aggregate_node(&[]);
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: sum(samples, 600000..1200000 step 30s) per block"
+        );
+    }
+
+    #[test]
+    fn aggregate_node_falls_through_when_the_alias_is_not_samples() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let keys = ["job".to_string()];
+        let group = [
+            vec![col(series::BLOCK_START), col(series::BLOCK_END)],
+            labels::group_exprs(&keys),
+        ]
+        .concat();
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                group,
+                vec![
+                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias("other"),
+                ],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: groupBy=[[block_start, block_end, labels.job AS __group__job]], \
+             aggr=[[sum(samples, 600000..1200000 step 30s) AS other]]"
+        );
+    }
+
+    #[test]
+    fn aggregate_node_falls_through_when_a_key_alias_does_not_match_group_alias() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let mismatched_group =
+            datafusion::functions::core::expr_fn::get_field(col(series::LABELS), "job")
+                .alias("not_a_group_alias");
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                vec![
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    mismatched_group,
+                ],
+                vec![
+                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias(SAMPLES),
+                ],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: groupBy=[[block_start, block_end, labels.job AS not_a_group_alias]], \
+             aggr=[[sum(samples, 600000..1200000 step 30s) AS samples]]"
+        );
+    }
+
+    #[test]
+    fn aggregate_node_falls_through_when_the_first_two_keys_are_not_the_block_columns() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string(),
+            "pod".to_string(),
+        ])));
+        let keys = ["job".to_string(), "pod".to_string()];
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                labels::group_exprs(&keys),
+                vec![
+                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias(SAMPLES),
+                ],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: groupBy=[[labels.job AS __group__job, labels.pod AS __group__pod]], \
+             aggr=[[sum(samples, 600000..1200000 step 30s) AS samples]]"
+        );
+    }
+
+    /// A selector or range aggregate is shaped exactly as `plan.rs` builds
+    /// it: grouped by the block and the whole `labels` column.
+    fn selector_series_group() -> Vec<Expr> {
+        vec![
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            col(series::LABELS),
+        ]
+    }
+
+    #[test]
+    fn selector_aggregate_node_with_offset_and_at_reads_like_promql() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                selector_series_group(),
+                vec![selector::call(
+                    col(SAMPLES),
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    &params(3_600_000, Some(900_000)),
+                )
+                .alias(SAMPLES)],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, \
+             lookback 5m) per series per block"
+        );
+    }
+
+    #[test]
+    fn range_aggregate_node_with_offset_and_at_reads_like_promql() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                selector_series_group(),
+                vec![range::call(
+                    col(SAMPLES),
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    range::Func::Rate,
+                    &params(3_600_000, Some(900_000)),
+                )
+                .alias(SAMPLES)],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: rate(samples[5m] offset 1h @ 900000, 600000..1200000 step 30s) \
+             per series per block"
+        );
+    }
+
+    #[test]
+    fn selector_aggregate_node_falls_through_when_the_third_key_is_not_labels() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let group = vec![
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            get_field_of("job").alias(labels::group_alias("job")),
+        ];
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                group,
+                vec![selector::call(
+                    col(SAMPLES),
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    &params(0, None),
+                )
+                .alias(SAMPLES)],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: groupBy=[[block_start, block_end, labels.job AS __group__job]], \
+             aggr=[[vector_selector(samples, 600000..1200000 step 30s, lookback 5m) AS samples]]"
+        );
+    }
+
+    #[test]
+    fn selector_aggregate_node_falls_through_when_the_calls_block_arguments_are_wrong() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        // The call's own block arguments are the two block columns
+        // swapped: the group key check alone cannot see this, so the
+        // call itself has to reject it.
+        let call = selector::udaf().call(vec![
+            col(SAMPLES),
+            col(series::BLOCK_END),
+            col(series::BLOCK_START),
+            lit(600_000i64),
+            lit(1_200_000i64),
+            lit(30_000i64),
+            lit(300_000i64),
+            lit(0i64),
+            lit(ScalarValue::Int64(None)),
+        ]);
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(selector_series_group(), vec![call.alias(SAMPLES)])
+            .unwrap()
+            .build()
+            .unwrap();
+        // The scan qualifies every column once the plan resolves it, so
+        // the expected text is built off the plan's own aggregate
+        // expression rather than the pre-resolution `call` above.
+        let LogicalPlan::Aggregate(a) = &plan else {
+            panic!("expected an Aggregate node")
+        };
+        let resolved = a.aggr_expr[0].to_string();
+        assert_eq!(
+            render_line(&plan, true),
+            format!("Aggregate: groupBy=[[block_start, block_end, labels]], aggr=[[{resolved}]]")
+        );
+    }
+
+    #[test]
+    fn labels_keeps_matching_get_field_pairs() {
+        let call = labels::call(vec![
+            ("job".to_string(), get_field_of("job")),
+            ("pod".to_string(), get_field_of("pod")),
+        ]);
+        assert_eq!(render_expr(&call, true), "labels{job, pod}");
+    }
+
+    #[test]
+    fn labels_regroups_a_non_get_field_value() {
+        let call = labels::call(vec![("job".to_string(), col("__group__job"))]);
+        assert_eq!(render_expr(&call, true), "labels{job: __group__job}");
+    }
+
+    #[test]
+    fn labels_keeps_the_qualifier_when_the_base_is_a_qualified_labels_column() {
+        let qualified = Expr::Column(Column::new(Some("selector_1"), "labels"));
+        let call = labels::call(vec![(
+            "job".to_string(),
+            datafusion::functions::core::expr_fn::get_field(qualified, "job"),
+        )]);
+        assert_eq!(render_expr(&call, false), "selector_1.labels{job}");
+    }
+
+    #[test]
+    fn labels_does_not_elide_a_get_field_from_a_non_labels_struct() {
+        let call = labels::call(vec![(
+            "job".to_string(),
+            datafusion::functions::core::expr_fn::get_field(col("other"), "job"),
+        )]);
+        assert_eq!(render_expr(&call, true), "labels{job: other.job}");
+    }
+
+    fn get_field_of(key: &str) -> Expr {
+        datafusion::functions::core::expr_fn::get_field(col("labels"), key)
+    }
+
+    #[test]
+    fn get_field_renders_as_dot_notation() {
+        let call = get_field_of("job");
+        assert_eq!(render_expr(&call, true), "labels.job");
+    }
+
+    /// Builds a `Projection` with an explicit output schema rather than
+    /// one DataFusion derives from `exprs` against a real input: the
+    /// shorthand guard reads `plan.schema()`, and this lets a test pick
+    /// that schema directly without also having to fabricate an input
+    /// plan whose columns the exprs would otherwise need to resolve
+    /// against.
+    fn projection_with_schema(exprs: Vec<Expr>, field_names: &[&str]) -> Projection {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let input = Arc::new(
+            LogicalPlanBuilder::scan("selector_0", source, None)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let fields: Vec<datafusion::arrow::datatypes::Field> = field_names
+            .iter()
+            .map(|n| {
+                datafusion::arrow::datatypes::Field::new(
+                    *n,
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    false,
+                )
+            })
+            .collect();
+        let schema = Arc::new(
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                fields,
+            ))
+            .unwrap(),
+        );
+        Projection::try_new_with_schema(exprs, input, schema).unwrap()
+    }
+
+    /// The two block columns, as they'd sit at the end of a canonical
+    /// four-column projection: pass-throughs, so a test only cares about
+    /// them when it means to break that invariant.
+    fn block_pass_throughs() -> Vec<Expr> {
+        vec![col(series::BLOCK_START), col(series::BLOCK_END)]
+    }
+
+    const CANONICAL_SCHEMA: [&str; 4] = [
+        series::LABELS,
+        series::SAMPLES,
+        series::BLOCK_START,
+        series::BLOCK_END,
+    ];
+
+    #[test]
+    fn projection_short_form_drops_a_regrouped_labels_alias() {
+        let mut exprs = vec![
+            labels::call(vec![("job".to_string(), col("__group__job"))]).alias(series::LABELS),
+            col(SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: labels{job: __group__job}"
+        );
+    }
+
+    #[test]
+    fn projection_short_form_drops_both_aliases_when_both_are_rebuilt() {
+        let mut exprs = vec![
+            labels::call(vec![
+                ("job".to_string(), get_field_of("job")),
+                ("pod".to_string(), get_field_of("pod")),
+            ])
+            .alias(series::LABELS),
+            range::call(
+                col(SAMPLES),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
+                range::Func::Rate,
+                &params(0, None),
+            )
+            .alias(series::SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: labels{job, pod}, rate(samples[5m], 600000..1200000 step 30s)"
+        );
+    }
+
+    #[test]
+    fn projection_short_form_drops_a_pass_through_labels_column() {
+        let mut exprs = vec![
+            col(series::LABELS),
+            selector::call(
+                col(SAMPLES),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
+                &params(0, None),
+            )
+            .alias(series::SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: vector_selector(samples, 600000..1200000 step 30s, lookback 5m)"
+        );
+    }
+
+    #[test]
+    fn projection_keeps_aliases_with_a_fifth_column() {
+        let mut exprs = vec![
+            labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS),
+            range::call(
+                col(SAMPLES),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
+                range::Func::Rate,
+                &params(0, None),
+            )
+            .alias(series::SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        exprs.push(col("extra"));
+        let mut field_names = CANONICAL_SCHEMA.to_vec();
+        field_names.push("extra");
+        let p = projection_with_schema(exprs, &field_names);
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: labels{job} AS labels, rate(samples[5m], 600000..1200000 step 30s) AS samples, \
+             block_start, block_end, extra"
+        );
+    }
+
+    #[test]
+    fn projection_keeps_aliases_with_the_columns_reordered() {
+        let p = projection_with_schema(
+            vec![
+                col(SAMPLES),
+                labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
+            ],
+            &[
+                series::SAMPLES,
+                series::LABELS,
+                series::BLOCK_START,
+                series::BLOCK_END,
+            ],
+        );
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: samples, labels{job} AS labels, block_start, block_end"
+        );
+    }
+
+    #[test]
+    fn projection_keeps_aliases_with_only_labels() {
+        let p = projection_with_schema(
+            vec![labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS)],
+            &[series::LABELS],
+        );
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: labels{job} AS labels"
+        );
+    }
+
+    #[test]
+    fn projection_identity_prints_the_stock_form() {
+        let mut exprs = vec![col(series::LABELS), col(series::SAMPLES)];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: labels, samples, block_start, block_end"
+        );
+    }
+
+    #[test]
+    fn column_is_bare_with_one_scan_qualified_with_two() {
+        let qualified = Expr::Column(Column::new(Some("selector_0"), "labels"));
+        assert_eq!(render_expr(&qualified, true), "labels");
+        assert_eq!(render_expr(&qualified, false), "selector_0.labels");
+    }
+
+    #[test]
+    fn table_scan_over_a_selector_table_prints_its_matchers() {
+        use crate::source::{SelectHints, SeriesSource};
+        use datafusion::catalog::Session;
+        use datafusion::error::Result as DfResult;
+        use datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan};
+
+        #[derive(Debug)]
+        struct Empty;
+
+        #[async_trait::async_trait]
+        impl SeriesSource for Empty {
+            async fn select(
+                &self,
+                _state: &dyn Session,
+                _matchers: &[LabelMatcher],
+                _hints: SelectHints,
+            ) -> DfResult<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(EmptyExec::new(crate::series::schema(&[
+                    "job".to_string()
+                ]))))
+            }
+        }
+
+        let matchers = vec![
+            matcher(METRIC_NAME, MatchOp::Equal, "http_requests_total"),
+            matcher("job", MatchOp::Equal, "api"),
+        ];
+        let ctx = datafusion::execution::context::SessionContext::new();
+        let table = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(SelectorTable::try_new(
+                &ctx.state(),
+                &Empty,
+                "http_requests_total",
+                &matchers,
+                SelectHints::range(0, 1),
+            ))
+            .unwrap();
+
+        let builder =
+            LogicalPlanBuilder::scan("selector_0", provider_as_source(Arc::new(table)), None)
+                .unwrap();
+        let plan = builder.build().unwrap();
+        // One scan in the whole plan: the name is dropped, since nothing
+        // needs to point back at it.
+        assert_eq!(render(&plan), "TableScan: http_requests_total{job=\"api\"}");
+        assert_eq!(
+            render_line(&plan, false),
+            "TableScan: selector_0 http_requests_total{job=\"api\"}"
+        );
+    }
+
+    #[test]
+    fn fallthrough_on_an_unrecognised_scalar_function() {
+        let call = datafusion::functions::expr_fn::upper(lit("x"));
+        assert_eq!(render_expr(&call, true), call.to_string());
+    }
+
+    #[test]
+    fn fallthrough_on_a_udf_with_the_wrong_argument_count() {
+        // Well short of `promql_vector_selector`'s nine arguments.
+        let call = selector::udaf().call(vec![col("samples"), lit(0i64)]);
+        assert_eq!(render_expr(&call, true), call.to_string());
+    }
+
+    #[test]
+    fn selector_folds_a_name_matcher_that_matches_the_selector_into_the_bare_prefix() {
+        let matchers = vec![
+            matcher(METRIC_NAME, MatchOp::Equal, "http_requests_total"),
+            matcher("job", MatchOp::Equal, "api"),
+        ];
+        assert_eq!(
+            render_selector("http_requests_total", &matchers),
+            "http_requests_total{job=\"api\"}"
+        );
+    }
+
+    #[test]
+    fn selector_keeps_a_name_matcher_that_does_not_match_the_selector_in_braces() {
+        // `{__name__="foo"}`: no bare metric name, so `node.Name` is `""`
+        // and the matcher's value never equals it.
+        let matchers = vec![matcher(METRIC_NAME, MatchOp::Equal, "foo")];
+        assert_eq!(render_selector("", &matchers), "{__name__=\"foo\"}");
+    }
+
+    #[test]
+    fn selector_keeps_a_second_name_matcher_in_braces() {
+        // Only the matcher whose value equals the selector's own name is
+        // folded; a second `__name__` matcher is never that, however it
+        // reads, so it stays in braces rather than being dropped.
+        let matchers = vec![
+            matcher(METRIC_NAME, MatchOp::Equal, "a"),
+            matcher(METRIC_NAME, MatchOp::Equal, "b"),
+        ];
+        assert_eq!(render_selector("a", &matchers), "a{__name__=\"b\"}");
+    }
+}

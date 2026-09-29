@@ -30,9 +30,9 @@ tests:
     query: |
       http_requests_total{job="api"}
     plan: |
-      Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-          TableScan: selector_0
+      Projection: labels, samples, block_start, block_end
+        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+          TableScan: http_requests_total{job="api"}
     physical: |
       ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
         AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
@@ -49,11 +49,11 @@ tests:
     query: |
       sum(http_requests_total)
     plan: |
-      Projection: promql_labels() AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
-          Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-            Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-              TableScan: selector_0
+      Projection: labels{}
+        Aggregate: sum(samples, 600000..1200000 step 30s) per block
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: http_requests_total
 
   - name: range function over a different label set
     description: >
@@ -69,9 +69,9 @@ tests:
     query: |
       rate(node_cpu_seconds_total[5m])
     plan: |
-      Projection: promql_labels(Utf8("cpu"), get_field(selector_0.labels, Utf8("cpu")), Utf8("instance"), get_field(selector_0.labels, Utf8("instance")), Utf8("mode"), get_field(selector_0.labels, Utf8("mode"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-          TableScan: selector_0
+      Projection: labels{cpu, instance, mode}
+        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+          TableScan: node_cpu_seconds_total
 
   - name: grouped aggregation over a range function
     description: >
@@ -84,11 +84,11 @@ tests:
     query: |
       sum by (job) (rate(http_requests_total[5m]))
     plan: |
-      Projection: promql_labels(Utf8("job"), __group__job) AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, get_field(labels, Utf8("job")) AS __group__job]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
-          Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-            Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-              TableScan: selector_0
+      Projection: labels{job: __group__job}
+        Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block
+          Projection: labels{job, pod}
+            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+              TableScan: http_requests_total
 
   - name: count over time
     description: >
@@ -101,9 +101,9 @@ tests:
     query: |
       count_over_time(http_requests_total[10m])
     plan: |
-      Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("count_over_time"), Int64(600000), Int64(1200000), Int64(30000), Int64(600000), Int64(0), Int64(NULL)) AS samples]]
-          TableScan: selector_0
+      Projection: labels{job, pod}
+        Aggregate: count_over_time(samples[10m], 600000..1200000 step 30s) per series per block
+          TableScan: http_requests_total
 
   - name: range function with an offset
     description: >
@@ -115,9 +115,9 @@ tests:
     query: |
       rate(http_requests_total[5m] offset 5m)
     plan: |
-      Projection: promql_labels(Utf8("job"), get_field(selector_0.labels, Utf8("job")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(300000), Int64(NULL)) AS samples]]
-          TableScan: selector_0
+      Projection: labels{job, pod}
+        Aggregate: rate(samples[5m] offset 5m, 600000..1200000 step 30s) per series per block
+          TableScan: http_requests_total
 
   - name: instant selector over chunks
     description: >
@@ -133,9 +133,9 @@ tests:
     query: |
       x
     plan: |
-      Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-          TableScan: selector_0
+      Projection: labels, samples, block_start, block_end
+        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+          TableScan: x
     physical: |
       ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
         AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
@@ -156,9 +156,9 @@ tests:
     query: |
       rate(x[5m])
     plan: |
-      Projection: promql_labels(Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-          TableScan: selector_0
+      Projection: labels{pod}
+        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+          TableScan: x
     physical: |
       ProjectionExec: expr=[promql_labels(pod, get_field(labels@2, pod)) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
         AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
@@ -183,11 +183,11 @@ tests:
     query: |
       sum by (pod) (rate(x[5m]))
     plan: |
-      Projection: promql_labels(Utf8("pod"), __group__pod) AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, get_field(labels, Utf8("pod")) AS __group__pod]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
-          Projection: promql_labels(Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-            Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-              TableScan: selector_0
+      Projection: labels{pod: __group__pod}
+        Aggregate: sum by (pod) (samples, 600000..1200000 step 30s) per block
+          Projection: labels{pod}
+            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+              TableScan: x
     physical: |
       ProjectionExec: expr=[promql_labels(pod, __group__pod@2) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
         AggregateExec: mode=FinalPartitioned, gby=[block_start@0 as block_start, block_end@1 as block_end, __group__pod@2 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=PartiallySorted([0, 1])
@@ -226,11 +226,11 @@ tests:
     query: |
       sum by (pod) (rate(x[5m]))
     plan: |
-      Projection: promql_labels(Utf8("pod"), __group__pod) AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, get_field(labels, Utf8("pod")) AS __group__pod]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
-          Projection: promql_labels(Utf8("i"), get_field(selector_0.labels, Utf8("i")), Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-            Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-              TableScan: selector_0
+      Projection: labels{pod: __group__pod}
+        Aggregate: sum by (pod) (samples, 600000..1200000 step 30s) per block
+          Projection: labels{i, pod}
+            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+              TableScan: x
     physical: |
       ProjectionExec: expr=[promql_labels(pod, __group__pod@2) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
         AggregateExec: mode=FinalPartitioned, gby=[block_start@0 as block_start, block_end@1 as block_end, __group__pod@2 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=PartiallySorted([0, 1])
@@ -254,11 +254,11 @@ tests:
     query: |
       sum(rate(x[5m]))
     plan: |
-      Projection: promql_labels() AS labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(600000), Int64(1200000), Int64(30000)) AS samples]]
-          Projection: promql_labels(Utf8("pod"), get_field(selector_0.labels, Utf8("pod"))) AS labels, samples, selector_0.block_start, selector_0.block_end
-            Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, Utf8("rate"), Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-              TableScan: selector_0
+      Projection: labels{}
+        Aggregate: sum(samples, 600000..1200000 step 30s) per block
+          Projection: labels{pod}
+            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+              TableScan: x
     physical: |
       ProjectionExec: expr=[{} as labels, samples@2 as samples, block_start@0 as block_start, block_end@1 as block_end]
         AggregateExec: mode=FinalPartitioned, gby=[block_start@0 as block_start, block_end@1 as block_end], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=Sorted
@@ -286,11 +286,44 @@ tests:
     query: |
       x
     plan: |
-      Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
-        Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples]]
-          TableScan: selector_0
+      Projection: labels, samples, block_start, block_end
+        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+          TableScan: x
     physical: |
       ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
         AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
           SeriesSetExec
             DataSourceExec: partitions=1, partition_sizes=[6]
+
+  - name: without resolves to the remaining keys at plan time
+    description: >
+      The planner turns without (pod) into by over whatever labels are
+      left, so the plan only ever holds a by clause: this pins that
+      sum by (job) is what without (pod) actually plans to, not a
+      without-shaped node the renderer would need to reconstruct.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      sum without (pod) (rate(http_requests_total[5m]))
+    plan: |
+      Projection: labels{job: __group__job}
+        Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block
+          Projection: labels{job, pod}
+            Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+              TableScan: http_requests_total
+
+  - name: an at modifier on a range function
+    description: >
+      @ takes seconds in PromQL but the plan carries milliseconds, so the
+      pin shows the raw resolved timestamp the plan holds rather than the
+      query's own units.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      rate(http_requests_total[5m] @ 900)
+    plan: |
+      Projection: labels{job, pod}
+        Aggregate: rate(samples[5m] @ 900000, 600000..1200000 step 30s) per series per block
+          TableScan: http_requests_total

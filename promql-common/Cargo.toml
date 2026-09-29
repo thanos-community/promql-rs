@@ -1,0 +1,14 @@
+[package]
+name = "promql-common"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+description = "Structural hand-port of prometheus/common's model package"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { workspace = true }
+thiserror = { workspace = true }

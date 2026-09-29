@@ -186,6 +186,19 @@ pub trait SeriesSource: fmt::Debug + Send + Sync {
 pub struct SelectorTable {
     plan: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
+    /// The selector's bare metric name (`vs.name`), `""` when it had
+    /// none. Kept alongside `matchers` because Go `VectorSelector.String()`
+    /// (`promql/parser/printer.go`) only folds a `__name__` matcher into
+    /// the bare-name prefix when its value equals this name — not for any
+    /// `__name__` matcher — so rendering the scan needs the name on its
+    /// own, not just recovered from the matcher list.
+    name: String,
+    /// The matchers `select` was called with. `select` only takes them,
+    /// never returns them, and a `TableScan` node has no other way to say
+    /// what it scans — kept here so `explain` can render `TableScan:
+    /// selector_0 [http_requests_total{job="api"}]` instead of a bare
+    /// table name.
+    matchers: Vec<LabelMatcher>,
 }
 
 impl SelectorTable {
@@ -193,18 +206,34 @@ impl SelectorTable {
     pub async fn try_new(
         state: &dyn Session,
         source: &dyn SeriesSource,
+        name: &str,
         matchers: &[LabelMatcher],
         hints: SelectHints,
     ) -> std::result::Result<Self, EngineError> {
         let plan = source.select(state, matchers, hints).await?;
         let schema = plan.schema();
         series::validate(&schema).map_err(EngineError::Schema)?;
-        Ok(Self { plan, schema })
+        Ok(Self {
+            plan,
+            schema,
+            name: name.to_string(),
+            matchers: matchers.to_vec(),
+        })
     }
 
     /// The label names this selection carries.
     pub fn label_names(&self) -> Vec<String> {
         series::label_names(&self.schema)
+    }
+
+    /// The selector's bare metric name, for `explain`; see the field doc.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// What this table scans, for `explain` to render on the `TableScan` line.
+    pub fn matchers(&self) -> &[LabelMatcher] {
+        &self.matchers
     }
 }
 

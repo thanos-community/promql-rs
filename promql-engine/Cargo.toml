@@ -15,6 +15,7 @@ bench = false
 async-trait = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
+promql-common = { path = "../promql-common" }
 promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }
