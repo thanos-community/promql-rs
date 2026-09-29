@@ -1,109 +1,166 @@
 # promql-rs
 
-A standalone Rust PromQL parser: a structural hand-port of
-[`prometheus/prometheus`](https://github.com/prometheus/prometheus)'s
-`promql/parser` package, plus the tooling that keeps the port in sync
-with upstream as Prometheus evolves.
+A PromQL query engine and a PromQL parser in Rust. The engine compiles a parsed
+query into a DataFusion logical plan over a store trait. The parser is a
+structural hand-port of the Go parser in
+[`prometheus/prometheus`](https://github.com/prometheus/prometheus). Both are
+measured against Prometheus's own test corpora, vendored in this repository and
+pinned to one upstream commit.
+
+Neither is complete. See [Status](#status) for what passes today and where the
+numbers come from.
 
 ## Layout
 
-| Path | What it is |
+The workspace has four crates:
+
+| Crate | What it is |
 |---|---|
-| `promql-parser/` | The parser crate. Grammar, lexer, AST, and error types ported from upstream. |
-| `promql-parser/upstream/` | Verbatim vendored copies of the upstream Go source the port is derived from. |
-| `promql-sync/` | Developer-invoked CLI that checks, pulls, and regenerates the port against upstream. |
-| `scripts/gen-conformance/` | Go tool that turns upstream's own parser test suite into a JSON fixture. |
-| `docs/parser-sync.md` | Design rationale for the parser and the sync tooling. |
-| `promql-engine/` | The PromQL engine crate: the `SeriesSource` trait every store implements, the series batch it returns, and the selector, aggregation and range-function operators over it. |
-| `docs/series-source.md` | Design note for `SeriesSource`: the trait and the Arrow shape. |
+| `promql-engine/` | Evaluates PromQL as DataFusion plans. Defines `SeriesSource`, the trait a store implements, and the Arrow schema its data comes back in. |
+| `promql-parser/` | The parser. Grammar, lexer, AST, and error types ported from upstream `promql/parser`. |
+| `promql-conformance/` | Replays Prometheus's promqltest corpus against the engine and records what passes. |
+| `promql-sync/` | Developer-invoked CLI that checks, pulls, and regenerates the vendored upstream files. |
 
-## Why hand-porting a parser needs its own tooling
+Vendored upstream material sits next to the crate that consumes it.
+`promql-parser/upstream/` holds the Go sources the port is derived from.
+`promql-conformance/testdata/prometheus/` holds the `.test` corpus. Both record
+their provenance in an `UPSTREAM.md` and a per-file SHA-256 in a
+`MANIFEST.toml`.
 
-A hand-ported parser rots quietly. Upstream adds a function, a keyword,
-or an AST field; nothing here fails to compile; the port just silently
-falls behind until someone notices a query behaves differently than it
-does in Prometheus. The tooling in this repo exists to make that
-divergence visible and cheap to close, instead of relying on someone
-remembering to diff two codebases by hand.
+The design notes are in `docs/`:
 
-**Upstream is vendored, not just referenced.** The Go sources this port
-is derived from live verbatim under `promql-parser/upstream/`, each
-file's SHA-256 recorded in `upstream/MANIFEST.toml` alongside the
-pinned commit in `upstream/UPSTREAM.md`. `promql-sync check` verifies
-every vendored file still matches its recorded hash — no network
-access, so it runs in CI on every PR. If someone hand-edits a vendored
-file instead of going through the sync tool, the check fails and says
-exactly which file drifted.
+- `docs/engine.md`: how the engine bounds memory, and the Prometheus and Thanos
+  lineage it takes that from.
+- `docs/series-source.md`: the `SeriesSource` trait and the Arrow shape a store
+  returns.
+- `docs/engine-blocks.md`: how a range function walks a block and crosses a
+  block edge. `docs/engine-blocks.html` is the same walkthrough with diagrams.
+- `docs/parser-sync.md`: the translation discipline for the parser port and the
+  sync tooling.
 
-**The grammar is generated, not hand-maintained in place.** `src/grammar.y`
-is not edited directly. `promql-sync generate-grammar` rebuilds it from
-three inputs: the vendored `upstream/generated_parser.y` for structure
-(rule ordering, alternatives, precedence), and two hand-maintained
-sidecar files, `grammar-actions.toml` and `grammar-tokens.toml`, for the
-Rust-specific parts (per-rule return types, per-alternative action
-bodies, upstream-to-grmtools token renames). Splitting it this way means
-a grammar rule that changed on the Rust side shows up as a small sidecar
-diff, not a diff buried inside a large generated file. Any upstream
-grammar alternative that has no matching sidecar entry gets an
-`Err(())` placeholder instead of blocking the build, and the tool prints
-the full list of unmapped alternatives at the end, so a sync always
-leaves a concrete, visible to-do list rather than a silent gap.
+Two tools live in `scripts/`. `scripts/gen-conformance` is a Go program that
+reads upstream's `promql/parser/parse_test.go` with `go/ast` and writes
+`promql-parser/tests/fixtures/parse_test_corpus.json`. `scripts/progress`
+reconstructs the promqltest pass count for every commit that changed it, by
+walking git rather than by reading a metrics database.
 
-**Conformance is checked against upstream's own tests.** `scripts/gen-conformance`
-reads upstream's `promql/parser/parse_test.go` with `go/ast` and emits
-`promql-parser/tests/fixtures/parse_test_corpus.json`, which
-`promql-parser/tests/conformance.rs` runs the port against. This closes
-the usual gap with hand-ported parsers, where the test suite is written
-once by the porter and slowly stops reflecting what upstream actually
-tests. Re-running the generator after an upstream bump refreshes the
-corpus straight from upstream's source of truth.
+## How the engine runs a query
 
-**Upgrades are a worktree diff, not a branch-and-PR pipeline.** Everything
-here is a plain CLI a developer runs locally:
+`plan::plan` turns an `Expr` into a DataFusion `LogicalPlan` that sits on top of
+whatever `ExecutionPlan` the store returned from `SeriesSource::select`. A
+series is a row from the store to the result, and the selector, aggregation, and
+range operators are DataFusion aggregate functions over the samples list. A
+series may arrive as several rows, and the engine folds them where it evaluates,
+so the whole series never exists as one array. `docs/engine.md` states the
+property that discipline buys. The unit of materialisation is the window, never
+the series.
+
+The crate reaches Arrow only through `datafusion::arrow`. A direct `arrow`
+dependency would pin a second Arrow version for any consumer that patches
+DataFusion to a fork, and every `RecordBatch` a store hands over would then be a
+type mismatch.
+
+`MemorySeriesSource` is an in-memory `SeriesSource` for tests and benchmarks.
+`promql-engine/benches` has three criterion targets, `kernels`, `engine`, and
+`memory`. `promql-engine/benches/README.md` covers taking a baseline and reading
+a profile.
+
+## Why the parser port needs its own tooling
+
+A hand-ported parser rots quietly. Upstream adds a function, a keyword, or an
+AST field, nothing here fails to compile, and the port falls behind until
+someone notices that a query behaves differently than it does in Prometheus.
+The tooling makes that divergence visible and cheap to close.
+
+**Upstream is vendored, not just referenced.** `promql-sync check` verifies
+every vendored file against its recorded hash. It needs no network, so CI runs
+it on every pull request. A hand-edited vendored file fails the check by name.
+
+**The grammar is generated, not hand-maintained in place.**
+`promql-sync generate-grammar` rebuilds `promql-parser/src/grammar.y` from the
+vendored `upstream/generated_parser.y` for structure, and from two
+hand-maintained sidecar files, `grammar-actions.toml` and `grammar-tokens.toml`,
+for the Rust parts. A rule that changed on the Rust side shows up as a small
+sidecar diff instead of a diff buried in a large generated file. An upstream
+alternative with no sidecar entry gets an `Err(())` placeholder rather than
+blocking the build, and the tool prints every unmapped alternative at the end.
+`grammar.y` holds 26 such placeholders today.
+
+**Upgrades are a worktree diff, not a pipeline.** Nothing here commits,
+branches, or opens a pull request:
 
 ```sh
 cargo run -p promql-sync -- pull --target <upstream-sha-or-tag>
 cargo run -p promql-sync -- generate-grammar
-# fill in any new [[actions]] entries in grammar-actions.toml
-# for alternatives the tool reported as unmapped
+# add a [[actions]] entry in grammar-actions.toml for each alternative
+# the tool reported as unmapped, then regenerate
 cargo run -p promql-sync -- generate-grammar
 cargo test -p promql-parser
 ```
 
-Nothing here commits, branches, or opens a PR on its own — `pull`
-rewrites the vendored files and reports what changed; the developer
-reviews the resulting `git diff`, does the translation work the report
-calls out, and commits when tests pass. That keeps upstream sync a
-routine, low-ceremony task instead of a rare, dreaded one.
+`pull` takes `--set parser` or `--set promqltest` and handles one vendored set
+per run. Re-pinning the promqltest set moves test content, so
+`promql-conformance/testdata/prometheus/UPSTREAM.md` describes the regeneration
+step that has to land in the same change.
 
 ## Status
 
-Not yet complete. What's missing:
+Both vendored sets are pinned to `prometheus/prometheus@83962c35`.
 
-- **Vector-matching modifiers** (`bool`, `on`, `ignoring`, `group_left`,
-  `group_right`) parse but aren't wired into `BinaryExpr` semantics yet.
-- **Series descriptions and histogram descriptors** aren't implemented
-  in the lexer or grammar.
-- **Duration-expression arithmetic** (e.g. `[5m+1m]`) isn't implemented;
-  only a literal duration is supported inside range/subquery/offset
-  expressions.
-- **Experimental productions** (`fill`, `trim_upper`, `trim_lower`,
-  `anchored`, `smoothed`) aren't implemented.
-- **The custom lexer** (`promql-parser/src/lexer.rs`, structurally
-  ported from upstream `lex.go`) exists but isn't wired into the
-  grmtools parser yet; the parser currently uses the regex-based
-  `lrlex` lexer in `src/lexer.l`, which is a placeholder.
-- **Conformance** against upstream's own parser test corpus currently
-  sits at a 55% pass-rate floor (`promql-parser/tests/conformance.rs`);
-  the gaps above are why.
+**The engine passes 268 of the corpus's 2,098 evals, 12.8%.** That count comes
+from `promql-conformance/testdata/prometheus/UNSUPPORTED.md`, which
+`PROMQL_PROMQLTEST_BLESS=1` regenerates from a real run. The same file lists
+each missing feature with the number of evals it blocks. The five largest are
+binary operators (199), `histogram_quantile` (78), subqueries (57),
+`histogram_fraction` (56), and `info` (41). Of the 20 corpus files, only
+`staleness.test` is fully green. `native_histograms.test` and `operators.test`
+pass nothing at all.
 
-`promql-sync` implements `check`, `pull`, and `generate-grammar` —
-byte-level diffing of vendored files plus a Markdown/JSON report of
-what changed. `docs/parser-sync.md` also describes a further structural
-Green/Yellow/Red change-classification system (auto-apply safe changes,
-flag risky ones, refuse silent ones) that isn't built yet; see the note
-at the top of that document for the line between what's implemented
-and what's planned.
+The engine evaluates range queries over vector selectors, eight aggregations
+(`sum`, `avg`, `count`, `min`, `max`, `group`, `stddev`, `stdvar`), and fourteen
+range functions (`rate`, `increase`, `delta`, `irate`, `idelta`,
+`sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`,
+`count_over_time`, `last_over_time`, `present_over_time`, `changes`, `resets`).
+Every other expression returns `Unsupported`, and those failures are the list of
+what to build next.
+
+CI gates the engine on an allowlist, not on the pass count.
+`promql-conformance/testdata/prometheus/SUPPORTED.toml` names the evals that
+must keep passing. A listed eval that stops passing turns CI red, and so does an
+unlisted eval that starts passing, which forces the new coverage to be declared.
+The suite parses and counts the `expect warn` and `expect info` assertions, 555
+evals, but does not check them. The engine has no annotation channel yet.
+
+The parser has four entry points: `parse_expr`, `parse_metric_selector`,
+`parse_metric`, and `parse_series_desc`. Vector-matching modifiers are wired
+into the AST, so `BinaryExpr` carries `vector_matching` and `return_bool`, which
+`promql-parser/tests/vector_matching.rs` covers. So are the `fill`, `fill_left`,
+and `fill_right` modifiers and the `trim_upper` and `trim_lower` operators.
+`parse_series_desc` reads promqltest load lines. Of the 1,015 distinct series
+lines in upstream's corpus, all 787 non-histogram lines produce the labels and
+values Go's `parser.ParseSeriesDesc` produces.
+
+What the parser still misses:
+
+- **Native-histogram descriptors** (`{{schema:1 ...}}`). `SequenceValue` is
+  float-only, and `parse_series_desc` rejects the 228 histogram lines in the
+  corpus.
+- **Duration-expression arithmetic** (`[5m+1m]`, `step()`, `range()`). The
+  `duration_expr` alternatives in `grammar.y` are `Err(())` placeholders. Only a
+  literal duration parses inside a range, subquery, or offset.
+- **Anchored and smoothed selectors.** `VectorSelector` has the fields and the
+  lexer has the keywords, but the actions set both to `false`.
+- **The custom lexer.** `promql-parser/src/lexer.rs`, ported from upstream
+  `lex.go`, is not wired into grmtools. The parser uses the regex-based `lrlex`
+  lexers in `src/lexer.l` and `src/series.l`.
+
+`promql-parser/tests/conformance.rs` runs the port against upstream's own
+`parse_test.go` cases and asserts a floor of 55% (`MIN_PASS_RATE`). The
+long-term target recorded there is 95%.
+
+`docs/parser-sync.md` also describes a structural change-classification scheme
+for `promql-sync` that is not built. The note at the top of that document draws
+the line between what is implemented and what is planned.
 
 ## Building
 
@@ -112,9 +169,44 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+CI runs those two, and then:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --benches
+cargo run -p promql-sync -- check
+```
+
+CI builds the benchmarks but does not run them, so a bench that stops compiling
+fails the build instead of rotting unnoticed. The `bench.yml` workflow runs them
+on demand.
+
+After those, CI re-blesses the promqltest allowlist and fails if the tree is
+dirty, which is what makes each commit's recorded pass count trustworthy.
+
+To see where the engine stands on the corpus, run the conformance suite
+directly. It prints a per-file scoreboard and the missing-feature table on every
+run, gated or not:
+
+```sh
+cargo test -p promql-conformance --test promqltest
+
+# every eval as its own trial, failing as it really is
+PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest
+
+# narrowed to one file, or to the feature you are implementing
+PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest -- operators/
+PROMQL_PROMQLTEST_ALL=1 cargo test -p promql-conformance --test promqltest -- topk
+```
+
+`AGENTS.md` describes the five gates an engine feature moves through before it
+is done.
+
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE). The vendored files under
-`promql-parser/upstream/` are copied verbatim from
-[`prometheus/prometheus`](https://github.com/prometheus/prometheus),
-also Apache-2.0; their upstream copyright headers are retained.
+`promql-parser/upstream/` and
+`promql-conformance/testdata/prometheus/` are copied verbatim from
+[`prometheus/prometheus`](https://github.com/prometheus/prometheus), also
+Apache-2.0. Their upstream copyright headers are retained.
