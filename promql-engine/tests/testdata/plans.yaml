@@ -73,6 +73,34 @@ tests:
         Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
           TableScan: node_cpu_seconds_total
 
+  - name: an elementwise function over a selector
+    description: >
+      One projection per function, each over the last: the operator
+      changes only the value, so the shape it runs on is the shape it
+      hands back. The subquery alias is what keeps the inner `labels`
+      and the rebuilt one apart when the two projections are merged.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      abs(temperature)
+    plan: |
+      Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: abs_0
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: temperature
+
+  - name: vector of a scalar
+    description: >
+      vector(s) asks no store: it is the scalar's value under an empty
+      label set, which is the table a scalar plan already is.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      vector(time())
+    plan: |
+      TableScan: scalar_0
+
   - name: grouped aggregation over a range function
     description: >
       by (job) becomes an ordinary DataFusion Aggregate, so grouping and
