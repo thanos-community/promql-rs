@@ -224,7 +224,7 @@ async fn the_plan_is_an_aggregate_over_the_label_fields() {
     let rendered = plan.display_indent().to_string();
     assert!(
         rendered.starts_with(
-            "Projection: promql_labels(Utf8(\"route\"), __group__route) AS labels, samples\n  Aggregate: groupBy=[[get_field(selector_0.labels, Utf8(\"route\")) AS __group__route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\"), Int64(0), Int64(60000), Int64(30000)) AS samples]]"
+            "Projection: promql_labels(Utf8(\"route\"), __group__route) AS labels, samples, selector_0.block_start, selector_0.block_end\n  Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, get_field(selector_0.labels, Utf8(\"route\")) AS __group__route]], aggr=[[promql_aggregate(samples, Utf8(\"sum\"), Int64(0), Int64(60000), Int64(30000)) AS samples]]"
         ),
         "{rendered}"
     );

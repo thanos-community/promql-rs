@@ -28,7 +28,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::ExecutionPlan;
-use promql_engine::series::{labels_type, sample_fields, sample_item, schema};
+use promql_engine::series::{labels_type, sample_fields, sample_item, schema, Block};
 use promql_engine::{SelectHints, SeriesSource};
 use promql_parser::ast::LabelMatcher;
 
@@ -39,7 +39,7 @@ pub struct Shape {
     pub series: usize,
     pub samples: usize,
     pub scrape_ms: i64,
-    /// Samples per row; `None` is one row per series.
+    /// Samples per chunk; `None` is one chunk per label set.
     pub chunk: Option<usize>,
     pub rows_per_batch: usize,
 }
@@ -70,18 +70,23 @@ impl Generated {
 
     pub fn resident(shape: Shape) -> Self {
         let mut s = Self::streamed(shape);
-        let all = s.partition(0, i64::MAX).batches().collect::<Result<_>>();
+        let all = s.partition(0, i64::MAX, 0).batches().collect::<Result<_>>();
         s.resident = Some(all.expect("generated batches are canonical"));
         s
     }
 
-    fn partition(&self, start_ms: i64, end_ms: i64) -> Partition {
+    /// One block over the whole select, the way `MemorySeriesSource` cuts.
+    fn partition(&self, start_ms: i64, end_ms: i64, window_ms: i64) -> Partition {
         Partition {
             shape: self.shape.clone(),
             schema: self.schema.clone(),
             order: self.order.clone(),
             start_ms,
             end_ms,
+            block: Block {
+                start_ms: start_ms.saturating_add(window_ms),
+                end_ms: end_ms.saturating_add(1),
+            },
         }
     }
 }
@@ -107,7 +112,8 @@ impl SeriesSource for Generated {
                 None,
             )?);
         }
-        let part: Arc<dyn PartitionStream> = Arc::new(self.partition(hints.start_ms, hints.end_ms));
+        let part: Arc<dyn PartitionStream> =
+            Arc::new(self.partition(hints.start_ms, hints.end_ms, hints.window_ms));
         Ok(Arc::new(StreamingTableExec::try_new(
             self.schema.clone(),
             vec![part],
@@ -126,6 +132,7 @@ struct Partition {
     order: Arc<Vec<usize>>,
     start_ms: i64,
     end_ms: i64,
+    block: Block,
 }
 
 impl Partition {
@@ -147,9 +154,10 @@ impl Partition {
         let schema = self.schema.clone();
         let scrape_ms = s.scrape_ms;
         let per_batch = s.rows_per_batch;
+        let block = self.block;
         std::iter::from_fn(move || {
             let rows: Vec<(usize, usize, usize)> = rows.by_ref().take(per_batch).collect();
-            (!rows.is_empty()).then(|| build(&schema, &rows, scrape_ms))
+            (!rows.is_empty()).then(|| build(&schema, &rows, scrape_ms, block))
         })
     }
 }
@@ -190,6 +198,7 @@ fn build(
     schema: &SchemaRef,
     rows: &[(usize, usize, usize)],
     scrape_ms: i64,
+    block: Block,
 ) -> Result<RecordBatch> {
     let mut labels: Vec<StringViewBuilder> =
         NAMES.iter().map(|_| StringViewBuilder::new()).collect();
@@ -239,8 +248,9 @@ fn build(
         Arc::new(entries),
         None,
     );
+    let [block_start, block_end] = block.columns(rows.len());
     Ok(RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(labels), Arc::new(samples)],
+        vec![Arc::new(labels), Arc::new(samples), block_start, block_end],
     )?)
 }

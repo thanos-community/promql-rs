@@ -31,7 +31,7 @@ use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::error::DataFusionError;
 
 use crate::error::EngineError;
-use crate::series::{LABELS, SAMPLES, TIMESTAMP};
+use crate::series::{BLOCK_START, LABELS, SAMPLES, TIMESTAMP};
 
 /// Prometheus's own sentence, word for word: the conformance suite
 /// compares error text, not error kinds.
@@ -97,8 +97,13 @@ pub fn reject_same_labelset(batches: &[RecordBatch]) -> Result<(), EngineError> 
 /// The `labels` struct's own order, which `SeriesSetExec` declares, is
 /// not that order: it compares field by field with `""` for an absent
 /// label, so `{app="q"}` sorts after `{i="0"}` there and before it here.
+///
+/// A label set that lived in several blocks is several rows, and they
+/// come out block by block, so a consumer that walks the result sees
+/// each series' points in time order without concatenating anything.
 pub fn sort_by_labelset(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, EngineError> {
     let mut columns = Vec::with_capacity(batches.len());
+    let mut starts = Vec::with_capacity(batches.len());
     for batch in batches {
         let labels = batch
             .column_by_name(LABELS)
@@ -118,13 +123,21 @@ pub fn sort_by_labelset(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, Eng
                 "result batches differ in schema".into(),
             ));
         }
+        starts.push(
+            batch
+                .column_by_name(BLOCK_START)
+                .ok_or_else(|| EngineError::Schema(format!("no {BLOCK_START} column")))?
+                .as_primitive::<TimestampMillisecondType>(),
+        );
     }
     let mut order: Vec<(usize, usize)> = batches
         .iter()
         .enumerate()
         .flat_map(|(b, batch)| (0..batch.num_rows()).map(move |row| (b, row)))
         .collect();
-    let cmp = |x: &(usize, usize), y: &(usize, usize)| compare(&columns, *x, *y);
+    let cmp = |x: &(usize, usize), y: &(usize, usize)| {
+        compare(&columns, *x, *y).then_with(|| starts[x.0].value(x.1).cmp(&starts[y.0].value(y.1)))
+    };
     // A single store partition, and label sets that all carry the same
     // names, come out of the plan in this order already.
     if order.is_sorted_by(|x, y| cmp(x, y) != Ordering::Greater) {
@@ -208,7 +221,11 @@ fn arrow_error(e: ArrowError) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::{encode, label_names_of, Series};
+    use crate::series::{label_names_of, Series, ONE_BLOCK};
+
+    fn encode(names: &[String], series: &[Series]) -> RecordBatch {
+        crate::series::encode(names, series, ONE_BLOCK).unwrap()
+    }
 
     fn row(pod: &str, name: &str, timestamps: Vec<i64>) -> Series {
         let values = vec![1.0; timestamps.len()];
@@ -222,7 +239,7 @@ mod tests {
     /// here — a plan that emits one is what this catches.
     fn check(batches: Vec<Vec<Series>>) -> Result<(), EngineError> {
         let names = label_names_of(&batches.concat());
-        let one = |row| encode(&names, std::slice::from_ref(row)).unwrap();
+        let one = |row| encode(&names, std::slice::from_ref(row));
         let schema = one(&batches[0][0]).schema();
         let batches: Vec<RecordBatch> = batches
             .iter()
@@ -299,10 +316,7 @@ mod tests {
             .collect();
         let names = label_names_of(&series);
         let (front, back) = series.split_at(4);
-        let batches = [
-            encode(&names, front).unwrap(),
-            encode(&names, back).unwrap(),
-        ];
+        let batches = [encode(&names, front), encode(&names, back)];
         let sorted = crate::series::decode(&sort_by_labelset(&batches).unwrap()).unwrap();
         let got: Vec<Vec<(&str, &str)>> = sorted.iter().map(|s| s.labels().collect()).collect();
         let mut want = sets.clone();
@@ -337,10 +351,7 @@ mod tests {
         let names = label_names_of(&series);
         let even: Vec<Series> = series.iter().step_by(2).cloned().collect();
         let odd: Vec<Series> = series.iter().skip(1).step_by(2).cloned().collect();
-        let batches = [
-            encode(&names, &odd).unwrap(),
-            encode(&names, &even).unwrap(),
-        ];
+        let batches = [encode(&names, &odd), encode(&names, &even)];
         let inputs: Vec<*const u8> = batches.iter().map(values_buffer).collect();
 
         let sorted = sort_by_labelset(&batches).unwrap();

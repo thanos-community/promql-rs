@@ -12,13 +12,23 @@
 //! ```text
 //! sum by (pod) (rate(http_requests_total[5m]))
 //!
-//! Projection: promql_labels('pod', __group__pod) AS labels, samples
-//!   Aggregate: groupBy=[get_field(labels, 'pod') AS __group__pod],
+//! Projection: promql_labels('pod', __group__pod) AS labels, samples, block_start, block_end
+//!   Aggregate: groupBy=[block_start, block_end, get_field(labels, 'pod') AS __group__pod],
 //!              aggr=[promql_aggregate(samples, 'sum') AS samples]
-//!     Projection: promql_labels(…without __name__) AS labels,
-//!                 promql_range_function(samples, 'rate', …) AS samples
-//!       TableScan: selector_0          ← SelectorTable over SeriesSource::select
+//!     Projection: promql_labels(…without __name__) AS labels, samples, block_start, block_end
+//!       Aggregate: groupBy=[block_start, block_end, labels],
+//!                  aggr=[promql_range_function(samples, block_start, block_end, 'rate', …) AS samples]
+//!         TableScan: selector_0        ← SelectorTable over SeriesSource::select
 //! ```
+//!
+//! Every group key leads with the block. The store's plan is ordered by
+//! block, then labels, so the selector and range aggregates run Sorted
+//! over it and close a series at the block edge as well as at the next
+//! label set; an aggregation above holds one partial per group and step
+//! of the open block and emits when the block's last series has passed.
+//! Each node projects back to the canonical column order, because an
+//! Aggregate puts its keys first and everything above reads the shape by
+//! position through [`series::validate`].
 //!
 //! The `__group__` prefix on a group key keeps a label named `labels`
 //! or `samples` from colliding with the engine's own columns; see
@@ -41,7 +51,7 @@ use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::params::{step_count, Params};
 use crate::range::{self, Func};
 use crate::selector;
-use crate::series::{LABELS, SAMPLES};
+use crate::series::{BLOCK_END, BLOCK_START, LABELS, SAMPLES};
 use crate::source::{Grouping, SelectHints, SelectorTable, SeriesSource};
 
 /// The range a query is evaluated over.
@@ -146,23 +156,20 @@ impl Planner<'_> {
         })
     }
 
-    /// The store's hints for one selector: the scan range it must honour
-    /// and whatever else may let it read less.
+    /// The store's hints for one selector: the scan range and the window
+    /// it must honour, and whatever else may let it read less.
     ///
     /// `range_ms` is the `[5m]` of a range selector, absent for an
     /// instant one. `step_ms` is always the step the caller passed: this
     /// engine has one entry point, so a query whose bounds happen to be
     /// equal is a one-step range query, not an instant one, and guessing
     /// otherwise would withhold a grid the store can still align to.
-    fn hints(
-        &self,
-        (start_ms, end_ms): (i64, i64),
-        range_ms: Option<i64>,
-        above: Above,
-    ) -> SelectHints {
+    fn hints(&self, params: &Params, range_ms: Option<i64>, above: Above) -> SelectHints {
+        let (start_ms, end_ms) = params.select_range();
         SelectHints {
             start_ms,
             end_ms,
+            window_ms: params.window_ms,
             step_ms: Some(self.query.step_ms),
             range_ms,
             func: above.func.map(str::to_string),
@@ -206,13 +213,19 @@ impl Planner<'_> {
             at_ms: resolve_at(vs, self.query),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
-        let hints = self.hints(params.select_range(), None, above);
+        let hints = self.hints(&params, None, above);
         let (builder, label_names) = self.scan(vs, hints).await?;
+        // Grouped by the block and the whole label set, so every chunk of
+        // a label set in a block folds into one group.
         let plan = builder
-            .project(vec![
-                col(LABELS),
-                selector::call(col(SAMPLES), &params).alias(SAMPLES),
-            ])?
+            .aggregate(
+                series_keys(),
+                vec![
+                    selector::call(col(SAMPLES), col(BLOCK_START), col(BLOCK_END), &params)
+                        .alias(SAMPLES),
+                ],
+            )?
+            .project(canonical(col(LABELS)))?
             .build()?;
         Ok(Planned { plan, label_names })
     }
@@ -270,7 +283,7 @@ impl Planner<'_> {
         // grouping above it no longer describes the selector's parent, so
         // it is dropped rather than threaded through.
         let hints = self.hints(
-            params.select_range(),
+            &params,
             Some(params.window_ms),
             Above {
                 func: Some(func.as_str()),
@@ -278,16 +291,28 @@ impl Planner<'_> {
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
-        let (labels_expr, label_names) = if func.drops_metric_name() {
-            labels::keep(&input_names, |n| n != METRIC_NAME)
-        } else {
-            (col(LABELS), input_names)
-        };
+        let builder = builder.aggregate(
+            series_keys(),
+            vec![range::call(
+                col(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+                func,
+                &params,
+            )
+            .alias(SAMPLES)],
+        )?;
+        // `__name__` is dropped above the grouping, not below it: below, two
+        // series differing only in their name would fold into one group.
+        if !func.drops_metric_name() {
+            return Ok(Planned {
+                plan: builder.project(canonical(col(LABELS)))?.build()?,
+                label_names: input_names,
+            });
+        }
+        let (labels_expr, label_names) = labels::keep(&input_names, |n| n != METRIC_NAME);
         let plan = builder
-            .project(vec![
-                labels_expr.alias(LABELS),
-                range::call(col(SAMPLES), func, &params).alias(SAMPLES),
-            ])?
+            .project(canonical(labels_expr.alias(LABELS)))?
             .build()?;
         Ok(Planned { plan, label_names })
     }
@@ -319,9 +344,13 @@ impl Planner<'_> {
             .await?;
 
         let keys = labels::group_keys(&input.label_names, &agg.grouping, agg.without);
+        // The block leads the key, so each group is one block's partials
+        // and leaves when the block does.
+        let mut group = vec![col(BLOCK_START), col(BLOCK_END)];
+        group.extend(labels::group_exprs(&keys));
         let plan = LogicalPlanBuilder::from(input.plan)
             .aggregate(
-                labels::group_exprs(&keys),
+                group,
                 vec![aggregate::call(
                     col(SAMPLES),
                     op,
@@ -331,13 +360,27 @@ impl Planner<'_> {
                 )
                 .alias(SAMPLES)],
             )?
-            .project(vec![labels::regroup(&keys).alias(LABELS), col(SAMPLES)])?
+            .project(canonical(labels::regroup(&keys).alias(LABELS)))?
             .build()?;
         Ok(Planned {
             plan,
             label_names: keys,
         })
     }
+}
+
+/// The group key of a selector or range aggregate: one group per label
+/// set and block.
+fn series_keys() -> Vec<datafusion::logical_expr::Expr> {
+    vec![col(BLOCK_START), col(BLOCK_END), col(LABELS)]
+}
+
+/// The canonical columns in order, `labels` being that column as given:
+/// a computed label set arrives aliased, the column itself bare, since
+/// aliasing `labels` to its own name leaves the optimizer two columns
+/// of that name to choose from.
+fn canonical(labels: datafusion::logical_expr::Expr) -> Vec<datafusion::logical_expr::Expr> {
+    vec![labels, col(SAMPLES), col(BLOCK_START), col(BLOCK_END)]
 }
 
 fn offset_ms(vs: &VectorSelector) -> i64 {

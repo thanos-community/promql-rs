@@ -14,6 +14,7 @@ bench = false
 [dependencies]
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+futures = { workspace = true }
 promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }
@@ -33,6 +34,7 @@ criterion = { workspace = true }
 futures = { workspace = true }
 pprof = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_norway = { workspace = true }
 
 # pprof's default unwinder, run in its signal handler, returns an empty stack

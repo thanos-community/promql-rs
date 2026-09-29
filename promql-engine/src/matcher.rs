@@ -212,7 +212,7 @@ mod tests {
             .iter()
             .map(|r| Series::new(r, vec![], vec![]).unwrap())
             .collect();
-        let batch = encode(&label_names_of(&series), &series).unwrap();
+        let batch = encode(&label_names_of(&series), &series, crate::series::ONE_BLOCK).unwrap();
         batch
             .column_by_name(crate::series::LABELS)
             .unwrap()
