@@ -1,0 +1,1403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How rate walks a block and crosses its edge</title>
+<style>
+:root{
+  --bg:#f2f4f5;
+  --surface:#ffffff;
+  --surface-2:#e9edef;
+  --text:#1a2129;
+  --text-dim:#57626c;
+  --text-faint:#7c8790;
+  --border:#d6dce0;
+  --border-strong:#b9c2c8;
+  --accent:#a6531f;
+  --accent-dim:#c98551;
+  --accent-bg:#fbeee4;
+  --accent-bg-strong:#f3dcc7;
+  --ok:#3a7d5c;
+  --ok-bg:#e6f2ec;
+  --absent:#8a5a1f;
+  --absent-bg:#f7ecd9;
+  --code-bg:#eef1f2;
+  --shadow:0 1px 2px rgba(20,30,38,0.06);
+  --ca:#1f66a8;
+  --cb:#9c3b78;
+  --cc:#1a7a63;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#12171c;
+    --surface:#1a2129;
+    --surface-2:#212a32;
+    --text:#e4e9ec;
+    --text-dim:#a7b2ba;
+    --text-faint:#7c8790;
+    --border:#2d3740;
+    --border-strong:#3c4a54;
+    --accent:#dd9057;
+    --accent-dim:#b97440;
+    --accent-bg:#33261c;
+    --accent-bg-strong:#432f1e;
+    --ok:#6fbf95;
+    --ok-bg:#1c2e26;
+    --absent:#d9ab5f;
+    --absent-bg:#332912;
+    --code-bg:#0f1418;
+    --shadow:0 1px 3px rgba(0,0,0,0.4);
+    --ca:#6fa8e0;
+    --cb:#e07ab4;
+    --cc:#4cc0a4;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#12171c;
+  --surface:#1a2129;
+  --surface-2:#212a32;
+  --text:#e4e9ec;
+  --text-dim:#a7b2ba;
+  --text-faint:#7c8790;
+  --border:#2d3740;
+  --border-strong:#3c4a54;
+  --accent:#dd9057;
+  --accent-dim:#b97440;
+  --accent-bg:#33261c;
+  --accent-bg-strong:#432f1e;
+  --ok:#6fbf95;
+  --ok-bg:#1c2e26;
+  --absent:#d9ab5f;
+  --absent-bg:#332912;
+  --code-bg:#0f1418;
+  --shadow:0 1px 3px rgba(0,0,0,0.4);
+  --ca:#6fa8e0;
+  --cb:#e07ab4;
+  --cc:#4cc0a4;
+}
+
+*{box-sizing:border-box;}
+html,body{background:var(--bg);}
+body{
+  margin:0;
+  padding-inline:max(16px, calc((100vw - 920px)/2));
+  padding-block:2.2rem 4rem;
+  font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  color:var(--text);
+  font-size:16px;
+  line-height:1.55;
+}
+main{max-width:920px; margin:0 auto;}
+
+h1,h2,h3{
+  font-family:"Newsreader", ui-serif, Georgia, serif;
+  font-weight:600;
+  color:var(--text);
+  text-wrap:balance;
+  line-height:1.15;
+}
+h1{font-size:2.05rem; margin:0 0 .3rem;}
+h2{
+  font-size:1.4rem;
+  margin:2.6rem 0 .9rem;
+  padding-top:1.1rem;
+  border-top:1px solid var(--border);
+}
+h3{font-size:1.05rem; margin:1.6rem 0 .6rem;}
+h3 code{font-size:.92em;}
+
+p{margin:.7rem 0; max-width:70ch;}
+p.lede{color:var(--text-dim); font-size:1.05rem; max-width:68ch; margin-top:.9rem;}
+a{color:var(--accent);}
+
+code, .fl, pre, .mono{font-family:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;}
+code{
+  background:var(--code-bg);
+  border:1px solid var(--border);
+  border-radius:4px;
+  padding:.05em .35em;
+  font-size:.86em;
+}
+.fl{
+  display:inline-block;
+  background:var(--accent-bg);
+  color:var(--accent);
+  border:1px solid var(--accent-bg-strong);
+  border-radius:4px;
+  padding:.06em .4em;
+  font-size:.78rem;
+  font-weight:500;
+  white-space:nowrap;
+  line-height:1.6;
+  text-decoration:none;
+}
+.byline{color:var(--text-faint); font-size:.85rem; margin-top:.15rem;}
+
+#glossary h2{margin-top:1.4rem;}
+dl.glossary{margin:.4rem 0 .8rem; max-width:70ch;}
+dl.glossary dt{font-weight:600; margin-top:.75rem;}
+dl.glossary dt code{font-weight:500;}
+dl.glossary dd{margin:.15rem 0 0 1.1rem; color:var(--text-dim); font-size:.92rem;}
+
+.query-banner{
+  margin-top:1.4rem;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-left:3px solid var(--accent);
+  border-radius:6px;
+  padding:.9rem 1.1rem;
+  box-shadow:var(--shadow);
+}
+.query-banner code{background:none; border:none; padding:0; font-size:1.05rem; font-weight:500; color:var(--text);}
+
+nav.toc{display:flex; flex-wrap:wrap; gap:.4rem .5rem; margin:1.6rem 0 0; padding:0; list-style:none;}
+nav.toc a{
+  display:inline-block;
+  font-size:.82rem;
+  text-decoration:none;
+  color:var(--text-dim);
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:999px;
+  padding:.3rem .75rem;
+}
+nav.toc a:hover{border-color:var(--accent-dim); color:var(--accent);}
+
+.tablewrap{
+  overflow-x:auto;
+  border:1px solid var(--border);
+  border-radius:8px;
+  margin:1rem 0 1.5rem;
+  background:var(--surface);
+}
+table{border-collapse:collapse; width:100%; font-size:.88rem; min-width:480px;}
+table.wide{min-width:720px;}
+th,td{
+  text-align:left;
+  padding:.5rem .7rem;
+  border-bottom:1px solid var(--border);
+  vertical-align:top;
+  white-space:nowrap;
+}
+thead th{
+  background:var(--surface-2);
+  color:var(--text-dim);
+  font-weight:600;
+  font-size:.76rem;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+}
+tbody tr:last-child td{border-bottom:none;}
+td.num, th.num{font-variant-numeric:tabular-nums; font-family:"IBM Plex Mono", monospace; font-size:.85rem;}
+td.dash{color:var(--text-faint);}
+table.checks td{white-space:normal; width:50%;}
+
+pre.codeblock{
+  overflow-x:auto;
+  background:var(--code-bg);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:.9rem 1.1rem;
+  font-size:.82rem;
+  line-height:1.6;
+  margin:1rem 0 1.5rem;
+}
+pre.codeblock code{background:none; border:none; padding:0; font-size:1em;}
+pre.codeblock.layout{font-size:.75rem; line-height:1.5;}
+
+.footnote{
+  margin-top:2.6rem;
+  padding-top:1rem;
+  border-top:1px dashed var(--border-strong);
+  color:var(--text-dim);
+  font-size:.88rem;
+}
+
+/* ---- overview ---- */
+.overview{
+  margin:1.1rem 0 .4rem;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:.7rem .8rem .8rem;
+  box-shadow:var(--shadow);
+}
+.ov-scroll{overflow-x:auto;}
+#ov-svg{display:block; width:100%; min-width:640px; height:auto;}
+#ov-svg text{font-family:"IBM Plex Mono", ui-monospace, monospace; fill:var(--text-dim); font-size:8.5px;}
+#ov-svg text.strong{fill:var(--text); font-weight:600;}
+#ov-svg text.acc{fill:var(--accent);}
+#ov-svg text.teal{fill:var(--cc);}
+#ov-svg .axis{stroke:var(--border-strong); fill:none;}
+#ov-svg .guide{stroke:var(--border-strong); stroke-dasharray:3 3; fill:none;}
+#ov-svg .guide.edge{stroke:var(--accent-dim); stroke-dasharray:none; stroke-width:1.3;}
+#ov-svg .b1{fill:var(--accent-bg); stroke:var(--accent-dim);}
+#ov-svg .b2{fill:var(--cc); fill-opacity:.1; stroke:var(--cc); stroke-opacity:.7;}
+#ov-svg .reach{fill:url(#ov-hatch); stroke:var(--border-strong); stroke-dasharray:3 2;}
+#ov-svg .detail{fill:none; stroke:var(--border); }
+#ov-svg .step1{fill:var(--accent);}
+#ov-svg .step2{fill:var(--cc);}
+#ov-svg .tile-a{fill:var(--ca); fill-opacity:.13; stroke:var(--ca);}
+#ov-svg .tile-b{fill:var(--cb); fill-opacity:.13; stroke:var(--cb);}
+#ov-svg .dot-a{fill:var(--ca);}
+#ov-svg .dot-b{fill:var(--cb);}
+#ov-svg .part{fill:var(--accent-bg-strong); stroke:var(--accent-dim);}
+#ov-svg .flow{stroke:var(--accent-dim); fill:none; stroke-width:1.2;}
+#ov-svg .arrhead{fill:var(--accent-dim);}
+#ov-svg .hatch-bg{fill:var(--surface-2);}
+#ov-svg .hatch-ln{stroke:var(--border-strong); stroke-width:1.4;}
+#ov-svg a:hover text{fill:var(--accent);}
+#ov-svg a{cursor:pointer;}
+.ov-caps{display:grid; grid-template-columns:repeat(3, 1fr); gap:.4rem 1.1rem; margin:.45rem .2rem 0; padding:0; list-style:none;}
+.ov-caps li{font-size:.84rem; line-height:1.45; color:var(--text-dim);}
+.ov-caps b{color:var(--text); font-weight:600;}
+@media (max-width:720px){ .ov-caps{grid-template-columns:1fr;} }
+
+/* ---- fold step-through ---- */
+.anim{
+  --adur:340ms;
+  margin:1.6rem 0 .6rem;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:.8rem .9rem .9rem;
+  box-shadow:var(--shadow);
+}
+.anim-bar{display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; margin-bottom:.6rem;}
+.anim-bar button{
+  font:500 .78rem "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  color:var(--text-dim);
+  background:var(--surface-2);
+  border:1px solid var(--border);
+  border-radius:5px;
+  padding:.25rem .6rem;
+  cursor:pointer;
+}
+.anim-bar button:hover{border-color:var(--accent-dim); color:var(--accent);}
+.anim-now{
+  margin-left:auto;
+  font-family:"IBM Plex Mono", monospace;
+  font-size:.76rem;
+  color:var(--text-faint);
+  font-variant-numeric:tabular-nums;
+}
+.anim-scroll{overflow-x:auto;}
+/* width:100% plus the viewBox ratio reserves the height, so nothing below jumps mid-fold */
+#fold-svg,#arrow-svg{display:block; width:100%; min-width:680px; height:auto;}
+#fold-svg text,#arrow-svg text{font-family:"IBM Plex Mono", ui-monospace, monospace; fill:var(--text-dim);}
+#fold-svg .axis{stroke:var(--border-strong); fill:none;}
+#fold-svg .rowbox{fill:var(--surface-2); stroke:var(--border);}
+#fold-svg .reach,#arrow-svg .reach{fill:url(#fold-hatch); stroke:none;}
+#fold-svg .hatch-bg{fill:var(--surface-2);}
+#fold-svg .hatch-ln{stroke:var(--border-strong); stroke-width:1.2;}
+#fold-svg .edge{stroke:var(--accent-dim); stroke-width:1.2; stroke-dasharray:5 3; fill:none;}
+#fold-svg .blkbody.b1{fill:var(--accent-bg); stroke:var(--accent-dim);}
+#fold-svg .blkbody.b2{fill:var(--cc); fill-opacity:.1; stroke:var(--cc); stroke-opacity:.7;}
+#fold-svg .blk{transition:opacity var(--adur) ease;}
+#fold-svg .blk.unknown{opacity:.3;}
+#fold-svg .blk.past{opacity:.45;}
+#fold-svg .lanebar{fill:var(--surface-2); stroke:var(--border);}
+#fold-svg .lanebar.b1{stroke:var(--accent-dim);}
+#fold-svg .lanebar.b2{stroke:var(--cc);}
+#fold-svg .lanebar.hit{fill:var(--accent-bg-strong); stroke:var(--accent);}
+#fold-svg .lanebar.done{fill:var(--ok-bg); stroke:var(--ok);}
+#fold-svg .dot{transition:r var(--adur) ease, opacity var(--adur) ease;}
+#fold-svg .g,#fold-svg .lane,#fold-svg .rowg{transition:opacity var(--adur) ease;}
+#fold-svg .gone,#arrow-svg .gone{opacity:0 !important;}
+#fold-svg .dim,#arrow-svg .dim{opacity:.3;}
+#fold-svg .drop{stroke:var(--accent); stroke-width:1.2; stroke-dasharray:3 3; fill:none;}
+#fold-svg .cursor{stroke:var(--ok); stroke-width:1.4; fill:none;}
+
+/* ---- arrow buffer inspector ---- */
+#arrow-svg .hdr{fill:var(--text-faint);}
+#arrow-svg .ucell{fill:var(--surface-2); stroke:var(--border);}
+#arrow-svg .cell,#arrow-svg .obox,#arrow-svg .lcell,#arrow-svg .g{
+  transition:opacity var(--adur) ease, fill var(--adur) ease;
+}
+#arrow-svg .obox rect{fill:var(--accent-bg); stroke:var(--accent-bg-strong);}
+#arrow-svg .obox text{fill:var(--accent);}
+#arrow-svg .otick{stroke:var(--accent-bg-strong); stroke-width:1; fill:none;}
+#arrow-svg .slice rect{fill:var(--accent); opacity:.14; transition:x var(--adur) ease, width var(--adur) ease;}
+#arrow-svg .slice text{fill:var(--accent); font-size:7.5px;}
+#arrow-svg .lcell rect{fill:var(--surface-2); stroke:var(--border);}
+#arrow-svg .lcell.hot rect{fill:var(--accent-bg-strong); stroke:var(--accent-dim);}
+#arrow-svg .lcell.done rect{fill:var(--ok-bg); stroke:var(--ok);}
+#arrow-svg .lcell.unset text{fill:var(--text-faint);}
+#arrow-svg .now rect{stroke:var(--accent); stroke-width:1.6;}
+
+.anim-cap{
+  min-height:3.6rem;
+  margin-top:.55rem;
+  padding-top:.55rem;
+  border-top:1px solid var(--border);
+  font-size:.85rem;
+  color:var(--text-dim);
+}
+.anim-cap b{color:var(--text); font-weight:600;}
+.insp-h{margin:1.3rem 0 .3rem; font-size:1rem;}
+.insp-lede{font-size:.85rem; color:var(--text-dim); margin:.2rem 0 .6rem; max-width:74ch;}
+
+table.lanes{min-width:640px; font-size:.83rem;}
+table.lanes td, table.lanes th{padding:.36rem .6rem;}
+table.lanes td{font-variant-numeric:tabular-nums; font-family:"IBM Plex Mono", monospace;}
+table.lanes td.lbl{font-family:"IBM Plex Sans", sans-serif; font-weight:600;}
+table.lanes td.unset{color:var(--text-faint);}
+table.lanes td{transition:background var(--adur) ease, color var(--adur) ease;}
+table.lanes td.hot{background:var(--accent-bg); color:var(--accent); font-weight:600;}
+table.lanes tr.closed td.lbl{color:var(--ok);}
+table.lanes td.out{color:var(--ok); font-weight:600;}
+
+@media (prefers-reduced-motion: reduce){ .anim{--adur:1ms;} }
+@media (max-width:520px){
+  h1{font-size:1.6rem;}
+  body{font-size:15px;}
+  .query-banner code{font-size:.92rem;}
+}
+</style>
+</head>
+<body>
+
+<main>
+
+<h1>How <code>rate</code> walks a block and crosses its edge</h1>
+<p class="byline">promql-engine internals &middot; companion to <a class="fl" href="engine.md">docs/engine.md</a> and <a class="fl" href="series-source.md">docs/series-source.md</a> &middot; illustrates <a class="fl" href="engine-blocks.md">docs/engine-blocks.md</a></p>
+
+<!-- The overview is the whole approach in one picture: time cut into blocks by the store,
+     one series folded at a time inside a block, steps leaving at the block's edge.
+     Times are the step-through's fixture, so the picture and the step-through agree. -->
+<section class="overview" id="overview" aria-label="Overview">
+  <div class="ov-scroll">
+  <svg id="ov-svg" viewBox="0 0 920 258" role="img" aria-label="A query range cut by the store into two blocks, each shading its reach-back before block_start; inside block 1 two series in label order are folded one at a time into one partial per step, and the partials leave at the block's edge">
+    <defs>
+      <pattern id="ov-hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <rect class="hatch-bg" width="6" height="6"/>
+        <path class="hatch-ln" d="M0 0V6"/>
+      </pattern>
+      <marker id="ov-arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+        <path class="arrhead" d="M0 0L8 4L0 8z"/>
+      </marker>
+    </defs>
+
+    <!-- the one select: steps 420..600 widened back by the 300 s window -->
+    <text x="90" y="12">one select per selector, 120 s &#8594; 600 s: the steps widened back by the window</text>
+    <path class="axis" d="M90 22V16H714V22"/>
+
+    <!-- block edges, carried down into the detail below -->
+    <path class="guide" d="M246 26V250"/>
+    <path class="guide edge" d="M558 26V146M558 192V250"/>
+    <path class="guide" d="M870 26V100"/>
+
+    <a href="#block-edge">
+      <rect class="reach" x="90" y="30" width="156" height="22" rx="3"/>
+      <text x="96" y="44.5">reach-back</text>
+      <rect class="b1" x="246" y="30" width="312" height="22" rx="3"/>
+      <text class="strong" x="254" y="44.5">block 1</text>
+      <text class="acc" x="300" y="44.5">block_start 240 &#183; block_end 480</text>
+      <rect class="reach" x="168" y="58" width="390" height="22" rx="3"/>
+      <text x="174" y="72.5">reach-back, 300 s before block_start</text>
+      <rect class="b2" x="558" y="58" width="312" height="22" rx="3"/>
+      <text class="strong" x="566" y="72.5">block 2</text>
+      <text class="teal" x="612" y="72.5">block_start 480 &#183; block_end 720</text>
+    </a>
+
+    <!-- time axis and the steps each block answers -->
+    <path class="axis" d="M64 104H883"/>
+    <path class="axis" d="M90 104v4M168 104v4M246 104v4M324 104v4M402 104v4M480 104v4M558 104v4M636 104v4M714 104v4M792 104v4M870 104v4"/>
+    <text x="90" y="118" text-anchor="middle">120</text>
+    <text x="168" y="118" text-anchor="middle">180</text>
+    <text x="246" y="118" text-anchor="middle">240</text>
+    <text x="324" y="118" text-anchor="middle">300</text>
+    <text x="402" y="118" text-anchor="middle">360</text>
+    <text x="480" y="118" text-anchor="middle">420</text>
+    <text x="558" y="118" text-anchor="middle">480</text>
+    <text x="636" y="118" text-anchor="middle">540</text>
+    <text x="714" y="118" text-anchor="middle">600</text>
+    <text x="792" y="118" text-anchor="middle">660</text>
+    <text x="870" y="118" text-anchor="middle">720</text>
+    <text x="894" y="118">s</text>
+    <text x="470" y="98" text-anchor="end">steps each block answers</text>
+    <circle class="step1" cx="480" cy="104" r="4.2"/>
+    <circle class="step1" cx="519" cy="104" r="4.2"/>
+    <circle class="step2" cx="558" cy="104" r="4.2"/>
+    <circle class="step2" cx="597" cy="104" r="4.2"/>
+    <circle class="step2" cx="636" cy="104" r="4.2"/>
+    <circle class="step2" cx="675" cy="104" r="4.2"/>
+    <circle class="step2" cx="714" cy="104" r="4.2"/>
+
+    <!-- inside block 1 -->
+    <rect class="detail" x="60" y="128" width="852" height="126" rx="6"/>
+    <text class="strong" x="70" y="142">inside block 1</text>
+
+    <a href="#shape">
+            <rect class="tile-a" x="318" y="151" width="207" height="15" rx="3"/>
+      <circle class="dot-a" cx="324" cy="158.5" r="2"/><circle class="dot-a" cx="363" cy="158.5" r="2"/>
+      <circle class="dot-a" cx="402" cy="158.5" r="2"/><circle class="dot-a" cx="441" cy="158.5" r="2"/>
+      <circle class="dot-a" cx="480" cy="158.5" r="2"/><circle class="dot-a" cx="519" cy="158.5" r="2"/>
+            <rect class="tile-b" x="123" y="173" width="402" height="15" rx="3"/>
+      <rect class="reach" x="123" y="173" width="123" height="15" rx="3" style="fill-opacity:.55"/>
+      <circle class="dot-b" cx="129" cy="180.5" r="2"/><circle class="dot-b" cx="168" cy="180.5" r="2"/>
+      <circle class="dot-b" cx="207" cy="180.5" r="2"/><circle class="dot-b" cx="246" cy="180.5" r="2"/>
+      <circle class="dot-b" cx="285" cy="180.5" r="2"/><circle class="dot-b" cx="324" cy="180.5" r="2"/>
+      <circle class="dot-b" cx="363" cy="180.5" r="2"/><circle class="dot-b" cx="402" cy="180.5" r="2"/>
+      <circle class="dot-b" cx="441" cy="180.5" r="2"/><circle class="dot-b" cx="480" cy="180.5" r="2"/>
+      <circle class="dot-b" cx="519" cy="180.5" r="2"/>
+      <text x="532" y="161.5">1st  x{pod="a"}</text>
+      <text x="532" y="183.5">2nd  x{pod="b"}</text>
+      <text x="70" y="162">series, one chunk each, in label order</text>
+    </a>
+
+    <a href="#block-edge">
+      <path class="flow" d="M480 190V210" marker-end="url(#ov-arr)"/>
+      <path class="flow" d="M519 190V210" marker-end="url(#ov-arr)"/>
+      <text x="454" y="203" text-anchor="end">rate folds one series at a time and forgets it at the next label set</text>
+    </a>
+
+    <a href="#block-edge">
+      <rect class="part" x="462" y="213" width="36" height="17" rx="2"/>
+      <rect class="part" x="501" y="213" width="36" height="17" rx="2"/>
+      <text class="acc" x="480" y="224.5" text-anchor="middle" style="font-size:7.5px">.0483</text>
+      <text class="acc" x="519" y="224.5" text-anchor="middle" style="font-size:7.5px">.0517</text>
+      <text x="454" y="225" text-anchor="end">sum: one partial per step of the block</text>
+      <path class="flow" d="M540 221.5H600" marker-end="url(#ov-arr)"/>
+      <text class="acc" x="606" y="213">emitted at the block's edge,</text>
+      <text class="acc" x="606" y="224.5">when block 2's first series arrives;</text>
+      <text class="acc" x="606" y="236">nothing per series crosses it</text>
+    </a>
+  </svg>
+  </div>
+  <ul class="ov-caps">
+    <li><b>The store cuts time.</b> Every series names its block, and each block reaches back by the window, so it answers its own steps alone.</li>
+    <li><b>A block is folded one series at a time.</b> Series come in label order. <code>rate</code> holds one label set's window buffer and drops it at the next label set.</li>
+    <li><b>The edge is when steps leave.</b> <code>sum</code> holds one partial per step of the open block and emits them once the block's last series has passed.</li>
+  </ul>
+</section>
+
+<section id="glossary" aria-label="Before you read">
+<h2>Before you read</h2>
+<dl class="glossary">
+  <dt>Block</dt>
+  <dd>The store's unit of time, such as a TSDB block, named on every series by <code>block_start</code> and <code>block_end</code>. It holds every sample that the windows of its steps reach, so the engine keeps nothing per series once the block ends. It is the unit of the engine's memory.</dd>
+  <dt>Batch (<code>RecordBatch</code>)</dt>
+  <dd>The series the store sends together. The store may cut a block into batches anywhere, even between two chunks of one series. It is the unit of transport.</dd>
+  <dt>Series</dt>
+  <dd>One series' labels and one chunk of its samples, with the two block columns, stored as one Arrow row. A series with several chunks arrives once per chunk, consecutive in sorted mode and tagged with a <code>series_id</code> in keyed mode. How many chunks a label set becomes in a block is the store's call: a TSDB-backed store sends one per chunk it keeps, a remote store may merge what it receives into one. It is the unit the engine folds.</dd>
+  <dt>Chunk</dt>
+  <dd>A run of one series' samples as the store keeps it, such as a compressed TSDB chunk. The store never decodes a chunk to trim it, so a series may reach past a block edge or overlap the next chunk of the same label set. It is the store's unit of storage.</dd>
+</dl>
+<p>One <code>select</code> yields blocks, a block arrives as batches, a batch holds series, and a series holds one chunk's samples.</p>
+</section>
+
+<p class="lede">How does <code>rate</code> reach across two chunks of one series that it never aligns? It copies what a later window reaches into one window buffer per open series, and a grouped aggregate folds a block, not a label set.</p>
+
+<div class="query-banner">
+  <code>sum(rate(x[5m]))</code> &nbsp;&middot;&nbsp; <code>x{pod="a"}</code>, <code>x{pod="b"}</code> &nbsp;&middot;&nbsp; step 30&thinsp;s, 420&thinsp;s &rarr; 600&thinsp;s &nbsp;&middot;&nbsp; blocks 1 and 2 &nbsp;&middot;&nbsp; batches C and D
+</div>
+
+<nav class="toc">
+  <a href="#glossary">Before you read</a>
+  <a href="#shape">The shape</a>
+  <a href="#checks">What the engine checks</a>
+  <a href="#block-edge">A block edge, step by step</a>
+  <a href="#finalising">Finalising</a>
+  <a href="#edge-cases">Edge cases</a>
+  <a href="#notes">Notes on the numbers</a>
+</nav>
+
+<h2 id="shape">The shape</h2>
+
+<pre class="codeblock"><code>labels       Struct&lt;__name__: Utf8View, ...&gt;
+samples      List&lt;Struct&lt;timestamp: Timestamp(Millisecond), value: Float64&gt;&gt;
+block_start  Timestamp(Millisecond)
+block_end    Timestamp(Millisecond)</code></pre>
+
+<p>One series is one Arrow row: labels, one chunk's samples, and the block it belongs to.</p>
+
+<h2 id="checks">What the engine checks on every series</h2>
+
+<p>A violation is a query error, not a wrong result.</p>
+
+<div class="tablewrap">
+<table class="checks">
+<thead><tr><th>check</th><th>what it catches</th></tr></thead>
+<tbody>
+<tr><td>One label comparison, against the previous series in sorted mode or the id's stored labels in keyed mode</td><td>a label set out of order, or split by another label set, and a <code>series_id</code> that names other labels</td></tr>
+<tr><td>The first sample timestamp does not decrease across a label set's chunks</td><td>chunks of one label set sent out of time order</td></tr>
+<tr><td><code>block_start</code> and <code>block_end</code> stay constant within a block</td><td>a series that disagrees with its block about where the block ends</td></tr>
+<tr><td>Blocks ascend and do not overlap</td><td>a series that goes back to an earlier block, or a block that starts before the last one ended</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A batch boundary is not among the events, because the store may cut a block anywhere, even between two chunks of one label set. In sorted mode the engine carries one open series per partition across a batch boundary, and in keyed mode every series of the block.</p>
+
+<h2 id="block-edge">Watch one query cross a block edge</h2>
+
+<p>The store cuts blocks every 240&thinsp;s here, so block 1 answers 420&thinsp;s and 450&thinsp;s and block 2 answers 480&thinsp;s to 600&thinsp;s. The engine selects once, from 120&thinsp;s to 600&thinsp;s with <code>window_ms</code> 300&thinsp;s, and the store reaches back by that window at each block.</p>
+
+<pre class="codeblock layout"><code>block  labels.pod  samples                     first / last sample timestamp
+  1    "a"         300 330 … 420 450    (6)    300 / 450
+  1    "b"         150 180 … 420 450   (11)    150 / 450
+  2    "a"         300 330 … 570 600   (11)    300 / 600    reach-back 300–450
+  2    "b"         180 210 … 570 600   (15)    180 / 600    reach-back 180–450</code></pre>
+
+<section id="fold" class="anim" aria-label="Step-through of sum(rate(x[5m])) across the block edge">
+  <div class="anim-bar">
+    <button type="button" id="fold-play">Play</button>
+    <button type="button" id="fold-prev">&larr; Step</button>
+    <button type="button" id="fold-next">Step &rarr;</button>
+    <button type="button" id="fold-restart">Restart</button>
+    <button type="button" id="fold-speed">1&times;</button>
+    <span class="anim-now" id="fold-now"></span>
+  </div>
+  <div class="anim-scroll">
+    <svg id="fold-svg" viewBox="0 0 900 352" role="img" aria-label="Two series, each with one chunk in each of two blocks, arriving in two RecordBatches, folded one series at a time into seven step windows; sum emits a block's steps when the block's last series has passed"></svg>
+  </div>
+  <p class="anim-cap" id="fold-cap"></p>
+
+  <h3 class="insp-h" id="inspector">The same step, as Arrow holds it</h3>
+  <p class="insp-lede">The top half draws the two input <code>RecordBatch</code>es, each with label and block columns and a <code>samples</code> list of offsets over two flat child buffers. The batch edge falls inside block 2 on purpose. The bottom half draws what outlives a chunk, the open series' window buffer and <code>sum</code>'s partials, then what <code>sum</code> has emitted.</p>
+  <div class="anim-scroll">
+    <svg id="arrow-svg" viewBox="0 0 900 328" role="img" aria-label="Two Arrow RecordBatches, each an offsets buffer over its own child buffers, above the open series' window buffer, sum's partials for the open block, and sum's output"></svg>
+  </div>
+  <p class="anim-cap" id="arrow-cap"></p>
+
+  <h3 class="insp-h">Partials per step</h3>
+  <p class="insp-lede">A partial exists only while its block is open. Every value comes from the page's own fold and its port of <code>extrapolatedRate</code>.</p>
+  <div class="anim-scroll">
+    <div class="tablewrap" style="margin-top:0">
+      <table class="lanes" id="sum-tbl">
+        <thead><tr>
+          <th>step</th><th>block</th><th>window</th><th>rate a</th><th>rate b</th><th>sum partial</th><th>state</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<p><code>sum</code> never sees samples, only the step values <code>rate</code> emits, each keyed by its step, so a batch cannot arrive early or late.</p>
+
+<p>With several partitions, each keeps its own partials, and the block's final <code>sum</code> adds them once every partition has passed the block, because its group key leads with <code>block_start</code> and the repartition beneath the Final preserves block order (<a href="engine.md#ordering-integrity">docs/engine.md</a>).</p>
+
+<h2 id="finalising">Finalising</h2>
+
+<p>Each lane of <code>x{pod="a"}</code> goes through Prometheus's <code>extrapolatedRate</code> when <code>rate</code> answers it, threshold clamp first, then the counter zero clip.</p>
+
+<pre class="codeblock"><code>result             = last_v - first_v + reset_sum = 6 - 11 + 16 = 11
+sampled_interval   = 600 - 330                                  = 270 s
+average_interval   = 270 / (10 - 1)                             = 30 s
+threshold          = 1.1 * 30                                   = 33 s
+duration_to_start  = 330 - 300 = 30 s   (&lt; 33, kept as measured)
+duration_to_zero   = 270 * (11 / 11) = 270 s   (30 &lt; 270, zero clip does not bite)
+duration_to_end    = 600 - 600 = 0 s    (&lt; 33, kept)
+factor             = (270 + 30 + 0) / 270                       = 10/9
+increase           = 11 * 10/9                                  = 12.2222222
+rate               = 12.2222222 / 300                           = 0.0407407407</code></pre>
+
+<div class="tablewrap">
+<table class="wide">
+<thead><tr><th>lane t</th><th class="num">result</th><th class="num">sampled interval</th><th class="num">to_start</th><th class="num">factor</th><th class="num">increase</th><th class="num">rate</th></tr></thead>
+<tbody>
+<tr><td>420&nbsp;s</td><td class="num">4</td><td class="num">120&nbsp;s</td><td class="num">15&nbsp;s (clamped)</td><td class="num">135/120</td><td class="num">4.5</td><td class="num"><b>0.015</b></td></tr>
+<tr><td>450&nbsp;s</td><td class="num">5</td><td class="num">150&nbsp;s</td><td class="num">15&nbsp;s (clamped)</td><td class="num">165/150</td><td class="num">5.5</td><td class="num"><b>0.0183333333</b></td></tr>
+<tr><td>480&nbsp;s</td><td class="num">6</td><td class="num">180&nbsp;s</td><td class="num">15&nbsp;s (clamped)</td><td class="num">195/180</td><td class="num">6.5</td><td class="num"><b>0.0216666667</b></td></tr>
+<tr><td>510&nbsp;s</td><td class="num">9</td><td class="num">210&nbsp;s</td><td class="num">15&nbsp;s (clamped)</td><td class="num">225/210</td><td class="num">9.6428571</td><td class="num"><b>0.0321428571</b></td></tr>
+<tr><td>540&nbsp;s</td><td class="num">10</td><td class="num">240&nbsp;s</td><td class="num">15&nbsp;s (clamped)</td><td class="num">255/240</td><td class="num">10.625</td><td class="num"><b>0.0354166667</b></td></tr>
+<tr><td>570&nbsp;s</td><td class="num">11</td><td class="num">270&nbsp;s</td><td class="num">30&nbsp;s</td><td class="num">300/270</td><td class="num">12.2222222</td><td class="num"><b>0.0407407407</b></td></tr>
+<tr><td>600&nbsp;s</td><td class="num">11</td><td class="num">270&nbsp;s</td><td class="num">30&nbsp;s</td><td class="num">300/270</td><td class="num">12.2222222</td><td class="num"><b>0.0407407407</b></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="edge-cases">Edge cases</h2>
+
+<p><b>Overlapping chunks.</b> Adjacent chunks of a label set may overlap in time, so the engine skips every sample at or before the last timestamp it copied and the first chunk wins. A stale marker claims its timestamp too (<a href="engine-blocks.md#6-overlapping-chunks">docs/engine-blocks.md</a>).</p>
+
+<p><b>Functions that need every sample.</b> <code>quantile_over_time</code> and functions like it keep no running state. They refold the lane's slice of the same buffer at each step (<a href="engine-blocks.md#7-functions-that-need-every-sample-in-the-window">docs/engine-blocks.md</a>).</p>
+
+<div class="footnote" id="notes">
+<p><b>Notes on the numbers.</b> The fold and <code>extrapolatedRate</code> run in this page, term for term after Prometheus's <code>promql/functions.go</code>. The engine checks itself against the same rates in <code>the_engine_blocks_fixture</code> in <code>buffer.rs</code>.</p>
+</div>
+
+</main>
+
+<script>
+(function(){
+  "use strict";
+  var NS = "http://www.w3.org/2000/svg";
+  var svg = document.getElementById("fold-svg");
+  var asvg = document.getElementById("arrow-svg");
+  var sec = document.getElementById("fold");
+  var cap = document.getElementById("fold-cap");
+  var acap = document.getElementById("arrow-cap");
+  var now = document.getElementById("fold-now");
+  var tbody = document.querySelector("#sum-tbl tbody");
+
+  function mk(tag, attrs, parent, text){
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    (parent || svg).appendChild(e);
+    return e;
+  }
+  function cls(el, name, on){ el.classList.toggle(name, !!on); }
+  function svar(k){ return "var(--" + k + ")"; }
+
+  /* ---- fixture: sum(rate(x[5m])) over x{pod="a"} and x{pod="b"}. Seconds throughout; the engine counts
+     milliseconds, and nothing on this page turns on the difference. Two
+     blocks the store declares and two series, each with one chunk per block.
+     The chunks come in two RecordBatches cut inside block 2 on purpose: the block edge (before
+     2·a) and the batch edge (before 2·b) fall in different places, and only
+     the first is an event for sum. ---- */
+  var RANGE = 300, STEP = 30;
+  var STEPS = [420, 450, 480, 510, 540, 570, 600];
+  var BLOCKS = [
+    {name:"1", start:240, end:480, key:"b1", color:"accent"},
+    {name:"2", start:480, end:720, key:"b2", color:"cc"}
+  ];
+  BLOCKS.forEach(function(b){
+    b.steps = STEPS.filter(function(t){ return t >= b.start && t < b.end; });
+  });
+  function blockOfStep(t){
+    for (var i = 0; i < BLOCKS.length; i++) if (t >= BLOCKS[i].start && t < BLOCKS[i].end) return i;
+    return -1;
+  }
+  // x{pod="a"} is the series the Finalising table lists rates for (docs/engine-blocks.md walks its single-block fold), reset at 510 s included; x{pod="b"} counts up by one per 30 s from 10 at 150 s
+  var A_VALUES = [10, 11, 12, 13, 14, 15, 16, 3, 4, 5, 6];
+  function samples(series, t0, t1){
+    var out = [];
+    for (var t = t0; t <= t1; t += STEP)
+      out.push([t, series === "a" ? A_VALUES[(t - 300) / STEP] : 10 + (t - 150) / STEP]);
+    return out;
+  }
+  var SER = {a:{label:'x{pod="a"}', key:"ca"}, b:{label:'x{pod="b"}', key:"cb"}};
+  var BATCHES = [
+    {name:"C", rows:[
+      {name:"1·a", series:"a", block:0, s:samples("a", 300, 450)},
+      {name:"1·b", series:"b", block:0, s:samples("b", 150, 450)},
+      {name:"2·a", series:"a", block:1, s:samples("a", 300, 600)}]},
+    {name:"D", rows:[
+      {name:"2·b", series:"b", block:1, s:samples("b", 180, 600)}]}
+  ];
+  // series in arrival order, one per chunk. Each batch keeps its own offsets and child buffers,
+  // both starting again at 0, because nothing in batch D may point into batch C
+  var ROWS = [];
+  BATCHES.forEach(function(b, bi){
+    b.offs = [0]; b.ts = [];
+    b.rows.forEach(function(r, ri){
+      r.batch = bi; r.ri = ri; r.idx = ROWS.length; r.base = b.offs[b.offs.length - 1];
+      ROWS.push(r);
+      b.offs.push(r.base + r.s.length);
+      r.s.forEach(function(p){ b.ts.push(p[0]); });
+    });
+  });
+  function rowOf(series, block){
+    for (var i = 0; i < ROWS.length; i++) if (ROWS[i].series === series && ROWS[i].block === block) return i;
+    return -1;
+  }
+
+  /* ---- a lane, and Prometheus's extrapolatedRate ----
+     Both live here rather than being hard-coded, so the diagrams and the table
+     cannot drift from the prose. The guard order is load-bearing: the threshold
+     clamp moves duration_to_start first, and only then may the counter zero
+     clip shorten it further (promql/functions.go). */
+  function hits(tStep, t){ return t > tStep - RANGE && t <= tStep; }
+  function laneOf(ss, tStep){
+    var l = {ft:null, fv:0, lt:0, lv:0, n:0, rs:0};
+    ss.forEach(function(p){
+      if (!hits(tStep, p[0])) return;
+      if (l.n === 0){ l.ft = p[0]; l.fv = p[1]; }
+      else if (p[1] < l.lv){ l.rs += l.lv; }
+      l.lt = p[0]; l.lv = p[1]; l.n++;
+    });
+    return l;
+  }
+  function extrapolated(l, tStep){
+    if (l.n < 2) return null;
+    var result = l.lv - l.fv + l.rs;
+    var si = l.lt - l.ft;
+    var dStart = l.ft - (tStep - RANGE);
+    var dEnd = tStep - l.lt;
+    var avg = si / (l.n - 1);
+    var thr = avg * 1.1;
+    if (dStart >= thr) dStart = avg / 2;
+    if (result > 0 && l.fv >= 0){
+      var dZero = si * (l.fv / result);
+      if (dZero < dStart) dStart = dZero;
+    }
+    if (dEnd >= thr) dEnd = avg / 2;
+    var factor = si !== 0 ? (si + dStart + dEnd) / si : 1;
+    return result * factor / RANGE;
+  }
+
+  /* ---- frames ----
+     The engine pushes a whole chunk at once. The page slows each push to one
+     frame per step it makes final, so the partials can be watched filling.
+     Between series: "close" when the label set changes inside a block, "edge"
+     when a series of the next block arrives, "end" when the stream does. */
+  var EV = [{k:"src", row:0}];
+  ROWS.forEach(function(r, ri){
+    if (ri > 0)
+      EV.push({k: r.block !== ROWS[ri - 1].block ? "edge" : "close", row:ri,
+               arrives: r.batch !== ROWS[ri - 1].batch});
+    var from = 0;
+    BLOCKS[r.block].steps.forEach(function(ts){
+      var to = from;
+      while (to < r.s.length && r.s[to][0] <= ts) to++;
+      if (to > from){ EV.push({k:"push", row:ri, from:from, to:to}); from = to; }
+    });
+    if (from < r.s.length) EV.push({k:"push", row:ri, from:from, to:r.s.length});
+  });
+  EV.push({k:"end"});
+  var TOTAL = EV.length;
+
+  /* State at every frame, precomputed by replaying the fold once. */
+  var HIST = [];
+  (function(){
+    var S = {open:-1, block:-1, batches:1, copied:ROWS.map(function(){ return 0; }),
+             closed:ROWS.map(function(){ return false; }), rate:ROWS.map(function(){ return {}; }),
+             partial:{}, pstate:{}, out:[]};
+    STEPS.forEach(function(t){ S.pstate[t] = "wait"; });
+    function openBlock(bi){
+      S.block = bi;
+      BLOCKS[bi].steps.forEach(function(t){ S.pstate[t] = "open"; });
+    }
+    // a step is final once its end is at or before the last timestamp pushed, or its series has closed
+    function answer(ri, upTo, touched){
+      var r = ROWS[ri];
+      BLOCKS[r.block].steps.forEach(function(ts){
+        if (ts in S.rate[ri] || ts > upTo) return;
+        var v = extrapolated(laneOf(r.s.slice(0, S.copied[ri]), ts), ts);
+        S.rate[ri][ts] = v;
+        if (v !== null) S.partial[ts] = (S.partial[ts] || 0) + v;
+        touched.push(ts);
+      });
+    }
+    function closeOpen(touched){
+      if (S.open < 0) return;
+      answer(S.open, Infinity, touched);
+      S.closed[S.open] = true;
+    }
+    function emitBlock(emitted){
+      BLOCKS[S.block].steps.forEach(function(ts){
+        S.out.push([ts, ts in S.partial ? S.partial[ts] : null]);
+        S.pstate[ts] = "emitted";
+        delete S.partial[ts];
+        emitted.push(ts);
+      });
+    }
+    EV.forEach(function(e){
+      var touched = [], emitted = [];
+      if (e.k === "src"){ openBlock(ROWS[0].block); S.open = 0; }
+      else if (e.k === "push"){ S.copied[e.row] = e.to; answer(e.row, ROWS[e.row].s[e.to - 1][0], touched); }
+      else if (e.k === "close"){ closeOpen(touched); S.open = e.row; }
+      else if (e.k === "edge"){ closeOpen(touched); emitBlock(emitted); openBlock(ROWS[e.row].block); S.open = e.row; }
+      else if (e.k === "end"){ closeOpen(touched); emitBlock(emitted); S.open = -1; }
+      if (e.arrives) S.batches++;
+      HIST.push({
+        open:S.open, block:S.block, batches:S.batches,
+        copied:S.copied.slice(), closed:S.closed.slice(),
+        rate:S.rate.map(function(o){ var c = {}; for (var k in o) c[k] = o[k]; return c; }),
+        partial:(function(){ var c = {}; for (var k in S.partial) c[k] = S.partial[k]; return c; })(),
+        pstate:(function(){ var c = {}; for (var k in S.pstate) c[k] = S.pstate[k]; return c; })(),
+        out:S.out.slice(), touched:touched, emitted:emitted
+      });
+    });
+  })();
+
+  function fmt(v){ return v == null ? "--" : String(Math.round(v * 1e10) / 1e10); }
+  function visible(h, bi){ return bi < h.batches; }
+  // a batch is released once a later batch has arrived: every series in it is folded
+  function released(h, bi){ return bi < h.batches - 1; }
+  function has(arr, v){ return arr.indexOf(v) >= 0; }
+  // the earliest step of the open series' block not yet answered for it; what lies at or
+  // before its window start is reached by no later window of the block
+  function reachFrom(h){
+    if (h.open < 0) return Infinity;
+    var r = ROWS[h.open], st = BLOCKS[r.block].steps;
+    for (var i = 0; i < st.length; i++) if (!(st[i] in h.rate[h.open])) return st[i] - RANGE;
+    return Infinity;
+  }
+
+  /* =====================  pipeline: series over a time axis  ===================== */
+  var X0 = 196, T0 = 110, PX = 1.34;
+  function X(t){ return X0 + (t - T0) * PX; }
+  var T_MAX = 620;
+  var BLK_Y = [6, 24], BLK_H = 14;
+  var ROW_Y = [54, 82, 110, 150], ROW_H = 22;
+  var BATCH_Y = [[48, 138], [144, 178]];         // outline top and bottom per batch
+  var AXIS_Y = 196;
+  var LANE_Y0 = 214, LANE_DY = 19, LANE_H = 12;
+
+  var defs = mk("defs", {});
+  var pat = mk("pattern", {id:"fold-hatch", width:6, height:6, patternUnits:"userSpaceOnUse",
+                           patternTransform:"rotate(45)"}, defs);
+  mk("rect", {"class":"hatch-bg", width:6, height:6}, pat);
+  mk("path", {"class":"hatch-ln", d:"M0 0V6"}, pat);
+
+  var blkG = [];
+  BLOCKS.forEach(function(b, bi){
+    var g = mk("g", {"class":"blk"}), y = BLK_Y[bi];
+    blkG.push(g);
+    var r0 = Math.max(120, b.start - RANGE);
+    mk("rect", {"class":"reach", x:X(r0), y:y, width:X(b.start) - X(r0), height:BLK_H, rx:2,
+                stroke:"var(--border-strong)", "stroke-dasharray":"3 2"}, g);
+    mk("rect", {"class":"blkbody " + b.key, x:X(b.start), y:y,
+                width:X(Math.min(b.end, T_MAX)) - X(b.start), height:BLK_H, rx:2}, g);
+    mk("text", {x:X(b.start) + 6, y:y + 10, "font-size":8, style:"fill:" + svar(b.color)}, g,
+       "block " + b.name + "  block_start " + b.start + "  block_end " + b.end);
+    mk("text", {x:X(r0) + 4, y:y + 10, "font-size":7}, g, "reach-back");
+  });
+  BLOCKS.forEach(function(b){
+    if (b.start > T0 && b.start < T_MAX)
+      mk("path", {"class":"edge", d:"M" + X(b.start) + " " + BLK_Y[0] + "V" + (LANE_Y0 + 7 * LANE_DY)});
+  });
+
+  var gAxis = mk("g", {});
+  mk("path", {"class":"axis", d:"M" + X(T0) + " " + AXIS_Y + "H" + X(T_MAX)}, gAxis);
+  for (var t = 120; t <= 600; t += STEP){
+    mk("path", {"class":"axis", d:"M" + X(t) + " " + AXIS_Y + "v5"}, gAxis);
+    if (t % 60 === 0)
+      mk("text", {x:X(t), y:AXIS_Y + 15, "font-size":8, "text-anchor":"middle"}, gAxis, String(t));
+  }
+  mk("text", {x:X(T_MAX) + 8, y:AXIS_Y + 15, "font-size":8}, gAxis, "s");
+
+  var batchG = [], rowG = [], dotG = [], rowState = [];
+  BATCHES.forEach(function(b, bi){
+    var bg = mk("g", {"class":"g"});
+    batchG.push(bg);
+    var y0 = BATCH_Y[bi][0] + 1, y1 = BATCH_Y[bi][1] - 1;
+    mk("rect", {x:4, y:y0, width:892, height:y1 - y0, rx:6, fill:"none",
+                stroke:"var(--border-strong)", "stroke-dasharray":"4 3"}, bg);
+    mk("text", {x:890, y:y0 + 10, "font-size":8, fill:"var(--text)", "text-anchor":"end"}, bg, "RecordBatch " + b.name);
+  });
+  ROWS.forEach(function(r, ri){
+    var g = mk("g", {"class":"rowg"}, batchG[r.batch]);
+    rowG.push(g);
+    var bl = BLOCKS[r.block], t0 = r.s[0][0], t1 = r.s[r.s.length - 1][0], y = ROW_Y[ri];
+    mk("rect", {"class":"rowbox", x:X(t0) - 9, y:y, width:X(t1) - X(t0) + 18, height:ROW_H, rx:4}, g);
+    // the series' reach-back: samples that feed this block's windows and answer none of its steps
+    if (t0 < bl.start)
+      mk("rect", {"class":"reach", x:X(t0) - 9, y:y, width:X(bl.start) - X(t0) + 9, height:ROW_H,
+                  rx:4, opacity:0.55}, g);
+    mk("text", {x:X0 - 12, y:y + 10, "font-size":9, "text-anchor":"end", fill:svar(SER[r.series].key)}, g,
+       r.name + "  " + SER[r.series].label);
+    rowState.push(mk("text", {x:X0 - 12, y:y + 19.5, "font-size":7, "text-anchor":"end"}, g, ""));
+    var ds = [];
+    r.s.forEach(function(p){
+      var sg = mk("g", {"class":"g"}, g), x = X(p[0]), cy = y + ROW_H / 2 + 2;
+      mk("text", {x:x, y:cy - 6, "font-size":7, "text-anchor":"middle"}, sg, String(p[1]));
+      var d = mk("circle", {"class":"dot", cx:x, cy:cy, r:3.2, fill:svar(SER[r.series].key)}, sg);
+      ds.push({g:sg, dot:d, x:x, y:cy});
+    });
+    dotG.push(ds);
+  });
+  // outside batchG so it stays legible while the batch itself is greyed; inline
+  // style because the stylesheet's text fill outranks a fill attribute
+  var gRel = mk("g", {"class":"g gone"});
+  mk("text", {x:X(460), y:BATCH_Y[0][0] + 11, "font-size":8, style:"fill:var(--accent)"}, gRel,
+     "batch C released: labels, blocks, offsets, child buffers");
+
+  var gDrop = mk("g", {"class":"g"});
+  var dropLine = mk("path", {"class":"drop", d:""}, gDrop);
+
+  var laneG = [], laneBar = [], laneTxt = [];
+  STEPS.forEach(function(ts, li){
+    var g = mk("g", {"class":"lane"}), y = LANE_Y0 + li * LANE_DY, bl = BLOCKS[blockOfStep(ts)];
+    laneG.push(g);
+    mk("text", {x:X0 - 12, y:y + 9, "font-size":8, "text-anchor":"end"}, g,
+       "t = " + ts + " s  block " + bl.name);
+    var lo = ts - RANGE;
+    laneBar.push(mk("rect", {"class":"lanebar " + bl.key, x:X(lo), y:y, width:X(ts) - X(lo),
+                             height:LANE_H, rx:2}, g));
+    // dashed at the open edge, solid at the closed one: the window is (t - 300 s, t]
+    mk("path", {d:"M" + X(lo) + " " + y + "v" + LANE_H, stroke:"var(--border-strong)",
+                "stroke-dasharray":"2 2", fill:"none"}, g);
+    laneTxt.push(mk("text", {x:X(ts) - 6, y:y + 9, "font-size":7.5, "text-anchor":"end",
+                             style:"fill:var(--accent)"}, g, ""));
+  });
+
+  // the open series' cursor: its last copied timestamp, what the overlap skip compares against
+  var gCur = mk("g", {"class":"g gone"});
+  var curLine = mk("path", {"class":"cursor", d:""}, gCur);
+  var curTxt = mk("text", {x:0, y:AXIS_Y - 7, "font-size":7.5, "text-anchor":"end",
+                           style:"fill:var(--ok)"}, gCur, "");
+  var gEdgeTxt = mk("g", {"class":"g gone"});
+  var edgeTxt = mk("text", {x:X(480) - 6, y:AXIS_Y - 7, "font-size":8, "text-anchor":"end", style:"fill:var(--accent)"}, gEdgeTxt, "");
+
+  /* =====================  Arrow buffer inspector  =====================
+     Driven by the same frame index. Top: the two input RecordBatches, each its
+     label and block columns plus the samples list as offsets over two flat
+     child buffers of its own. Bottom: what outlives a chunk, the open series'
+     window buffer, copied out of its batch, and sum's partials for the open
+     block. Only the bottom half outlives a batch, and only sum's partials
+     outlive a series. */
+  var ICW = 22;                                   // child buffer cell width
+  var BX = 236;                                   // child buffer origin
+  var PANEL_Y = [0, 96];
+  var CCOLS = [
+    {name:"labels.pod", w:40, get:function(r){ return '"' + r.series + '"'; }},
+    {name:"block_start", w:50, get:function(r){ return String(BLOCKS[r.block].start); }},
+    {name:"block_end", w:50, get:function(r){ return String(BLOCKS[r.block].end); }}
+  ];
+  var panel = [], colCells = [], derivedG = [], tsCell = [], valCell = [], cellRow = [];
+  BATCHES.forEach(function(b, bi){
+    var y0 = PANEL_Y[bi], pg = mk("g", {"class":"g"}, asvg);
+    panel.push(pg);
+    mk("text", {x:10, y:y0 + 12, "font-size":9, fill:"var(--text)"}, pg, "RecordBatch " + b.name);
+    mk("text", {"class":"hdr", x:BX, y:y0 + 12, "font-size":6.5}, pg,
+       "samples  List<Struct<timestamp, value>>: offsets over two child buffers of its own");
+    var cx = 46;
+    CCOLS.forEach(function(c){
+      mk("text", {"class":"hdr", x:cx + 2, y:y0 + 24, "font-size":6.5}, pg, c.name);
+      cx += c.w + 4;
+    });
+    b.rows.forEach(function(r){
+      var cy = y0 + 29 + r.ri * 17, cg = [];
+      mk("text", {x:40, y:cy + 10.5, "font-size":7, "text-anchor":"end", fill:svar(SER[r.series].key)}, pg, r.name);
+      var x = 46;
+      CCOLS.forEach(function(c){
+        var g = mk("g", {"class":"cell"}, pg);
+        mk("rect", {"class":"ucell", x:x, y:cy, width:c.w, height:15, rx:2}, g);
+        mk("text", {x:x + 4, y:cy + 10.5, "font-size":7, fill:"var(--text)"}, g, c.get(r));
+        cg.push(g);
+        x += c.w + 4;
+      });
+      colCells[r.idx] = cg;
+    });
+
+    var OFF_Y = y0 + 27, TS_Y = y0 + 38, VAL_Y = y0 + 55;
+    mk("text", {x:BX - 14, y:OFF_Y + 3, "font-size":7, "text-anchor":"end"}, pg, "offsets");
+    mk("text", {x:BX - 6, y:TS_Y + 10.5, "font-size":7, "text-anchor":"end"}, pg, "timestamp");
+    mk("text", {x:BX - 6, y:VAL_Y + 10.5, "font-size":7, "text-anchor":"end"}, pg, "value");
+    tsCell.push([]); valCell.push([]); cellRow.push([]);
+    var idx = 0;
+    b.rows.forEach(function(r){
+      r.s.forEach(function(p, si){
+        var x = BX + idx * ICW, mid = x + ICW / 2 - 0.5, k = SER[r.series].key;
+        var gt = mk("g", {"class":"cell"}, pg);
+        mk("rect", {x:x, y:TS_Y, width:ICW - 1, height:15, rx:2,
+                    fill:svar(k), "fill-opacity":0.14, stroke:svar(k)}, gt);
+        mk("text", {x:mid, y:TS_Y + 10.5, "font-size":6.5, "text-anchor":"middle", fill:"var(--text)"}, gt, String(p[0]));
+        var gv = mk("g", {"class":"cell"}, pg);
+        mk("rect", {x:x, y:VAL_Y, width:ICW - 1, height:15, rx:2,
+                    fill:svar(k), "fill-opacity":0.05, stroke:svar(k), "stroke-opacity":0.5}, gv);
+        mk("text", {x:mid, y:VAL_Y + 10.5, "font-size":6.5, "text-anchor":"middle", fill:"var(--text)"}, gv, String(p[1]));
+        tsCell[bi].push(gt); valCell[bi].push(gv); cellRow[bi].push([r.idx, si]);
+        idx++;
+      });
+    });
+    // offsets boxes sit on the boundaries they define
+    b.offs.forEach(function(o){
+      var g = mk("g", {"class":"obox"}, pg), x = BX + o * ICW;
+      mk("rect", {x:x - 9, y:OFF_Y - 7, width:18, height:12, rx:3}, g);
+      mk("path", {"class":"otick", d:"M" + x + " " + (OFF_Y + 5) + "V" + TS_Y}, g);
+      mk("text", {x:x, y:OFF_Y + 2.5, "font-size":6.5, "text-anchor":"middle"}, g, String(o));
+    });
+    // not columns: read off this batch's offsets, which is why each batch carries its own
+    b.rows.forEach(function(r){
+      var g = mk("g", {"class":"cell"}, pg), lo = b.offs[r.ri], hi = b.offs[r.ri + 1];
+      // odd rows one line down, so a short row's labels cannot run into its neighbour's
+      var dy = y0 + 80 + (r.ri % 2) * 8;
+      mk("text", {"class":"hdr", x:BX + lo * ICW + 2, y:dy, "font-size":6}, g, "ts[" + lo + "] " + b.ts[lo]);
+      mk("text", {"class":"hdr", x:BX + hi * ICW - 3, y:dy, "font-size":6, "text-anchor":"end"}, g,
+         "ts[" + (hi - 1) + "] " + b.ts[hi - 1]);
+      derivedG[r.idx] = g;
+    });
+  });
+  var gARel = mk("g", {"class":"g gone"}, asvg);
+  mk("text", {x:120, y:12, "font-size":8, style:"fill:var(--accent)"}, gARel, "released");
+
+  // the slice the fold is reading, drawn over the cells of its batch
+  var gSlice = mk("g", {"class":"slice gone"}, asvg);
+  var sliceRect = mk("rect", {x:0, y:0, width:0, height:36, rx:2}, gSlice);
+  var sliceTxt = mk("text", {x:0, y:0}, gSlice, "");
+
+  // bottom left: the open series' window buffer, rebuilt each frame
+  var BUF_X = 90, BUF_Y = 212;
+  var bufTitle = mk("text", {x:10, y:BUF_Y - 8, "font-size":9, fill:"var(--text)"}, asvg, "");
+  mk("text", {x:BUF_X - 6, y:BUF_Y + 10.5, "font-size":7, "text-anchor":"end"}, asvg, "timestamp");
+  mk("text", {x:BUF_X - 6, y:BUF_Y + 27.5, "font-size":7, "text-anchor":"end"}, asvg, "value");
+  var gBuf = mk("g", {}, asvg);
+  var bufNote = mk("text", {"class":"hdr", x:BUF_X, y:BUF_Y + 46, "font-size":6.5}, asvg, "");
+  mk("text", {x:BUF_X - 6, y:BUF_Y + 64, "font-size":7, "text-anchor":"end"}, asvg, "last_ts");
+  var curCell = mk("g", {"class":"lcell"}, asvg);
+  mk("rect", {x:BUF_X, y:BUF_Y + 54, width:40, height:14, rx:2}, curCell);
+  var curCellTxt = mk("text", {x:BUF_X + 20, y:BUF_Y + 64, "font-size":6.5, "text-anchor":"middle",
+                               fill:"var(--text)"}, curCell, "");
+  mk("text", {"class":"hdr", x:BUF_X + 46, y:BUF_Y + 64, "font-size":6.5}, asvg,
+     "what the overlap skip compares against; dropped with the series");
+
+  // bottom right: sum's partials, one slot per step of the open block
+  var PX0 = 520, PCW = 72, MAXSLOTS = 5;
+  var partTitle = mk("text", {x:PX0, y:BUF_Y - 8, "font-size":9, fill:"var(--text)"}, asvg, "");
+  var partSlot = [];
+  for (var si = 0; si < MAXSLOTS; si++){
+    var x = PX0 + si * PCW;
+    var gh = mk("g", {"class":"lcell"}, asvg);
+    mk("rect", {x:x, y:BUF_Y, width:PCW - 2, height:15, rx:2}, gh);
+    var th = mk("text", {x:x + (PCW - 2) / 2, y:BUF_Y + 10.5, "font-size":6.5, "text-anchor":"middle",
+                         fill:"var(--text)"}, gh, "");
+    var gv = mk("g", {"class":"lcell"}, asvg);
+    mk("rect", {x:x, y:BUF_Y + 17, width:PCW - 2, height:15, rx:2}, gv);
+    var tv = mk("text", {x:x + (PCW - 2) / 2, y:BUF_Y + 27.5, "font-size":6.5, "text-anchor":"middle",
+                         fill:"var(--text)"}, gv, "");
+    partSlot.push({gh:gh, th:th, gv:gv, tv:tv});
+  }
+  mk("text", {"class":"hdr", x:PX0, y:BUF_Y + 46, "font-size":6.5}, asvg,
+     "one partial per step of the open block, dropped when it is emitted");
+
+  // bottom: sum's output, filled at each block edge
+  var OUT_Y = 306, OX = BUF_X;
+  mk("text", {x:10, y:OUT_Y - 8, "font-size":9, fill:"var(--text)"}, asvg, "sum output");
+  mk("text", {x:OX - 6, y:OUT_Y + 10.5, "font-size":7, "text-anchor":"end"}, asvg, "timestamp");
+  var outSlot = [];
+  STEPS.forEach(function(ts, li){
+    var x = OX + li * PCW;
+    var g = mk("g", {"class":"lcell unset"}, asvg);
+    mk("rect", {x:x, y:OUT_Y, width:PCW - 2, height:15, rx:2}, g);
+    var tt = mk("text", {x:x + (PCW - 2) / 2, y:OUT_Y + 10.5, "font-size":6.5, "text-anchor":"middle",
+                         fill:"var(--text)"}, g, "");
+    outSlot.push({g:g, t:tt});
+  });
+  mk("text", {"class":"hdr", x:OX + 7 * PCW + 4, y:OUT_Y + 10.5, "font-size":6.5}, asvg, "ms, value");
+
+  /* ---- per-step table ---- */
+  var cells = [];
+  STEPS.forEach(function(ts){
+    var tr = document.createElement("tr"), row = [];
+    for (var c = 0; c < 7; c++){
+      var td = document.createElement("td");
+      if (c === 0) td.className = "lbl";
+      tr.appendChild(td);
+      row.push(td);
+    }
+    row[0].textContent = "t = " + ts + " s";
+    row[1].textContent = BLOCKS[blockOfStep(ts)].name;
+    row[2].textContent = "(" + (ts - RANGE) + ", " + ts + "]";
+    cells.push(row);
+    tbody.appendChild(tr);
+  });
+
+  /* ---- render ---- */
+  var frame = 0, playing = false, timer = null, speed = 1;
+  var reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function dur(){ return reduced ? 1 : 340 / speed; }
+  function dwell(){ return reduced ? 120 : 1250 / speed; }
+  function c(s){ return "<code>" + s + "</code>"; }
+  function sec_(t){ return t + "&thinsp;s"; }
+  function outValue(h, ts){
+    for (var i = 0; i < h.out.length; i++) if (h.out[i][0] === ts) return h.out[i][1];
+    return undefined;
+  }
+  function stepList(ts){
+    if (ts.length === 0) return "";
+    if (ts.length <= 2) return ts.map(sec_).join(" and ");
+    return sec_(ts[0]) + " to " + sec_(ts[ts.length - 1]);
+  }
+
+  // timestamps of the open series that no later window of its block reaches, newly so on this frame
+  function droppedNow(h, p){
+    var ri = h.open, reach = reachFrom(h), was = p && p.open === ri ? reachFrom(p) : -Infinity;
+    var before = p && p.open === ri ? p.copied[ri] : 0;
+    return ROWS[ri].s.slice(0, h.copied[ri]).filter(function(q, i){
+      return q[0] <= reach && !(i < before && q[0] <= was);
+    }).map(function(q){ return q[0]; });
+  }
+
+  function say(e, h){
+    var r, s;
+    if (e.k === "src"){
+      return "<b>Batch C arrives</b>, and its first series, 1&middot;a, names block 1, " + c("block_start") +
+        " 240&thinsp;s and " + c("block_end") + " 480&thinsp;s. Before any sample is read, the engine knows " +
+        "the block answers only 420&thinsp;s and 450&thinsp;s, and " + c("sum") + " opens one partial for each. " +
+        "The engine pushes a chunk whole, and the frames below slow each push to one step at a time.";
+    }
+    if (e.k === "push"){
+      r = ROWS[e.row];
+      var bl = BLOCKS[r.block], lo = r.s[e.from][0], hi = r.s[e.to - 1][0], lab = c(SER[r.series].label);
+      var reach = reachFrom(h), gone = droppedNow(h, frame > 0 ? HIST[frame - 1] : null);
+      s = "<b>" + r.name + " pushes " + (e.to - e.from > 1 ? lo + "&ndash;" + hi : hi) + "&thinsp;s</b> into " + lab + "'s buffer";
+      if (h.touched.length){
+        var ts = h.touched[0];
+        s += ", so the lane at " + sec_(ts) + " is final, " + c("rate") + " answers " + fmt(h.rate[e.row][ts]) +
+             ", and " + c("sum") + "'s partial for " + sec_(ts) + " is " + fmt(h.partial[ts]);
+      }
+      s += ". ";
+      if (e.from === 0 && lo < bl.start)
+        s += "The samples before " + sec_(bl.start) + " are block " + bl.name + "'s reach-back, which fill windows and answer no step" +
+             (r.block > 0 ? ", not even 450&thinsp;s, which block 1 answered" : "") + ". ";
+      for (var i = Math.max(1, e.from); i < e.to; i++)
+        if (r.s[i][1] < r.s[i - 1][1])
+          s += "The value falls from " + r.s[i - 1][1] + " to " + r.s[i][1] + ", a counter reset that " +
+               c("rate") + " keeps for " + c("reset_sum") + ". ";
+      if (reach === Infinity)
+        s += "Block " + bl.name + " answers no later step, so no window reaches the buffer any more.";
+      else if (gone.length)
+        s += "The window at " + sec_(reach + RANGE) + " starts at " + sec_(reach) + ", so the buffer drops " +
+             stepList(gone) + " from the front.";
+      else
+        s += "The window at " + sec_(reach + RANGE) + " still reaches every sample, so the buffer drops nothing.";
+      return s;
+    }
+    if (e.k === "close"){
+      r = ROWS[e.row];
+      var prev = ROWS[e.row - 1];
+      s = e.arrives
+        ? "<b>Batch D arrives, and " + r.name + " closes " + c(SER[prev.series].label) + ".</b> What closes " + c(prev.series) +
+          " is " + r.name + "'s label set, not the batch boundary, and it would close " + c(prev.series) + " the same way inside batch C. " +
+          c(prev.series) + "'s window buffer is dropped with the series, and batch C is released."
+        : "<b>" + r.name + " closes " + c(SER[prev.series].label) + ".</b> Its label set sorts after " + c(prev.series) +
+          "'s, so " + c(prev.series) + " is done in this block, and its window buffer is dropped with it before any of " +
+          c(r.series) + "'s samples is read. Only " + c("sum") + "'s partials hold anything of " + c(prev.series) + ", one number per step.";
+      return s;
+    }
+    if (e.k === "edge"){
+      return "<b>Block edge.</b> 2&middot;a carries " + c("block_start") + " 480&thinsp;s, so block 1's last series has passed and " +
+        c('x{pod="b"}') + " closes with its window buffer. " + c("sum") + " emits " + stepList(h.emitted) +
+        ", drops their partials, and opens five for block 2, where every series starts from an empty buffer.";
+    }
+    return "<b>End of stream.</b> " + c('x{pod="b"}') + " closes with its window buffer, block 2's last series has passed, and " +
+      c("sum") + " emits " + stepList(h.emitted) + ". " + c("sum") + " never held partials for more than one block's steps, five here, and " +
+      c("rate") + " never more than one series' buffer.";
+  }
+  function asay(e, h){
+    if (e.k === "push"){
+      var r = ROWS[e.row], b = BATCHES[r.batch], lo = r.base + e.from, hi = r.base + e.to;
+      return "Reading cells <b>" + lo + "</b> to <b>" + (hi - 1) + "</b> of batch " + b.name + "'s child buffers, inside the slice " +
+        c("[" + r.base + ", " + (r.base + r.s.length) + ")") + " its offsets delimit. They are copied into the window buffer below, " +
+        "not held as a slice, so the batch can go once its series are folded. Greyed buffer cells are reached by no later window of the block.";
+    }
+    if (e.k === "src")
+      return "Batch C holds three Arrow rows over two blocks, with offsets " + c("[" + BATCHES[0].offs.join(", ") + "]") +
+        ". " + c("block_start") + " and " + c("block_end") + " are plain columns, constant within a block; the engine reads them off the " +
+        "first series and checks the rest against them.";
+    if (e.k === "close" && e.arrives)
+      return "Batch D brings its own columns and its own offsets " + c("[" + BATCHES[1].offs.join(", ") + "]") +
+        ", indexed from 0 again. Nothing in it points back at batch C, and nothing needs to: " + c("sum") +
+        "'s partials were never in a batch.";
+    if (e.k === "close")
+      return "The window buffer is empty again: " + c("b") + " starts from nothing, and " + c("a") + "'s copied samples and " +
+        c("last_ts") + " are gone. " + c("sum") + "'s two partials are the only state left from " + c("a") + ".";
+    if (e.k === "edge")
+      return "Block 1's partials move into " + c("sum") + "'s output and leave the slots, which block 2's steps take over. " +
+        "What " + c("sum") + " holds is bounded by one block's steps, not by the range.";
+    return "All seven steps are in " + c("sum") + "'s output, block by block, and nothing is held: no buffer, no partial.";
+  }
+
+  function render(){
+    var e = EV[frame], h = HIST[frame];
+    var pushed = function(ri, i){ return e.k === "push" && e.row === ri && i >= e.from && i < e.to; };
+
+    /* ---------- pipeline ---------- */
+    BLOCKS.forEach(function(b, bi){
+      cls(blkG[bi], "unknown", bi > h.block);
+      cls(blkG[bi], "past", bi < h.block || (e.k === "end"));
+    });
+    BATCHES.forEach(function(b, bi){
+      cls(batchG[bi], "gone", !visible(h, bi));
+      cls(batchG[bi], "dim", released(h, bi));
+    });
+    cls(gRel, "gone", !released(h, 0));
+    ROWS.forEach(function(r, ri){
+      var open = h.open === ri, closed = h.closed[ri];
+      cls(rowG[ri], "dim", !released(h, r.batch) && (closed || (!open && h.copied[ri] === 0 && e.k === "push")));
+      rowState[ri].textContent = "block " + BLOCKS[r.block].name + " · " +
+        (open ? "open" : closed ? "closed, buffer dropped" : "not read yet");
+      dotG[ri].forEach(function(d, i){
+        var isNow = pushed(ri, i);
+        d.dot.setAttribute("r", isNow ? 5.4 : 3.2);
+        cls(d.g, "dim", !isNow && i >= h.copied[ri]);
+      });
+    });
+
+    if (e.k === "push" && h.touched.length){
+      var p = ROWS[e.row].s[e.to - 1];
+      var hiL = STEPS.indexOf(Math.max.apply(null, h.touched));
+      dropLine.setAttribute("d", "M" + X(p[0]) + " " + (ROW_Y[e.row] + ROW_H) +
+        "V" + (LANE_Y0 + hiL * LANE_DY + LANE_H));
+      cls(gDrop, "gone", false);
+    } else {
+      cls(gDrop, "gone", true);
+    }
+
+    STEPS.forEach(function(ts, li){
+      var ps = h.pstate[ts], bi = blockOfStep(ts);
+      cls(laneG[li], "dim", ps === "wait");
+      cls(laneBar[li], "hit", has(h.touched, ts) || has(h.emitted, ts));
+      cls(laneBar[li], "done", ps === "emitted");
+      var txt = "";
+      if (ps === "emitted") txt = "emitted " + fmt(outValue(h, ts));
+      else if (ps === "open"){
+        var parts = [];
+        ["a", "b"].forEach(function(sr){
+          var ri = rowOf(sr, bi);
+          if (ri >= 0 && ts in h.rate[ri]) parts.push(sr + " " + fmt(h.rate[ri][ts]));
+        });
+        txt = parts.join(" + ") + (parts.length > 1 ? " = " + fmt(h.partial[ts]) : "");
+      }
+      laneTxt[li].textContent = txt;
+    });
+
+    var hasCur = h.open >= 0 && h.copied[h.open] > 0;
+    cls(gCur, "gone", !hasCur);
+    if (hasCur){
+      var lastT = ROWS[h.open].s[h.copied[h.open] - 1][0];
+      curLine.setAttribute("d", "M" + X(lastT) + " " + (AXIS_Y - 4) + "v10");
+      curTxt.setAttribute("x", X(lastT) - 5);
+      curTxt.textContent = ROWS[h.open].series + " last_ts " + lastT + " s";
+    }
+    cls(gEdgeTxt, "gone", e.k !== "edge" && e.k !== "end");
+    if (e.k === "edge") edgeTxt.textContent = "block 1's last series has passed: 420 s, 450 s leave";
+    if (e.k === "end") edgeTxt.textContent = "end of stream: 480 s to 600 s leave";
+    if (e.k === "edge" || e.k === "end") cls(gCur, "gone", true);
+
+    /* ---------- arrow inspector ---------- */
+    BATCHES.forEach(function(b, bi){
+      cls(panel[bi], "gone", !visible(h, bi));
+      cls(panel[bi], "dim", released(h, bi));
+    });
+    cls(gARel, "gone", !released(h, 0));
+    ROWS.forEach(function(r, ri){
+      var off = !released(h, r.batch) && e.k === "push" && e.row !== ri;
+      colCells[ri].forEach(function(g){ cls(g, "dim", off); });
+      cls(derivedG[ri], "dim", off);
+    });
+    BATCHES.forEach(function(b, bi){
+      for (var ci = 0; ci < b.ts.length; ci++){
+        var rr = cellRow[bi][ci], read = released(h, bi) || rr[1] < h.copied[rr[0]], isNow = pushed(rr[0], rr[1]);
+        cls(tsCell[bi][ci], "dim", !read && !isNow);
+        cls(valCell[bi][ci], "dim", !read && !isNow);
+        cls(tsCell[bi][ci], "now", isNow);
+        cls(valCell[bi][ci], "now", isNow);
+      }
+    });
+    if (e.k === "push"){
+      var row = ROWS[e.row], y0 = PANEL_Y[row.batch];
+      sliceRect.setAttribute("x", BX + row.base * ICW);
+      sliceRect.setAttribute("y", y0 + 36);
+      sliceRect.setAttribute("width", row.s.length * ICW - 1);
+      // in the panel's header line: between the offsets boxes and the cells there is no room
+      sliceTxt.setAttribute("x", 890);
+      sliceTxt.setAttribute("y", y0 + 12);
+      sliceTxt.setAttribute("text-anchor", "end");
+      sliceTxt.textContent = "reading " + row.name + ": values().slice(" + row.base + ", " + row.s.length + ")";
+      cls(gSlice, "gone", false);
+    } else {
+      cls(gSlice, "gone", true);
+    }
+
+    while (gBuf.firstChild) gBuf.removeChild(gBuf.firstChild);
+    var reach = reachFrom(h);
+    if (h.open >= 0){
+      var orow = ROWS[h.open], k = SER[orow.series].key;
+      bufTitle.textContent = "window buffer  " + SER[orow.series].label + "  block " + BLOCKS[orow.block].name;
+      for (var bi2 = 0; bi2 < h.copied[h.open]; bi2++){
+        var sp = orow.s[bi2], x = BUF_X + bi2 * ICW, mid = x + ICW / 2 - 0.5;
+        var g = mk("g", {"class":"cell"}, gBuf);
+        cls(g, "dim", !(sp[0] > reach));
+        cls(g, "now", pushed(h.open, bi2));
+        mk("rect", {x:x, y:BUF_Y, width:ICW - 1, height:15, rx:2, fill:svar(k), "fill-opacity":0.14, stroke:svar(k)}, g);
+        mk("text", {x:mid, y:BUF_Y + 10.5, "font-size":6.5, "text-anchor":"middle", fill:"var(--text)"}, g, String(sp[0]));
+        mk("rect", {x:x, y:BUF_Y + 17, width:ICW - 1, height:15, rx:2, fill:svar(k), "fill-opacity":0.05,
+                    stroke:svar(k), "stroke-opacity":0.5}, g);
+        mk("text", {x:mid, y:BUF_Y + 27.5, "font-size":6.5, "text-anchor":"middle", fill:"var(--text)"}, g, String(sp[1]));
+      }
+      bufNote.textContent = h.copied[h.open] === 0 ? "empty: this series starts from nothing in this block"
+        : h.copied[h.open] + " copied samples, no reference into the batch";
+    } else {
+      bufTitle.textContent = "window buffer  none open";
+      bufNote.textContent = "every series of the stream is closed";
+    }
+    curCellTxt.textContent = hasCur ? String(ROWS[h.open].s[h.copied[h.open] - 1][0]) : "-";
+    cls(curCell, "unset", !hasCur);
+    cls(curCell, "hot", e.k === "push");
+
+    var bl = BLOCKS[h.block];
+    partTitle.textContent = "sum  partials of block " + bl.name;
+    partSlot.forEach(function(sl, i){
+      var ts = bl.steps[i], used = ts !== undefined;
+      cls(sl.gh, "gone", !used); cls(sl.gv, "gone", !used);
+      if (!used) return;
+      var ps = h.pstate[ts];
+      sl.th.textContent = ts + " s";
+      sl.tv.textContent = ps === "emitted" ? "emitted" : (ts in h.partial ? fmt(h.partial[ts]) : "-");
+      cls(sl.gv, "unset", !(ts in h.partial));
+      cls(sl.gv, "hot", has(h.touched, ts));
+      cls(sl.gv, "done", ps === "emitted");
+    });
+    outSlot.forEach(function(sl, i){
+      var o = h.out[i];
+      sl.t.textContent = o ? (o[0] * 1000) + "  " + (Math.round(o[1] * 1e6) / 1e6) : "";
+      cls(sl.g, "unset", !o);
+      cls(sl.g, "hot", !!o && has(h.emitted, o[0]));
+    });
+
+    /* ---------- per-step table ---------- */
+    STEPS.forEach(function(ts, li){
+      var row = cells[li], bi = blockOfStep(ts), ps = h.pstate[ts];
+      ["a", "b"].forEach(function(sr, j){
+        var ri = rowOf(sr, bi), td = row[3 + j], set = ri >= 0 && ts in h.rate[ri];
+        td.textContent = set ? fmt(h.rate[ri][ts]) : "--";
+        cls(td, "unset", !set);
+        cls(td, "hot", set && has(h.touched, ts) && ROWS[e.row] && e.k === "push" && ROWS[e.row].series === sr);
+      });
+      var ov = outValue(h, ts);
+      row[5].textContent = ps === "emitted" ? fmt(ov) : (ts in h.partial ? fmt(h.partial[ts]) : "--");
+      cls(row[5], "unset", ps !== "emitted" && !(ts in h.partial));
+      cls(row[5], "hot", has(h.touched, ts));
+      cls(row[5], "out", ps === "emitted");
+      row[6].textContent = ps === "wait" ? "block not reached" : ps === "open" ? "open" : "emitted, dropped";
+      cls(row[6], "hot", has(h.emitted, ts));
+      cls(row[0].parentNode, "closed", ps === "emitted");
+    });
+
+    /* ---------- captions ---------- */
+    cap.innerHTML = say(e, h);
+    acap.innerHTML = asay(e, h);
+    var LABEL = {src:"batch C arrives", close:"series closes", edge:"block edge", end:"end of stream"};
+    now.textContent = (frame + 1) + " / " + TOTAL + " · " +
+      (e.k === "push" ? "push " + ROWS[e.row].name + " to " + ROWS[e.row].s[e.to - 1][0] + " s" : LABEL[e.k]);
+  }
+
+  /* ---- controls ---- */
+  var btnPlay = document.getElementById("fold-play");
+  function stop(){ playing = false; btnPlay.textContent = "Play"; if (timer) clearTimeout(timer); timer = null; }
+  function tick(){
+    if (!playing) return;
+    if (frame >= TOTAL - 1){ stop(); return; }
+    frame++; render();
+    timer = setTimeout(tick, dwell());
+  }
+  function play(){
+    if (playing){ stop(); return; }
+    if (frame >= TOTAL - 1){ frame = 0; render(); }
+    playing = true; btnPlay.textContent = "Pause";
+    timer = setTimeout(tick, dwell());
+  }
+  function goTo(f){ stop(); frame = Math.max(0, Math.min(TOTAL - 1, f)); render(); }
+  btnPlay.addEventListener("click", play);
+  document.getElementById("fold-next").addEventListener("click", function(){ goTo(frame + 1); });
+  document.getElementById("fold-prev").addEventListener("click", function(){ goTo(frame - 1); });
+  document.getElementById("fold-restart").addEventListener("click", function(){ goTo(0); });
+  var btnSpeed = document.getElementById("fold-speed");
+  btnSpeed.addEventListener("click", function(){
+    speed = speed === 1 ? 2 : 1;
+    btnSpeed.innerHTML = speed + "&times;";
+    sec.style.setProperty("--adur", dur() + "ms");
+  });
+  document.addEventListener("keydown", function(ev){
+    if (!sec.contains(document.activeElement) && document.activeElement !== document.body) return;
+    if (ev.key === " "){ ev.preventDefault(); play(); }
+    else if (ev.key === "ArrowRight"){ ev.preventDefault(); goTo(frame + 1); }
+    else if (ev.key === "ArrowLeft"){ ev.preventDefault(); goTo(frame - 1); }
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
