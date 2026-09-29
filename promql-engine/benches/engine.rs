@@ -92,7 +92,12 @@ fn synthetic(shape: &Shape) -> Arc<dyn SeriesSource> {
             Series::new(&labels, ts, vs).unwrap()
         })
         .collect();
-    Arc::new(MemorySeriesSource::try_new(all).unwrap())
+    let source = MemorySeriesSource::try_new(all).unwrap();
+    // PROMQL_BENCH_PARTS=n spreads the series over n store partitions.
+    match std::env::var("PROMQL_BENCH_PARTS") {
+        Ok(n) => Arc::new(source.partitions(n.parse().expect("PROMQL_BENCH_PARTS is a count"))),
+        Err(_) => Arc::new(source),
+    }
 }
 
 /// The queries, from a bare selector to the SLO recording-rule shape.
