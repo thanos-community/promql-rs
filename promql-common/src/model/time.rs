@@ -65,13 +65,34 @@ struct UnitInfo {
 /// not accepting a finer unit here that Go's grammar never had.
 fn unit_info_basic(unit: &str) -> Option<UnitInfo> {
     Some(match unit {
-        "ms" => UnitInfo { pos: 7, mult_nanos: 1_000_000 },
-        "s" => UnitInfo { pos: 6, mult_nanos: 1_000_000_000 },
-        "m" => UnitInfo { pos: 5, mult_nanos: 60 * 1_000_000_000 },
-        "h" => UnitInfo { pos: 4, mult_nanos: 3600 * 1_000_000_000 },
-        "d" => UnitInfo { pos: 3, mult_nanos: 24 * 3600 * 1_000_000_000 },
-        "w" => UnitInfo { pos: 2, mult_nanos: 7 * 24 * 3600 * 1_000_000_000 },
-        "y" => UnitInfo { pos: 1, mult_nanos: 365 * 24 * 3600 * 1_000_000_000 },
+        "ms" => UnitInfo {
+            pos: 7,
+            mult_nanos: 1_000_000,
+        },
+        "s" => UnitInfo {
+            pos: 6,
+            mult_nanos: 1_000_000_000,
+        },
+        "m" => UnitInfo {
+            pos: 5,
+            mult_nanos: 60 * 1_000_000_000,
+        },
+        "h" => UnitInfo {
+            pos: 4,
+            mult_nanos: 3600 * 1_000_000_000,
+        },
+        "d" => UnitInfo {
+            pos: 3,
+            mult_nanos: 24 * 3600 * 1_000_000_000,
+        },
+        "w" => UnitInfo {
+            pos: 2,
+            mult_nanos: 7 * 24 * 3600 * 1_000_000_000,
+        },
+        "y" => UnitInfo {
+            pos: 1,
+            mult_nanos: 365 * 24 * 3600 * 1_000_000_000,
+        },
         _ => return None,
     })
 }
@@ -85,8 +106,14 @@ fn unit_info_basic(unit: &str) -> Option<UnitInfo> {
 /// `unit_info_basic`).
 fn unit_info_nanos(unit: &str) -> Option<UnitInfo> {
     match unit {
-        "us" | "µs" | "μs" => Some(UnitInfo { pos: 8, mult_nanos: 1_000 }),
-        "ns" => Some(UnitInfo { pos: 9, mult_nanos: 1 }),
+        "us" | "µs" | "μs" => Some(UnitInfo {
+            pos: 8,
+            mult_nanos: 1_000,
+        }),
+        "ns" => Some(UnitInfo {
+            pos: 9,
+            mult_nanos: 1,
+        }),
         _ => unit_info_basic(unit),
     }
 }
@@ -412,12 +439,18 @@ mod tests {
             ("5m", 5 * 60 * 1_000_000_000, "5m"),
             ("1h", 3600 * 1_000_000_000, "1h"),
             ("4d", 4 * 24 * 3600 * 1_000_000_000, "4d"),
-            ("4d1h", 4 * 24 * 3600 * 1_000_000_000 + 3600 * 1_000_000_000, "4d1h"),
+            (
+                "4d1h",
+                4 * 24 * 3600 * 1_000_000_000 + 3600 * 1_000_000_000,
+                "4d1h",
+            ),
             ("14d", 14 * 24 * 3600 * 1_000_000_000, "2w"),
             ("3w", 3 * 7 * 24 * 3600 * 1_000_000_000, "3w"),
             (
                 "3w2d1h",
-                3 * 7 * 24 * 3600 * 1_000_000_000 + 2 * 24 * 3600 * 1_000_000_000 + 3600 * 1_000_000_000,
+                3 * 7 * 24 * 3600 * 1_000_000_000
+                    + 2 * 24 * 3600 * 1_000_000_000
+                    + 3600 * 1_000_000_000,
                 "23d1h",
             ),
             ("10y", 10 * 365 * 24 * 3600 * 1_000_000_000, "10y"),
@@ -445,14 +478,17 @@ mod tests {
             ("-1w", -7 * 24 * 3600 * 1_000_000_000, "-1w"),
             (
                 "-3w2d1h",
-                -(3 * 7 * 24 * 3600 * 1_000_000_000 + 2 * 24 * 3600 * 1_000_000_000 + 3600 * 1_000_000_000),
+                -(3 * 7 * 24 * 3600 * 1_000_000_000
+                    + 2 * 24 * 3600 * 1_000_000_000
+                    + 3600 * 1_000_000_000),
                 "-23d1h",
             ),
             ("-10y", -10 * 365 * 24 * 3600 * 1_000_000_000, "-10y"),
         ];
 
         for &(input, want_nanos, want_string) in cases {
-            let d = Duration::parse_allow_negative(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            let d =
+                Duration::parse_allow_negative(input).unwrap_or_else(|e| panic!("{input}: {e}"));
             assert_eq!(d.as_nanos_i64(), want_nanos, "{input}");
             assert_eq!(d.to_string(), want_string, "{input}");
         }
@@ -489,8 +525,8 @@ mod tests {
     #[test]
     fn round_trip_parse_format() {
         let cases = [
-            "0s", "324ms", "3s", "5m", "1h", "4d", "4d1h", "2w", "3w", "23d1h", "10y",
-            "-3s", "-23d1h",
+            "0s", "324ms", "3s", "5m", "1h", "4d", "4d1h", "2w", "3w", "23d1h", "10y", "-3s",
+            "-23d1h",
         ];
         for c in cases {
             let d = Duration::parse_allow_negative(c).unwrap();
@@ -502,7 +538,10 @@ mod tests {
 
     #[test]
     fn from_str_matches_parse() {
-        assert_eq!("5m".parse::<Duration>().unwrap(), Duration::parse("5m").unwrap());
+        assert_eq!(
+            "5m".parse::<Duration>().unwrap(),
+            Duration::parse("5m").unwrap()
+        );
     }
 
     #[test]
@@ -554,9 +593,13 @@ mod tests {
     fn as_secs_f64_matches_go_split_not_undivided() {
         let d = Duration::parse("1s118ms").unwrap();
         let nanos = d.as_nanos_i64();
-        let go_way = (nanos / 1_000_000_000) as f64 + (nanos % 1_000_000_000) as f64 / 1_000_000_000.0;
+        let go_way =
+            (nanos / 1_000_000_000) as f64 + (nanos % 1_000_000_000) as f64 / 1_000_000_000.0;
         let undivided = nanos as f64 / 1_000_000_000.0;
-        assert_ne!(go_way, undivided, "test input must actually exercise the rounding difference");
+        assert_ne!(
+            go_way, undivided,
+            "test input must actually exercise the rounding difference"
+        );
         assert_eq!(d.as_secs_f64(), go_way);
         assert_eq!(d.as_secs_f64(), 1.1179999999999999);
     }
@@ -609,7 +652,10 @@ mod tests {
     /// unchanged from Go's.
     #[test]
     fn display_sub_millisecond_remainder() {
-        assert_eq!(Duration::parse_nanos("1ms500us").unwrap().to_string(), "1ms500us");
+        assert_eq!(
+            Duration::parse_nanos("1ms500us").unwrap().to_string(),
+            "1ms500us"
+        );
         assert_eq!(Duration::parse_nanos("1ns").unwrap().to_string(), "1ns");
         assert_eq!(Duration::parse_nanos("1s1ns").unwrap().to_string(), "1s1ns");
         assert_eq!(Duration::from_millis(1500).unwrap().to_string(), "1s500ms");
@@ -623,8 +669,8 @@ mod tests {
     fn round_trip_parse_nanos_format() {
         // Basic-table cases, built with `parse_allow_negative` (signed).
         let basic = [
-            "0s", "324ms", "3s", "5m", "1h", "4d", "4d1h", "2w", "3w", "23d1h", "10y",
-            "-3s", "-23d1h",
+            "0s", "324ms", "3s", "5m", "1h", "4d", "4d1h", "2w", "3w", "23d1h", "10y", "-3s",
+            "-23d1h",
         ];
         // Nanosecond-table-only cases (unsigned; `parse_nanos` has no
         // negative variant).
@@ -640,7 +686,8 @@ mod tests {
                 Some(rest) => (true, rest),
                 None => (false, formatted.as_str()),
             };
-            let mut d2 = Duration::parse_nanos(unsigned).unwrap_or_else(|e| panic!("{formatted}: {e}"));
+            let mut d2 =
+                Duration::parse_nanos(unsigned).unwrap_or_else(|e| panic!("{formatted}: {e}"));
             if neg {
                 d2 = Duration(-TimeDelta::from(d2));
             }
@@ -649,7 +696,8 @@ mod tests {
         for c in nanos {
             let d = Duration::parse_nanos(c).unwrap_or_else(|e| panic!("{c}: {e}"));
             let formatted = d.to_string();
-            let d2 = Duration::parse_nanos(&formatted).unwrap_or_else(|e| panic!("{formatted}: {e}"));
+            let d2 =
+                Duration::parse_nanos(&formatted).unwrap_or_else(|e| panic!("{formatted}: {e}"));
             assert_eq!(d2, d, "round trip for {c:?} -> {formatted:?}");
         }
     }

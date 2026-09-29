@@ -4,9 +4,10 @@
 //! `LogicalPlan::display_indent()` prints every node exactly, but this
 //! engine's own scalar and aggregate functions carry their PromQL
 //! parameters as a flat, untyped argument list —
-//! `promql_range_function(samples, 'rate', 600000, 1200000, 30000, 300000,
-//! 0, NULL)` — which is what DataFusion's UDFs give it to work with, not
-//! what a reviewer diffing a plan pin wants to read. This module
+//! `promql_range_function(samples, block_start, block_end, 'rate', 600000,
+//! 1200000, 30000, 300000, 0, NULL)` — which is what DataFusion's UDFs
+//! give it to work with, not what a reviewer diffing a plan pin wants to
+//! read. This module
 //! recognises the shapes this engine's own planner builds
 //! ([`crate::selector`], [`crate::range`], [`crate::labels`],
 //! [`crate::aggregate`], `get_field`, and a scan over a
@@ -52,7 +53,11 @@ pub fn render(plan: &LogicalPlan) -> String {
 
 fn count_table_scans(plan: &LogicalPlan) -> usize {
     let here = usize::from(matches!(plan, LogicalPlan::TableScan(_)));
-    here + plan.inputs().iter().map(|p| count_table_scans(p)).sum::<usize>()
+    here + plan
+        .inputs()
+        .iter()
+        .map(|p| count_table_scans(p))
+        .sum::<usize>()
 }
 
 fn render_node(plan: &LogicalPlan, indent: usize, single_scan: bool, out: &mut String) {
@@ -79,16 +84,23 @@ fn render_line(plan: &LogicalPlan, single_scan: bool) -> String {
         LogicalPlan::Filter(Filter { predicate, .. }) => {
             format!("Filter: {}", render_expr(predicate, single_scan))
         }
-        LogicalPlan::Aggregate(a) => render_aggregate_node(a, single_scan)
-            .unwrap_or_else(|| {
-                let group: Vec<_> = a.group_expr.iter().map(|e| render_expr(e, single_scan)).collect();
-                let aggr: Vec<_> = a.aggr_expr.iter().map(|e| render_expr(e, single_scan)).collect();
-                format!(
-                    "Aggregate: groupBy=[[{}]], aggr=[[{}]]",
-                    group.join(", "),
-                    aggr.join(", ")
-                )
-            }),
+        LogicalPlan::Aggregate(a) => render_aggregate_node(a, single_scan).unwrap_or_else(|| {
+            let group: Vec<_> = a
+                .group_expr
+                .iter()
+                .map(|e| render_expr(e, single_scan))
+                .collect();
+            let aggr: Vec<_> = a
+                .aggr_expr
+                .iter()
+                .map(|e| render_expr(e, single_scan))
+                .collect();
+            format!(
+                "Aggregate: groupBy=[[{}]], aggr=[[{}]]",
+                group.join(", "),
+                aggr.join(", ")
+            )
+        }),
         LogicalPlan::Sort(Sort { expr, fetch, .. }) => {
             let mut s = String::from("Sort: ");
             for (i, e) in expr.iter().enumerate() {
@@ -111,31 +123,30 @@ fn render_line(plan: &LogicalPlan, single_scan: bool) -> String {
     }
 }
 
-/// Every series batch in this engine carries exactly two columns,
-/// `labels` then `samples` (`series::LABELS`/`series::SAMPLES` are the
-/// schema's own names for them, not this module's choice) — so a
-/// `Projection` whose *output* schema is those two fields in that order
-/// is restating an invariant the reader already knows, and its
-/// pass-through columns and `AS labels`/`AS samples` aliases are noise on
-/// top of it. This checks `plan.schema()`, not the expression list
-/// itself: an expression can be aliased to `labels` without being a bare
-/// `labels` column (a rebuilt struct, say), and only the output name is
-/// what the guard cares about.
+/// Every series batch in this engine carries exactly four columns,
+/// `labels, samples, block_start, block_end` in that order
+/// (`series::LABELS`/`SAMPLES`/`BLOCK_START`/`BLOCK_END` are the schema's
+/// own names for them, not this module's choice) — so a `Projection`
+/// whose *output* schema is those four fields in that order is restating
+/// an invariant the reader already knows, and its pass-through columns
+/// and self-aliases are noise on top of it. This checks `plan.schema()`,
+/// not the expression list itself: an expression can be aliased to
+/// `labels` without being a bare `labels` column (a rebuilt struct, say),
+/// and only the output name is what the guard cares about.
 ///
-/// Anything else — a third column, the two in the other order, only one
-/// of them, or a shape this schema check can't see — prints every
-/// expression with its alias, unchanged from before this shorthand
-/// existed: that fallthrough is what keeps a projection that breaks the
-/// two-column invariant visible in a pin instead of silently going
-/// short-form.
+/// Anything else — a fifth column, the four out of order, missing one of
+/// them, or a shape this schema check can't see — prints every
+/// expression with its alias: that fallthrough is what keeps a
+/// projection that breaks the four-column invariant visible in a pin
+/// instead of silently going short-form.
 fn render_projection(p: &Projection, single_scan: bool) -> String {
-    if is_labels_then_samples_schema(&p.schema) {
+    if is_canonical_series_schema(&p.schema) {
         let parts: Vec<_> = p
             .expr
             .iter()
             .filter_map(|e| render_short_projection_expr(e, single_scan))
             .collect();
-        // Both fields were pass-throughs: this is an identity projection,
+        // Every field was a pass-through: this is an identity projection,
         // and printing `Projection:` with nothing after it would hide
         // that from a reviewer reading the pin. Falling through to the
         // stock form below is what keeps it visible.
@@ -147,19 +158,21 @@ fn render_projection(p: &Projection, single_scan: bool) -> String {
     format!("Projection: {}", rendered.join(", "))
 }
 
-fn is_labels_then_samples_schema(schema: &datafusion::common::DFSchema) -> bool {
+fn is_canonical_series_schema(schema: &datafusion::common::DFSchema) -> bool {
     let fields = schema.fields();
-    fields.len() == 2
+    fields.len() == 4
         && fields[0].name() == series::LABELS
         && fields[1].name() == series::SAMPLES
+        && fields[2].name() == series::BLOCK_START
+        && fields[3].name() == series::BLOCK_END
 }
 
 /// `None` for a pass-through reference to its own output name — a bare
-/// `labels`/`samples` column, or one aliased right back to the name it
-/// already has — since the schema already says that's what it is.
-/// `Some` for anything else, rendered without the `AS labels`/`AS
-/// samples` alias the two-column guard already established as this
-/// expression's position in the schema.
+/// `labels`/`samples`/`block_start`/`block_end` column, or one aliased
+/// right back to the name it already has — since the schema already says
+/// that's what it is. `Some` for anything else, rendered without the `AS
+/// labels`/`AS samples`/… alias the four-column guard already established
+/// as this expression's position in the schema.
 fn render_short_projection_expr(e: &Expr, single_scan: bool) -> Option<String> {
     match e {
         Expr::Column(_) => None,
@@ -226,7 +239,8 @@ fn render_selector(name: &str, matchers: &[LabelMatcher]) -> String {
 
     let mut rest = Vec::new();
     for m in matchers {
-        if m.name == METRIC_NAME && m.op == MatchOp::Equal && m.value == name && !m.value.is_empty() {
+        if m.name == METRIC_NAME && m.op == MatchOp::Equal && m.value == name && !m.value.is_empty()
+        {
             continue;
         }
         rest.push(m.to_string());
@@ -274,37 +288,55 @@ fn render_column(c: &Column, single_scan: bool) -> String {
 
 fn render_scalar_function(f: &ScalarFunction, single_scan: bool) -> Option<String> {
     match f.name() {
-        selector::NAME => render_vector_selector(&f.args, single_scan),
-        range::NAME => render_range_function(&f.args, single_scan),
         labels::NAME => render_labels(&f.args, single_scan),
         "get_field" => render_get_field(&f.args, single_scan),
         _ => None,
     }
 }
 
-/// `promql_vector_selector(samples, start, end, step, lookback, offset, at)`
-/// as `vector_selector(samples[ offset OFFSET][ @ N], START..END step
-/// STEP, lookback LOOKBACK)` — PromQL has no syntax for the evaluation
-/// range, so that stays a trailing argument on every call, but `offset`
-/// and `@` are PromQL's own selector modifiers and take PromQL's own
-/// order and spelling, attached to the column they modify rather than
-/// tacked onto the end.
+/// A bare column named `name`, any qualifier: what `block_start`/
+/// `block_end` look like as a selector/range/`Aggregate`-node group-key
+/// argument. `per block`/`per series per block` is what a reader is told
+/// instead, so this is also the check that lets that phrase stand in for
+/// the argument rather than silently dropping a different expression that
+/// happens to sit in the same slot.
+fn is_block_column(e: &Expr, name: &str) -> bool {
+    matches!(e, Expr::Column(c) if c.name == name)
+}
+
+/// `promql_vector_selector(samples, block_start, block_end, start, end,
+/// step, lookback, offset, at)` as `vector_selector(samples[ offset
+/// OFFSET][ @ N], START..END step STEP, lookback LOOKBACK)` — PromQL has
+/// no syntax for the evaluation range, so that stays a trailing argument
+/// on every call, but `offset` and `@` are PromQL's own selector
+/// modifiers and take PromQL's own order and spelling, attached to the
+/// column they modify rather than tacked onto the end. The block
+/// arguments never print: a caller only reaches this once it already
+/// knows to say `per block` for them (see [`render_aggregate_node`]), and
+/// requiring them to actually be the block columns is what keeps this
+/// call from omitting some other expression that merely sits in that
+/// slot.
 ///
 /// The `@` value is `Params::at_ms`, the millisecond timestamp
 /// `plan.rs`'s `resolve_at` already resolved it to, printed raw rather
 /// than through `Duration`'s formatting: it names a point in time, not a
 /// span.
 fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
-    if args.len() != 7 {
+    if args.len() != 9 {
+        return None;
+    }
+    if !is_block_column(&args[1], series::BLOCK_START)
+        || !is_block_column(&args[2], series::BLOCK_END)
+    {
         return None;
     }
     let mut samples = render_expr(&args[0], single_scan);
-    let start = require_i64(&args[1])?;
-    let end = require_i64(&args[2])?;
-    let step = require_i64(&args[3])?;
-    let lookback = require_i64(&args[4])?;
-    let offset = require_i64(&args[5])?;
-    let at = optional_i64(&args[6])?;
+    let start = require_i64(&args[3])?;
+    let end = require_i64(&args[4])?;
+    let step = require_i64(&args[5])?;
+    let lookback = require_i64(&args[6])?;
+    let offset = require_i64(&args[7])?;
+    let at = optional_i64(&args[8])?;
     push_offset_and_at(&mut samples, offset, at)?;
 
     Some(format!(
@@ -314,24 +346,30 @@ fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
     ))
 }
 
-/// `promql_range_function(samples, '<func>', start, end, step, range,
-/// offset, at)` as `<func>(samples[WINDOW][ offset OFFSET][ @ N],
-/// START..END step STEP)`. The window goes in brackets after the column,
-/// like a PromQL range selector; see [`render_vector_selector`] for why
-/// `offset`/`@` sit there too and why the evaluation range stays a
-/// trailing argument.
+/// `promql_range_function(samples, block_start, block_end, '<func>',
+/// start, end, step, range, offset, at)` as `<func>(samples[WINDOW][
+/// offset OFFSET][ @ N], START..END step STEP)`. The window goes in
+/// brackets after the column, like a PromQL range selector; see
+/// [`render_vector_selector`] for why `offset`/`@` sit there too, why the
+/// evaluation range stays a trailing argument, and why the block
+/// arguments never print.
 fn render_range_function(args: &[Expr], single_scan: bool) -> Option<String> {
-    if args.len() != 8 {
+    if args.len() != 10 {
+        return None;
+    }
+    if !is_block_column(&args[1], series::BLOCK_START)
+        || !is_block_column(&args[2], series::BLOCK_END)
+    {
         return None;
     }
     let samples = render_expr(&args[0], single_scan);
-    let func = utf8_literal(&args[1])?;
-    let start = require_i64(&args[2])?;
-    let end = require_i64(&args[3])?;
-    let step = require_i64(&args[4])?;
-    let window = require_i64(&args[5])?;
-    let offset = require_i64(&args[6])?;
-    let at = optional_i64(&args[7])?;
+    let func = utf8_literal(&args[3])?;
+    let start = require_i64(&args[4])?;
+    let end = require_i64(&args[5])?;
+    let step = require_i64(&args[6])?;
+    let window = require_i64(&args[7])?;
+    let offset = require_i64(&args[8])?;
+    let at = optional_i64(&args[9])?;
 
     let mut column = format!("{samples}[{}]", Duration::from_millis(window).ok()?);
     push_offset_and_at(&mut column, offset, at)?;
@@ -401,7 +439,12 @@ fn labels_column_text(base: &Expr, single_scan: bool) -> Option<String> {
     }
 }
 
-fn render_label_field(name: &str, value: &Expr, single_scan: bool, prefix: &mut Option<String>) -> String {
+fn render_label_field(
+    name: &str,
+    value: &Expr,
+    single_scan: bool,
+    prefix: &mut Option<String>,
+) -> String {
     if let Expr::ScalarFunction(f) = value {
         if f.name() == "get_field" && f.args.len() == 2 && utf8_literal(&f.args[1]) == Some(name) {
             if let Some(base) = labels_column_text(&f.args[0], single_scan) {
@@ -428,25 +471,32 @@ fn render_get_field(args: &[Expr], single_scan: bool) -> Option<String> {
     Some(format!("{}.{key}", render_expr(&args[0], single_scan)))
 }
 
-/// `promql_aggregate(samples, '<op>', start, end, step)` as
-/// `<op>(samples, START..END step STEP)`.
-///
-/// The call has exactly these five positional arguments today — no
-/// `topk`/`quantile` parameter, since `plan.rs`'s `aggregate` rejects an
-/// aggregation with a parameter as unsupported before planning reaches
-/// here — but `DISTINCT`, a `FILTER` clause or an `ORDER BY` are metadata
-/// `AggregateFunction` carries outside the argument list, so those fall
-/// through too rather than being silently dropped if a later change
-/// starts setting them.
+/// Every aggregate function this engine plans — `promql_vector_selector`,
+/// `promql_range_function`, `promql_aggregate` — takes only positional
+/// literal/column arguments, so `DISTINCT`, a `FILTER` clause or an
+/// `ORDER BY` are metadata a plan step of this engine's own never sets;
+/// falling through when one is present, instead of ignoring it, is what
+/// keeps a later change that starts setting them from being silently
+/// misrendered.
 fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option<String> {
-    if f.func.name() != aggregate::NAME {
-        return None;
-    }
     let p = &f.params;
     if p.distinct || p.filter.is_some() || !p.order_by.is_empty() || p.null_treatment.is_some() {
         return None;
     }
-    let args = &p.args;
+    match f.func.name() {
+        selector::NAME => render_vector_selector(&p.args, single_scan),
+        range::NAME => render_range_function(&p.args, single_scan),
+        aggregate::NAME => render_aggregate_call(&p.args, single_scan),
+        _ => None,
+    }
+}
+
+/// `promql_aggregate(samples, '<op>', start, end, step)` as
+/// `<op>(samples, START..END step STEP)`. No `topk`/`quantile` parameter:
+/// `plan.rs`'s `aggregate` rejects an aggregation with a parameter as
+/// unsupported before planning reaches here, so the call has exactly
+/// these five positional arguments.
+fn render_aggregate_call(args: &[Expr], single_scan: bool) -> Option<String> {
     if args.len() != 5 {
         return None;
     }
@@ -461,16 +511,31 @@ fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option
     ))
 }
 
-/// An `Aggregate` node whose shape is exactly what `plan.rs`'s
-/// `aggregate` builds — [`labels::group_exprs`] grouping keys and one
-/// [`aggregate::call`] aliased `samples` — as `<op> by (k…) (samples,
-/// START..END step STEP)`, PromQL's own `by`/`without` syntax (`without`
-/// never appears: `plan.rs` already resolves it to the `by` keys that
-/// remain, per [`labels::group_keys`]). `None` on anything else — a
-/// second aggregate expression, a different alias, a group key whose
-/// `get_field`/alias pair doesn't match [`labels::group_alias`] — so the
-/// caller's stock `groupBy=[[…]], aggr=[[…]]` line is what a shape this
-/// does not expect falls back to, same as every other recogniser here.
+/// An `Aggregate` node whose shape is exactly what `plan.rs` builds for a
+/// selector, a range function or a PromQL aggregation over a block-and-
+/// label-set grouping: one aggregate expression aliased `samples`, group
+/// keys led by `block_start, block_end` (`plan.rs`'s `series_keys`/
+/// `aggregate` both put the block first, so each group leaves when its
+/// block does), then either the whole `labels` column over
+/// `promql_vector_selector`/`promql_range_function` (`per series per
+/// block`: each group is one series' chunks in one block) or zero or more
+/// [`labels::group_exprs`] keys over `promql_aggregate` (`per block`: a
+/// PromQL aggregate has no series left to speak of, only blocks),
+/// PromQL's own `by`/`without` syntax (`without` never appears: `plan.rs`
+/// already resolves it to the `by` keys that remain, per
+/// [`labels::group_keys`]).
+///
+/// `None` on anything else — wrong key count or order, a key that isn't
+/// the shape [`labels::group_alias`] or the bare `labels` column
+/// establishes, a call whose own block arguments (see
+/// [`render_vector_selector`]/[`render_range_function`]) aren't columns
+/// named `block_start`/`block_end` — so the caller's stock
+/// `groupBy=[[…]], aggr=[[…]]` line is what a shape this does not expect
+/// falls back to, same as every other recogniser here. The planner always
+/// passes the grouped block columns as these arguments, so a plain name
+/// check is enough to tell a call built by this engine from one that
+/// merely takes the same slots; there is nothing here to compare the
+/// group's own qualifier against.
 fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
     if agg.aggr_expr.len() != 1 {
         return None;
@@ -484,49 +549,71 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
     let Expr::AggregateFunction(f) = alias.expr.as_ref() else {
         return None;
     };
-    if f.func.name() != aggregate::NAME {
-        return None;
-    }
     let p = &f.params;
     if p.distinct || p.filter.is_some() || !p.order_by.is_empty() || p.null_treatment.is_some() {
         return None;
     }
-    let args = &p.args;
-    if args.len() != 5 {
+
+    let [first, second, rest @ ..] = agg.group_expr.as_slice() else {
+        return None;
+    };
+    if !is_block_column(first, series::BLOCK_START) || !is_block_column(second, series::BLOCK_END) {
         return None;
     }
-    let samples = render_expr(&args[0], single_scan);
-    let op = utf8_literal(&args[1])?;
-    let start = require_i64(&args[2])?;
-    let end = require_i64(&args[3])?;
-    let step = require_i64(&args[4])?;
 
-    let mut keys = Vec::with_capacity(agg.group_expr.len());
-    for e in &agg.group_expr {
-        let Expr::Alias(a) = e else { return None };
-        let Expr::ScalarFunction(gf) = a.expr.as_ref() else {
-            return None;
-        };
-        if gf.name() != "get_field" || gf.args.len() != 2 {
-            return None;
+    match f.func.name() {
+        selector::NAME | range::NAME => {
+            let [key] = rest else { return None };
+            if !matches!(key, Expr::Column(c) if c.name == series::LABELS) {
+                return None;
+            }
+            let call = if f.func.name() == selector::NAME {
+                render_vector_selector(&p.args, single_scan)?
+            } else {
+                render_range_function(&p.args, single_scan)?
+            };
+            Some(format!("Aggregate: {call} per series per block"))
         }
-        labels_column_text(&gf.args[0], single_scan)?;
-        let key = utf8_literal(&gf.args[1])?;
-        if a.name != labels::group_alias(key) {
-            return None;
+        aggregate::NAME => {
+            let args = &p.args;
+            if args.len() != 5 {
+                return None;
+            }
+            let samples = render_expr(&args[0], single_scan);
+            let op = utf8_literal(&args[1])?;
+            let start = require_i64(&args[2])?;
+            let end = require_i64(&args[3])?;
+            let step = require_i64(&args[4])?;
+
+            let mut keys = Vec::with_capacity(rest.len());
+            for e in rest {
+                let Expr::Alias(a) = e else { return None };
+                let Expr::ScalarFunction(gf) = a.expr.as_ref() else {
+                    return None;
+                };
+                if gf.name() != "get_field" || gf.args.len() != 2 {
+                    return None;
+                }
+                labels_column_text(&gf.args[0], single_scan)?;
+                let key = utf8_literal(&gf.args[1])?;
+                if a.name != labels::group_alias(key) {
+                    return None;
+                }
+                keys.push(key);
+            }
+
+            let step_text = Duration::from_millis(step).ok()?;
+            Some(if keys.is_empty() {
+                format!("Aggregate: {op}({samples}, {start}..{end} step {step_text}) per block")
+            } else {
+                format!(
+                    "Aggregate: {op} by ({}) ({samples}, {start}..{end} step {step_text}) per block",
+                    keys.join(", ")
+                )
+            })
         }
-        keys.push(key);
+        _ => None,
     }
-
-    let step_text = Duration::from_millis(step).ok()?;
-    Some(if keys.is_empty() {
-        format!("Aggregate: {op}({samples}, {start}..{end} step {step_text})")
-    } else {
-        format!(
-            "Aggregate: {op} by ({}) ({samples}, {start}..{end} step {step_text})",
-            keys.join(", ")
-        )
-    })
 }
 
 /// A literal, non-`NULL` `Int64` — every timestamp/duration argument in
@@ -599,7 +686,12 @@ mod tests {
 
     #[test]
     fn vector_selector_with_neither_offset_nor_at() {
-        let call = selector::call(col("samples"), col(series::BLOCK_START), col(series::BLOCK_END), &params(0, None));
+        let call = selector::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            &params(0, None),
+        );
         assert_eq!(
             render_expr(&call, true),
             "vector_selector(samples, 600000..1200000 step 30s, lookback 5m)"
@@ -608,7 +700,12 @@ mod tests {
 
     #[test]
     fn vector_selector_with_offset_and_at() {
-        let call = selector::call(col("samples"), col(series::BLOCK_START), col(series::BLOCK_END), &params(3_600_000, Some(900_000)));
+        let call = selector::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            &params(3_600_000, Some(900_000)),
+        );
         assert_eq!(
             render_expr(&call, true),
             "vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m)"
@@ -617,7 +714,13 @@ mod tests {
 
     #[test]
     fn range_function_renders_its_name_and_window() {
-        let call = range::call(col("samples"), col(series::BLOCK_START), col(series::BLOCK_END), range::Func::Rate, &params(0, None));
+        let call = range::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            range::Func::Rate,
+            &params(0, None),
+        );
         assert_eq!(
             render_expr(&call, true),
             "rate(samples[5m], 600000..1200000 step 30s)"
@@ -648,13 +751,25 @@ mod tests {
     fn range_function_with_unrenderable_step_falls_through_to_datafusion() {
         let mut p = params(0, None);
         p.step_ms = i64::MAX;
-        let call = range::call(col("samples"), col(series::BLOCK_START), col(series::BLOCK_END), range::Func::Rate, &p);
+        let call = range::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            range::Func::Rate,
+            &p,
+        );
         assert_eq!(render_expr(&call, true), call.to_string());
     }
 
     #[test]
     fn aggregate_renders_its_op() {
-        let call = aggregate::call(col("samples"), aggregate::Op::Sum, 600_000, 1_200_000, 30_000);
+        let call = aggregate::call(
+            col("samples"),
+            aggregate::Op::Sum,
+            600_000,
+            1_200_000,
+            30_000,
+        );
         assert_eq!(
             render_expr(&call, true),
             "sum(samples, 600000..1200000 step 30s)"
@@ -662,16 +777,19 @@ mod tests {
     }
 
     /// An `Aggregate` node shaped exactly as `plan.rs`'s `aggregate`
-    /// builds it, over a two-label source, for `keys` group columns.
+    /// builds it, over a two-label source, for `keys` group columns led
+    /// by the block.
     fn aggregate_node(keys: &[String]) -> LogicalPlan {
         let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
             "job".to_string(),
             "pod".to_string(),
         ])));
+        let mut group = vec![col(series::BLOCK_START), col(series::BLOCK_END)];
+        group.extend(labels::group_exprs(keys));
         LogicalPlanBuilder::scan("selector_0", source, None)
             .unwrap()
             .aggregate(
-                labels::group_exprs(keys),
+                group,
                 vec![
                     aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
                         .alias(SAMPLES),
@@ -687,7 +805,7 @@ mod tests {
         let plan = aggregate_node(&["job".to_string()]);
         assert_eq!(
             render_line(&plan, true),
-            "Aggregate: sum by (job) (samples, 600000..1200000 step 30s)"
+            "Aggregate: sum by (job) (samples, 600000..1200000 step 30s) per block"
         );
     }
 
@@ -696,20 +814,25 @@ mod tests {
         let plan = aggregate_node(&[]);
         assert_eq!(
             render_line(&plan, true),
-            "Aggregate: sum(samples, 600000..1200000 step 30s)"
+            "Aggregate: sum(samples, 600000..1200000 step 30s) per block"
         );
     }
 
     #[test]
     fn aggregate_node_falls_through_when_the_alias_is_not_samples() {
         let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
-            "job".to_string(),
+            "job".to_string()
         ])));
         let keys = ["job".to_string()];
+        let group = [
+            vec![col(series::BLOCK_START), col(series::BLOCK_END)],
+            labels::group_exprs(&keys),
+        ]
+        .concat();
         let plan = LogicalPlanBuilder::scan("selector_0", source, None)
             .unwrap()
             .aggregate(
-                labels::group_exprs(&keys),
+                group,
                 vec![
                     aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
                         .alias("other"),
@@ -720,7 +843,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             render_line(&plan, true),
-            "Aggregate: groupBy=[[labels.job AS __group__job]], \
+            "Aggregate: groupBy=[[block_start, block_end, labels.job AS __group__job]], \
              aggr=[[sum(samples, 600000..1200000 step 30s) AS other]]"
         );
     }
@@ -728,14 +851,19 @@ mod tests {
     #[test]
     fn aggregate_node_falls_through_when_a_key_alias_does_not_match_group_alias() {
         let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
-            "job".to_string(),
+            "job".to_string()
         ])));
-        let mismatched_group = datafusion::functions::core::expr_fn::get_field(col(series::LABELS), "job")
-            .alias("not_a_group_alias");
+        let mismatched_group =
+            datafusion::functions::core::expr_fn::get_field(col(series::LABELS), "job")
+                .alias("not_a_group_alias");
         let plan = LogicalPlanBuilder::scan("selector_0", source, None)
             .unwrap()
             .aggregate(
-                vec![mismatched_group],
+                vec![
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    mismatched_group,
+                ],
                 vec![
                     aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
                         .alias(SAMPLES),
@@ -746,8 +874,169 @@ mod tests {
             .unwrap();
         assert_eq!(
             render_line(&plan, true),
-            "Aggregate: groupBy=[[labels.job AS not_a_group_alias]], \
+            "Aggregate: groupBy=[[block_start, block_end, labels.job AS not_a_group_alias]], \
              aggr=[[sum(samples, 600000..1200000 step 30s) AS samples]]"
+        );
+    }
+
+    #[test]
+    fn aggregate_node_falls_through_when_the_first_two_keys_are_not_the_block_columns() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string(),
+            "pod".to_string(),
+        ])));
+        let keys = ["job".to_string(), "pod".to_string()];
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                labels::group_exprs(&keys),
+                vec![
+                    aggregate::call(col(SAMPLES), aggregate::Op::Sum, 600_000, 1_200_000, 30_000)
+                        .alias(SAMPLES),
+                ],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: groupBy=[[labels.job AS __group__job, labels.pod AS __group__pod]], \
+             aggr=[[sum(samples, 600000..1200000 step 30s) AS samples]]"
+        );
+    }
+
+    /// A selector or range aggregate is shaped exactly as `plan.rs` builds
+    /// it: grouped by the block and the whole `labels` column.
+    fn selector_series_group() -> Vec<Expr> {
+        vec![
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            col(series::LABELS),
+        ]
+    }
+
+    #[test]
+    fn selector_aggregate_node_with_offset_and_at_reads_like_promql() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                selector_series_group(),
+                vec![selector::call(
+                    col(SAMPLES),
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    &params(3_600_000, Some(900_000)),
+                )
+                .alias(SAMPLES)],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, \
+             lookback 5m) per series per block"
+        );
+    }
+
+    #[test]
+    fn range_aggregate_node_with_offset_and_at_reads_like_promql() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                selector_series_group(),
+                vec![range::call(
+                    col(SAMPLES),
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    range::Func::Rate,
+                    &params(3_600_000, Some(900_000)),
+                )
+                .alias(SAMPLES)],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: rate(samples[5m] offset 1h @ 900000, 600000..1200000 step 30s) \
+             per series per block"
+        );
+    }
+
+    #[test]
+    fn selector_aggregate_node_falls_through_when_the_third_key_is_not_labels() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        let group = vec![
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            get_field_of("job").alias(labels::group_alias("job")),
+        ];
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(
+                group,
+                vec![selector::call(
+                    col(SAMPLES),
+                    col(series::BLOCK_START),
+                    col(series::BLOCK_END),
+                    &params(0, None),
+                )
+                .alias(SAMPLES)],
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            render_line(&plan, true),
+            "Aggregate: groupBy=[[block_start, block_end, labels.job AS __group__job]], \
+             aggr=[[vector_selector(samples, 600000..1200000 step 30s, lookback 5m) AS samples]]"
+        );
+    }
+
+    #[test]
+    fn selector_aggregate_node_falls_through_when_the_calls_block_arguments_are_wrong() {
+        let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
+            "job".to_string()
+        ])));
+        // The call's own block arguments are the two block columns
+        // swapped: the group key check alone cannot see this, so the
+        // call itself has to reject it.
+        let call = selector::udaf().call(vec![
+            col(SAMPLES),
+            col(series::BLOCK_END),
+            col(series::BLOCK_START),
+            lit(600_000i64),
+            lit(1_200_000i64),
+            lit(30_000i64),
+            lit(300_000i64),
+            lit(0i64),
+            lit(ScalarValue::Int64(None)),
+        ]);
+        let plan = LogicalPlanBuilder::scan("selector_0", source, None)
+            .unwrap()
+            .aggregate(selector_series_group(), vec![call.alias(SAMPLES)])
+            .unwrap()
+            .build()
+            .unwrap();
+        // The scan qualifies every column once the plan resolves it, so
+        // the expected text is built off the plan's own aggregate
+        // expression rather than the pre-resolution `call` above.
+        let LogicalPlan::Aggregate(a) = &plan else {
+            panic!("expected an Aggregate node")
+        };
+        let resolved = a.aggr_expr[0].to_string();
+        assert_eq!(
+            render_line(&plan, true),
+            format!("Aggregate: groupBy=[[block_start, block_end, labels]], aggr=[[{resolved}]]")
         );
     }
 
@@ -803,7 +1092,7 @@ mod tests {
     /// against.
     fn projection_with_schema(exprs: Vec<Expr>, field_names: &[&str]) -> Projection {
         let source = Arc::new(LogicalTableSource::new(crate::series::schema(&[
-            "job".to_string(),
+            "job".to_string()
         ])));
         let input = Arc::new(
             LogicalPlanBuilder::scan("selector_0", source, None)
@@ -813,23 +1102,45 @@ mod tests {
         );
         let fields: Vec<datafusion::arrow::datatypes::Field> = field_names
             .iter()
-            .map(|n| datafusion::arrow::datatypes::Field::new(*n, datafusion::arrow::datatypes::DataType::Utf8, false))
+            .map(|n| {
+                datafusion::arrow::datatypes::Field::new(
+                    *n,
+                    datafusion::arrow::datatypes::DataType::Utf8,
+                    false,
+                )
+            })
             .collect();
         let schema = Arc::new(
-            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(fields)).unwrap(),
+            datafusion::common::DFSchema::try_from(datafusion::arrow::datatypes::Schema::new(
+                fields,
+            ))
+            .unwrap(),
         );
         Projection::try_new_with_schema(exprs, input, schema).unwrap()
     }
 
+    /// The two block columns, as they'd sit at the end of a canonical
+    /// four-column projection: pass-throughs, so a test only cares about
+    /// them when it means to break that invariant.
+    fn block_pass_throughs() -> Vec<Expr> {
+        vec![col(series::BLOCK_START), col(series::BLOCK_END)]
+    }
+
+    const CANONICAL_SCHEMA: [&str; 4] = [
+        series::LABELS,
+        series::SAMPLES,
+        series::BLOCK_START,
+        series::BLOCK_END,
+    ];
+
     #[test]
     fn projection_short_form_drops_a_regrouped_labels_alias() {
-        let p = projection_with_schema(
-            vec![
-                labels::call(vec![("job".to_string(), col("__group__job"))]).alias(series::LABELS),
-                col(SAMPLES),
-            ],
-            &[series::LABELS, series::SAMPLES],
-        );
+        let mut exprs = vec![
+            labels::call(vec![("job".to_string(), col("__group__job"))]).alias(series::LABELS),
+            col(SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
         assert_eq!(
             render_projection(&p, true),
             "Projection: labels{job: __group__job}"
@@ -838,17 +1149,23 @@ mod tests {
 
     #[test]
     fn projection_short_form_drops_both_aliases_when_both_are_rebuilt() {
-        let p = projection_with_schema(
-            vec![
-                labels::call(vec![
-                    ("job".to_string(), get_field_of("job")),
-                    ("pod".to_string(), get_field_of("pod")),
-                ])
-                .alias(series::LABELS),
-                range::call(col(SAMPLES), col(series::BLOCK_START), col(series::BLOCK_END), range::Func::Rate, &params(0, None)).alias(series::SAMPLES),
-            ],
-            &[series::LABELS, series::SAMPLES],
-        );
+        let mut exprs = vec![
+            labels::call(vec![
+                ("job".to_string(), get_field_of("job")),
+                ("pod".to_string(), get_field_of("pod")),
+            ])
+            .alias(series::LABELS),
+            range::call(
+                col(SAMPLES),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
+                range::Func::Rate,
+                &params(0, None),
+            )
+            .alias(series::SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
         assert_eq!(
             render_projection(&p, true),
             "Projection: labels{job, pod}, rate(samples[5m], 600000..1200000 step 30s)"
@@ -857,13 +1174,18 @@ mod tests {
 
     #[test]
     fn projection_short_form_drops_a_pass_through_labels_column() {
-        let p = projection_with_schema(
-            vec![
-                col(series::LABELS),
-                selector::call(col(SAMPLES), col(series::BLOCK_START), col(series::BLOCK_END), &params(0, None)).alias(series::SAMPLES),
-            ],
-            &[series::LABELS, series::SAMPLES],
-        );
+        let mut exprs = vec![
+            col(series::LABELS),
+            selector::call(
+                col(SAMPLES),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
+                &params(0, None),
+            )
+            .alias(series::SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
         assert_eq!(
             render_projection(&p, true),
             "Projection: vector_selector(samples, 600000..1200000 step 30s, lookback 5m)"
@@ -871,33 +1193,49 @@ mod tests {
     }
 
     #[test]
-    fn projection_keeps_aliases_with_a_third_column() {
-        let p = projection_with_schema(
-            vec![
-                labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS),
-                range::call(col(SAMPLES), col(series::BLOCK_START), col(series::BLOCK_END), range::Func::Rate, &params(0, None)).alias(series::SAMPLES),
-                col("extra"),
-            ],
-            &[series::LABELS, series::SAMPLES, "extra"],
-        );
+    fn projection_keeps_aliases_with_a_fifth_column() {
+        let mut exprs = vec![
+            labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS),
+            range::call(
+                col(SAMPLES),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
+                range::Func::Rate,
+                &params(0, None),
+            )
+            .alias(series::SAMPLES),
+        ];
+        exprs.extend(block_pass_throughs());
+        exprs.push(col("extra"));
+        let mut field_names = CANONICAL_SCHEMA.to_vec();
+        field_names.push("extra");
+        let p = projection_with_schema(exprs, &field_names);
         assert_eq!(
             render_projection(&p, true),
-            "Projection: labels{job} AS labels, rate(samples[5m], 600000..1200000 step 30s) AS samples, extra"
+            "Projection: labels{job} AS labels, rate(samples[5m], 600000..1200000 step 30s) AS samples, \
+             block_start, block_end, extra"
         );
     }
 
     #[test]
-    fn projection_keeps_aliases_with_the_columns_reversed() {
+    fn projection_keeps_aliases_with_the_columns_reordered() {
         let p = projection_with_schema(
             vec![
                 col(SAMPLES),
                 labels::call(vec![("job".to_string(), get_field_of("job"))]).alias(series::LABELS),
+                col(series::BLOCK_START),
+                col(series::BLOCK_END),
             ],
-            &[series::SAMPLES, series::LABELS],
+            &[
+                series::SAMPLES,
+                series::LABELS,
+                series::BLOCK_START,
+                series::BLOCK_END,
+            ],
         );
         assert_eq!(
             render_projection(&p, true),
-            "Projection: samples, labels{job} AS labels"
+            "Projection: samples, labels{job} AS labels, block_start, block_end"
         );
     }
 
@@ -915,11 +1253,13 @@ mod tests {
 
     #[test]
     fn projection_identity_prints_the_stock_form() {
-        let p = projection_with_schema(
-            vec![col(series::LABELS), col(series::SAMPLES)],
-            &[series::LABELS, series::SAMPLES],
+        let mut exprs = vec![col(series::LABELS), col(series::SAMPLES)];
+        exprs.extend(block_pass_throughs());
+        let p = projection_with_schema(exprs, &CANONICAL_SCHEMA);
+        assert_eq!(
+            render_projection(&p, true),
+            "Projection: labels, samples, block_start, block_end"
         );
-        assert_eq!(render_projection(&p, true), "Projection: labels, samples");
     }
 
     #[test]
@@ -948,7 +1288,7 @@ mod tests {
                 _hints: SelectHints,
             ) -> DfResult<Arc<dyn ExecutionPlan>> {
                 Ok(Arc::new(EmptyExec::new(crate::series::schema(&[
-                    "job".to_string(),
+                    "job".to_string()
                 ]))))
             }
         }
@@ -991,7 +1331,7 @@ mod tests {
 
     #[test]
     fn fallthrough_on_a_udf_with_the_wrong_argument_count() {
-        // One argument short of `promql_vector_selector`'s seven.
+        // Well short of `promql_vector_selector`'s nine arguments.
         let call = selector::udaf().call(vec![col("samples"), lit(0i64)]);
         assert_eq!(render_expr(&call, true), call.to_string());
     }

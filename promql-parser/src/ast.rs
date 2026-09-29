@@ -473,12 +473,12 @@ mod tests {
             ("a\"b", "\"a\\\"b\""),
             ("a\\b", "\"a\\\\b\""),
             ("\n", "\"\\n\""),
-            ("\u{07}", "\"\\a\""),  // BEL, named \a, not \x07
+            ("\u{07}", "\"\\a\""), // BEL, named \a, not \x07
             ("\u{7f}", "\"\\x7f\""),
-            ("\u{85}", "\"\\u0085\""), // NEL, a Cc control above ASCII
-            ("\u{a0}", "\"\\u00a0\""), // NBSP, Zs
+            ("\u{85}", "\"\\u0085\""),   // NEL, a Cc control above ASCII
+            ("\u{a0}", "\"\\u00a0\""),   // NBSP, Zs
             ("\u{2028}", "\"\\u2028\""), // LINE SEPARATOR, Zl
-            ("ü", "\"ü\""),         // printable non-ASCII: stays raw
+            ("ü", "\"ü\""),              // printable non-ASCII: stays raw
         ];
         for (input, want) in cases {
             assert_eq!(&go_quote(input), want, "go_quote({input:?})");
@@ -493,10 +493,7 @@ mod tests {
             value: value.to_string(),
             pos_range: PositionRange::default(),
         };
-        assert_eq!(
-            m("job", MatchOp::Equal, "api").to_string(),
-            r#"job="api""#
-        );
+        assert_eq!(m("job", MatchOp::Equal, "api").to_string(), r#"job="api""#);
         assert_eq!(
             m("job", MatchOp::RegexEqual, "a|b").to_string(),
             r#"job=~"a|b""#
