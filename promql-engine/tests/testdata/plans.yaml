@@ -84,10 +84,11 @@ tests:
     query: |
       abs(temperature)
     plan: |
-      Projection: promql_labels(Utf8("city"), get_field(abs_0.labels, Utf8("city"))) AS labels, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL)) AS samples
+      Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
         SubqueryAlias: abs_0
-          Projection: selector_0.labels, promql_vector_selector(selector_0.samples, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(0), Int64(NULL)) AS samples
-            TableScan: selector_0
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: temperature
 
   - name: vector of a scalar
     description: >
