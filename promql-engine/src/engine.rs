@@ -96,7 +96,6 @@ impl Engine {
         ctx.register_udaf(range::udaf());
         ctx.register_udf(elementwise::udf());
         ctx.register_udaf(binary::udaf());
-        ctx.register_udf(sort::Value::udf());
         ctx.register_udf(sort::Natural::udf());
         ctx.register_udf(sort::Set::udf());
         Self { ctx, rt: None }

@@ -14,23 +14,23 @@
 //!   natural order in which `cpu="100"` follows `cpu="20"`, and breaks a
 //!   tie with `labels.Compare` over the full label set.
 //!
-//! So each comparator becomes a key function here: [`Value`] reads the
-//! value at the step out of a row's samples, [`Natural`] and [`Set`] turn
-//! a label value and a whole label set into byte strings whose bytewise
-//! order *is* the Go comparator's. Mirrors Prometheus at 83962c35
+//! The value needs no key function: `isnan` as a leading key restores
+//! NaN-last where Arrow's total order puts NaN above every number. The
+//! labels do: [`Natural`] and [`Set`] turn a label value and a whole
+//! label set into byte strings whose bytewise order *is* the Go
+//! comparator's. Mirrors Prometheus at 83962c35
 //! (`promql/functions.go`); floats only, so the `filterFloats` that drops
 //! native histograms before sorting has nothing to do here.
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BinaryBuilder, Float64Builder, StructArray,
-};
-use datafusion::arrow::datatypes::{DataType, Float64Type};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StructArray};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::plan_err;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::functions::math::expr_fn::isnan;
+use datafusion::functions_nested::expr_fn::array_element;
 use datafusion::logical_expr::{
     col, lit, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SortExpr,
     Volatility,
@@ -94,7 +94,10 @@ impl Func {
 pub fn exprs(func: Func, labels: &[String], label_names: &[String]) -> Vec<SortExpr> {
     let asc = func.ascending();
     if !func.by_label() {
-        let value = Value::udf().call(vec![col(SAMPLES)]);
+        // An instant query narrows a row to at most one sample, so the
+        // last is the step's. A row with none is null, which sorts after
+        // every NaN, and `drop_empty` removes it before anyone sees it.
+        let value = get_field(array_element(col(SAMPLES), lit(-1_i64)), VALUE);
         return vec![
             // NaN last whichever way the values go: `funcSort` and
             // `funcSortDesc` both reverse a heap that sorts NaN first.
@@ -120,70 +123,6 @@ pub fn exprs(func: Func, labels: &[String], label_names: &[String]) -> Vec<SortE
             false,
         )))
         .collect()
-}
-
-/// `promql_sort_value(samples)`: the value a row contributes to the
-/// instant vector being sorted.
-///
-/// Prometheus sorts a `Vector`, one `Sample` per series; here a row is a
-/// list of samples that an instant query has narrowed to at most one. A
-/// row with none answers NaN, which sorts it with the NaNs — and it is
-/// dropped from the result before anyone sees the order anyway.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct Value {
-    signature: Signature,
-}
-
-pub const VALUE_NAME: &str = "promql_sort_value";
-
-impl Default for Value {
-    fn default() -> Self {
-        Self {
-            signature: Signature::exact(vec![series::samples_type()], Volatility::Immutable),
-        }
-    }
-}
-
-impl Value {
-    pub fn udf() -> ScalarUDF {
-        ScalarUDF::new_from_impl(Value::default())
-    }
-}
-
-impl ScalarUDFImpl for Value {
-    fn name(&self) -> &str {
-        VALUE_NAME
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Float64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let samples = match &args.args[0] {
-            ColumnarValue::Array(a) => Arc::clone(a),
-            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
-        };
-        let samples = samples.as_list::<i32>();
-        let values = samples
-            .values()
-            .as_struct()
-            .column_by_name(VALUE)
-            .ok_or_else(|| DataFusionError::Execution(format!("{VALUE_NAME}: no `{VALUE}`")))?
-            .as_primitive::<Float64Type>()
-            .values();
-        let offsets = samples.offsets();
-        let mut out = Float64Builder::with_capacity(samples.len());
-        for row in 0..samples.len() {
-            let (from, to) = (offsets[row] as usize, offsets[row + 1] as usize);
-            out.append_value(if from == to { f64::NAN } else { values[to - 1] });
-        }
-        Ok(ColumnarValue::Array(Arc::new(out.finish())))
-    }
 }
 
 /// `promql_natural_key(value)`: one label value as a byte string ordered
