@@ -41,11 +41,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray,
-    StructArray, TimestampMillisecondArray,
+    new_empty_array, Array, ArrayRef, AsArray, BooleanArray, Datum, Float64Array, Int64Array,
+    ListArray, StringArray, StringViewArray, StructArray, TimestampMillisecondArray,
 };
-use datafusion::arrow::buffer::OffsetBuffer;
+use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer};
+use datafusion::arrow::compute::kernels::numeric;
+use datafusion::arrow::compute::{binary, concat, FilterBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Float64Type, Int64Type};
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -95,6 +98,22 @@ pub enum Op {
 }
 
 impl Op {
+    pub const ALL: [Op; 13] = [
+        Op::Add,
+        Op::Sub,
+        Op::Mul,
+        Op::Div,
+        Op::Mod,
+        Op::Pow,
+        Op::Atan2,
+        Op::Eql,
+        Op::Neq,
+        Op::Gtr,
+        Op::Lss,
+        Op::Gte,
+        Op::Lte,
+    ];
+
     pub fn from_token(op: ItemType) -> Option<Op> {
         Some(match op {
             ItemType::Add => Op::Add,
@@ -197,6 +216,119 @@ impl Op {
             _ => unreachable!("only a comparison compares"),
         }
     }
+
+    /// [`Op::value`] over whole lanes, for the two shapes with a vector
+    /// in them. It must stay bit for bit what `value` answers, pair by
+    /// pair; the tests hold it to that.
+    ///
+    /// The arithmetic is Arrow's `numeric` kernels, which for floats run
+    /// the `_wrapping` ops (`float_op`, arrow-arith 58.4.0), and for
+    /// `f64` those are the bare IEEE `+ - * / %`. The `_checked` ones
+    /// would refuse the division by zero that Go answers with an
+    /// infinity or a NaN.
+    ///
+    /// A comparison answers with where it holds rather than with values:
+    /// the value a filtering comparison keeps is the caller's to name.
+    pub fn kernel(&self, lhs: Operand, rhs: Operand, return_bool: bool) -> Result<Computed> {
+        if let (Operand::Lane(l), Operand::Lane(r)) = (lhs, rhs) {
+            if l.len() != r.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "{NAME}: lanes of {} and {} values",
+                    l.len(),
+                    r.len()
+                )));
+            }
+        }
+        let holds = match self {
+            Op::Add => return arithmetic(numeric::add, lhs, rhs),
+            Op::Sub => return arithmetic(numeric::sub, lhs, rhs),
+            Op::Mul => return arithmetic(numeric::mul, lhs, rhs),
+            Op::Div => return arithmetic(numeric::div, lhs, rhs),
+            Op::Mod => return arithmetic(numeric::rem, lhs, rhs),
+            Op::Pow => return native(lhs, rhs, f64::powf),
+            Op::Atan2 => return native(lhs, rhs, f64::atan2),
+            // Not `arrow::compute::kernels::cmp`: it orders floats by
+            // `total_cmp`, so there NaN == NaN and -0 < +0. Go's `==`
+            // and `<`, like Rust's, have a NaN compare false to
+            // everything and the two zeros equal, and the corpus
+            // depends on both.
+            Op::Eql => holds(lhs, rhs, |l, r| l == r),
+            Op::Neq => holds(lhs, rhs, |l, r| l != r),
+            Op::Gtr => holds(lhs, rhs, |l, r| l > r),
+            Op::Lss => holds(lhs, rhs, |l, r| l < r),
+            Op::Gte => holds(lhs, rhs, |l, r| l >= r),
+            Op::Lte => holds(lhs, rhs, |l, r| l <= r),
+        };
+        Ok(match return_bool {
+            true => Computed::Values(Float64Array::from_iter_values(holds.iter().map(f64::from))),
+            false => Computed::Holds(holds),
+        })
+    }
+}
+
+/// One side of [`Op::kernel`]: a lane of values, or the scalar a
+/// `vector op scalar` folded while planning, standing at every position.
+/// Two scalars answer with a lane of one.
+#[derive(Debug, Clone, Copy)]
+pub enum Operand<'a> {
+    Lane(&'a Float64Array),
+    Scalar(f64),
+}
+
+/// What [`Op::kernel`] answers with, position by position.
+#[derive(Debug)]
+pub enum Computed {
+    Values(Float64Array),
+    /// Where a filtering comparison holds. Between vectors the sample
+    /// kept is the left one; against a scalar it is the vector's,
+    /// whichever side the scalar was written on.
+    Holds(BooleanBuffer),
+}
+
+type NumericKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<ArrayRef, ArrowError>;
+
+fn arithmetic(kernel: NumericKernel, lhs: Operand, rhs: Operand) -> Result<Computed> {
+    let scalar = Float64Array::new_scalar;
+    let out = match (lhs, rhs) {
+        (Operand::Lane(l), Operand::Lane(r)) => kernel(l, r),
+        (Operand::Lane(l), Operand::Scalar(r)) => kernel(l, &scalar(r)),
+        (Operand::Scalar(l), Operand::Lane(r)) => kernel(&scalar(l), r),
+        (Operand::Scalar(l), Operand::Scalar(r)) => kernel(&scalar(l), &scalar(r)),
+    }?;
+    Ok(Computed::Values(out.as_primitive::<Float64Type>().clone()))
+}
+
+/// The operators Arrow has no kernel for, through its arity kernels.
+/// `f` is a function item, not a pointer, so each operator gets a loop
+/// of its own with the call inlined.
+fn native(lhs: Operand, rhs: Operand, f: impl Fn(f64, f64) -> f64) -> Result<Computed> {
+    Ok(Computed::Values(match (lhs, rhs) {
+        (Operand::Lane(l), Operand::Lane(r)) => binary::<_, _, _, Float64Type>(l, r, f)?,
+        (Operand::Lane(l), Operand::Scalar(r)) => l.unary::<_, Float64Type>(|l| f(l, r)),
+        (Operand::Scalar(l), Operand::Lane(r)) => r.unary::<_, Float64Type>(|r| f(l, r)),
+        (Operand::Scalar(l), Operand::Scalar(r)) => Float64Array::from_value(f(l, r), 1),
+    }))
+}
+
+/// Where `f` holds, 64 positions to a word, which is the shape LLVM
+/// vectorises. The sample value column carries no nulls, so there is no
+/// validity to fold in.
+fn holds(lhs: Operand, rhs: Operand, f: impl Fn(f64, f64) -> bool) -> BooleanBuffer {
+    match (lhs, rhs) {
+        (Operand::Lane(l), Operand::Lane(r)) => {
+            let (l, r) = (l.values(), r.values());
+            BooleanBuffer::collect_bool(l.len(), |i| f(l[i], r[i]))
+        }
+        (Operand::Lane(l), Operand::Scalar(r)) => {
+            let l = l.values();
+            BooleanBuffer::collect_bool(l.len(), |i| f(l[i], r))
+        }
+        (Operand::Scalar(l), Operand::Lane(r)) => {
+            let r = r.values();
+            BooleanBuffer::collect_bool(r.len(), |i| f(l, r[i]))
+        }
+        (Operand::Scalar(l), Operand::Scalar(r)) => BooleanBuffer::collect_bool(1, |_| f(l, r)),
+    }
 }
 
 /// The `__name__` an output series kept, and the samples that came out
@@ -246,23 +378,7 @@ pub fn parse_literal(s: &str) -> Option<(Op, bool)> {
         Some(spelling) => (spelling, true),
         None => (s, false),
     };
-    let op = [
-        Op::Add,
-        Op::Sub,
-        Op::Mul,
-        Op::Div,
-        Op::Mod,
-        Op::Pow,
-        Op::Atan2,
-        Op::Eql,
-        Op::Neq,
-        Op::Gtr,
-        Op::Lss,
-        Op::Gte,
-        Op::Lte,
-    ]
-    .into_iter()
-    .find(|op| op.as_str() == spelling)?;
+    let op = Op::ALL.into_iter().find(|op| op.as_str() == spelling)?;
     // `1 + bool 2` is not a query upstream's parser accepts, so it is
     // not a plan this reads back either.
     if return_bool && !op.is_comparison() {
@@ -270,10 +386,6 @@ pub fn parse_literal(s: &str) -> Option<(Op, bool)> {
     }
     Some((op, return_bool))
 }
-
-/// The samples one output series ends up with, timestamps beside
-/// values as the canonical shape wants them.
-type Bucket = (Vec<i64>, Vec<f64>);
 
 /// One match group: what each side put at each step of the grid.
 #[derive(Debug)]
@@ -439,9 +551,13 @@ impl Accumulator for Pairing {
         Ok(())
     }
 
-    /// The step grid walked once, in upstream's order: a duplicate on
-    /// the "one" side is reported before a left side that matched twice,
-    /// and both before any value is emitted.
+    /// The step grid walked once for the two matching errors, in
+    /// upstream's order: the first step to fail wins, and at a step a
+    /// duplicate on the "one" side is reported before a left side that
+    /// matched twice. Only then are the values computed, once over the
+    /// whole lanes. A step that did not pair holds a NaN on some side,
+    /// is computed like any other and filtered away after, which is
+    /// cheaper than a branch per step in front of the kernel.
     ///
     /// A step whose left side is empty is skipped rather than checked,
     /// which is where this parts company with upstream: there the
@@ -450,14 +566,10 @@ impl Accumulator for Pairing {
     /// had a left-hand sample at that step. Seeing that would take a
     /// second pass over every group.
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        // One bucket per name the left side wore. The shapes that drop
-        // the name never intern, so they all land in bucket 0 and the
-        // group answers with the single series it always did.
-        let mut buckets: Vec<Bucket> = (0..self.pool.len())
-            .map(|_| (Vec::new(), Vec::new()))
-            .collect();
-        for step in 0..self.grid.len() {
-            let (left, right) = (self.counts[LHS][step], self.counts[RHS][step]);
+        let len = self.grid.len();
+        let [left, right] = &self.counts;
+        for step in 0..len {
+            let (left, right) = (left[step], right[step]);
             if left == 0 {
                 continue;
             }
@@ -474,54 +586,73 @@ impl Accumulator for Pairing {
                         .into(),
                 ));
             }
-            // A comparison that does not hold leaves the step out
-            // entirely, which is what upstream's `keep` decides.
-            if let Some(value) = self.op.value(
-                self.values[LHS][step],
-                self.values[RHS][step],
-                self.return_bool,
-            ) {
-                let bucket = &mut buckets[self.names[step] as usize];
-                bucket.0.push(self.grid.timestamp(step));
-                bucket.1.push(value);
+        }
+        let paired = BooleanBuffer::collect_bool(len, |i| left[i] == 1 && right[i] == 1);
+        let grid = self.grid;
+        let timestamps =
+            TimestampMillisecondArray::from_iter_values((0..len).map(|step| grid.timestamp(step)));
+
+        // One series per name the left side wore, sorted by name,
+        // because DataFusion is free to hand the rows of a group over in
+        // any order and the answer must not be. The shapes that drop the
+        // name never intern, so they answer with the one series under
+        // name 0 and skip the per-name masks.
+        let order: Vec<u32> = match self.named {
+            true => {
+                let mut order: Vec<u32> = (0..self.pool.len() as u32).collect();
+                order.sort_by_key(|name| self.pool[*name as usize].as_str());
+                order
             }
-        }
+            false => vec![0],
+        };
 
-        // Sorted by name, because DataFusion is free to hand the rows
-        // of a group over in any order and the answer must not be.
-        let mut out: Vec<(&str, &Bucket)> = self
-            .pool
-            .iter()
-            .map(String::as_str)
-            .zip(buckets.iter())
-            .filter(|(_, bucket)| !bucket.0.is_empty())
-            .collect();
-        out.sort_by_key(|(name, _)| *name);
+        let (op, return_bool, named, names) = (self.op, self.return_bool, self.named, &self.names);
+        let [l, r] = &mut self.values;
+        let (kept, timestamps, values) = lend(l, |l| {
+            lend(r, |r| -> Result<_> {
+                let (keep, values) =
+                    match op.kernel(Operand::Lane(l), Operand::Lane(r), return_bool)? {
+                        Computed::Values(values) => (paired, values),
+                        Computed::Holds(holds) => (&paired & &holds, l.clone()),
+                    };
+                let mut kept = Vec::with_capacity(order.len());
+                let mut timestamp_parts = Vec::with_capacity(order.len());
+                let mut value_parts = Vec::with_capacity(order.len());
+                for name in order {
+                    let mask = match named {
+                        true => &keep & &BooleanBuffer::collect_bool(len, |i| names[i] == name),
+                        false => keep.clone(),
+                    };
+                    let count = mask.count_set_bits();
+                    if count == 0 {
+                        continue;
+                    }
+                    let predicate = FilterBuilder::new(&BooleanArray::new(mask, None))
+                        .optimize()
+                        .build();
+                    timestamp_parts.push(predicate.filter(&timestamps)?);
+                    value_parts.push(predicate.filter(&values)?);
+                    kept.push((name, count));
+                }
+                Ok((
+                    kept,
+                    joined(&timestamp_parts, series::timestamp_type())?,
+                    joined(&value_parts, DataType::Float64)?,
+                ))
+            })
+        })?;
 
-        let mut offsets = Vec::with_capacity(out.len() + 1);
-        offsets.push(0i32);
-        let mut timestamps = Vec::new();
-        let mut values = Vec::new();
-        for (_, bucket) in &out {
-            timestamps.extend_from_slice(&bucket.0);
-            values.extend_from_slice(&bucket.1);
-            offsets.push(timestamps.len() as i32);
-        }
-        let entries = StructArray::new(
-            series::sample_fields(),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(timestamps)),
-                Arc::new(Float64Array::from(values)),
-            ],
-            None,
-        );
+        let entries = StructArray::new(series::sample_fields(), vec![timestamps, values], None);
         let samples = ListArray::new(
             series::sample_item(),
-            OffsetBuffer::new(offsets.into()),
+            OffsetBuffer::from_lengths(kept.iter().map(|(_, count)| *count)),
             Arc::new(entries),
             None,
         );
-        let names: Vec<&str> = out.iter().map(|(name, _)| *name).collect();
+        let names: Vec<&str> = kept
+            .iter()
+            .map(|(name, _)| self.pool[*name as usize].as_str())
+            .collect();
         let pairs = StructArray::new(
             pair_fields(),
             vec![Arc::new(StringViewArray::from(names)), Arc::new(samples)],
@@ -713,6 +844,34 @@ fn one_row(item: FieldRef, entries: ArrayRef) -> ScalarValue {
         entries,
         None,
     )))
+}
+
+/// `lane` as an Arrow array for the length of `f`, then back in place.
+///
+/// `evaluate` may not consume the state, since a window frame evaluates
+/// again, and copying both lanes into arrays would cost as much as the
+/// kernel saves. Moving the `Vec` in and out is free while nothing else
+/// holds the buffer; where `f`'s answer still does — `filter` hands its
+/// input back whole when every position is kept — the lane is copied
+/// out of it instead.
+fn lend<R>(lane: &mut Vec<f64>, f: impl FnOnce(&Float64Array) -> R) -> R {
+    let array = Float64Array::new(std::mem::take(lane).into(), None);
+    let out = f(&array);
+    let (_, values, _) = array.into_parts();
+    *lane = values
+        .into_inner()
+        .into_vec()
+        .unwrap_or_else(|shared| shared.typed_data::<f64>().to_vec());
+    out
+}
+
+/// The pieces end to end; `concat` refuses to join nothing.
+fn joined(parts: &[ArrayRef], empty: DataType) -> Result<ArrayRef> {
+    Ok(match parts {
+        [] => new_empty_array(&empty),
+        [one] => Arc::clone(one),
+        many => concat(&many.iter().map(AsRef::as_ref).collect::<Vec<_>>())?,
+    })
 }
 
 fn child<'a, T: 'static>(entries: &'a StructArray, name: &str) -> Result<&'a T> {
@@ -943,6 +1102,26 @@ impl AggregateUDFImpl for Binary {
     }
 }
 
+/// The floats where Go and a plausible Rust port part ways, for the
+/// tests of both kernels to pair up every way round: both zeros, NaN
+/// with either sign bit, the infinities, the largest float and the
+/// smallest subnormal.
+#[cfg(test)]
+pub(crate) const EDGES: [f64; 12] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    2.5,
+    -3.0,
+    f64::NAN,
+    -f64::NAN,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::MAX,
+    5e-324,
+];
+
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::StringViewArray;
@@ -952,6 +1131,21 @@ mod tests {
 
     fn pairing(op: Op) -> Pairing {
         Pairing::new(op, false, Grid::new(NAME, 0, 30_000, 10_000).unwrap())
+    }
+
+    /// Bits to compare results by: every NaN is one value. Which NaN (sign,
+    /// payload) an IEEE op yields from NaN inputs is unspecified and
+    /// codegen picks it (Arrow's vectorised add gives the negative NaN in
+    /// release where `Op::value` gives the positive one); PromQL output
+    /// cannot see it. Stale markers, the one NaN with meaning, are dropped
+    /// by the selector and range kernels before any operator. Everything
+    /// else stays exact, so -0 against +0 still fails.
+    fn bits(v: f64) -> u64 {
+        if v.is_nan() {
+            f64::NAN.to_bits()
+        } else {
+            v.to_bits()
+        }
     }
 
     /// Every output series of one match group: the name it kept and the
@@ -1055,21 +1249,7 @@ mod tests {
 
     #[test]
     fn every_operator_round_trips_through_its_promql_spelling() {
-        for op in [
-            Op::Add,
-            Op::Sub,
-            Op::Mul,
-            Op::Div,
-            Op::Mod,
-            Op::Pow,
-            Op::Atan2,
-            Op::Eql,
-            Op::Neq,
-            Op::Gtr,
-            Op::Lss,
-            Op::Gte,
-            Op::Lte,
-        ] {
+        for op in Op::ALL {
             assert_eq!(parse_literal(literal(op, false)), Some((op, false)));
             if op.is_comparison() {
                 assert_eq!(parse_literal(literal(op, true)), Some((op, true)));
@@ -1241,6 +1421,192 @@ mod tests {
                 ("b".to_string(), vec![(10_000, 7.0)]),
             ]
         );
+    }
+
+    /// Every operator shape the query language allows: `bool` only on a
+    /// comparison.
+    fn shapes() -> impl Iterator<Item = (Op, bool)> {
+        Op::ALL.into_iter().flat_map(|op| {
+            [(op, false), (op, true)]
+                .into_iter()
+                .filter(|(op, return_bool)| !return_bool || op.is_comparison())
+        })
+    }
+
+    /// Every edge value against every other, itself included.
+    fn edge_pairs() -> Vec<(f64, f64)> {
+        EDGES
+            .iter()
+            .flat_map(|l| EDGES.iter().map(move |r| (*l, *r)))
+            .collect()
+    }
+
+    /// The kernel's answer at each position against [`Op::value`] on the
+    /// pair that stood there, compared as [`bits`] so that a zero's sign
+    /// counts.
+    fn assert_kernel_is_value(
+        op: Op,
+        return_bool: bool,
+        lhs: Operand,
+        rhs: Operand,
+        pairs: &[(f64, f64)],
+    ) {
+        let got = op.kernel(lhs, rhs, return_bool).unwrap();
+        let len = match &got {
+            Computed::Values(values) => values.len(),
+            Computed::Holds(holds) => holds.len(),
+        };
+        assert_eq!(len, pairs.len(), "{}", literal(op, return_bool));
+        for (i, &(l, r)) in pairs.iter().enumerate() {
+            let want = op.value(l, r, return_bool);
+            let what = format!("{l:?} {} {r:?}", literal(op, return_bool));
+            match &got {
+                Computed::Values(values) => {
+                    let want = want.unwrap_or_else(|| panic!("{what}: value drops it"));
+                    assert_eq!(bits(values.value(i)), bits(want), "{what}");
+                }
+                Computed::Holds(holds) => {
+                    assert!(op.is_comparison() && !return_bool, "{what}");
+                    assert_eq!(holds.value(i), want.is_some(), "{what}");
+                }
+            }
+        }
+    }
+
+    /// The lane kernel answers what `vectorElemBinop` does one pair at a
+    /// time, for every operator, both lanes against each other and each
+    /// against a scalar on either side.
+    #[test]
+    fn the_lane_kernel_is_vector_elem_binop_bit_for_bit() {
+        let pairs = edge_pairs();
+        let lhs = Float64Array::from_iter_values(pairs.iter().map(|p| p.0));
+        let rhs = Float64Array::from_iter_values(pairs.iter().map(|p| p.1));
+        let lane = Float64Array::from(EDGES.to_vec());
+        for (op, return_bool) in shapes() {
+            assert_kernel_is_value(
+                op,
+                return_bool,
+                Operand::Lane(&lhs),
+                Operand::Lane(&rhs),
+                &pairs,
+            );
+            for s in EDGES {
+                assert_kernel_is_value(
+                    op,
+                    return_bool,
+                    Operand::Lane(&lane),
+                    Operand::Scalar(s),
+                    &EDGES.map(|v| (v, s)),
+                );
+                assert_kernel_is_value(
+                    op,
+                    return_bool,
+                    Operand::Scalar(s),
+                    Operand::Lane(&lane),
+                    &EDGES.map(|v| (s, v)),
+                );
+            }
+        }
+    }
+
+    fn bits_of(value: ScalarValue) -> Vec<(String, Vec<(i64, u64)>)> {
+        pairs_of(value)
+            .into_iter()
+            .map(|(name, samples)| {
+                let samples = samples.into_iter().map(|(t, v)| (t, bits(v))).collect();
+                (name, samples)
+            })
+            .collect()
+    }
+
+    /// The whole of `evaluate` over the edge pairs, one per step, with a
+    /// step only the left reached and one only the right reached: what
+    /// comes out is `Op::value` at the paired steps and nothing else.
+    /// Evaluated twice, because the lanes are lent to the kernel and
+    /// have to be back for a window frame's next call.
+    #[test]
+    fn evaluate_is_vector_elem_binop_at_every_paired_step() {
+        let pairs = edge_pairs();
+        let steps = pairs.len() as i64 + 2;
+        let paired: Vec<i64> = (0..pairs.len() as i64).collect();
+        for (op, return_bool) in shapes() {
+            let grid = Grid::new(NAME, 0, steps - 1, 1).unwrap();
+            let mut pairing = Pairing::new(op, return_bool, grid);
+            let left: Vec<f64> = pairs.iter().map(|p| p.0).chain([1.0]).collect();
+            let left_steps: Vec<i64> = paired.iter().copied().chain([steps - 2]).collect();
+            pairing.fold(LHS, &left_steps, &left, 0).unwrap();
+            let right: Vec<f64> = pairs.iter().map(|p| p.1).chain([1.0]).collect();
+            let right_steps: Vec<i64> = paired.iter().copied().chain([steps - 1]).collect();
+            pairing.fold(RHS, &right_steps, &right, 0).unwrap();
+
+            let want: Vec<(i64, u64)> = pairs
+                .iter()
+                .enumerate()
+                .filter_map(|(step, &(l, r))| {
+                    op.value(l, r, return_bool).map(|v| (step as i64, bits(v)))
+                })
+                .collect();
+            let want = match want.is_empty() {
+                true => Vec::new(),
+                false => vec![(String::new(), want)],
+            };
+            let what = literal(op, return_bool);
+            assert_eq!(bits_of(pairing.evaluate().unwrap()), want, "{what}");
+            assert_eq!(bits_of(pairing.evaluate().unwrap()), want, "{what} again");
+        }
+    }
+
+    /// Go's `==` and `<` on floats, which Rust's native operators share
+    /// and Arrow's comparison kernels do not: those order by `total_cmp`,
+    /// where a NaN equals itself and -0 sorts below +0.
+    #[test]
+    fn a_nan_is_equal_to_nothing_and_the_zeros_are_equal() {
+        let grid = Grid::new(NAME, 0, 1, 1).unwrap();
+        let run = |op: Op, return_bool: bool| {
+            let mut pairing = Pairing::new(op, return_bool, grid);
+            pairing.fold(LHS, &[0, 1], &[f64::NAN, -0.0], 0).unwrap();
+            pairing.fold(RHS, &[0, 1], &[f64::NAN, 0.0], 0).unwrap();
+            bits_of(pairing.evaluate().unwrap())
+        };
+        let one = |samples: Vec<(i64, f64)>| {
+            let samples = samples.into_iter().map(|(t, v)| (t, bits(v))).collect();
+            vec![(String::new(), samples)]
+        };
+        assert_eq!(run(Op::Eql, false), one(vec![(1, -0.0)]));
+        assert_eq!(run(Op::Eql, true), one(vec![(0, 0.0), (1, 1.0)]));
+        assert_eq!(run(Op::Neq, false), one(vec![(0, f64::NAN)]));
+        assert_eq!(run(Op::Lss, false), Vec::new());
+        assert_eq!(run(Op::Lte, false), one(vec![(1, -0.0)]));
+        assert_eq!(run(Op::Gte, true), one(vec![(0, 0.0), (1, 1.0)]));
+    }
+
+    /// A comparison that keeps every step gets its own left lane back
+    /// from `filter`, still sharing the buffer that was lent; the lane
+    /// has to be whole again for the next evaluation all the same.
+    #[test]
+    fn a_lane_the_answer_still_shares_is_there_next_time() {
+        let mut pairing = pairing(Op::Gtr);
+        let steps = [0, 10_000, 20_000, 30_000];
+        pairing.fold(LHS, &steps, &[5.0, 6.0, 7.0, 8.0], 0).unwrap();
+        pairing.fold(RHS, &steps, &[1.0; 4], 0).unwrap();
+        let want = [(0, 5.0), (10_000, 6.0), (20_000, 7.0), (30_000, 8.0)];
+        assert_eq!(samples_of(pairing.evaluate().unwrap()), want);
+        assert_eq!(samples_of(pairing.evaluate().unwrap()), want);
+    }
+
+    /// Two lanes that do not line up are a broken caller, not a
+    /// panic inside the comparison loop.
+    #[test]
+    fn lanes_of_different_lengths_are_refused() {
+        let (short, long) = (
+            Float64Array::from(vec![1.0]),
+            Float64Array::from(vec![1.0, 2.0]),
+        );
+        for op in [Op::Add, Op::Pow, Op::Gtr] {
+            assert!(op
+                .kernel(Operand::Lane(&short), Operand::Lane(&long), false)
+                .is_err());
+        }
     }
 
     /// The label set as Prometheus prints it, with the canonical

@@ -207,6 +207,37 @@ fn binary(c: &mut Criterion) {
         });
     }
     g.finish();
+
+    // A day of a 15s scrape at a 60s step: 1440 steps per series instead of
+    // 121, which is the size at which the per-step lanes of the pairing and
+    // the per-sample loop of the elementwise path dominate the fixed costs
+    // the hour above is mostly made of. Ids are
+    // `engine/binary/<shape>_24h/<series>x<samples>`.
+    let day = Shape {
+        series: 1_000,
+        samples: 5_760,
+    };
+    let source = synthetic(&day);
+    let range = RangeQuery::new(0, day.end_ms(), 60_000);
+    let mut g = c.benchmark_group("engine/binary");
+    g.throughput(Throughput::Elements(day.elements()));
+    for (qname, q) in [
+        (
+            "vector_vector_24h",
+            "http_requests_total / http_requests_total",
+        ),
+        ("vector_scalar_24h", "http_requests_total / 2"),
+        ("vector_scalar_compare_24h", "http_requests_total > 100"),
+    ] {
+        g.bench_function(BenchmarkId::new(qname, day.id()), |b| {
+            b.iter(|| {
+                engine
+                    .range_query(source.as_ref(), black_box(q), &range)
+                    .unwrap()
+            })
+        });
+    }
+    g.finish();
 }
 
 /// Parsing and planning alone. The store's `select` runs here, so the gap

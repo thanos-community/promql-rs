@@ -17,14 +17,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanBufferBuilder};
-use datafusion::arrow::datatypes::{Field, FieldRef, Schema};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, ListArray,
+};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::function::AccumulatorArgs;
 use datafusion::logical_expr::{AggregateUDF, EmitTo, GroupsAccumulator};
 use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_expr::PhysicalExpr;
 use promql_engine::aggregate::{Grouped, Op};
+use promql_engine::binary::{self, Op as BinOp};
+use promql_engine::elementwise;
 use promql_engine::math::{self, FlagLane, Welford};
 use promql_engine::range::{self, Func};
 use promql_engine::selector::{self, STALE_NAN_BITS};
@@ -468,6 +472,153 @@ fn aggregate_state_merge(c: &mut Criterion) {
     g.finish();
 }
 
+/// The plan's `promql_binary` aggregate over match groups: a fresh accumulator, one left and one right row, then
+/// `evaluate`. Accumulator construction is inside the timed closure because
+/// the plan builds one per match group too, and at 1 group against 1000 the
+/// pair separates the per-step lane work from that fixed cost. Fixtures are
+/// sliced out of one encoded batch beforehand, so only the kernel is timed.
+/// Ids are `binary/pairing/<op>/<groups>x<steps>`.
+fn binary_pairing(c: &mut Criterion) {
+    let steps = 1440usize;
+    let step_ms = 60_000i64;
+    let end_ms = (steps as i64 - 1) * step_ms;
+    let mut g = c.benchmark_group("binary/pairing");
+    for groups in [1usize, 1_000] {
+        // Left and right of group `i` are rows `2i` and `2i + 1`. Left
+        // ranges over 1..=100 and right sits at 50.5, so a `>` keeps about
+        // half the steps and never ties.
+        let rows: Vec<Series> = (0..groups * 2)
+            .map(|row| {
+                let (i, right) = (row / 2, row % 2 == 1);
+                let id = format!("g-{i}");
+                // The two sides of a batch cannot share a label set, so
+                // they differ by name like `a / b` does.
+                let name = if right { "rhs" } else { "lhs" };
+                let labels = [("__name__", name), ("group", id.as_str())];
+                let ts = (0..steps).map(|j| j as i64 * step_ms).collect();
+                let vs = (0..steps)
+                    .map(|j| {
+                        if right {
+                            50.5
+                        } else {
+                            ((i + j) % 100 + 1) as f64
+                        }
+                    })
+                    .collect();
+                Series::new(&labels, ts, vs).unwrap()
+            })
+            .collect();
+        let batch = series::encode(&series::label_names_of(&rows), &rows, WHOLE).unwrap();
+        let samples = batch.column_by_name(series::SAMPLES).unwrap();
+        let labels = batch.column_by_name(series::LABELS).unwrap();
+        let sides: ArrayRef = Arc::new(BooleanArray::from(vec![false, true]));
+        let pairs: Vec<[ArrayRef; 3]> = (0..groups)
+            .map(|i| {
+                [
+                    samples.slice(2 * i, 2),
+                    Arc::clone(&sides),
+                    labels.slice(2 * i, 2),
+                ]
+            })
+            .collect();
+        let schema = Schema::new(vec![
+            Field::new(series::SAMPLES, series::samples_type(), false),
+            Field::new("side", DataType::Boolean, false),
+            Field::new(series::LABELS, labels.data_type().clone(), false),
+        ]);
+        g.throughput(Throughput::Elements((groups * steps) as u64));
+        for (name, op, return_bool) in [
+            ("add", BinOp::Add, false),
+            ("div", BinOp::Div, false),
+            ("gtr", BinOp::Gtr, false),
+            ("gtr_bool", BinOp::Gtr, true),
+        ] {
+            let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+                Arc::new(Column::new(series::SAMPLES, 0)),
+                Arc::new(Column::new("side", 1)),
+                Arc::new(Column::new(series::LABELS, 2)),
+            ];
+            exprs.extend(
+                [
+                    ScalarValue::from(binary::literal(op, return_bool)),
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(end_ms)),
+                    ScalarValue::Int64(Some(step_ms)),
+                ]
+                .into_iter()
+                .map(|v| Arc::new(Literal::new(v)) as Arc<dyn PhysicalExpr>),
+            );
+            let fields: Vec<FieldRef> = exprs
+                .iter()
+                .map(|e| e.return_field(&schema).unwrap())
+                .collect();
+            let udaf = binary::udaf();
+            let args = AccumulatorArgs {
+                return_field: Arc::new(Field::new("out", binary::output_type(), false)),
+                schema: &schema,
+                ignore_nulls: false,
+                order_bys: &[],
+                is_reversed: false,
+                name: udaf.name(),
+                is_distinct: false,
+                exprs: &exprs,
+                expr_fields: &fields,
+            };
+            // A grid the literals got wrong pairs nothing, and the bench
+            // would time an empty walk.
+            let mut probe = udaf.accumulator(args.clone()).unwrap();
+            probe.update_batch(&pairs[0]).unwrap();
+            let ScalarValue::List(out) = probe.evaluate().unwrap() else {
+                panic!("a list of output series")
+            };
+            assert!(!out.value(0).is_empty());
+            g.bench_function(BenchmarkId::new(name, format!("{groups}x{steps}")), |b| {
+                b.iter(|| {
+                    for pair in &pairs {
+                        let mut acc = udaf.accumulator(args.clone()).unwrap();
+                        acc.update_batch(black_box(pair)).unwrap();
+                        black_box(acc.evaluate().unwrap());
+                    }
+                })
+            });
+        }
+    }
+    g.finish();
+}
+
+/// `elementwise::apply` under a binary operator's bound, the vector-scalar
+/// path. The sawtooth values straddle 100, so `> 100` keeps about half and
+/// the filtered path rebuilds row boundaries for a realistic fraction,
+/// where `* 2` leaves them alone. Ids are
+/// `elementwise/binary/<op>/<rows>x<samples>`.
+fn elementwise_binary(c: &mut Criterion) {
+    let (rows, samples) = (1_000usize, 1_440usize);
+    let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
+        .map(|i| {
+            let ts = (0..samples).map(|j| j as i64 * 60_000).collect();
+            let vs = (0..samples).map(|j| ((i * 7 + j) % 200) as f64).collect();
+            (ts, vs)
+        })
+        .collect();
+    let column = samples_of(&all);
+    let list: &ListArray = column.as_list::<i32>();
+    let mut g = c.benchmark_group("elementwise/binary");
+    g.throughput(Throughput::Elements((rows * samples) as u64));
+    for (name, spelling, scalar) in [
+        ("mul", "*", 2.0),
+        ("gtr", ">", 100.0),
+        ("gtr_bool", "> bool", 100.0),
+    ] {
+        let bound = elementwise::Func::parse(spelling)
+            .unwrap()
+            .bind(Some(scalar), None);
+        g.bench_function(BenchmarkId::new(name, format!("{rows}x{samples}")), |b| {
+            b.iter(|| elementwise::apply(black_box(list), bound))
+        });
+    }
+    g.finish();
+}
+
 /// The two edges of the seam: rows into a batch and back, plus clipping
 /// one series to a range.
 fn series_encode_decode(c: &mut Criterion) {
@@ -506,6 +657,8 @@ criterion_group! {
         range_apply,
         aggregate_add_series,
         aggregate_state_merge,
+        binary_pairing,
+        elementwise_binary,
         series_encode_decode
 }
 criterion_main!(benches);
