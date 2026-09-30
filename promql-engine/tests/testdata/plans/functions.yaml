@@ -106,7 +106,7 @@ tests:
     query: |
       sort(http_requests_total)
     plan: |
-      Sort: isnan(promql_sort_value(samples)) ASC NULLS LAST, promql_sort_value(samples) ASC NULLS LAST
+      Sort: isnan(get_field(array_element(samples, Int64(-1)), Utf8("value"))) ASC NULLS LAST, array_element(samples, Int64(-1)).value ASC NULLS LAST
         Projection: labels, samples, block_start, block_end
           Aggregate: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
             TableScan: http_requests_total
