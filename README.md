@@ -107,58 +107,19 @@ step that has to land in the same change.
 
 Both vendored sets are pinned to `prometheus/prometheus@83962c35`.
 
-**Most of the corpus does not pass.** The engine plans a narrow slice of
-PromQL, so the bulk of the evals fail on an expression it cannot plan at all,
-and whole corpus files score zero.
-`promql-conformance/testdata/prometheus/UNSUPPORTED.md` records the pass count,
-the per-file scoreboard, and every missing feature with the number of evals it
-blocks. `PROMQL_PROMQLTEST_BLESS=1` regenerates it from a real run.
+**Neither the engine nor the parser is complete, and most of the corpus does
+not pass.** The engine plans a narrow slice of PromQL, so most evals fail on an
+expression it cannot plan at all, and whole corpus files score zero. The parser
+misses native-histogram descriptors, duration arithmetic, and the anchored and
+smoothed selectors. `promql-conformance/testdata/prometheus/UNSUPPORTED.md`
+records the pass count, the per-file scoreboard, and every missing feature with
+the number of evals it blocks. `PROMQL_PROMQLTEST_BLESS=1` regenerates it from a
+real run. `docs/parser-sync.md` draws the same line for the parser port.
 
-The engine evaluates range queries over vector selectors, the aggregations
-`sum`, `avg`, `count`, `min`, `max`, `group`, `stddev`, and `stdvar`, and the
-range functions `rate`, `increase`, `delta`, `irate`, `idelta`,
-`sum_over_time`, `avg_over_time`, `min_over_time`, `max_over_time`,
-`count_over_time`, `last_over_time`, `present_over_time`, `changes`, and
-`resets`. Every other expression returns `Unsupported`, and those failures are
-the list of what to build next.
-
-CI gates the engine on an allowlist, not on the pass count.
+CI gates the engine on an allowlist rather than on that count.
 `promql-conformance/testdata/prometheus/SUPPORTED.toml` names the evals that
 must keep passing. A listed eval that stops passing turns CI red, and so does an
 unlisted eval that starts passing, which forces the new coverage to be declared.
-The suite parses and counts the `expect warn` and `expect info` assertions but
-does not check them, and prints how many it skipped on every run. The engine has
-no annotation channel yet.
-
-The parser has four entry points: `parse_expr`, `parse_metric_selector`,
-`parse_metric`, and `parse_series_desc`. Vector-matching modifiers are wired
-into the AST, so `BinaryExpr` carries `vector_matching` and `return_bool`. So
-are the `fill`, `fill_left`, and `fill_right` modifiers and the `trim_upper` and
-`trim_lower` operators. `parse_series_desc` reads promqltest load lines, and
-every non-histogram line in upstream's corpus produces the labels and values
-Go's `parser.ParseSeriesDesc` produces.
-
-What the parser still misses:
-
-- **Native-histogram descriptors** (`{{schema:1 ...}}`). `SequenceValue` is
-  float-only, and `parse_series_desc` rejects every histogram line in the
-  corpus.
-- **Duration-expression arithmetic** (`[5m+1m]`, `step()`, `range()`). The
-  `duration_expr` alternatives in `grammar.y` are `Err(())` placeholders. Only a
-  literal duration parses inside a range, subquery, or offset.
-- **Anchored and smoothed selectors.** `VectorSelector` has the fields and the
-  lexer has the keywords, but the actions set both to `false`.
-- **The custom lexer.** The port of upstream's hand-written lexer is not wired
-  into grmtools. The parser uses the regex-based `lrlex` lexers in
-  `src/lexer.l` and `src/series.l`.
-
-`promql-parser/tests/conformance.rs` runs the port against upstream's own
-parser test cases and fails when the pass rate drops below a floor. That floor
-and the long-term target are constants at the top of the file.
-
-`docs/parser-sync.md` also describes a structural change-classification scheme
-for `promql-sync` that is not built. The note at the top of that document draws
-the line between what is implemented and what is planned.
 
 ## Building
 
