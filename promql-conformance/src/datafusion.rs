@@ -70,11 +70,7 @@ impl SourceMode {
                 .map(Self::Chunked)
                 .ok_or_else(bad),
             ("blocks", None) => Ok(Self::Blocks(DEFAULT_BLOCK_MS)),
-            ("blocks", Some(ms)) => ms
-                .parse()
-                .ok()
-                .map(Self::Blocks)
-                .ok_or_else(bad),
+            ("blocks", Some(ms)) => ms.parse().ok().map(Self::Blocks).ok_or_else(bad),
             ("partitions", None) => Ok(Self::Partitions(DEFAULT_PARTITIONS)),
             ("partitions", Some(n)) => n.parse().ok().map(Self::Partitions).ok_or_else(bad),
             _ => Err(bad()),
