@@ -78,20 +78,25 @@ impl Engine {
         Self { ctx, rt: None }
     }
 
-    /// An engine with its own runtime, for synchronous callers. Must not
-    /// be dropped from inside another Tokio runtime; Tokio forbids that.
+    /// An engine with its own runtime, for synchronous callers. The blocking
+    /// methods refuse to run from inside a Tokio runtime; async callers use
+    /// the `*_async` methods.
     pub fn blocking() -> Result<Self, EngineError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| EngineError::Runtime(e.to_string()))?;
-        Ok(Self {
-            rt: Some(rt),
-            ..Self::new()
-        })
+        // Not `..Self::new()`: struct update cannot move out of a Drop type.
+        let mut engine = Self::new();
+        engine.rt = Some(rt);
+        Ok(engine)
     }
 
     /// Plan a query without running it, for inspection.
+    ///
+    /// Like every `*_async` method, this must run on a Tokio runtime:
+    /// DataFusion spawns onto it once a plan has more than one partition, and
+    /// panics ("no reactor running") under any other executor.
     pub async fn plan_async(
         &self,
         source: &dyn SeriesSource,
@@ -106,6 +111,7 @@ impl Engine {
     /// The optimized `ExecutionPlan` a range query runs, for inspection or
     /// for a caller that streams it instead of paying for
     /// [`Self::range_query_async`]'s buffering, as the memory bench does.
+    /// Must run on a Tokio runtime, see [`Self::plan_async`].
     /// It has passed [`check_selector_plans`], so it is exactly what
     /// [`Self::range_query_async`] executes.
     pub async fn physical_plan_async(
@@ -129,6 +135,9 @@ impl Engine {
     /// ([`crate::series`]) with empty series already dropped, series in
     /// Prometheus's label-set order; call
     /// [`series::decode`] to get [`Series`](crate::Series) instead.
+    ///
+    /// Must run on a Tokio runtime, see [`Self::plan_async`]. A single-partition
+    /// store hides the requirement; a multi-partition one panics without it.
     pub async fn range_query_async(
         &self,
         source: &dyn SeriesSource,
@@ -157,12 +166,26 @@ impl Engine {
     }
 
     /// [`Self::range_query_async`], blocking on the engine's own runtime.
+    ///
+    /// Refused with [`EngineError::Runtime`] on any thread that has a Tokio
+    /// runtime context, `spawn_blocking` threads included, where blocking
+    /// would be legal but Tokio gives no public way to tell them apart. Use
+    /// `range_query_async` or a plain thread there.
     pub fn range_query(
         &self,
         source: &dyn SeriesSource,
         query: &str,
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
+        // `block_on` panics inside a runtime, on a worker thread of either
+        // flavor; an error lets the caller find the `*_async` method instead.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(EngineError::Runtime(
+                "range_query blocks and cannot run inside a Tokio runtime, spawn_blocking threads \
+                 included; use range_query_async or a plain thread"
+                    .into(),
+            ));
+        }
         self.runtime()?
             .block_on(self.range_query_async(source, query, range))
     }
@@ -341,6 +364,23 @@ fn reaches(
         match node.children().as_slice() {
             [child] if through(node) => node = child,
             _ => return false,
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // A plain drop of a `Runtime` waits for its blocking workers, which
+        // Tokio forbids inside another runtime (an engine held in axum state
+        // is dropped there at shutdown). Detaching avoids the panic but
+        // abandons in-flight `spawn_blocking` tasks, so it is the fallback
+        // for that case only: a sync caller keeps the waiting shutdown.
+        if let Some(rt) = self.rt.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                rt.shutdown_background();
+            } else {
+                drop(rt);
+            }
         }
     }
 }

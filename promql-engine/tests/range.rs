@@ -280,3 +280,45 @@ fn a_series_with_no_output_points_cannot_collide() {
     let series = promql_engine::series::decode(&out).unwrap();
     assert_eq!(series.len(), 1, "{series:?}");
 }
+
+fn instant() -> RangeQuery {
+    RangeQuery::new(300_000, 300_000, 30_000)
+}
+
+fn assert_refuses_inside_runtime(
+    result: Result<Vec<datafusion::arrow::array::RecordBatch>, EngineError>,
+) {
+    match result {
+        Err(EngineError::Runtime(msg)) => assert!(msg.contains("range_query_async"), "{msg}"),
+        other => panic!("expected EngineError::Runtime, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blocking_query_inside_a_multi_thread_runtime_is_an_error() {
+    let engine = Engine::blocking().unwrap();
+    let result = engine.range_query(source().as_ref(), "http_requests_total", &instant());
+    assert_refuses_inside_runtime(result);
+    // Dropping here also exercises the Drop path from inside a runtime.
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_query_inside_a_current_thread_runtime_is_an_error() {
+    let engine = Engine::blocking().unwrap();
+    let result = engine.range_query(source().as_ref(), "http_requests_total", &instant());
+    assert_refuses_inside_runtime(result);
+}
+
+#[test]
+fn dropping_a_blocking_engine_outside_a_runtime_works() {
+    let engine = Engine::blocking().unwrap();
+    engine
+        .range_query(source().as_ref(), "http_requests_total", &instant())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_blocking_engine_inside_a_task_does_not_panic() {
+    let engine = Engine::blocking().unwrap();
+    tokio::spawn(async move { drop(engine) }).await.unwrap();
+}
