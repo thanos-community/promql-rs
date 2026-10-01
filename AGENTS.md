@@ -15,10 +15,10 @@ Each gate catches a different failure, so a skipped gate hides which layer broke
 per gate. A pull request that stops before gate 5 names the gate it reached and stays a
 draft.
 
-1. **Unit.** `cargo test -p promql-engine` and
-   `cargo clippy --workspace --all-targets -- -D warnings`, which is what CI runs.
-   Green: both pass, and every new kernel or planner branch has a test that fails
-   without it.
+1. **Unit.** The steps of `.github/workflows/ci.yml` before the promqltest allowlist
+   check, run locally. The workflow is the list: a copy of it here went stale and
+   missed `cargo fmt --check`. Green: all pass, and every new kernel or planner branch
+   has a test that fails without it.
 2. **Conformance.** The promqltest corpus in `promql-conformance`; the doc comment in
    `tests/promqltest.rs` says what turns CI red. Re-bless with
    `PROMQL_PROMQLTEST_BLESS=1` and commit `SUPPORTED.toml` and `UNSUPPORTED.md` together
