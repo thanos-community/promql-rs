@@ -171,23 +171,23 @@ fn parse_generated(input: &str, mode: ParseMode) -> Result<ParseResult, ParseErr
         for e in errs {
             out.push(ParseError::new(format!("{e}"), error_range(&e)));
         }
-        return Err(ParseErrors(out));
+        return Err(ParseErrors::new(out));
     }
     // Neither of these carries a span of its own, so they cover the
     // whole input rather than claiming a misleading `0..0`.
     let whole = PositionRange::new(0, input.len() as Pos);
     match ast {
         Some(Ok(result)) => Ok(result),
-        Some(Err(())) => Err(ParseErrors(vec![ParseError::new(
+        Some(Err(())) => Err(ParseErrors::new(vec![ParseError::new(
             "parse produced an error node",
             whole,
         )])),
-        None => Err(ParseErrors(vec![ParseError::new("empty parse", whole)])),
+        None => Err(ParseErrors::new(vec![ParseError::new("empty parse", whole)])),
     }
 }
 
 fn unexpected_mode(what: &str, input: &str) -> ParseErrors {
-    ParseErrors(vec![ParseError::new(
+    ParseErrors::new(vec![ParseError::new(
         format!("input is not {what}"),
         PositionRange::new(0, input.len() as Pos),
     )])

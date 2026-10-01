@@ -35,10 +35,12 @@
 //! `metric` and `label_set` rules as expressions instead of getting a
 //! parallel grammar. See [`parser`] for the lexer-mode side of it.
 
-pub mod actions;
+pub(crate) mod actions;
 pub mod ast;
 pub mod error;
-pub mod lexer;
+// Tested port of lex.go that nothing calls until it replaces the lrlex lexers.
+#[allow(dead_code)]
+pub(crate) mod lexer;
 pub mod parser;
 pub mod posrange;
 pub mod token;

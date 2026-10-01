@@ -399,21 +399,6 @@ pub fn label_matcher<'l, 'i: 'l>(
     })
 }
 
-pub fn quoted_metric_name_matcher<'l, 'i: 'l>(
-    lexer: &'l L<'l, 'i>,
-    span: Span,
-    value_lx: Lx,
-) -> Result<LabelMatcher, ()> {
-    let raw = lexer.span_str(value_lx.span());
-    let value = unquote_string(raw).unwrap_or_else(|_| raw.to_string());
-    Ok(LabelMatcher {
-        name: "__name__".to_string(),
-        op: MatchOp::Equal,
-        value,
-        pos_range: to_pos_range(span),
-    })
-}
-
 /// Variant of [`quoted_metric_name_matcher`] where the string has
 /// already been unquoted (e.g. via `actions::string_literal_value`).
 pub fn quoted_metric_name_matcher_from_ident<'l, 'i: 'l>(
@@ -450,56 +435,6 @@ pub fn label_matcher_quoted_name<'l, 'i: 'l>(
 }
 
 // -------- matrix / subquery / offset / @ --------
-
-/// `matrix_selector : expr LBRACKET DURATION RBRACKET` in the
-/// raw-token grammar shape. An unparseable window errors, see
-/// [`duration_literal`].
-pub fn matrix_selector<'l, 'i: 'l>(
-    lexer: &'l L<'l, 'i>,
-    span: Span,
-    selector: Result<Expr, ()>,
-    duration_lx: Lx,
-) -> Result<Expr, ()> {
-    let raw = lexer.span_str(duration_lx.span());
-    let range_secs = parse_duration_seconds(raw)?;
-    Ok(Expr::MatrixSelector(MatrixSelector {
-        vector_selector: Box::new(selector?),
-        range_secs,
-        range_expr: None,
-        end_pos: span.end() as Pos,
-    }))
-}
-
-/// `subquery_expr : expr LBRACKET DURATION COLON [DURATION] RBRACKET`
-/// in the raw-token grammar shape. Range and step error rather than
-/// defaulting, see [`duration_literal`]. An *absent* step is still
-/// zero: the production's own default, not a parse failure.
-pub fn subquery<'l, 'i: 'l>(
-    lexer: &'l L<'l, 'i>,
-    span: Span,
-    inner: Result<Expr, ()>,
-    range_lx: Lx,
-    step_lx: Option<Lx>,
-) -> Result<Expr, ()> {
-    let range_secs = parse_duration_seconds(lexer.span_str(range_lx.span()))?;
-    let step_secs = match step_lx {
-        Some(l) => parse_duration_seconds(lexer.span_str(l.span()))?,
-        None => 0.0,
-    };
-    Ok(Expr::Subquery(SubqueryExpr {
-        expr: Box::new(inner?),
-        range_secs,
-        range_expr: None,
-        original_offset_secs: 0.0,
-        original_offset_expr: None,
-        offset_secs: 0.0,
-        timestamp: None,
-        start_or_end: None,
-        step_secs,
-        step_expr: None,
-        end_pos: span.end() as Pos,
-    }))
-}
 
 /// Variant of [`matrix_selector`] for the upstream-shaped grammar,
 /// where the range arrives as a full Expr (produced by the
@@ -576,19 +511,6 @@ fn duration_from_expr(e: &Expr) -> Result<f64, ()> {
     }
 }
 
-/// `offset_expr : expr OFFSET [SUB] DURATION` in the raw-token grammar
-/// shape. An unparseable offset errors, see [`duration_literal`].
-pub fn offset<'l, 'i: 'l>(
-    lexer: &'l L<'l, 'i>,
-    inner: Result<Expr, ()>,
-    negate: bool,
-    duration_lx: Lx,
-) -> Result<Expr, ()> {
-    let secs = parse_duration_seconds(lexer.span_str(duration_lx.span()))?;
-    let offset_secs = if negate { -secs } else { secs };
-    Ok(apply_offset(inner?, offset_secs))
-}
-
 fn apply_offset(mut e: Expr, offset_secs: f64) -> Expr {
     match &mut e {
         Expr::VectorSelector(vs) => {
@@ -608,18 +530,6 @@ fn apply_offset(mut e: Expr, offset_secs: f64) -> Expr {
         _ => {}
     }
     e
-}
-
-pub fn at_timestamp<'l, 'i: 'l>(
-    lexer: &'l L<'l, 'i>,
-    inner: Result<Expr, ()>,
-    negate: bool,
-    number_lx: Lx,
-) -> Result<Expr, ()> {
-    let raw = lexer.span_str(number_lx.span());
-    let secs = parse_number_literal(raw).unwrap_or(0.0);
-    let secs = if negate { -secs } else { secs };
-    Ok(apply_at_timestamp(inner?, secs))
 }
 
 fn apply_at_timestamp(mut e: Expr, secs: f64) -> Expr {

@@ -196,7 +196,7 @@ fn parse_error_points_at_the_offending_token() {
     // tell where the problem was without re-parsing the message text.
     let input = "sum(foo) by";
     let errs = parse_expr(input).expect_err("rejects");
-    let range = errs.0.first().expect("at least one error").range;
+    let range = errs.iter().next().expect("at least one error").range;
     assert!(
         range.start > 0,
         "expected a position past the start of the input, got {range:?}"
@@ -214,8 +214,8 @@ fn parse_error_position_tracks_the_input() {
     // rather than meaningful.
     let near = parse_expr("foo +").expect_err("rejects");
     let far = parse_expr("foo + bar + baz +").expect_err("rejects");
-    let near_start = near.0.first().expect("an error").range.start;
-    let far_start = far.0.first().expect("an error").range.start;
+    let near_start = near.iter().next().expect("an error").range.start;
+    let far_start = far.iter().next().expect("an error").range.start;
     assert!(
         far_start > near_start,
         "expected the later error to report a later offset, got {far_start} vs {near_start}"
@@ -227,7 +227,7 @@ fn empty_input_error_covers_the_input() {
     // No lexeme to blame, so the range spans what was given rather than
     // claiming a misleading `0..0`.
     let errs = parse_expr("").expect_err("rejects");
-    let range = errs.0.first().expect("an error").range;
+    let range = errs.iter().next().expect("an error").range;
     assert_eq!(range.start, 0);
 }
 
@@ -277,4 +277,13 @@ fn float_literals_may_end_in_a_dot() {
 #[test]
 fn a_second_dot_is_still_an_error() {
     assert!(parse_expr("1..6").is_err());
+}
+
+#[test]
+fn parse_errors_can_be_taken_by_value() {
+    let errs = parse_expr("sum(foo) by").expect_err("rejects");
+    let n = errs.len();
+    let owned: Vec<promql_parser::ParseError> = errs.clone().into_iter().collect();
+    assert_eq!(owned.len(), n);
+    assert_eq!(errs.into_vec().len(), n);
 }

@@ -22,7 +22,47 @@ impl ParseError {
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("PromQL parse errors: {}", format_all(.0))]
-pub struct ParseErrors(pub Vec<ParseError>);
+pub struct ParseErrors(Vec<ParseError>);
+
+impl ParseErrors {
+    pub(crate) fn new(errors: Vec<ParseError>) -> Self {
+        Self(errors)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, ParseError> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn into_vec(self) -> Vec<ParseError> {
+        self.0
+    }
+}
+
+impl IntoIterator for ParseErrors {
+    type Item = ParseError;
+    type IntoIter = std::vec::IntoIter<ParseError>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ParseErrors {
+    type Item = &'a ParseError;
+    type IntoIter = std::slice::Iter<'a, ParseError>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
 
 fn format_all(errs: &[ParseError]) -> String {
     errs.iter()
