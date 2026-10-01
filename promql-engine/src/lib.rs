@@ -9,9 +9,9 @@
 //! engine's side of that trait as ordinary DataFusion plans and functions.
 //!
 //! `docs/series-source.md` is the design note for the trait and the shape.
-//! Above them, [`plan`] turns a parsed expression into a `LogicalPlan`
+//! Above them, `plan` turns a parsed expression into a `LogicalPlan`
 //! over the store's plan, with [`selector`], [`aggregate`] and [`range`]
-//! as DataFusion aggregate functions over the samples list, and [`engine`]
+//! as DataFusion aggregate functions over the samples list, and `engine`
 //! runs it.
 //!
 //! ```text
@@ -29,30 +29,32 @@
 //! consumer that patches DataFusion to a fork, and every `RecordBatch` a
 //! store hands over would then be a type mismatch.
 
-pub mod aggregate;
+pub mod aggregate; // benches/kernels.rs
 mod buffer;
-pub mod elementwise;
-pub mod engine;
-pub mod error;
-pub mod explain;
-pub mod function;
-pub mod labels;
+pub(crate) mod elementwise;
+pub(crate) mod engine;
+pub(crate) mod error;
+pub(crate) mod explain;
+pub(crate) mod function;
+pub(crate) mod labels;
 mod labelset;
-pub mod matcher;
-pub mod math;
-pub mod memory;
-pub mod params;
-pub mod plan;
-pub mod range;
-pub mod scalar;
-pub mod selector;
+mod matcher;
+pub mod math; // benches/kernels.rs
+pub(crate) mod memory;
+pub(crate) mod params;
+pub(crate) mod plan;
+pub mod range; // benches/kernels.rs
+pub(crate) mod scalar;
+pub mod selector; // benches/kernels.rs
 pub mod series;
 pub mod source;
-pub mod value_type;
+pub(crate) mod value_type;
 
-pub use engine::{Engine, RangeQuery};
+pub use engine::{check_selector_plans, Engine, RangeQuery};
 pub use error::EngineError;
 pub use explain::render as explain_plan;
+pub use matcher::{CompiledMatcher, METRIC_NAME};
 pub use memory::MemorySeriesSource;
+pub use params::Params;
 pub use series::Series;
 pub use source::{Grouping, SelectHints, SelectorTable, SeriesSource, Shard};

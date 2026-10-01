@@ -20,6 +20,15 @@ use std::sync::Arc;
 
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series};
 use serde::{Deserialize, Serialize};
+use std::num::{NonZeroU64, NonZeroUsize};
+
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).expect("a count of at least one")
+}
+
+fn nz64(n: u64) -> NonZeroU64 {
+    NonZeroU64::new(n).expect("a span of at least a millisecond")
+}
 
 const CORPUS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/testdata/parity.json");
 
@@ -190,7 +199,7 @@ fn replay_against_chunked_one_row_per_batch() {
     let source = Arc::new(
         MemorySeriesSource::from_descriptions(&descriptions(&corpus.series), corpus.interval_secs)
             .chunked(0)
-            .rows_per_batch(1),
+            .rows_per_batch(nz(1)),
     );
     for case in &corpus.cases {
         let actual = run(&source, case);
@@ -206,7 +215,7 @@ fn replay_against_partitions() {
     let corpus = load_corpus();
     let source = Arc::new(
         MemorySeriesSource::from_descriptions(&descriptions(&corpus.series), corpus.interval_secs)
-            .partitions(4),
+            .partitions(nz(4)),
     );
     for case in &corpus.cases {
         let actual = run(&source, case);
@@ -222,21 +231,21 @@ fn replay_against_partitions() {
 #[test]
 fn replay_against_blocks() {
     let corpus = load_corpus();
-    let interval_ms = (corpus.interval_secs * 1000.0).round() as i64;
+    let interval_ms = (corpus.interval_secs * 1000.0).round() as u64;
     let stored = || {
         MemorySeriesSource::from_descriptions(&descriptions(&corpus.series), corpus.interval_secs)
     };
     for block_ms in [interval_ms, 150_000, 3_600_000] {
-        let source = stored().blocks(block_ms);
+        let source = stored().blocks(nz64(block_ms));
         for case in &corpus.cases {
             assert_matches_recorded(case, run(&source, case));
         }
     }
     let source = stored()
-        .blocks(150_000)
+        .blocks(nz64(150_000))
         .chunked(0)
-        .rows_per_batch(3)
-        .partitions(4);
+        .rows_per_batch(nz(3))
+        .partitions(nz(4));
     for case in &corpus.cases {
         assert_matches_recorded(case, run(&source, case));
     }

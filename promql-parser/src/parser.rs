@@ -182,7 +182,10 @@ fn parse_generated(input: &str, mode: ParseMode) -> Result<ParseResult, ParseErr
             "parse produced an error node",
             whole,
         )])),
-        None => Err(ParseErrors::new(vec![ParseError::new("empty parse", whole)])),
+        None => Err(ParseErrors::new(vec![ParseError::new(
+            "empty parse",
+            whole,
+        )])),
     }
 }
 
