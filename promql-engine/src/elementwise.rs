@@ -142,16 +142,22 @@ impl Func {
     /// The function with its scalar arguments folded in, ready to run
     /// over values. `a` and `b` are the call's arguments after the
     /// vector, absent where the call did not give them.
-    pub fn bind(self, a: Option<f64>, b: Option<f64>) -> Bound {
-        match self {
+    ///
+    /// `None` is the empty result: `clamp` with `max < min` drops every
+    /// sample (`clamp`, `promql/functions.go:705-707` at 83962c35), however
+    /// many series came in. It is not a `Bound` variant because such a
+    /// variant has no value to compute, and `Bound::value` would have to
+    /// panic on it.
+    pub fn bind(self, a: Option<f64>, b: Option<f64>) -> Option<Bound> {
+        Some(match self {
             // `round(v)` is `round(v, 1)`: the default is in upstream's
             // signature, not in a branch.
             Func::Round => Bound::Round(a.unwrap_or(1.0)),
-            Func::Clamp => Bound::clamp(a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN)),
-            Func::ClampMin => Bound::clamp(a.unwrap_or(f64::NAN), f64::INFINITY),
-            Func::ClampMax => Bound::clamp(f64::NEG_INFINITY, a.unwrap_or(f64::NAN)),
+            Func::Clamp => Bound::clamp(a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN))?,
+            Func::ClampMin => Bound::clamp(a.unwrap_or(f64::NAN), f64::INFINITY)?,
+            Func::ClampMax => Bound::clamp(f64::NEG_INFINITY, a.unwrap_or(f64::NAN))?,
             other => Bound::Map(other.map_fn()),
-        }
+        })
     }
 
     /// The `func(float64) float64` upstream hands `simpleFloatFunc`.
@@ -207,22 +213,16 @@ fn sgn(v: f64) -> f64 {
 pub enum Bound {
     Map(fn(f64) -> f64),
     Round(f64),
-    Clamp {
-        min: f64,
-        max: f64,
-    },
-    /// `clamp` with `max < min` drops every sample it is given
-    /// (`clamp`, `promql/functions.go:705-707` at 83962c35), so the
-    /// answer is the empty vector however many series came in.
-    Nothing,
+    Clamp { min: f64, max: f64 },
 }
 
 impl Bound {
-    fn clamp(min: f64, max: f64) -> Bound {
+    fn clamp(min: f64, max: f64) -> Option<Bound> {
+        // Not `max >= min`: a NaN bound is not inverted, it clamps to NaN.
         if max < min {
-            Bound::Nothing
+            None
         } else {
-            Bound::Clamp { min, max }
+            Some(Bound::Clamp { min, max })
         }
     }
 
@@ -237,7 +237,6 @@ impl Bound {
                 (v * inverse + 0.5).floor() / inverse
             }
             Bound::Clamp { min, max } => go_max(*min, go_min(*max, v)),
-            Bound::Nothing => unreachable!("an empty result has no values"),
         }
     }
 }
@@ -375,7 +374,9 @@ fn float_arg(args: &ScalarFunctionArgs, i: usize) -> Result<Option<f64>> {
 /// The timestamps and the row boundaries come back untouched: an
 /// elementwise function moves no sample between series and drops none,
 /// so only the values are rebuilt.
-pub fn apply(samples: &ListArray, bound: Bound) -> ListArray {
+///
+/// `None` is [`Func::bind`]'s empty result: every series comes back empty.
+pub fn apply(samples: &ListArray, bound: Option<Bound>) -> ListArray {
     let entries = samples.values().as_struct();
     let timestamps = entries
         .column_by_name(series::TIMESTAMP)
@@ -385,9 +386,9 @@ pub fn apply(samples: &ListArray, bound: Bound) -> ListArray {
         .expect("validated by return_type")
         .as_primitive::<Float64Type>();
 
-    if matches!(bound, Bound::Nothing) {
+    let Some(bound) = bound else {
         return empty_rows(samples.len(), samples.nulls().cloned());
-    }
+    };
 
     let mapped: Float64Array = values.values().iter().map(|v| bound.value(*v)).collect();
     let entries = StructArray::new(
@@ -426,7 +427,11 @@ mod tests {
     use super::*;
 
     fn value(name: &str, v: f64) -> f64 {
-        Func::parse(name).expect(name).bind(None, None).value(v)
+        Func::parse(name)
+            .expect(name)
+            .bind(None, None)
+            .expect(name)
+            .value(v)
     }
 
     #[test]
@@ -482,7 +487,7 @@ mod tests {
     /// `floor(v + 0.5)` does and what `math.Round` does not.
     #[test]
     fn round_settles_ties_upwards() {
-        let round = |v: f64, to: Option<f64>| Func::Round.bind(to, None).value(v);
+        let round = |v: f64, to: Option<f64>| Func::Round.bind(to, None).unwrap().value(v);
         assert_eq!(round(2.5, None), 3.0);
         assert_eq!(round(-2.5, None), -2.0);
         assert_eq!(round(1.4, None), 1.0);
@@ -498,28 +503,38 @@ mod tests {
 
     #[test]
     fn clamp_is_max_of_min_and_bounds_that_cross_give_nothing() {
-        let clamp = |v: f64, min, max| Func::Clamp.bind(Some(min), Some(max)).value(v);
+        let clamp = |v: f64, min, max| Func::Clamp.bind(Some(min), Some(max)).unwrap().value(v);
         assert_eq!(clamp(5.0, 0.0, 1.0), 1.0);
         assert_eq!(clamp(-5.0, 0.0, 1.0), 0.0);
         assert_eq!(clamp(0.5, 0.0, 1.0), 0.5);
-        assert!(matches!(
-            Func::Clamp.bind(Some(1.0), Some(0.0)),
-            Bound::Nothing
-        ));
+        assert!(Func::Clamp.bind(Some(1.0), Some(0.0)).is_none());
         // Equal bounds still clamp; only max < min is empty.
         assert_eq!(clamp(5.0, 1.0, 1.0), 1.0);
         // Go's math.Min and math.Max propagate a NaN; Rust's return the
         // other operand, which would clamp a NaN to a bound.
         assert!(clamp(f64::NAN, 0.0, 1.0).is_nan());
 
-        assert_eq!(Func::ClampMin.bind(Some(3.0), None).value(1.0), 3.0);
-        assert_eq!(Func::ClampMin.bind(Some(3.0), None).value(9.0), 9.0);
-        assert_eq!(Func::ClampMax.bind(Some(3.0), None).value(9.0), 3.0);
-        assert_eq!(Func::ClampMax.bind(Some(3.0), None).value(1.0), 1.0);
+        assert_eq!(
+            Func::ClampMin.bind(Some(3.0), None).unwrap().value(1.0),
+            3.0
+        );
+        assert_eq!(
+            Func::ClampMin.bind(Some(3.0), None).unwrap().value(9.0),
+            9.0
+        );
+        assert_eq!(
+            Func::ClampMax.bind(Some(3.0), None).unwrap().value(9.0),
+            3.0
+        );
+        assert_eq!(
+            Func::ClampMax.bind(Some(3.0), None).unwrap().value(1.0),
+            1.0
+        );
         // `min.max(max.min(v))` with a NaN bound answers as Go's
         // math.Max(min, math.Min(max, v)) does.
         assert!(Func::ClampMin
             .bind(Some(f64::NAN), None)
+            .unwrap()
             .value(1.0)
             .is_nan());
     }

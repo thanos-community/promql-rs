@@ -9,6 +9,7 @@
 //! anything else is a bug to be reported as one.
 
 use std::collections::BTreeMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use promql_engine::series::{coalesce, decode};
 use promql_engine::{MemorySeriesSource, RangeQuery};
@@ -31,10 +32,13 @@ pub enum SourceMode {
     /// [`MemorySeriesSource::chunked`].
     Chunked(i64),
     /// [`MemorySeriesSource::blocks`].
-    Blocks(i64),
+    Blocks(NonZeroU64),
     /// [`MemorySeriesSource::partitions`].
-    Partitions(usize),
+    Partitions(NonZeroUsize),
 }
+
+const DEFAULT_BLOCK_MS: NonZeroU64 = NonZeroU64::new(60_000).unwrap();
+const DEFAULT_PARTITIONS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 impl SourceMode {
     /// The variable [`DataFusionEngine::new`] reads the mode from.
@@ -65,20 +69,10 @@ impl SourceMode {
                 .filter(|ms| *ms >= 0)
                 .map(Self::Chunked)
                 .ok_or_else(bad),
-            ("blocks", None) => Ok(Self::Blocks(60_000)),
-            ("blocks", Some(ms)) => ms
-                .parse()
-                .ok()
-                .filter(|ms| *ms > 0)
-                .map(Self::Blocks)
-                .ok_or_else(bad),
-            ("partitions", None) => Ok(Self::Partitions(4)),
-            ("partitions", Some(n)) => n
-                .parse()
-                .ok()
-                .filter(|n| *n > 0)
-                .map(Self::Partitions)
-                .ok_or_else(bad),
+            ("blocks", None) => Ok(Self::Blocks(DEFAULT_BLOCK_MS)),
+            ("blocks", Some(ms)) => ms.parse().ok().map(Self::Blocks).ok_or_else(bad),
+            ("partitions", None) => Ok(Self::Partitions(DEFAULT_PARTITIONS)),
+            ("partitions", Some(n)) => n.parse().ok().map(Self::Partitions).ok_or_else(bad),
             _ => Err(bad()),
         }
     }
@@ -303,6 +297,14 @@ mod tests {
         assert!(merge(&[]).is_empty());
     }
 
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("a count of at least one")
+    }
+
+    fn nz64(n: u64) -> NonZeroU64 {
+        NonZeroU64::new(n).expect("a span of at least a millisecond")
+    }
+
     #[test]
     fn source_modes_parse() {
         assert_eq!(SourceMode::parse("plain"), Ok(SourceMode::Plain));
@@ -311,18 +313,21 @@ mod tests {
             SourceMode::parse("chunked=150000"),
             Ok(SourceMode::Chunked(150_000))
         );
-        assert_eq!(SourceMode::parse("blocks"), Ok(SourceMode::Blocks(60_000)));
+        assert_eq!(
+            SourceMode::parse("blocks"),
+            Ok(SourceMode::Blocks(nz64(60_000)))
+        );
         assert_eq!(
             SourceMode::parse("blocks=150000"),
-            Ok(SourceMode::Blocks(150_000))
+            Ok(SourceMode::Blocks(nz64(150_000)))
         );
         assert_eq!(
             SourceMode::parse("partitions"),
-            Ok(SourceMode::Partitions(4))
+            Ok(SourceMode::Partitions(nz(4)))
         );
         assert_eq!(
             SourceMode::parse("partitions=7"),
-            Ok(SourceMode::Partitions(7))
+            Ok(SourceMode::Partitions(nz(7)))
         );
         for bad in [
             "",
@@ -362,9 +367,9 @@ mod tests {
         for mode in [
             SourceMode::Chunked(0),
             SourceMode::Chunked(150_000),
-            SourceMode::Blocks(30_000),
-            SourceMode::Blocks(200_000),
-            SourceMode::Partitions(4),
+            SourceMode::Blocks(nz64(30_000)),
+            SourceMode::Blocks(nz64(200_000)),
+            SourceMode::Partitions(nz(4)),
         ] {
             assert_eq!(run(mode), plain, "{mode:?}");
         }

@@ -33,43 +33,68 @@ use crate::error::EngineError;
 pub const METRIC_NAME: &str = "__name__";
 
 /// A matcher with its regex compiled once.
+///
+/// The compiled regex lives only in the regex variants of `Kind`, so the
+/// operator and the regex cannot disagree and no reader has to assume one
+/// exists.
 #[derive(Debug, Clone)]
 pub struct CompiledMatcher {
-    pub name: String,
-    pub op: MatchOp,
-    pub value: String,
-    regex: Option<Regex>,
+    name: String,
+    value: String,
+    kind: Kind,
+}
+
+#[derive(Debug, Clone)]
+enum Kind {
+    Equal,
+    NotEqual,
+    Regex(Regex),
+    NotRegex(Regex),
 }
 
 impl CompiledMatcher {
     pub fn compile(m: &LabelMatcher) -> Result<Self, EngineError> {
-        let regex = match m.op {
-            MatchOp::RegexEqual | MatchOp::RegexNotEqual => {
-                let anchored = format!("^(?:{})$", m.value);
-                Some(Regex::new(&anchored).map_err(|e| {
-                    EngineError::Query(format!(
-                        "invalid regular expression {:?} for label {:?}: {e}",
-                        m.value, m.name
-                    ))
-                })?)
-            }
-            MatchOp::Equal | MatchOp::NotEqual => None,
+        let anchored = || {
+            let anchored = format!("^(?:{})$", m.value);
+            Regex::new(&anchored).map_err(|e| {
+                EngineError::Query(format!(
+                    "invalid regular expression {:?} for label {:?}: {e}",
+                    m.value, m.name
+                ))
+            })
+        };
+        let kind = match m.op {
+            MatchOp::Equal => Kind::Equal,
+            MatchOp::NotEqual => Kind::NotEqual,
+            MatchOp::RegexEqual => Kind::Regex(anchored()?),
+            MatchOp::RegexNotEqual => Kind::NotRegex(anchored()?),
         };
         Ok(Self {
             name: m.name.clone(),
-            op: m.op,
             value: m.value.clone(),
-            regex,
+            kind,
         })
+    }
+
+    /// Only a test reads the operator back; the engine dispatches on
+    /// [`Kind`].
+    #[cfg(test)]
+    fn op(&self) -> MatchOp {
+        match self.kind {
+            Kind::Equal => MatchOp::Equal,
+            Kind::NotEqual => MatchOp::NotEqual,
+            Kind::Regex(_) => MatchOp::RegexEqual,
+            Kind::NotRegex(_) => MatchOp::RegexNotEqual,
+        }
     }
 
     /// Whether one label value satisfies this matcher.
     pub fn matches(&self, value: &str) -> bool {
-        match self.op {
-            MatchOp::Equal => value == self.value,
-            MatchOp::NotEqual => value != self.value,
-            MatchOp::RegexEqual => self.regex.as_ref().expect("compiled").is_match(value),
-            MatchOp::RegexNotEqual => !self.regex.as_ref().expect("compiled").is_match(value),
+        match &self.kind {
+            Kind::Equal => value == self.value,
+            Kind::NotEqual => value != self.value,
+            Kind::Regex(re) => re.is_match(value),
+            Kind::NotRegex(re) => !re.is_match(value),
         }
     }
 
@@ -115,19 +140,22 @@ impl CompiledMatcher {
             return Ok(BooleanArray::new(set, None));
         };
         let values = column.as_string_view();
-        match self.op {
-            MatchOp::Equal | MatchOp::NotEqual => {
+        match &self.kind {
+            Kind::Equal | Kind::NotEqual => {
                 let needle = Scalar::new(StringViewArray::from(vec![self.value.as_str()]));
-                let cmp = if self.op == MatchOp::Equal { eq } else { neq };
+                let cmp = if matches!(self.kind, Kind::Equal) {
+                    eq
+                } else {
+                    neq
+                };
                 cmp(&values, &needle)
             }
             // Arrow's `regexp_is_match_scalar` takes a view array but
             // recompiles the pattern from a string, and we hold the
             // anchored `Regex` already, compiled once with the error
             // message the query needs.
-            MatchOp::RegexEqual | MatchOp::RegexNotEqual => {
-                let regex = self.regex.as_ref().expect("compiled");
-                let negated = self.op == MatchOp::RegexNotEqual;
+            Kind::Regex(regex) | Kind::NotRegex(regex) => {
+                let negated = matches!(self.kind, Kind::NotRegex(_));
                 let mut mask = BooleanBufferBuilder::new(rows);
                 for row in 0..rows {
                     let keep = selection.is_none_or(|s| s.value(row))
@@ -310,6 +338,18 @@ mod tests {
             .collect();
         let got: Vec<bool> = mask_all(&ms, &l).unwrap().iter().flatten().collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_compiled_matcher_keeps_the_operator_it_was_built_from() {
+        for op in [
+            MatchOp::Equal,
+            MatchOp::NotEqual,
+            MatchOp::RegexEqual,
+            MatchOp::RegexNotEqual,
+        ] {
+            assert_eq!(m("k", op, "v").op(), op);
+        }
     }
 
     #[test]

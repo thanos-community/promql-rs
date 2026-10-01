@@ -32,6 +32,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -123,9 +124,22 @@ impl MemorySeriesSource {
     /// no step at all. Combines with [`Self::chunked`] and
     /// [`Self::partitions`], which cut inside each block; a batch may
     /// still straddle a block edge.
-    pub fn blocks(mut self, block_ms: i64) -> Self {
-        assert!(block_ms > 0, "a block spans at least a millisecond");
-        self.block_ms = Some(block_ms);
+    ///
+    /// A width is unsigned and non-zero, so the zero or negative width a
+    /// block cut cannot make sense of is a type error:
+    ///
+    /// ```compile_fail
+    /// # use promql_engine::MemorySeriesSource;
+    /// # use std::num::NonZeroU64;
+    /// # fn f(source: MemorySeriesSource) {
+    /// source.blocks(NonZeroU64::new(-5).unwrap());
+    /// # }
+    /// ```
+    pub fn blocks(mut self, block_ms: NonZeroU64) -> Self {
+        // Unsigned so a non-positive width cannot be written down. A width
+        // past i64::MAX ms is wider than any timestamp, so saturating it
+        // still gives one block, which is what the exact width would.
+        self.block_ms = Some(i64::try_from(block_ms.get()).unwrap_or(i64::MAX));
         self
     }
 
@@ -136,9 +150,8 @@ impl MemorySeriesSource {
     /// across batches wants. A bench at one row per batch measures
     /// DataFusion's per-batch cost, about half of a chunked 30-day query,
     /// not the engine.
-    pub fn rows_per_batch(mut self, n: usize) -> Self {
-        assert!(n > 0, "a batch holds at least one row");
-        self.rows_per_batch = n;
+    pub fn rows_per_batch(mut self, n: NonZeroUsize) -> Self {
+        self.rows_per_batch = n.get();
         self
     }
 
@@ -146,9 +159,8 @@ impl MemorySeriesSource {
     /// of their label set, each series whole in one partition and each
     /// partition in struct order, the way a store scanning shards in
     /// parallel does. Combines with [`Self::chunked`].
-    pub fn partitions(mut self, n: usize) -> Self {
-        assert!(n > 0, "a plan has at least one partition");
-        self.partitions = n;
+    pub fn partitions(mut self, n: NonZeroUsize) -> Self {
+        self.partitions = n.get();
         self
     }
 
@@ -451,6 +463,15 @@ fn split_into_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("a count of at least one")
+    }
+
+    fn nz64(n: u64) -> NonZeroU64 {
+        NonZeroU64::new(n).expect("a span of at least a millisecond")
+    }
     use datafusion::physical_plan::{collect, ExecutionPlanProperties};
     use datafusion::prelude::SessionContext;
     use promql_parser::ast::MatchOp;
@@ -689,7 +710,7 @@ mod tests {
         let parted = select_all(
             &MemorySeriesSource::try_new(many)
                 .unwrap()
-                .partitions(4)
+                .partitions(nz(4))
                 .chunked(60_000),
         )
         .await;
@@ -768,15 +789,15 @@ mod tests {
         let stored = || MemorySeriesSource::try_new(many.clone()).unwrap();
 
         // 30s apart, a 60s span is three samples: four chunks per series.
-        let one = batches(stored().chunked(60_000).rows_per_batch(1)).await;
+        let one = batches(stored().chunked(60_000).rows_per_batch(nz(1))).await;
         assert_eq!(sizes(&one), vec![1; 64]);
-        let packed = batches(stored().chunked(60_000).rows_per_batch(5)).await;
+        let packed = batches(stored().chunked(60_000).rows_per_batch(nz(5))).await;
         assert_eq!(sizes(&packed), [vec![5; 12], vec![4]].concat());
         assert_eq!(pods(&packed), pods(&one));
         assert_eq!(samples(&packed), samples(&one));
         assert_eq!(sizes(&batches(stored().chunked(60_000)).await), [64]);
 
-        let whole = batches(stored().rows_per_batch(5)).await;
+        let whole = batches(stored().rows_per_batch(nz(5))).await;
         assert_eq!(sizes(&whole), [5, 5, 5, 1]);
         assert_eq!(samples(&whole), samples(&batches(stored()).await));
     }
@@ -788,7 +809,7 @@ mod tests {
     async fn blocks_cut_the_window_end_domain_and_reach_back() {
         let ctx = SessionContext::new();
         let plan = source()
-            .blocks(40_000)
+            .blocks(nz64(40_000))
             .select(
                 &ctx.state(),
                 &[matcher("__name__", MatchOp::Equal, "http_requests_total")],
@@ -848,7 +869,7 @@ mod tests {
         // sample and the two after it hold nothing rather than an empty
         // series.
         let plan = source()
-            .blocks(40_000)
+            .blocks(nz64(40_000))
             .select(
                 &ctx.state(),
                 &[matcher("pod", MatchOp::Equal, "envoy-1")],

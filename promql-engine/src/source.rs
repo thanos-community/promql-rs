@@ -81,7 +81,13 @@ use crate::series::{self, Block, BLOCK_END, BLOCK_START, LABELS, SAMPLES, TIMEST
 ///
 /// Prometheus's `Limit` and `DisableTrimming` are left out: the first
 /// serves its label-values API, the second its own chunk trimming.
+///
+/// `#[non_exhaustive]`: the engine adds hints over time, and a struct
+/// literal in a store's own code would stop compiling with each one. A
+/// store reads the fields; tests that need a hint build it with
+/// [`Self::range`] and the `with_` methods.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SelectHints {
     pub start_ms: i64,
     pub end_ms: i64,
@@ -128,10 +134,41 @@ impl SelectHints {
             shard: None,
         }
     }
+
+    pub fn with_window_ms(mut self, window_ms: i64) -> Self {
+        self.window_ms = window_ms;
+        self
+    }
+
+    pub fn with_step_ms(mut self, step_ms: i64) -> Self {
+        self.step_ms = Some(step_ms);
+        self
+    }
+
+    pub fn with_range_ms(mut self, range_ms: i64) -> Self {
+        self.range_ms = Some(range_ms);
+        self
+    }
+
+    pub fn with_func(mut self, func: impl Into<String>) -> Self {
+        self.func = Some(func.into());
+        self
+    }
+
+    pub fn with_grouping(mut self, grouping: Grouping) -> Self {
+        self.grouping = Some(grouping);
+        self
+    }
+
+    pub fn with_shard(mut self, shard: Shard) -> Self {
+        self.shard = Some(shard);
+        self
+    }
 }
 
 /// `by (labels…)` or `without (labels…)` of an enclosing aggregation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Grouping {
     pub labels: Vec<String>,
     /// `true` for `by`, `false` for `without`. Carried for parity with
@@ -140,11 +177,24 @@ pub struct Grouping {
     pub by: bool,
 }
 
+impl Grouping {
+    pub fn new(labels: Vec<String>, by: bool) -> Self {
+        Self { labels, by }
+    }
+}
+
 /// One of `count` equal parts of the series space, by series identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Shard {
     pub index: u64,
     pub count: u64,
+}
+
+impl Shard {
+    pub fn new(index: u64, count: u64) -> Self {
+        Self { index, count }
+    }
 }
 
 /// A store of series, as the engine sees it.
@@ -156,7 +206,7 @@ pub trait SeriesSource: fmt::Debug + Send + Sync {
     /// `matchers` arrive verbatim from the parser, including `__name__`
     /// (synthesized from a bare metric name). An absent label compares as
     /// `""`, and regexes are anchored to the whole value; see
-    /// [`crate::matcher`] for the reference semantics a store is held to.
+    /// [`crate::CompiledMatcher`] for the reference semantics a store is held to.
     async fn select(
         &self,
         state: &dyn Session,
@@ -594,6 +644,33 @@ mod tests {
     use datafusion::prelude::SessionContext;
 
     use crate::series::{sample_fields, sample_item, schema};
+
+    #[test]
+    fn hints_built_by_the_builders_carry_what_was_set() {
+        let hints = SelectHints::range(10, 20)
+            .with_window_ms(5)
+            .with_step_ms(2)
+            .with_range_ms(5)
+            .with_func("rate")
+            .with_grouping(Grouping::new(vec!["route".into()], true))
+            .with_shard(Shard::new(1, 4));
+        assert_eq!(
+            hints,
+            SelectHints {
+                start_ms: 10,
+                end_ms: 20,
+                window_ms: 5,
+                step_ms: Some(2),
+                range_ms: Some(5),
+                func: Some("rate".into()),
+                grouping: Some(Grouping {
+                    labels: vec!["route".into()],
+                    by: true
+                }),
+                shard: Some(Shard { index: 1, count: 4 }),
+            }
+        );
+    }
 
     /// `(labels, timestamps)`; a label missing from a series is `""`, as
     /// in the canonical shape.

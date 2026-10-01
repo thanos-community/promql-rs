@@ -10,13 +10,13 @@
 //! - [`posrange`]: byte-offset position ranges matching upstream's
 //!   `promql/parser/posrange`.
 //! - [`token`]: `Item` / `ItemType` matching upstream `lex.go`.
-//! - [`lexer`]: standalone state-machine tokenizer mirroring
+//! - `lexer`: standalone state-machine tokenizer mirroring
 //!   `upstream/lex.go`. Wired to grmtools as a custom lexer in a
 //!   follow-up; today grmtools uses the regex-based lrlex lexers in
 //!   `src/lexer.l` and `src/series.l`.
 //! - [`error`]: accumulated `ParseError` / `ParseErrors` matching
 //!   upstream's multi-error parse result.
-//! - [`actions`]: per-production Rust action helpers invoked from
+//! - `actions`: per-production Rust action helpers invoked from
 //!   `src/grammar.y`.
 //! - [`parser`]: public entry points ([`parse_expr`],
 //!   [`parse_metric_selector`], [`parse_series_desc`], [`parse_metric`]).
@@ -35,10 +35,12 @@
 //! `metric` and `label_set` rules as expressions instead of getting a
 //! parallel grammar. See [`parser`] for the lexer-mode side of it.
 
-pub mod actions;
+pub(crate) mod actions;
 pub mod ast;
 pub mod error;
-pub mod lexer;
+// Tested port of lex.go that nothing calls until it replaces the lrlex lexers.
+#[allow(dead_code)]
+pub(crate) mod lexer;
 pub mod parser;
 pub mod posrange;
 pub mod token;

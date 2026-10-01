@@ -26,10 +26,10 @@ use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_expr::PhysicalExpr;
 use promql_engine::aggregate::{Grouped, Op};
 use promql_engine::math::{self, FlagLane, Welford};
-use promql_engine::params::Params;
 use promql_engine::range::{self, Func};
 use promql_engine::selector::{self, STALE_NAN_BITS};
 use promql_engine::series::{self, Block, Series};
+use promql_engine::Params;
 
 #[path = "support/pprof.rs"]
 mod profiler;

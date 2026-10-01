@@ -81,7 +81,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Partitioning};
-use promql_engine::engine::check_selector_plans;
+use promql_engine::check_selector_plans;
 use promql_engine::series::{encode, label_names_of, Block};
 use promql_engine::{
     range, selector, Engine, EngineError, MemorySeriesSource, RangeQuery, SelectHints, Series,
@@ -89,6 +89,15 @@ use promql_engine::{
 };
 use promql_parser::ast::LabelMatcher;
 use serde::Deserialize;
+use std::num::{NonZeroU64, NonZeroUsize};
+
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).expect("a count of at least one")
+}
+
+fn nz64(n: u64) -> NonZeroU64 {
+    NonZeroU64::new(n).expect("a span of at least a millisecond")
+}
 
 #[derive(Debug, Deserialize)]
 struct Suite {
@@ -119,7 +128,7 @@ struct Case {
     /// as chunks of at most this span, which only the physical plan shows.
     chunked_ms: Option<i64>,
     /// [`MemorySeriesSource::blocks`].
-    blocks_ms: Option<i64>,
+    blocks_ms: Option<u64>,
     /// [`MemorySeriesSource::partitions`].
     partitions: Option<usize>,
 }
@@ -152,13 +161,13 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     // One chunk per batch: the cases show a label set crossing batches
     // as the batch count under SeriesSetExec.
     if let Some(ms) = case.chunked_ms {
-        source = source.chunked(ms).rows_per_batch(1);
+        source = source.chunked(ms).rows_per_batch(nz(1));
     }
     if let Some(ms) = case.blocks_ms {
-        source = source.blocks(ms);
+        source = source.blocks(nz64(ms));
     }
     if let Some(n) = case.partitions {
-        source = source.partitions(n);
+        source = source.partitions(nz(n));
     }
 
     // `Engine::new`, not `blocking`: an engine that owns a runtime cannot
@@ -294,7 +303,7 @@ fn the_selector_aggregate_runs_sorted_at_one_and_four_partitions() {
     for n in [1, 4] {
         let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
             .chunked(150_000)
-            .partitions(n);
+            .partitions(nz(n));
         for query in ["x", "rate(x[5m])", "sum by (pod) (rate(x[5m]))"] {
             let plan = physical_plan(&source, query);
             let shown = displayable(plan.as_ref()).indent(true).to_string();
@@ -340,7 +349,7 @@ fn under_the_selector(
 #[test]
 fn the_engine_accepts_its_own_plans() {
     for n in [1, 4] {
-        let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(n);
+        let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(n));
         for query in ["x", "rate(x[5m])", "sum(x)"] {
             let plan = physical_plan(&source, query);
             check_selector_plans(&plan).unwrap_or_else(|e| {
@@ -441,7 +450,7 @@ fn prometheus_ordered_input_is_rejected() {
 fn the_label_projection_drops_the_hash_partitioning() {
     let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0)
         .chunked(150_000)
-        .partitions(4);
+        .partitions(nz(4));
     let plan = physical_plan(&source, "sum by (pod) (rate(x[5m]))");
     let shown = displayable(plan.as_ref()).indent(true).to_string();
     // The ProjectionExec that feeds the upper Partial, right above the
@@ -484,7 +493,7 @@ fn the_label_projection_drops_the_hash_partitioning() {
 /// own hash, and is accepted.
 #[test]
 fn a_partitioned_join_over_the_store_partitioning_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
     let join = |wrap: &dyn Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>| {
         let (left, right) = (
             wrap(physical_plan(&source, "x")),
@@ -531,7 +540,7 @@ fn a_partitioned_join_over_the_store_partitioning_is_refused() {
 /// the other, handing a Sorted consumer above it the same label set twice.
 #[test]
 fn an_interleave_over_the_store_partitioning_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
     let inputs = vec![physical_plan(&source, "x"), physical_plan(&source, "x")];
     let plan: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(inputs).unwrap());
     let shown = displayable(plan.as_ref()).indent(true).to_string();
@@ -547,7 +556,7 @@ fn an_interleave_over_the_store_partitioning_is_refused() {
 /// Hash partitioning, must stay accepted.
 #[test]
 fn a_union_over_coalesced_children_is_accepted() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
     let inputs = vec![
         Arc::new(CoalescePartitionsExec::new(physical_plan(&source, "x")))
             as Arc<dyn ExecutionPlan>,
@@ -570,7 +579,7 @@ fn a_union_over_coalesced_children_is_accepted() {
 /// unchanged and the join must still be refused.
 #[test]
 fn a_partitioned_join_over_a_filter_over_the_store_partitioning_is_refused() {
-    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(4);
+    let source = MemorySeriesSource::from_descriptions(&two_counters(), 30.0).partitions(nz(4));
     let filtered = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
         Arc::new(FilterExec::try_new(lit(true), input).unwrap())
     };

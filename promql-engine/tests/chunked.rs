@@ -19,6 +19,15 @@ use datafusion::prelude::SessionContext;
 use promql_engine::source::SeriesSetExec;
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series};
 use promql_parser::SeriesDescription;
+use std::num::{NonZeroU64, NonZeroUsize};
+
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).expect("a count of at least one")
+}
+
+fn nz64(n: u64) -> NonZeroU64 {
+    NonZeroU64::new(n).expect("a span of at least a millisecond")
+}
 
 /// Short enough that a 5m/10m window, and even a one-step selector's
 /// lookback, always straddles at least one chunk boundary: 20 samples at
@@ -28,7 +37,7 @@ const CHUNK_MS: i64 = 150_000;
 /// Not a multiple of the step or the chunk, so block edges fall between
 /// steps and inside chunks, and every window of a 5m/10m query straddles
 /// one: the reach-back, not the block's own samples, answers most steps.
-const BLOCK_MS: i64 = 200_000;
+const BLOCK_MS: u64 = 200_000;
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
     lines
@@ -54,7 +63,7 @@ fn chunked() -> Arc<MemorySeriesSource> {
     Arc::new(
         MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
             .chunked(CHUNK_MS)
-            .rows_per_batch(1),
+            .rows_per_batch(nz(1)),
     )
 }
 
@@ -63,8 +72,8 @@ fn blocked() -> Arc<MemorySeriesSource> {
     Arc::new(
         MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
             .chunked(CHUNK_MS)
-            .blocks(BLOCK_MS)
-            .rows_per_batch(1),
+            .blocks(nz64(BLOCK_MS))
+            .rows_per_batch(nz(1)),
     )
 }
 
@@ -180,8 +189,8 @@ fn binary_op_matching_the_selector_with_itself() {
 fn chunks_over_four_partitions() {
     let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
         .chunked(CHUNK_MS)
-        .rows_per_batch(1)
-        .partitions(4);
+        .rows_per_batch(nz(1))
+        .partitions(nz(4));
     for q in ["x", "rate(x[5m])", "sum(x)", "count_over_time(x[10m])"] {
         assert_same_on(&source, q, RangeQuery::new(300_000, 600_000, 30_000));
     }
@@ -237,7 +246,7 @@ fn every_query_over_many_steps() {
 fn one_sample_per_row() {
     let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
         .chunked(0)
-        .rows_per_batch(1);
+        .rows_per_batch(nz(1));
     for q in [
         "x",
         "rate(x[5m])",
@@ -257,7 +266,8 @@ fn one_sample_per_row() {
 #[test]
 fn blocks_of_every_span() {
     for block_ms in [30_000, 60_000, 45_000, 130_000, 3_600_000] {
-        let source = MemorySeriesSource::from_descriptions(&descriptions(), 30.0).blocks(block_ms);
+        let source =
+            MemorySeriesSource::from_descriptions(&descriptions(), 30.0).blocks(nz64(block_ms));
         for q in [
             "x",
             "rate(x[5m])",
@@ -299,9 +309,9 @@ fn partitions_match_unpartitioned() {
                 source = source.chunked(ms);
             }
             if let Some(ms) = block_ms {
-                source = source.blocks(ms);
+                source = source.blocks(nz64(ms));
             }
-            let source = source.rows_per_batch(rows).partitions(n);
+            let source = source.rows_per_batch(nz(rows)).partitions(nz(n));
             for q in [
                 "x",
                 "rate(x[5m])",
@@ -369,7 +379,7 @@ fn a_group_spanning_every_partition_matches_unpartitioned() {
     for n in [4, 7] {
         let source = MemorySeriesSource::from_descriptions(&descriptions, 30.0)
             .chunked(CHUNK_MS)
-            .partitions(n);
+            .partitions(nz(n));
         let layout = pods_per_partition(&source);
         assert_eq!(layout.len(), n);
         for (p, pods) in layout.iter().enumerate() {
@@ -428,7 +438,7 @@ fn series_come_back_in_label_set_order() {
         for n in [4, 7] {
             let source = MemorySeriesSource::from_descriptions(&descriptions, 30.0)
                 .chunked(CHUNK_MS)
-                .partitions(n);
+                .partitions(nz(n));
             let got = label_sets(&query(&source, q, multi_step()));
             assert_eq!(got, want, "{q} over {n} partitions");
         }
