@@ -6,9 +6,35 @@
 //! reference engine also rejects some queries), [`EngineError::Schema`] is
 //! a store's bug, and everything else is DataFusion's or this crate's.
 
+use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
+use promql_parser::ParseErrors;
 
+/// What the [`crate::series`] functions reject: an Arrow kernel failing,
+/// or a shape this module's own checks refuse. Kept apart from
+/// [`EngineError`] because the functions are called by stores too, which
+/// have no use for planner categories.
 #[derive(Debug, thiserror::Error)]
+pub enum SeriesError {
+    #[error("{0}")]
+    Arrow(#[from] ArrowError),
+
+    #[error("{0}")]
+    Invalid(String),
+}
+
+// Lets `?` lift the plain-message failures of `series.rs` without a
+// wrapper at every site.
+impl From<String> for SeriesError {
+    fn from(message: String) -> Self {
+        SeriesError::Invalid(message)
+    }
+}
+
+/// `#[non_exhaustive]` so a new failure mode is not a breaking change for
+/// callers that already match on the variants they care about.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EngineError {
     /// The expression parsed but uses something this engine does not
     /// implement yet. Named so that progress is countable per feature.
@@ -20,10 +46,34 @@ pub enum EngineError {
     #[error("{0}")]
     Query(String),
 
+    /// [`EngineError::Query`] for a query that did not parse. Kept as the
+    /// parser's own error so a caller can read each [`ParseError`]'s
+    /// position; the `Display` text is the same as `Query`'s was.
+    ///
+    /// [`ParseError`]: promql_parser::ParseError
+    #[error("{0}")]
+    Parse(#[source] ParseErrors),
+
+    /// [`EngineError::Query`] for a regular expression matcher that does
+    /// not compile. Raised in `select`, so it travels through DataFusion
+    /// like [`EngineError::Source`].
+    #[error("invalid regular expression {pattern:?} for label {label:?}: {source}")]
+    Regex {
+        label: String,
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
+
     /// A store handed back something other than the canonical series
     /// schema. Reported at plan time, before anything executes.
     #[error("series source schema: {0}")]
     Schema(String),
+
+    /// [`EngineError::Schema`] for a store whose batch an Arrow kernel
+    /// could not process, with the Arrow error kept.
+    #[error("series source schema: {0}")]
+    Arrow(#[source] ArrowError),
 
     /// A store broke the order it promised: a label set's chunks not
     /// consecutive, series not label-sorted, blocks out of order, or a
@@ -40,6 +90,19 @@ pub enum EngineError {
     /// could not be built.
     #[error("runtime: {0}")]
     Runtime(String),
+
+    /// The runtime of [`EngineError::Runtime`] could not be built.
+    #[error("runtime: {0}")]
+    RuntimeBuild(#[source] std::io::Error),
+}
+
+impl From<SeriesError> for EngineError {
+    fn from(e: SeriesError) -> Self {
+        match e {
+            SeriesError::Arrow(e) => EngineError::Arrow(e),
+            SeriesError::Invalid(m) => EngineError::Schema(m),
+        }
+    }
 }
 
 impl From<DataFusionError> for EngineError {
@@ -57,7 +120,7 @@ impl From<DataFusionError> for EngineError {
                 EngineError::DataFusion(inner) => {
                     EngineError::DataFusion(DataFusionError::Context(ctx, Box::new(inner)))
                 }
-                engine => engine,
+                engine => engine.with_context(&ctx),
             },
             // A repartition hands one input error to every output partition,
             // so it arrives shared and usually cannot be moved out.
@@ -77,16 +140,47 @@ impl From<DataFusionError> for EngineError {
 }
 
 impl EngineError {
-    /// `DataFusionError` is not `Clone`, so an engine error wrapping one
-    /// cannot be copied out of a shared reference; every other can.
+    /// Keep the context DataFusion wrapped an unwrapped engine error in.
+    /// The message variants take it as a prefix so the variant survives;
+    /// the ones holding a cause cannot, and go back inside DataFusion's
+    /// own `Context` rather than silently lose it.
+    fn with_context(self, ctx: &str) -> Self {
+        match self {
+            EngineError::Unsupported(m) => EngineError::Unsupported(format!("{ctx}: {m}")),
+            EngineError::Query(m) => EngineError::Query(format!("{ctx}: {m}")),
+            EngineError::Schema(m) => EngineError::Schema(format!("{ctx}: {m}")),
+            EngineError::Source(m) => EngineError::Source(format!("{ctx}: {m}")),
+            EngineError::Runtime(m) => EngineError::Runtime(format!("{ctx}: {m}")),
+            other => EngineError::DataFusion(DataFusionError::Context(
+                ctx.to_string(),
+                Box::new(DataFusionError::External(Box::new(other))),
+            )),
+        }
+    }
+
+    /// `DataFusionError`, `ArrowError` and `io::Error` are not `Clone`, so
+    /// an engine error holding one cannot be copied out of a shared
+    /// reference; every other can.
     fn copied(&self) -> Option<EngineError> {
         Some(match self {
             EngineError::Unsupported(m) => EngineError::Unsupported(m.clone()),
             EngineError::Query(m) => EngineError::Query(m.clone()),
+            EngineError::Parse(e) => EngineError::Parse(e.clone()),
+            EngineError::Regex {
+                label,
+                pattern,
+                source,
+            } => EngineError::Regex {
+                label: label.clone(),
+                pattern: pattern.clone(),
+                source: source.clone(),
+            },
             EngineError::Schema(m) => EngineError::Schema(m.clone()),
             EngineError::Source(m) => EngineError::Source(m.clone()),
             EngineError::Runtime(m) => EngineError::Runtime(m.clone()),
-            EngineError::DataFusion(_) => return None,
+            EngineError::DataFusion(_) | EngineError::Arrow(_) | EngineError::RuntimeBuild(_) => {
+                return None
+            }
         })
     }
 }
@@ -132,6 +226,64 @@ mod tests {
             EngineError::Source(m) if m == "out of order"
         ));
         drop(other_partition);
+    }
+
+    /// `Context` text said where an error was raised; unwrapping the
+    /// engine error out of it must not throw that away.
+    #[test]
+    fn the_context_of_an_unwrapped_error_is_kept() {
+        let in_context = DataFusionError::Context(
+            "while collecting".into(),
+            Box::new(DataFusionError::External(Box::new(EngineError::Source(
+                "out of order".into(),
+            )))),
+        );
+        match EngineError::from(in_context) {
+            EngineError::Source(m) => {
+                assert!(
+                    m.contains("while collecting") && m.contains("out of order"),
+                    "{m}"
+                )
+            }
+            other => panic!("expected Source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_context_of_a_cause_holding_error_is_kept_too() {
+        let pattern = String::from("(");
+        let regex = regex::Regex::new(&pattern).unwrap_err();
+        let in_context = DataFusionError::Context(
+            "while selecting".into(),
+            Box::new(DataFusionError::External(Box::new(EngineError::Regex {
+                label: "pod".into(),
+                pattern: "(".into(),
+                source: regex,
+            }))),
+        );
+        let shown = EngineError::from(in_context).to_string();
+        assert!(
+            shown.contains("while selecting") && shown.contains("pod"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn an_arrow_error_is_kept_as_the_cause() {
+        let e = EngineError::from(SeriesError::from(ArrowError::ComputeError("x".into())));
+        assert!(matches!(e, EngineError::Arrow(_)), "{e:?}");
+        assert!(std::error::Error::source(&e).is_some_and(|c| c.is::<ArrowError>()));
+        assert_eq!(e.to_string(), "series source schema: Compute error: x");
+
+        let m = EngineError::from(SeriesError::Invalid("bad".into()));
+        assert_eq!(m.to_string(), "series source schema: bad");
+    }
+
+    #[test]
+    fn a_runtime_build_failure_keeps_the_io_error() {
+        let e = EngineError::RuntimeBuild(std::io::Error::other("no threads"));
+        assert!(std::error::Error::source(&e).is_some_and(|c| c.is::<std::io::Error>()));
+        assert_eq!(e.to_string(), "runtime: no threads");
     }
 
     #[test]

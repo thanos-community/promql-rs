@@ -85,7 +85,7 @@ impl Engine {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| EngineError::Runtime(e.to_string()))?;
+            .map_err(EngineError::RuntimeBuild)?;
         // Not `..Self::new()`: struct update cannot move out of a Drop type.
         let mut engine = Self::new();
         engine.rt = Some(rt);
@@ -103,8 +103,7 @@ impl Engine {
         query: &str,
         range: &RangeQuery,
     ) -> Result<LogicalPlan, EngineError> {
-        let expr =
-            promql_parser::parse_expr(query).map_err(|e| EngineError::Query(e.to_string()))?;
+        let expr = promql_parser::parse_expr(query).map_err(EngineError::Parse)?;
         crate::plan::plan(&self.ctx.state(), source, &expr, range).await
     }
 
@@ -155,7 +154,7 @@ impl Engine {
             .map(|b| {
                 let schema = b.schema();
                 if !validated.as_ref().is_some_and(|s| Arc::ptr_eq(s, &schema)) {
-                    series::validate(&schema).map_err(EngineError::Schema)?;
+                    series::validate(&schema)?;
                 }
                 validated = Some(schema);
                 Ok(series::drop_empty(b))

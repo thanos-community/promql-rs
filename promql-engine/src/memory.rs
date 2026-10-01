@@ -40,6 +40,7 @@ use datafusion::arrow::array::{Array, AsArray, ListArray, RecordBatch, UInt32Arr
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
 use datafusion::arrow::datatypes::TimestampMillisecondType;
+use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -47,6 +48,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::ExecutionPlan;
 use promql_parser::ast::{LabelMatcher, SeriesDescription};
 
+use crate::error::{EngineError, SeriesError};
 use crate::matcher::{mask_all, CompiledMatcher};
 #[cfg(test)]
 use crate::series::decode;
@@ -94,10 +96,10 @@ impl MemorySeriesSource {
     /// one series split in two, and it is caught here rather than on
     /// every query. The block stamped here is a placeholder; `select`
     /// replaces it with the block of the select.
-    pub fn try_new(series: Vec<Series>) -> std::result::Result<Self, String> {
+    pub fn try_new(series: Vec<Series>) -> std::result::Result<Self, SeriesError> {
         let batch = encode(&label_names_of(&series), &series, WHOLE)?;
         Ok(Self {
-            batch: sort_by_labels(&batch).map_err(|e| e.to_string())?,
+            batch: sort_by_labels(&batch)?,
             chunk_ms: None,
             block_ms: None,
             partitions: 1,
@@ -252,7 +254,7 @@ impl SeriesSource for MemorySeriesSource {
         let labels = self.batch.column_by_name(LABELS).expect("canonical");
         let mask = mask_all(&compiled, labels.as_struct())?;
         let selected = filter_record_batch(&self.batch, &mask)?;
-        let selected = drop_unused_labels(&selected).map_err(DataFusionError::Execution)?;
+        let selected = drop_unused_labels(&selected).map_err(external)?;
 
         // Obligation 2, blocks: by default one over the whole window-end
         // domain, `[start_ms + window_ms, end_ms]`, its end exclusive.
@@ -268,7 +270,7 @@ impl SeriesSource for MemorySeriesSource {
                     .map(|one| vec![one])
             }
         }
-        .map_err(DataFusionError::Execution)?;
+        .map_err(external)?;
 
         // Obligations 3 and 4, partition and order, come for free: the
         // stored batch already holds one series per label set in struct
@@ -300,17 +302,24 @@ impl SeriesSource for MemorySeriesSource {
     }
 }
 
+/// Carry a series error out of `select` as an engine error, which
+/// `EngineError::from` takes back out of DataFusion with its cause intact.
+/// `DataFusionError::Execution` would flatten it to text first.
+fn external(e: SeriesError) -> DataFusionError {
+    DataFusionError::External(Box::new(EngineError::from(e)))
+}
+
 /// `batch`'s rows in struct order of their labels, the order DataFusion
 /// compares `labels` in, which is what `SeriesSetExec` declares and
 /// checks. It differs from the `(name, value)` order the rows may have
 /// been merged in, so it cannot be skipped for series that "look" sorted.
-fn sort_by_labels(batch: &RecordBatch) -> Result<RecordBatch> {
+fn sort_by_labels(batch: &RecordBatch) -> std::result::Result<RecordBatch, ArrowError> {
     let labels = batch.column_by_name(LABELS).expect("canonical");
     let converter = RowConverter::new(vec![SortField::new(labels.data_type().clone())])?;
     let rows = converter.convert_columns(std::slice::from_ref(labels))?;
     let mut order: Vec<u32> = (0..batch.num_rows() as u32).collect();
     order.sort_unstable_by_key(|&i| rows.row(i as usize));
-    Ok(take_record_batch(batch, &UInt32Array::from(order))?)
+    take_record_batch(batch, &UInt32Array::from(order))
 }
 
 /// Test mode: the select's window-end domain `[start_ms + window_ms,
@@ -325,7 +334,7 @@ fn cut_into_blocks(
     batch: &RecordBatch,
     hints: &SelectHints,
     block_ms: i64,
-) -> std::result::Result<Vec<RecordBatch>, String> {
+) -> std::result::Result<Vec<RecordBatch>, SeriesError> {
     let (lo, hi) = (
         i128::from(hints.start_ms) + i128::from(hints.window_ms),
         i128::from(hints.end_ms),
@@ -523,7 +532,7 @@ mod tests {
             counter(&[("__name__", "up")], 2.0, 0.0, 1),
         ])
         .unwrap_err();
-        assert!(err.contains(r#"__name__="up""#), "{err}");
+        assert!(err.to_string().contains(r#"__name__="up""#), "{err}");
     }
 
     #[tokio::test]

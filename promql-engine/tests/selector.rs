@@ -162,7 +162,7 @@ fn range_query_returns_validated_batches_with_no_empty_series() {
 }
 
 #[test]
-fn a_parse_error_is_a_query_error() {
+fn a_parse_error_keeps_the_parsers_positions() {
     let engine = Engine::blocking().unwrap();
     let err = engine
         .range_query(
@@ -171,7 +171,26 @@ fn a_parse_error_is_a_query_error() {
             &RangeQuery::new(0, 0, 30_000),
         )
         .unwrap_err();
-    assert!(matches!(err, EngineError::Query(_)), "{err}");
+    assert!(matches!(err, EngineError::Parse(_)), "{err}");
+    let cause = std::error::Error::source(&err)
+        .and_then(|e| e.downcast_ref::<promql_parser::ParseErrors>())
+        .expect("the cause is the parser's own error");
+    assert!(!cause.is_empty());
+    assert!(cause.iter().all(|e| e.range.start <= e.range.end));
+}
+
+#[test]
+fn a_bad_regex_keeps_its_cause() {
+    let engine = Engine::blocking().unwrap();
+    let err = engine
+        .range_query(
+            envoy().as_ref(),
+            r#"http_requests_total{pod=~"("}"#,
+            &RangeQuery::new(0, 0, 30_000),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Regex { .. }), "{err}");
+    assert!(std::error::Error::source(&err).is_some_and(|e| e.is::<regex::Error>()));
 }
 
 #[tokio::test]

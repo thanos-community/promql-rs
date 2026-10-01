@@ -211,7 +211,13 @@ impl Engine for DataFusionEngine {
             Err(promql_engine::EngineError::Unsupported(feature)) => {
                 Err(EngineError::Unsupported(feature))
             }
-            Err(promql_engine::EngineError::Query(msg)) => Ok(QueryResult::Error(msg)),
+            // A parse or regex failure is an answer like any other `Query`;
+            // its text is what the corpus's expected errors are matched on.
+            Err(
+                e @ (promql_engine::EngineError::Query(_)
+                | promql_engine::EngineError::Parse(_)
+                | promql_engine::EngineError::Regex { .. }),
+            ) => Ok(QueryResult::Error(e.to_string())),
             Err(other) => Err(EngineError::Other(other.to_string())),
         }
     }
