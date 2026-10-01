@@ -1,0 +1,91 @@
+# Plan pins for the topic of promql-conformance/testdata/prometheus/functions.test.
+# tests/plan.rs says what a case holds and how to add one.
+defaults:
+  start_ms: 600000
+  end_ms: 1200000
+  step_ms: 30000
+
+tests:
+  - name: range function over a different label set
+    description: >
+      The range function is an aggregate grouped by the whole labels
+      struct, like the selector. rate drops __name__, so the labels are
+      rebuilt field by field above it: dropped below, two series differing
+      only in their name would fold into one group. The fields named here
+      are this case's own, which is what shows that the projection follows
+      the data rather than a fixed schema.
+    load:
+      - node_cpu_seconds_total{cpu="0", instance="a", mode="idle"} 0
+      - node_cpu_seconds_total{cpu="1", instance="a", mode="user"} 0
+    query: |
+      rate(node_cpu_seconds_total[5m])
+    plan: |
+      Projection: labels{cpu, instance, mode}
+        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+          TableScan: node_cpu_seconds_total
+
+  - name: an elementwise function over a selector
+    description: >
+      One projection per function, each over the last: the operator
+      changes only the value, so the shape it runs on is the shape it
+      hands back. The subquery alias is what keeps the inner `labels`
+      and the rebuilt one apart when the two projections are merged.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      abs(temperature)
+    plan: |
+      Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: abs_0
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: temperature
+
+  - name: vector of a scalar
+    description: >
+      vector(s) asks no store: it is the scalar's value under an empty
+      label set, which is the table a scalar plan already is.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      vector(time())
+    plan: |
+      TableScan: scalar_0
+
+  - name: count over time
+    description: >
+      A counting function takes the same aggregate as rate; only the
+      function-name literal differs, so one registration serves the whole
+      family.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      count_over_time(http_requests_total[10m])
+    plan: |
+      Projection: labels{job, pod}
+        Aggregate: count_over_time(samples[10m], 600000..1200000 step 30s) per series per block
+          TableScan: http_requests_total
+
+  - name: range function over chunks in four partitions
+    description: >
+      Four store partitions, each series whole in one of them and chunked
+      within it. Each partition's Partial folds its own series Sorted and
+      emits them finished; a merge on labels hands them in order to one
+      Final, which stays Sorted too.
+    chunked_ms: 150000
+    partitions: 4
+    load:
+      - x{pod="a"} 1+1x19
+      - x{pod="b"} 2+3x19
+    query: |
+      rate(x[5m])
+    plan: |
+      Projection: labels{pod}
+        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
+          TableScan: x
+    physical: |
+      ProjectionExec: expr=[promql_labels(pod, get_field(labels@2, pod)) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
+        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+          SeriesSetExec
+            DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]

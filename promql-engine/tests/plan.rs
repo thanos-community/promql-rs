@@ -1,4 +1,4 @@
-//! The planner's output shape, pinned as text in `testdata/plans.yaml`.
+//! The planner's output shape, pinned as text in `testdata/plans/*.yaml`.
 //!
 //! Every other suite here checks numbers, which a planner change can keep
 //! right while quietly moving work between nodes: a projection that stops
@@ -14,9 +14,21 @@
 //! change updates the YAML, and that diff is the review. The corpus is
 //! meant to grow one query at a time as shapes are added.
 //!
+//! # One file per upstream topic
+//!
+//! Each file is named after the promqltest file in
+//! `promql-conformance/testdata/prometheus/` whose topic it covers, so a
+//! shape sits next to the evaluations that check its numbers. A file is
+//! self-contained like a `.test` file: its `defaults` are the one query
+//! range all its cases plan with, so the literals in a plan never differ
+//! within a file. Each file is its own `#[test]`, named after it, and a
+//! file missing from the list at the bottom fails the suite rather than
+//! never running.
+//!
 //! # Adding a case
 //!
-//! Append an entry to `testdata/plans.yaml` with a `name`, a
+//! Append an entry to the file for its topic, or start a file named after
+//! the upstream `.test` file and add it to `plan_files!`, with a `name`, a
 //! `description` saying what shape it pins, the `load` series the query
 //! runs over, the `query: |`, and an empty `plan: |` block. Both of those
 //! are block scalars even for a one-line query, so every entry has one
@@ -133,8 +145,8 @@ struct Case {
     partitions: Option<usize>,
 }
 
-fn plans_file() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/plans.yaml")
+fn plans_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testdata/plans")
 }
 
 /// The logical plan's text, and the physical plan's when `case` pins one.
@@ -203,9 +215,8 @@ fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
     (logical, physical)
 }
 
-#[test]
-fn every_case_plans_to_its_expected_shape() {
-    let path = plans_file();
+fn check_plan_file(topic: &str) {
+    let path = plans_dir().join(format!("{topic}.yaml"));
     let body = std::fs::read_to_string(&path).expect("the plans file is readable");
     let suite: Suite = serde_norway::from_str(&body).expect("the plans file parses");
     assert!(!suite.tests.is_empty(), "{} has no cases", path.display());
@@ -252,6 +263,35 @@ fn every_case_plans_to_its_expected_shape() {
         failures.join("\n\n"),
     );
 }
+
+macro_rules! plan_files {
+    ($($topic:ident),* $(,)?) => {
+        $(
+            #[test]
+            fn $topic() {
+                check_plan_file(stringify!($topic));
+            }
+        )*
+
+        #[test]
+        fn every_plan_file_has_a_test() {
+            let listed = [$(stringify!($topic)),*];
+            let unlisted: Vec<_> = std::fs::read_dir(plans_dir())
+                .expect("the plans directory is readable")
+                .map(|e| e.expect("a directory entry").path())
+                .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
+                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .filter(|stem| !listed.contains(&stem.as_str()))
+                .collect();
+            assert!(
+                unlisted.is_empty(),
+                "plan files never run, add them to plan_files!: {unlisted:?}"
+            );
+        }
+    };
+}
+
+plan_files!(aggregators, at_modifier, functions, selectors);
 
 // The physical plan decides what the logical plan cannot: whether the
 // selector aggregate holds one open series per partition (Sorted) or every

@@ -1,5 +1,5 @@
 //! A readable `Display` for a planned [`LogicalPlan`], for pinning in
-//! `promql-engine/tests/testdata/plans.yaml`.
+//! `promql-engine/tests/testdata/plans/`.
 //!
 //! `LogicalPlan::display_indent()` prints every node exactly, but this
 //! engine's own scalar and aggregate functions carry their PromQL
@@ -42,7 +42,7 @@ use crate::matcher::METRIC_NAME;
 use crate::source::SelectorTable;
 use crate::{aggregate, labels, range, selector, series};
 
-/// Renders `plan` the way `plans.yaml` pins it. See the module doc
+/// Renders `plan` the way `tests/testdata/plans/` pins it. See the module doc
 /// comment for what "readable" means and why it is safe to pin.
 pub fn render(plan: &LogicalPlan) -> String {
     let single_scan = count_table_scans(plan) == 1;
