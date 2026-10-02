@@ -249,6 +249,10 @@ pub struct SelectorTable {
     /// selector_0 [http_requests_total{job="api"}]` instead of a bare
     /// table name.
     matchers: Vec<LabelMatcher>,
+    /// What `select` was asked, for the [`SeriesSetExec`] above the
+    /// store's plan to print; rendered here because `select` takes the
+    /// hints by value.
+    selection: String,
 }
 
 impl SelectorTable {
@@ -260,6 +264,7 @@ impl SelectorTable {
         matchers: &[LabelMatcher],
         hints: SelectHints,
     ) -> std::result::Result<Self, EngineError> {
+        let selection = crate::explain::render_selection(name, matchers, &hints);
         let plan = source.select(state, matchers, hints).await?;
         let schema = plan.schema();
         series::validate(&schema)?;
@@ -268,6 +273,7 @@ impl SelectorTable {
             schema,
             name: name.to_string(),
             matchers: matchers.to_vec(),
+            selection,
         })
     }
 
@@ -304,7 +310,9 @@ impl TableProvider for SelectorTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(SeriesSetExec::new(Arc::clone(&self.plan)));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            SeriesSetExec::new(Arc::clone(&self.plan)).with_selection(self.selection.clone()),
+        );
         let Some(cols) = projection else {
             return Ok(plan);
         };
@@ -352,6 +360,9 @@ impl TableProvider for SelectorTable {
 pub struct SeriesSetExec {
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
+    /// What the store was asked for, from [`SelectorTable`]; empty for a
+    /// node built without one.
+    selection: String,
 }
 
 impl SeriesSetExec {
@@ -379,13 +390,30 @@ impl SeriesSetExec {
             .with_eq_properties(eq)
             .with_partitioning(Partitioning::Hash(vec![labels], n))
             .into();
-        Self { input, properties }
+        Self {
+            input,
+            properties,
+            selection: String::new(),
+        }
+    }
+
+    pub(crate) fn with_selection(mut self, selection: String) -> Self {
+        self.selection = selection;
+        self
     }
 }
 
+/// The request the store answered, and the partitioning this node
+/// declares on the store's behalf: that declaration is what
+/// [`crate::check_selector_plans`] reasons about, and no other node shows
+/// it.
 impl DisplayAs for SeriesSetExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SeriesSetExec")
+        write!(f, "SeriesSetExec: ")?;
+        if !self.selection.is_empty() {
+            write!(f, "{}, ", self.selection)?;
+        }
+        write!(f, "partitioning={}", self.properties.partitioning)
     }
 }
 
@@ -421,7 +449,9 @@ impl ExecutionPlan for SeriesSetExec {
                 "SeriesSetExec takes exactly one child".into(),
             ));
         }
-        Ok(Arc::new(Self::new(children.swap_remove(0))))
+        Ok(Arc::new(
+            Self::new(children.swap_remove(0)).with_selection(self.selection.clone()),
+        ))
     }
 
     fn execute(
@@ -731,6 +761,37 @@ mod tests {
 
     fn block(start_ms: i64, end_ms: i64) -> Block {
         Block { start_ms, end_ms }
+    }
+
+    #[test]
+    fn series_set_without_a_selection_prints_its_partitioning() {
+        let batch = batch(&[], &[]);
+        let plan = series_set(vec![vec![batch.clone()], vec![batch]]);
+        assert_eq!(
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .one_line()
+                .to_string()
+                .trim_end(),
+            "SeriesSetExec: partitioning=Hash([labels@0], 2)"
+        );
+    }
+
+    #[test]
+    fn series_set_keeps_its_selection_through_new_children() {
+        let batch = batch(&[], &[]);
+        let plan = Arc::new(
+            SeriesSetExec::new(
+                MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                    .unwrap(),
+            )
+            .with_selection("x 0..1 window=0s".into()),
+        );
+        let child = Arc::clone(plan.children()[0]);
+        let rebuilt = plan.with_new_children(vec![child]).unwrap();
+        assert!(datafusion::physical_plan::displayable(rebuilt.as_ref())
+            .one_line()
+            .to_string()
+            .starts_with("SeriesSetExec: x 0..1 window=0s, partitioning="));
     }
 
     fn series_set(partitions: Vec<Vec<RecordBatch>>) -> Arc<SeriesSetExec> {

@@ -69,7 +69,7 @@ tests:
             AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
               ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.pod as __datafusion_extracted_1]
                 AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-                  SeriesSetExec
+                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=Hash([labels@0], 4)
                     DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
   - name: grouped aggregation with every group in every partition
@@ -112,7 +112,7 @@ tests:
             AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
               ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.pod as __datafusion_extracted_1]
                 AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-                  SeriesSetExec
+                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=Hash([labels@0], 4)
                     DataSourceExec: partitions=4, partition_sizes=[6, 12, 8, 6]
 
   - name: ungrouped aggregation over chunks in four partitions
@@ -140,7 +140,7 @@ tests:
             AggregateExec: mode=Partial, gby=[block_start@1, block_end@2], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=Sorted
               ProjectionExec: expr=[samples@3, block_start@0, block_end@1]
                 AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-                  SeriesSetExec
+                  SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=Hash([labels@0], 4)
                     DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
   - name: without resolves to the remaining keys at plan time
