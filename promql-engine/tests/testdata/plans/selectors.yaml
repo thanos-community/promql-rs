@@ -22,8 +22,8 @@ tests:
         Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
           TableScan: http_requests_total{job="api"}
     physical: |
-      ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL, false) as samples], ordering_mode=Sorted
+      ProjectionExec: expr=[labels@2, samples@3, block_start@0, block_end@1]
+        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[vector_selector(samples@1, 600000..1200000 step 30s, lookback 5m)], ordering_mode=Sorted
           SeriesSetExec
             DataSourceExec: partitions=1, partition_sizes=[1]
 
@@ -45,8 +45,8 @@ tests:
         Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
           TableScan: x
     physical: |
-      ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL, false) as samples], ordering_mode=Sorted
+      ProjectionExec: expr=[labels@2, samples@3, block_start@0, block_end@1]
+        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[vector_selector(samples@1, 600000..1200000 step 30s, lookback 5m)], ordering_mode=Sorted
           SeriesSetExec
             DataSourceExec: partitions=1, partition_sizes=[4]
 
@@ -71,8 +71,8 @@ tests:
         Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
           TableScan: x
     physical: |
-      ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL, false) as samples], ordering_mode=Sorted
+      ProjectionExec: expr=[labels@2, samples@3, block_start@0, block_end@1]
+        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[vector_selector(samples@1, 600000..1200000 step 30s, lookback 5m)], ordering_mode=Sorted
           SeriesSetExec
             DataSourceExec: partitions=1, partition_sizes=[6]
 

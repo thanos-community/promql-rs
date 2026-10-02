@@ -39,8 +39,11 @@
 //! not expect, not to record one.
 //!
 //! A `physical: |` block, added the same way, also pins the
-//! `ExecutionPlan`. Only small cases can carry one: partition counts and
-//! repartitioning make larger physical plans too fragile to hold as text.
+//! `ExecutionPlan`, rendered by `promql_engine::explain_physical_plan`:
+//! the calls read as in the logical plan, and every column keeps the
+//! `@index` the node evaluates. Only small cases can carry one: partition
+//! counts and repartitioning make larger physical plans too fragile to
+//! hold as text.
 //!
 //! `chunked_ms` and `partitions` run a case over
 //! [`MemorySeriesSource::chunked`] and [`MemorySeriesSource::partitions`],
@@ -210,8 +213,7 @@ fn plan_of(case: &Case, defaults: Bounds) -> (String, Option<String>) {
         let exec = rt
             .block_on(engine.physical_plan_async(&source, query, range))
             .expect("the plan lowers");
-        // The renderer borrows the plan, so it cannot be the tail expression.
-        let rendered = displayable(exec.as_ref()).indent(true).to_string();
+        let rendered = promql_engine::explain_physical_plan(exec.as_ref());
         // A shuffle above the selector is as wide as the session's
         // target_partitions, DataFusion's default of one per core.
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());

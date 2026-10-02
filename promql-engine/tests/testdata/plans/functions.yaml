@@ -161,8 +161,8 @@ tests:
         Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
           TableScan: x
     physical: |
-      ProjectionExec: expr=[promql_labels(pod, get_field(labels@2, pod)) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+      ProjectionExec: expr=[labels@2{pod}, samples@3, block_start@0, block_end@1]
+        AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
           SeriesSetExec
             DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 

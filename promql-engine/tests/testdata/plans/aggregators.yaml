@@ -63,12 +63,12 @@ tests:
             Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: x
     physical: |
-      ProjectionExec: expr=[promql_labels(pod, __group__pod@2) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=FinalPartitioned, gby=[block_start@0 as block_start, block_end@1 as block_end, __group__pod@2 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=PartiallySorted([0, 1])
+      ProjectionExec: expr=[labels{pod: __group__pod@2}, samples@3, block_start@0, block_end@1]
+        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1, __group__pod@2], aggr=[sum(samples[steps]@3, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
           RepartitionExec: partitioning=Hash([block_start@0, block_end@1, __group__pod@2], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC, block_end@1 ASC
-            AggregateExec: mode=Partial, gby=[block_start@1 as block_start, block_end@2 as block_end, __datafusion_extracted_1@3 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=PartiallySorted([0, 1])
-              ProjectionExec: expr=[samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end, get_field(promql_labels(pod, get_field(labels@2, pod)), pod) as __datafusion_extracted_1]
-                AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
+              ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.pod as __datafusion_extracted_1]
+                AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
                   SeriesSetExec
                     DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
@@ -106,12 +106,12 @@ tests:
             Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: x
     physical: |
-      ProjectionExec: expr=[promql_labels(pod, __group__pod@2) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=FinalPartitioned, gby=[block_start@0 as block_start, block_end@1 as block_end, __group__pod@2 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=PartiallySorted([0, 1])
+      ProjectionExec: expr=[labels{pod: __group__pod@2}, samples@3, block_start@0, block_end@1]
+        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1, __group__pod@2], aggr=[sum(samples[steps]@3, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
           RepartitionExec: partitioning=Hash([block_start@0, block_end@1, __group__pod@2], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC, block_end@1 ASC
-            AggregateExec: mode=Partial, gby=[block_start@1 as block_start, block_end@2 as block_end, __datafusion_extracted_1@3 as __group__pod], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=PartiallySorted([0, 1])
-              ProjectionExec: expr=[samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end, get_field(promql_labels(i, get_field(labels@2, i), pod, get_field(labels@2, pod)), pod) as __datafusion_extracted_1]
-                AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__pod], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
+              ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.pod as __datafusion_extracted_1]
+                AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
                   SeriesSetExec
                     DataSourceExec: partitions=4, partition_sizes=[6, 12, 8, 6]
 
@@ -134,12 +134,12 @@ tests:
             Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: x
     physical: |
-      ProjectionExec: expr=[{} as labels, samples@2 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=FinalPartitioned, gby=[block_start@0 as block_start, block_end@1 as block_end], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=Sorted
+      ProjectionExec: expr=[{}, samples@2, block_start@0, block_end@1]
+        AggregateExec: mode=FinalPartitioned, gby=[block_start@0, block_end@1], aggr=[sum(samples[steps]@2, 600000..1200000 step 30s)], ordering_mode=Sorted
           RepartitionExec: partitioning=Hash([block_start@0, block_end@1], target_partitions), input_partitions=4, preserve_order=true, sort_exprs=block_start@0 ASC, block_end@1 ASC
-            AggregateExec: mode=Partial, gby=[block_start@1 as block_start, block_end@2 as block_end], aggr=[promql_aggregate(samples, sum, 600000, 1200000, 30000) as samples], ordering_mode=Sorted
-              ProjectionExec: expr=[samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-                AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
+            AggregateExec: mode=Partial, gby=[block_start@1, block_end@2], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=Sorted
+              ProjectionExec: expr=[samples@3, block_start@0, block_end@1]
+                AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
                   SeriesSetExec
                     DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
