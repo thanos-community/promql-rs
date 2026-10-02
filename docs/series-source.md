@@ -118,7 +118,8 @@ everything above that plan and never looks inside it.
 In a printed plan, `SeriesSetExec` shows the request: the selector, the
 range and every hint `select` was given, and the partitioning it declares
 on the store's behalf. The store's nodes below it show the answer, each
-through its own `DisplayAs`, which the engine prints verbatim. A store
+through its own `DisplayAs`; only its `ProjectionExec`s and
+`AggregateExec`s are re-rendered, by the same rules as the engine's. A store
 that wants what it did to be visible, such as the pushdown it took or the
 endpoints it asked, returns a node of its own that says so; a plain
 `DataSourceExec` looks the same from every store.

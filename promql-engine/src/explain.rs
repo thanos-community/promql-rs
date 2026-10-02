@@ -659,7 +659,7 @@ struct Entry {
 /// Folds every run of at least [`FOLD_MIN`] consecutive entries with one
 /// shape into its first entry, the last one's tail and the count:
 /// `a@1 … z@71 (71 alike)`. The first entry prints whole, so a folded run
-/// still shows exactly what each entry computes; an entry of another
+/// still shows what each entry computes; an entry of another
 /// shape ends the run and prints on its own.
 fn fold_alike(entries: Vec<Entry>, noun: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -886,12 +886,15 @@ fn utf8_literal<A: Arg>(e: &A) -> Option<&str> {
 /// per level, as `displayable(plan).indent(true)` lays it out.
 ///
 /// Only the two node kinds that carry this engine's calls are re-rendered,
-/// `ProjectionExec` and `AggregateExec`. Their calls read as in the
-/// logical pin, and every column keeps its `@index`: in a physical plan
-/// the index is what is evaluated and the name is only a label, so a name
-/// that drifted from its index would otherwise be invisible. Every other
-/// node, a store's own nodes included, prints exactly as `indent(true)`
-/// prints it, by the same fallthrough rule as the logical renderer.
+/// `ProjectionExec` and `AggregateExec`, wherever they sit, a store's own
+/// included. Their calls read as in the logical pin, and every column
+/// they print keeps its `@index`: in a physical plan the index is what is
+/// evaluated and the name is only a label, so a name that drifted from
+/// its index would otherwise be invisible. The one exception is a
+/// selector or range call's block arguments, left out as in the logical
+/// pin once their names say they are the block columns. Every other node
+/// prints exactly as `indent(true)` prints it, by the same fallthrough
+/// rule as the logical renderer.
 pub fn render_physical(plan: &dyn ExecutionPlan) -> String {
     let mut out = String::new();
     render_exec_node(plan, 0, &mut out);
@@ -954,57 +957,86 @@ fn render_projection_exec(p: &ProjectionExec) -> String {
 /// expression is a column of that very name, or, with
 /// `drop_series_aliases`, the alias is one of the four series columns,
 /// which no query can rename.
+///
+/// A series alias on another column stays: `block_end@3 as block_start`
+/// renames one series column to another, which position cannot tell.
 fn output_entry(e: &Arc<dyn PhysicalExpr>, alias: &str, drop_series_aliases: bool) -> Entry {
     let text = e.render(false);
-    if e.column_name() == Some(alias) || (drop_series_aliases && is_series_column(alias)) {
+    let same_column = e.column_name() == Some(alias);
+    let series_alias = drop_series_aliases && is_series_column(alias) && e.column_name().is_none();
+    if same_column || series_alias {
         Entry {
-            shape: shape_of(e),
+            shape: shape_of(e, None),
             tail: text.clone(),
             text,
         }
     } else {
         Entry {
             text: format!("{text} as {alias}"),
-            shape: format!("{} as", shape_of(e)),
+            shape: shape_of(e, Some(alias)),
             tail: format!("as {alias}"),
         }
     }
 }
 
-/// `e` printed with every column, and every struct field `get_field`
-/// reads, as the same nameless one, so two entries share a shape exactly
-/// when they compute the same thing over different columns or labels.
-/// Masking the printed text instead would also hit a name that happens to
-/// sit inside another name or a literal.
-fn shape_of(e: &Arc<dyn PhysicalExpr>) -> String {
-    Arc::clone(e)
-        .transform(|node| {
-            if node.column_name().is_some() {
-                let nameless: Arc<dyn PhysicalExpr> = Arc::new(PhysicalColumn::new("", 0));
-                return Ok(Transformed::yes(nameless));
+/// `e` printed with each name it reads, a column or a struct field
+/// `get_field` takes, and then its `alias`, replaced by a placeholder
+/// numbered by first appearance: one string, one placeholder. Two
+/// entries share a shape when they compute the same thing over different
+/// names *and* use those names the same way, so `labels@0.l3 as l3` and
+/// `labels@0.l4 as l4` fold together while `labels@0.l3 as l4` breaks
+/// the run, and so does a `CASE` that reads its two columns swapped.
+/// Masking every name to one blank would fold all three alike.
+///
+/// What it cannot see is a pairing between names that differ by design,
+/// such as `__datafusion_extracted_1@3 as __group__a`; a run of those
+/// folds even when one pair in its middle is wrong.
+fn shape_of(e: &Arc<dyn PhysicalExpr>, alias: Option<&str>) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut placeholder = |name: &str| {
+        let n = names
+            .iter()
+            .position(|seen| seen == name)
+            .unwrap_or_else(|| {
+                names.push(name.to_string());
+                names.len() - 1
+            });
+        format!("${n}")
+    };
+    let masked = Arc::clone(e).transform(|node| {
+        if let Some(name) = node.column_name() {
+            let renamed: Arc<dyn PhysicalExpr> =
+                Arc::new(PhysicalColumn::new(&placeholder(name), 0));
+            return Ok(Transformed::yes(renamed));
+        }
+        if let Some(("get_field", [base, key])) = node.call() {
+            if let Some(key) = utf8_literal(key) {
+                let renamed: Arc<dyn PhysicalExpr> =
+                    Arc::new(Literal::new(ScalarValue::Utf8(Some(placeholder(key)))));
+                let base = Arc::clone(base);
+                return node
+                    .with_new_children(vec![base, renamed])
+                    .map(Transformed::yes);
             }
-            if let Some(("get_field", [base, key])) = node.call() {
-                if utf8_literal(key).is_some() {
-                    let nameless: Arc<dyn PhysicalExpr> =
-                        Arc::new(Literal::new(ScalarValue::Utf8(Some(String::new()))));
-                    let base = Arc::clone(base);
-                    return node
-                        .with_new_children(vec![base, nameless])
-                        .map(Transformed::yes);
-                }
-            }
-            Ok(Transformed::no(node))
-        })
-        .map_or_else(|_| e.render(false), |masked| masked.data.render(false))
+        }
+        Ok(Transformed::no(node))
+    });
+    let mut shape = masked.map_or_else(|_| e.render(false), |masked| masked.data.render(false));
+    if let Some(alias) = alias {
+        shape.push_str(&format!(" as {}", placeholder(alias)));
+    }
+    shape
 }
 
 fn is_series_column(name: &str) -> bool {
     SERIES_COLUMNS.contains(&name)
 }
 
-/// The stock `AggregateExec` line with its expressions re-rendered. Group
-/// keys and aggregate outputs are named by `plan.rs` alone, so their series
-/// aliases always go.
+/// The stock `AggregateExec` line with its expressions re-rendered. A call
+/// aliased to a series column drops the alias with no order guard, unlike
+/// a projection: `plan.rs` only aliases a call to the column it fills.
+/// A store's own aggregates below `SeriesSetExec` render by the same
+/// rules, so a store that aliases otherwise reads as if it did not.
 ///
 /// The aggregate's arguments are the ones the node evaluates, from
 /// DataFusion's own [`aggregate_expressions`]. Stock DataFusion prints
@@ -2001,17 +2033,17 @@ mod tests {
                 Box::new(get_field_of(name)),
                 to,
             ));
-            shape_of(&physical(e, &["a", "b"]))
+            shape_of(&physical(e, &["a", "b"]), None)
         };
         assert_eq!(cast("a", DataType::Utf8), cast("b", DataType::Utf8));
         assert_ne!(
-            shape_of(&physical(get_field_of("a"), &["a"])),
-            shape_of(&physical(col(series::LABELS), &["a"]))
+            shape_of(&physical(get_field_of("a"), &["a"]), None),
+            shape_of(&physical(col(series::LABELS), &["a"]), None)
         );
         assert_ne!(cast("a", DataType::Utf8), cast("a", DataType::LargeUtf8));
         assert_ne!(
-            shape_of(&physical(col(series::SAMPLES), &["a"])),
-            shape_of(&physical(lit("a"), &["a"]))
+            shape_of(&physical(col(series::SAMPLES), &["a"]), None),
+            shape_of(&physical(lit("a"), &["a"]), None)
         );
     }
 
@@ -2138,5 +2170,49 @@ mod tests {
             render_selection("up", &up(), &hints),
             r#"up{job="api"} 0..1 window=0s without=(pod)"#
         );
+    }
+
+    #[test]
+    fn a_run_breaks_where_an_entry_uses_its_names_differently() {
+        let names = many(FOLD_MIN + 1);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        // The fourth output reads `l3` but calls it `l4`.
+        let exprs: Vec<(Expr, &str)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (get_field_of(n), if i == 3 { names[4] } else { *n }))
+            .collect();
+        let shown = projection(exprs, &names);
+        assert!(
+            shown.contains("labels@0.l3 as l4"),
+            "the odd entry must print whole: {shown}"
+        );
+    }
+
+    #[test]
+    fn shape_tells_swapped_columns_apart() {
+        let case = |first: &str, second: &str| {
+            let e = Expr::Case(datafusion::logical_expr::Case::new(
+                None,
+                vec![(
+                    Box::new(get_field_of(first).is_null()),
+                    Box::new(get_field_of(second)),
+                )],
+                Some(Box::new(get_field_of(first))),
+            ));
+            shape_of(&physical(e, &["a", "b", "c", "d"]), None)
+        };
+        assert_eq!(case("a", "b"), case("c", "d"));
+        assert_ne!(case("a", "b"), case("a", "a"));
+    }
+
+    #[test]
+    fn physical_aggregate_style_rename_between_series_columns_keeps_its_alias() {
+        let entry = output_entry(
+            &physical(col(series::BLOCK_END), &["pod"]),
+            series::BLOCK_START,
+            true,
+        );
+        assert_eq!(entry.text, "block_end@3 as block_start");
     }
 }
