@@ -115,6 +115,33 @@ tests:
                   SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=Hash([labels@0], 4)
                     DataSourceExec: partitions=4, partition_sizes=[6, 12, 8, 6]
 
+  - name: grouped aggregation over a wide label set
+    description: >
+      Twelve labels per series, grouped by three, the shape a wide store
+      produces at scale: the range function rebuilds every label but
+      __name__, and DataFusion extracts each group key through that rebuilt
+      struct. The logical struct folds once its run of keys reaches eight,
+      and each extracted key reads as the one field it is rather than the
+      whole struct spelled out per key.
+    load:
+      - x{cloud="aws", cluster="c1", container="app", host="h1", job="api", namespace="prod", region="eu", service="quote", team="t1", os_name="linux", os_type="unix", os_version="6"} 1
+      - x{cloud="aws", cluster="c1", container="app", host="h1", job="api", namespace="prod", region="eu", service="quote", team="t1", os_name="darwin", os_type="unix", os_version="24"} 2
+    query: |
+      sum by (os_name, os_type, os_version) (sum_over_time(x[5m]))
+    plan: |
+      Projection: labels{os_name: __group__os_name, os_type: __group__os_type, os_version: __group__os_version}
+        Aggregate: sum by (os_name, os_type, os_version) (samples, 600000..1200000 step 30s) per block
+          Projection: labels{cloud … team (12 labels)}
+            Aggregate: sum_over_time(samples[5m], 600000..1200000 step 30s) per series per block
+              TableScan: x
+    physical: |
+      ProjectionExec: expr=[labels{os_name: __group__os_name@2, os_type: __group__os_type@3, os_version: __group__os_version@4}, samples@5, block_start@0, block_end@1]
+        AggregateExec: mode=SinglePartitioned, gby=[block_start@1, block_end@2, __datafusion_extracted_1@3 as __group__os_name, __datafusion_extracted_2@4 as __group__os_type, __datafusion_extracted_3@5 as __group__os_version], aggr=[sum(samples@0, 600000..1200000 step 30s)], ordering_mode=PartiallySorted([0, 1])
+          ProjectionExec: expr=[samples@3, block_start@0, block_end@1, labels@2.os_name as __datafusion_extracted_1, labels@2.os_type as __datafusion_extracted_2, labels@2.os_version as __datafusion_extracted_3]
+            AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[sum_over_time(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
+              SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=sum_over_time, partitioning=Hash([labels@0], 1)
+                DataSourceExec: partitions=1, partition_sizes=[1]
+
   - name: ungrouped aggregation over chunks in four partitions
     description: >
       With no group key the block columns are still a key: a Partial per
