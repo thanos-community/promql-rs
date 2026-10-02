@@ -85,7 +85,7 @@ pub enum EngineError {
 
     /// DataFusion refused or failed the plan.
     #[error("datafusion: {0}")]
-    DataFusion(DataFusionError),
+    DataFusion(#[source] DataFusionError),
 
     /// A blocking call on an engine without a runtime, or a runtime that
     /// could not be built.
@@ -153,9 +153,10 @@ impl EngineError {
     }
 
     /// Keep the context DataFusion wrapped an unwrapped engine error in.
-    /// The message variants take it as a prefix so the variant survives;
-    /// the ones holding a cause cannot, and go back inside DataFusion's
-    /// own `Context` rather than silently lose it.
+    /// The message variants take it as a prefix. The ones holding a cause
+    /// have no message to prefix and drop it: their variant and cause are
+    /// what a caller matches and downcasts on, and none of them is raised
+    /// under a DataFusion context today.
     fn with_context(self, ctx: &str) -> Self {
         match self {
             EngineError::Unsupported(m) => EngineError::Unsupported(format!("{ctx}: {m}")),
@@ -163,16 +164,14 @@ impl EngineError {
             EngineError::Schema(m) => EngineError::Schema(format!("{ctx}: {m}")),
             EngineError::Source(m) => EngineError::Source(format!("{ctx}: {m}")),
             EngineError::Runtime(m) => EngineError::Runtime(format!("{ctx}: {m}")),
-            other => EngineError::DataFusion(DataFusionError::Context(
-                ctx.to_string(),
-                Box::new(DataFusionError::External(Box::new(other))),
-            )),
+            other => other,
         }
     }
 
-    /// `DataFusionError`, `ArrowError` and `io::Error` are not `Clone`, so
-    /// an engine error holding one cannot be copied out of a shared
-    /// reference; every other can.
+    /// An engine error held by a `Shared` that other partitions still
+    /// reference, rebuilt since it cannot be moved out. `None` only for a
+    /// cause that cannot be rebuilt: a `DataFusionError`, or an Arrow
+    /// error wrapping a foreign one.
     fn copied(&self) -> Option<EngineError> {
         Some(match self {
             EngineError::Unsupported(m) => EngineError::Unsupported(m.clone()),
@@ -190,11 +189,47 @@ impl EngineError {
             EngineError::Schema(m) => EngineError::Schema(m.clone()),
             EngineError::Source(m) => EngineError::Source(m.clone()),
             EngineError::Runtime(m) => EngineError::Runtime(m.clone()),
-            EngineError::DataFusion(_) | EngineError::Arrow(_) | EngineError::RuntimeBuild(_) => {
-                return None
-            }
+            EngineError::Arrow(e) => EngineError::Arrow(copied_arrow(e)?),
+            EngineError::RuntimeBuild(e) => EngineError::RuntimeBuild(copied_io(e)),
+            EngineError::DataFusion(_) => return None,
         })
     }
+}
+
+/// `ArrowError` is not `Clone`, but every variant except `ExternalError`
+/// holds only text. The match is exhaustive on purpose: a variant a new
+/// Arrow release adds should fail the build here rather than degrade a
+/// shared error to an opaque one.
+fn copied_arrow(e: &ArrowError) -> Option<ArrowError> {
+    use ArrowError as A;
+    Some(match e {
+        A::NotYetImplemented(m) => A::NotYetImplemented(m.clone()),
+        A::ExternalError(_) => return None,
+        A::CastError(m) => A::CastError(m.clone()),
+        A::MemoryError(m) => A::MemoryError(m.clone()),
+        A::ParseError(m) => A::ParseError(m.clone()),
+        A::SchemaError(m) => A::SchemaError(m.clone()),
+        A::ComputeError(m) => A::ComputeError(m.clone()),
+        A::DivideByZero => A::DivideByZero,
+        A::ArithmeticOverflow(m) => A::ArithmeticOverflow(m.clone()),
+        A::CsvError(m) => A::CsvError(m.clone()),
+        A::JsonError(m) => A::JsonError(m.clone()),
+        A::AvroError(m) => A::AvroError(m.clone()),
+        A::IoError(m, io) => A::IoError(m.clone(), copied_io(io)),
+        A::IpcError(m) => A::IpcError(m.clone()),
+        A::InvalidArgumentError(m) => A::InvalidArgumentError(m.clone()),
+        A::ParquetError(m) => A::ParquetError(m.clone()),
+        A::CDataInterface(m) => A::CDataInterface(m.clone()),
+        A::DictionaryKeyOverflowError => A::DictionaryKeyOverflowError,
+        A::RunEndIndexOverflowError => A::RunEndIndexOverflowError,
+        A::OffsetOverflowError(n) => A::OffsetOverflowError(*n),
+    })
+}
+
+/// Kind and text survive; the inner error and OS code do not, and no
+/// caller reads them off an engine error.
+fn copied_io(e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), e.to_string())
 }
 
 #[cfg(test)]
@@ -261,25 +296,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_context_of_a_cause_holding_error_is_kept_too() {
-        let pattern = String::from("(");
-        let regex = regex::Regex::new(&pattern).unwrap_err();
-        let in_context = DataFusionError::Context(
-            "while selecting".into(),
-            Box::new(DataFusionError::External(Box::new(EngineError::Regex {
-                label: "pod".into(),
-                pattern: "(".into(),
-                source: regex,
-            }))),
-        );
-        let shown = EngineError::from(in_context).to_string();
-        assert!(
-            shown.contains("while selecting") && shown.contains("pod"),
-            "{shown}"
-        );
-    }
-
     fn regex_error() -> EngineError {
         let pattern = String::from("(");
         EngineError::Regex {
@@ -291,6 +307,69 @@ mod tests {
 
     fn external(e: EngineError) -> DataFusionError {
         DataFusionError::External(Box::new(e))
+    }
+
+    #[test]
+    fn a_cause_holding_error_keeps_its_variant_out_of_a_context() {
+        let in_context = |e| DataFusionError::Context("while selecting".into(), Box::new(e));
+
+        let regex = EngineError::from(in_context(external(regex_error())));
+        assert!(matches!(regex, EngineError::Regex { .. }), "{regex:?}");
+        assert!(std::error::Error::source(&regex).is_some_and(|c| c.is::<regex::Error>()));
+
+        let arrow = EngineError::Arrow(ArrowError::ComputeError("x".into()));
+        let arrow = EngineError::from(in_context(external(arrow)));
+        assert!(matches!(arrow, EngineError::Arrow(_)), "{arrow:?}");
+    }
+
+    /// The other partition keeps its reference, so the error cannot be
+    /// moved out of the `Arc` and has to be rebuilt.
+    fn shared_while_held(e: EngineError) -> EngineError {
+        let held = std::sync::Arc::new(external(e));
+        let other_partition = std::sync::Arc::clone(&held);
+        let out = EngineError::from(DataFusionError::Shared(held));
+        drop(other_partition);
+        out
+    }
+
+    #[test]
+    fn a_cause_holding_error_survives_a_repartition_sharing_it() {
+        let io = || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe");
+        let arrow = shared_while_held(EngineError::Arrow(ArrowError::IoError("ipc".into(), io())));
+        match &arrow {
+            EngineError::Arrow(ArrowError::IoError(m, e)) => {
+                assert_eq!(
+                    (m.as_str(), e.kind()),
+                    ("ipc", std::io::ErrorKind::BrokenPipe)
+                )
+            }
+            other => panic!("expected Arrow(IoError), got {other:?}"),
+        }
+        assert_eq!(
+            arrow.to_string(),
+            EngineError::Arrow(ArrowError::IoError("ipc".into(), io())).to_string()
+        );
+
+        let runtime = shared_while_held(EngineError::RuntimeBuild(io()));
+        assert!(
+            matches!(&runtime, EngineError::RuntimeBuild(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
+            "{runtime:?}"
+        );
+        assert!(matches!(
+            shared_while_held(regex_error()),
+            EngineError::Regex { .. }
+        ));
+    }
+
+    /// The one cause that cannot be rebuilt: a foreign error inside Arrow's.
+    #[test]
+    fn a_shared_foreign_arrow_error_stays_a_datafusion_error() {
+        let foreign = ArrowError::ExternalError(Box::new(std::fmt::Error));
+        let e = shared_while_held(EngineError::Arrow(foreign));
+        assert!(
+            matches!(e, EngineError::DataFusion(DataFusionError::Shared(_))),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -338,5 +417,6 @@ mod tests {
     fn any_other_datafusion_error_stays_one() {
         let e = EngineError::from(DataFusionError::Execution("boom".into()));
         assert!(matches!(e, EngineError::DataFusion(_)), "{e:?}");
+        assert!(std::error::Error::source(&e).is_some_and(|c| c.is::<DataFusionError>()));
     }
 }
