@@ -51,7 +51,7 @@ pub mod source;
 pub(crate) mod value_type;
 
 pub use engine::{check_selector_plans, Engine, RangeQuery};
-pub use error::EngineError;
+pub use error::{EngineError, SeriesError};
 pub use explain::render as explain_plan;
 pub use matcher::{CompiledMatcher, METRIC_NAME};
 pub use memory::MemorySeriesSource;
