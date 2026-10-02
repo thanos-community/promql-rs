@@ -31,7 +31,7 @@
 
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::source_as_provider;
-use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
+use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{
     Aggregate, Expr, Filter, LogicalPlan, Projection, Sort, SortExpr, TableScan,
 };
@@ -256,6 +256,44 @@ fn render_selector(name: &str, matchers: &[LabelMatcher]) -> String {
     out
 }
 
+/// What the call recognisers below read off an argument, so that they do
+/// not depend on which kind of plan the argument comes from.
+trait Arg: Sized {
+    /// The whole argument, re-rendered recursively.
+    fn render(&self, single_scan: bool) -> String;
+    fn column_name(&self) -> Option<&str>;
+    fn literal(&self) -> Option<&ScalarValue>;
+    /// A scalar function call's name and arguments.
+    fn call(&self) -> Option<(&str, &[Self])>;
+}
+
+impl Arg for Expr {
+    fn render(&self, single_scan: bool) -> String {
+        render_expr(self, single_scan)
+    }
+
+    fn column_name(&self) -> Option<&str> {
+        match self {
+            Expr::Column(c) => Some(&c.name),
+            _ => None,
+        }
+    }
+
+    fn literal(&self) -> Option<&ScalarValue> {
+        match self {
+            Expr::Literal(v, _) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn call(&self) -> Option<(&str, &[Expr])> {
+        match self {
+            Expr::ScalarFunction(f) => Some((f.name(), &f.args)),
+            _ => None,
+        }
+    }
+}
+
 /// One expression, recursively. Anything not recognised — a node this
 /// engine never plans, or a recognised call whose shape does not match
 /// (wrong argument count, a non-literal where a literal is required) —
@@ -266,7 +304,7 @@ fn render_expr(e: &Expr, single_scan: bool) -> String {
         Expr::Alias(a) => format!("{} AS {}", render_expr(&a.expr, single_scan), a.name),
         Expr::Column(c) => render_column(c, single_scan),
         Expr::ScalarFunction(f) => {
-            render_scalar_function(f, single_scan).unwrap_or_else(|| e.to_string())
+            render_scalar_call(f.name(), &f.args, single_scan).unwrap_or_else(|| e.to_string())
         }
         Expr::AggregateFunction(f) => {
             render_aggregate_function(f, single_scan).unwrap_or_else(|| e.to_string())
@@ -286,10 +324,19 @@ fn render_column(c: &Column, single_scan: bool) -> String {
     }
 }
 
-fn render_scalar_function(f: &ScalarFunction, single_scan: bool) -> Option<String> {
-    match f.name() {
-        labels::NAME => render_labels(&f.args, single_scan),
-        "get_field" => render_get_field(&f.args, single_scan),
+fn render_scalar_call<A: Arg>(name: &str, args: &[A], single_scan: bool) -> Option<String> {
+    match name {
+        labels::NAME => render_labels(args, single_scan),
+        "get_field" => render_get_field(args, single_scan),
+        _ => None,
+    }
+}
+
+fn render_aggregate_call<A: Arg>(name: &str, args: &[A], single_scan: bool) -> Option<String> {
+    match name {
+        selector::NAME => render_vector_selector(args, single_scan),
+        range::NAME => render_range_function(args, single_scan),
+        aggregate::NAME => render_aggregate_op(args, single_scan),
         _ => None,
     }
 }
@@ -300,8 +347,8 @@ fn render_scalar_function(f: &ScalarFunction, single_scan: bool) -> Option<Strin
 /// instead, so this is also the check that lets that phrase stand in for
 /// the argument rather than silently dropping a different expression that
 /// happens to sit in the same slot.
-fn is_block_column(e: &Expr, name: &str) -> bool {
-    matches!(e, Expr::Column(c) if c.name == name)
+fn is_block_column<A: Arg>(e: &A, name: &str) -> bool {
+    e.column_name() == Some(name)
 }
 
 /// `promql_vector_selector(samples, block_start, block_end, start, end,
@@ -321,7 +368,7 @@ fn is_block_column(e: &Expr, name: &str) -> bool {
 /// `plan.rs`'s `resolve_at` already resolved it to, printed raw rather
 /// than through `Duration`'s formatting: it names a point in time, not a
 /// span.
-fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
+fn render_vector_selector<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     if args.len() != 9 {
         return None;
     }
@@ -330,7 +377,7 @@ fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
     {
         return None;
     }
-    let mut samples = render_expr(&args[0], single_scan);
+    let mut samples = args[0].render(single_scan);
     let start = require_i64(&args[3])?;
     let end = require_i64(&args[4])?;
     let step = require_i64(&args[5])?;
@@ -353,7 +400,7 @@ fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
 /// [`render_vector_selector`] for why `offset`/`@` sit there too, why the
 /// evaluation range stays a trailing argument, and why the block
 /// arguments never print.
-fn render_range_function(args: &[Expr], single_scan: bool) -> Option<String> {
+fn render_range_function<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     if args.len() != 10 {
         return None;
     }
@@ -362,7 +409,7 @@ fn render_range_function(args: &[Expr], single_scan: bool) -> Option<String> {
     {
         return None;
     }
-    let samples = render_expr(&args[0], single_scan);
+    let samples = args[0].render(single_scan);
     let func = utf8_literal(&args[3])?;
     let start = require_i64(&args[4])?;
     let end = require_i64(&args[5])?;
@@ -412,7 +459,7 @@ fn push_offset_and_at(s: &mut String, offset: i64, at: Option<i64>) -> Option<()
 /// eligible pair matches it; a pair whose base doesn't match — a
 /// different scan, or not the labels column at all — falls back to
 /// `name: <rendered value>` instead of being silently elided.
-fn render_labels(args: &[Expr], single_scan: bool) -> Option<String> {
+fn render_labels<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     if !args.len().is_multiple_of(2) {
         return None;
     }
@@ -432,22 +479,19 @@ fn render_labels(args: &[Expr], single_scan: bool) -> Option<String> {
 /// The base of a `get_field` call, rendered, but only when that base is
 /// actually the canonical `labels` column — not just any struct — since
 /// that is the one column the bare-key shorthand is entitled to elide.
-fn labels_column_text(base: &Expr, single_scan: bool) -> Option<String> {
-    match base {
-        Expr::Column(c) if c.name == series::LABELS => Some(render_column(c, single_scan)),
-        _ => None,
-    }
+fn labels_column_text<A: Arg>(base: &A, single_scan: bool) -> Option<String> {
+    (base.column_name() == Some(series::LABELS)).then(|| base.render(single_scan))
 }
 
-fn render_label_field(
+fn render_label_field<A: Arg>(
     name: &str,
-    value: &Expr,
+    value: &A,
     single_scan: bool,
     prefix: &mut Option<String>,
 ) -> String {
-    if let Expr::ScalarFunction(f) = value {
-        if f.name() == "get_field" && f.args.len() == 2 && utf8_literal(&f.args[1]) == Some(name) {
-            if let Some(base) = labels_column_text(&f.args[0], single_scan) {
+    if let Some(("get_field", [base, key])) = value.call() {
+        if utf8_literal(key) == Some(name) {
+            if let Some(base) = labels_column_text(base, single_scan) {
                 match prefix {
                     Some(p) if *p == base => return name.to_string(),
                     None => {
@@ -459,16 +503,14 @@ fn render_label_field(
             }
         }
     }
-    format!("{name}: {}", render_expr(value, single_scan))
+    format!("{name}: {}", value.render(single_scan))
 }
 
 /// `get_field(labels, 'job')` as `labels.job`.
-fn render_get_field(args: &[Expr], single_scan: bool) -> Option<String> {
-    if args.len() != 2 {
-        return None;
-    }
-    let key = utf8_literal(&args[1])?;
-    Some(format!("{}.{key}", render_expr(&args[0], single_scan)))
+fn render_get_field<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
+    let [base, key] = args else { return None };
+    let key = utf8_literal(key)?;
+    Some(format!("{}.{key}", base.render(single_scan)))
 }
 
 /// Every aggregate function this engine plans — `promql_vector_selector`,
@@ -483,12 +525,7 @@ fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option
     if p.distinct || p.filter.is_some() || !p.order_by.is_empty() || p.null_treatment.is_some() {
         return None;
     }
-    match f.func.name() {
-        selector::NAME => render_vector_selector(&p.args, single_scan),
-        range::NAME => render_range_function(&p.args, single_scan),
-        aggregate::NAME => render_aggregate_call(&p.args, single_scan),
-        _ => None,
-    }
+    render_aggregate_call(f.func.name(), &p.args, single_scan)
 }
 
 /// `promql_aggregate(samples, '<op>', start, end, step)` as
@@ -496,11 +533,11 @@ fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option
 /// `plan.rs`'s `aggregate` rejects an aggregation with a parameter as
 /// unsupported before planning reaches here, so the call has exactly
 /// these five positional arguments.
-fn render_aggregate_call(args: &[Expr], single_scan: bool) -> Option<String> {
+fn render_aggregate_op<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     if args.len() != 5 {
         return None;
     }
-    let samples = render_expr(&args[0], single_scan);
+    let samples = args[0].render(single_scan);
     let op = utf8_literal(&args[1])?;
     let start = require_i64(&args[2])?;
     let end = require_i64(&args[3])?;
@@ -619,9 +656,9 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
 /// A literal, non-`NULL` `Int64` — every timestamp/duration argument in
 /// this engine's calls except the trailing `@` one, which is
 /// `NULL`-shaped when absent (see [`optional_i64`]).
-fn require_i64(e: &Expr) -> Option<i64> {
-    match e {
-        Expr::Literal(ScalarValue::Int64(Some(n)), _) => Some(*n),
+fn require_i64<A: Arg>(e: &A) -> Option<i64> {
+    match e.literal()? {
+        ScalarValue::Int64(Some(n)) => Some(*n),
         _ => None,
     }
 }
@@ -629,17 +666,16 @@ fn require_i64(e: &Expr) -> Option<i64> {
 /// A literal `Int64`, `NULL` meaning "absent" (the `@` modifier when the
 /// query has none). `None` only when the argument is not even a literal
 /// `Int64` at all, which is the actual fallthrough signal.
-fn optional_i64(e: &Expr) -> Option<Option<i64>> {
-    match e {
-        Expr::Literal(ScalarValue::Int64(v), _) => Some(*v),
+fn optional_i64<A: Arg>(e: &A) -> Option<Option<i64>> {
+    match e.literal()? {
+        ScalarValue::Int64(v) => Some(*v),
         _ => None,
     }
 }
 
-fn utf8_literal(e: &Expr) -> Option<&str> {
-    match e {
-        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s.as_str()),
-        Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => Some(s.as_str()),
+fn utf8_literal<A: Arg>(e: &A) -> Option<&str> {
+    match e.literal()? {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => Some(s.as_str()),
         _ => None,
     }
 }
