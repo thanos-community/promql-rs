@@ -1,4 +1,5 @@
-//! A readable `Display` for a planned [`LogicalPlan`], for pinning in
+//! A readable `Display` for a planned [`LogicalPlan`], and for the
+//! `ExecutionPlan` it lowers to ([`render_physical`]), for pinning in
 //! `promql-engine/tests/testdata/plans/`.
 //!
 //! `LogicalPlan::display_indent()` prints every node exactly, but this
@@ -29,12 +30,24 @@
 //! worst it prints the unrecognised shape verbatim, which is what
 //! `display_indent()` always did.
 
+use std::fmt;
+use std::sync::Arc;
+
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::source_as_provider;
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{
     Aggregate, Expr, Filter, LogicalPlan, Projection, Sort, SortExpr, TableScan,
 };
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
+use datafusion::physical_expr::expressions::{Column as PhysicalColumn, Literal};
+use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
+use datafusion::physical_plan::aggregates::{
+    aggregate_expressions, AggregateExec, AggregateInputMode, AggregateMode,
+};
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, InputOrderMode};
 use promql_common::model::Duration;
 use promql_parser::ast::LabelMatcher;
 
@@ -159,12 +172,20 @@ fn render_projection(p: &Projection, single_scan: bool) -> String {
 }
 
 fn is_canonical_series_schema(schema: &datafusion::common::DFSchema) -> bool {
-    let fields = schema.fields();
-    fields.len() == 4
-        && fields[0].name() == series::LABELS
-        && fields[1].name() == series::SAMPLES
-        && fields[2].name() == series::BLOCK_START
-        && fields[3].name() == series::BLOCK_END
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    is_series_columns(&names)
+}
+
+/// The four columns of every series batch, in schema order.
+const SERIES_COLUMNS: [&str; 4] = [
+    series::LABELS,
+    series::SAMPLES,
+    series::BLOCK_START,
+    series::BLOCK_END,
+];
+
+fn is_series_columns(names: &[&str]) -> bool {
+    names == SERIES_COLUMNS
 }
 
 /// `None` for a pass-through reference to its own output name — a bare
@@ -256,10 +277,13 @@ fn render_selector(name: &str, matchers: &[LabelMatcher]) -> String {
     out
 }
 
-/// What the call recognisers below read off an argument, so that they do
-/// not depend on which kind of plan the argument comes from.
+/// What the call recognisers below read off an argument. The logical
+/// `Expr` and the physical `PhysicalExpr` both implement it, so a call
+/// prints the same in a logical pin and a physical one; a second copy of
+/// the recognisers over `PhysicalExpr` would let the two drift apart.
 trait Arg: Sized {
-    /// The whole argument, re-rendered recursively.
+    /// The whole argument, re-rendered recursively. A physical column has
+    /// no qualifier to drop, so `single_scan` only matters for `Expr`.
     fn render(&self, single_scan: bool) -> String;
     fn column_name(&self) -> Option<&str>;
     fn literal(&self) -> Option<&ScalarValue>;
@@ -459,6 +483,10 @@ fn push_offset_and_at(s: &mut String, offset: i64, at: Option<i64>) -> Option<()
 /// eligible pair matches it; a pair whose base doesn't match — a
 /// different scan, or not the labels column at all — falls back to
 /// `name: <rendered value>` instead of being silently elided.
+///
+/// A long run of shorthand keys folds by [`fold_alike`]: a store with a
+/// wide schema hands every series dozens of labels, and the struct that
+/// rebuilds them would otherwise be one name per label.
 fn render_labels<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     if !args.len().is_multiple_of(2) {
         return None;
@@ -467,12 +495,24 @@ fn render_labels<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     let mut fields = Vec::with_capacity(args.len() / 2);
     for pair in args.chunks(2) {
         let name = utf8_literal(&pair[0])?;
-        fields.push(render_label_field(name, &pair[1], single_scan, &mut prefix));
+        let text = render_label_field(name, &pair[1], single_scan, &mut prefix);
+        // Every shorthand key has one shape; a `name: value` pair is only
+        // ever alike with itself.
+        let shape = if text == name {
+            String::new()
+        } else {
+            text.clone()
+        };
+        fields.push(Entry {
+            tail: text.clone(),
+            text,
+            shape,
+        });
     }
     Some(format!(
         "{}{{{}}}",
         prefix.unwrap_or_else(|| series::LABELS.to_string()),
-        fields.join(", ")
+        fold_alike(fields, "labels").join(", ")
     ))
 }
 
@@ -510,7 +550,84 @@ fn render_label_field<A: Arg>(
 fn render_get_field<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
     let [base, key] = args else { return None };
     let key = utf8_literal(key)?;
+    if let Some(field) = field_of_rebuilt_labels(base, key, single_scan) {
+        return Some(field);
+    }
     Some(format!("{}.{key}", base.render(single_scan)))
+}
+
+/// `get_field(promql_labels(…, 'job', get_field(labels, 'job'), …), 'job')`
+/// as `labels.job`. DataFusion builds this when it extracts a group key
+/// through a projection that rebuilt the labels: every key then spells out
+/// the whole struct, dozens of labels each on a wide store, to read one
+/// field back.
+///
+/// Printing the field alone is exact only because the value is read
+/// straight out of the canonical `labels` column: `promql_labels` then
+/// has nothing to cast and no NULL to turn into `""`. Any other value, or
+/// a key the struct names twice or not at all, prints in full.
+fn field_of_rebuilt_labels<A: Arg>(base: &A, key: &str, single_scan: bool) -> Option<String> {
+    let (labels::NAME, pairs) = base.call()? else {
+        return None;
+    };
+    if !pairs.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut named = pairs
+        .chunks(2)
+        .filter(|pair| utf8_literal(&pair[0]) == Some(key));
+    let ([_, value], None) = (named.next()?, named.next()) else {
+        return None;
+    };
+    let Some(("get_field", [labels, inner_key])) = value.call() else {
+        return None;
+    };
+    if utf8_literal(inner_key) != Some(key) {
+        return None;
+    }
+    Some(format!(
+        "{}.{key}",
+        labels_column_text(labels, single_scan)?
+    ))
+}
+
+/// The least number of consecutive alike entries that fold. A store that
+/// gives each label its own column repeats one expression per label at
+/// every node, 72 times over in a production plan; below this a list
+/// stays whole, which keeps every pin's lists and the three pass-through
+/// columns of a series projection, alike as they are, readable one by one.
+const FOLD_MIN: usize = 8;
+
+/// One entry of a printed list. `shape` is what two entries must share to
+/// fold together, and `tail` is how the last entry of a folded run prints.
+struct Entry {
+    text: String,
+    shape: String,
+    tail: String,
+}
+
+/// Folds every run of at least [`FOLD_MIN`] consecutive entries with one
+/// shape into its first entry, the last one's tail and the count:
+/// `a@1 … z@71 (71 alike)`. The first entry prints whole, so a folded run
+/// still shows exactly what each entry computes; an entry of another
+/// shape ends the run and prints on its own.
+fn fold_alike(entries: Vec<Entry>, noun: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = entries.as_slice();
+    while let Some(first) = rest.first() {
+        let run = rest.iter().take_while(|e| e.shape == first.shape).count();
+        if run >= FOLD_MIN {
+            out.push(format!(
+                "{} … {} ({run} {noun})",
+                first.text,
+                rest[run - 1].tail
+            ));
+        } else {
+            out.extend(rest[..run].iter().map(|e| e.text.clone()));
+        }
+        rest = &rest[run..];
+    }
+    out
 }
 
 /// Every aggregate function this engine plans — `promql_vector_selector`,
@@ -677,6 +794,239 @@ fn utf8_literal<A: Arg>(e: &A) -> Option<&str> {
     match e.literal()? {
         ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// Renders an `ExecutionPlan` the way the `physical:` blocks in
+/// `tests/testdata/plans/` pin it: one node per line, indented two spaces
+/// per level, as `displayable(plan).indent(true)` lays it out.
+///
+/// Only the two node kinds that carry this engine's calls are re-rendered,
+/// `ProjectionExec` and `AggregateExec`. Their calls read as in the
+/// logical pin, and every column keeps its `@index`: in a physical plan
+/// the index is what is evaluated and the name is only a label, so a name
+/// that drifted from its index would otherwise be invisible. Every other
+/// node, a store's own nodes included, prints exactly as `indent(true)`
+/// prints it, by the same fallthrough rule as the logical renderer.
+pub fn render_physical(plan: &dyn ExecutionPlan) -> String {
+    let mut out = String::new();
+    render_exec_node(plan, 0, &mut out);
+    out
+}
+
+fn render_exec_node(plan: &dyn ExecutionPlan, indent: usize, out: &mut String) {
+    if indent > 0 {
+        out.push('\n');
+    }
+    out.push_str(&" ".repeat(indent * 2));
+    out.push_str(&render_exec_line(plan));
+    for child in plan.children() {
+        render_exec_node(child.as_ref(), indent + 1, out);
+    }
+}
+
+fn render_exec_line(plan: &dyn ExecutionPlan) -> String {
+    if let Some(p) = plan.downcast_ref::<ProjectionExec>() {
+        return render_projection_exec(p);
+    }
+    if let Some(line) = plan
+        .downcast_ref::<AggregateExec>()
+        .and_then(render_aggregate_exec)
+    {
+        return line;
+    }
+    Stock(plan).to_string()
+}
+
+/// A node's own line exactly as `displayable(plan).indent(true)` prints
+/// it, which is `fmt_as` with `Verbose`.
+struct Stock<'a>(&'a dyn ExecutionPlan);
+
+impl fmt::Display for Stock<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt_as(DisplayFormatType::Verbose, f)
+    }
+}
+
+/// Like the logical [`render_projection`], the four series columns' own
+/// aliases go only when the output is exactly those four in order. A
+/// projection that adds, drops or reorders one keeps them, since nothing
+/// else would then say which output a call such as `{}` fills.
+fn render_projection_exec(p: &ProjectionExec) -> String {
+    let names: Vec<&str> = p.expr().iter().map(|e| e.alias.as_str()).collect();
+    let series_columns = is_series_columns(&names);
+    let exprs = p
+        .expr()
+        .iter()
+        .map(|e| output_entry(&e.expr, &e.alias, series_columns))
+        .collect();
+    format!(
+        "ProjectionExec: expr=[{}]",
+        fold_alike(exprs, "alike").join(", ")
+    )
+}
+
+/// `expr as alias`, without the alias where it says nothing: the
+/// expression is a column of that very name, or, with
+/// `drop_series_aliases`, the alias is one of the four series columns,
+/// which no query can rename.
+fn output_entry(e: &Arc<dyn PhysicalExpr>, alias: &str, drop_series_aliases: bool) -> Entry {
+    let text = e.render(false);
+    if e.column_name() == Some(alias) || (drop_series_aliases && is_series_column(alias)) {
+        Entry {
+            shape: shape_of(e),
+            tail: text.clone(),
+            text,
+        }
+    } else {
+        Entry {
+            text: format!("{text} as {alias}"),
+            shape: format!("{} as", shape_of(e)),
+            tail: format!("as {alias}"),
+        }
+    }
+}
+
+/// `e` printed with every column, and every struct field `get_field`
+/// reads, as the same nameless one, so two entries share a shape exactly
+/// when they compute the same thing over different columns or labels.
+/// Masking the printed text instead would also hit a name that happens to
+/// sit inside another name or a literal.
+fn shape_of(e: &Arc<dyn PhysicalExpr>) -> String {
+    Arc::clone(e)
+        .transform(|node| {
+            if node.column_name().is_some() {
+                let nameless: Arc<dyn PhysicalExpr> = Arc::new(PhysicalColumn::new("", 0));
+                return Ok(Transformed::yes(nameless));
+            }
+            if let Some(("get_field", [base, key])) = node.call() {
+                if utf8_literal(key).is_some() {
+                    let nameless: Arc<dyn PhysicalExpr> =
+                        Arc::new(Literal::new(ScalarValue::Utf8(Some(String::new()))));
+                    let base = Arc::clone(base);
+                    return node
+                        .with_new_children(vec![base, nameless])
+                        .map(Transformed::yes);
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .map_or_else(|_| e.render(false), |masked| masked.data.render(false))
+}
+
+fn is_series_column(name: &str) -> bool {
+    SERIES_COLUMNS.contains(&name)
+}
+
+/// The stock `AggregateExec` line with its expressions re-rendered. Group
+/// keys and aggregate outputs are named by `plan.rs` alone, so their series
+/// aliases always go.
+///
+/// The aggregate's arguments are the ones the node evaluates, from
+/// DataFusion's own [`aggregate_expressions`]. Stock DataFusion prints
+/// the aggregate's logical name instead, which shows neither index and,
+/// in a final mode, names the raw samples where the node reads the
+/// partial state.
+///
+/// `None`, and so the stock line, for what this does not print: grouping
+/// sets and a limit.
+fn render_aggregate_exec(a: &AggregateExec) -> Option<String> {
+    let group = a.group_expr();
+    if !group.is_single() || a.limit_options().is_some() {
+        return None;
+    }
+    let reads = aggregate_expressions(a.aggr_expr(), a.mode(), group.expr().len()).ok()?;
+    let gby = group
+        .expr()
+        .iter()
+        .map(|(e, alias)| output_entry(e, alias, true))
+        .collect();
+    let gby = fold_alike(gby, "alike");
+    let aggr: Vec<_> = a
+        .aggr_expr()
+        .iter()
+        .zip(&reads)
+        .map(|(agg, reads)| {
+            render_aggregate_expr(agg, a.mode(), reads).unwrap_or_else(|| stock_aggregate_expr(agg))
+        })
+        .collect();
+    let mut line = format!(
+        "AggregateExec: mode={:?}, gby=[{}], aggr=[{}]",
+        a.mode(),
+        gby.join(", "),
+        aggr.join(", ")
+    );
+    if *a.input_order_mode() != InputOrderMode::Linear {
+        line.push_str(&format!(", ordering_mode={:?}", a.input_order_mode()));
+    }
+    Some(line)
+}
+
+/// One of this engine's aggregate calls over the columns `reads`.
+///
+/// In a mode whose input is partial state, the node reads the state
+/// column where the raw call took `samples`, and that column goes in the
+/// call's first argument. Only when the call's other arguments are all
+/// literals, which they are for `promql_aggregate`: the selector and range
+/// functions also take the block columns, and with those swapped for
+/// state there is no call left to print truthfully.
+fn render_aggregate_expr(
+    agg: &AggregateFunctionExpr,
+    mode: &AggregateMode,
+    reads: &[Arc<dyn PhysicalExpr>],
+) -> Option<String> {
+    if agg.is_distinct() || agg.ignore_nulls() || !agg.order_bys().is_empty() {
+        return None;
+    }
+    let args = match mode.input_mode() {
+        AggregateInputMode::Raw => reads.to_vec(),
+        AggregateInputMode::Partial => {
+            let [state] = reads else { return None };
+            let mut args = agg.expressions();
+            let (first, params) = args.split_first_mut()?;
+            if params.iter().any(|p| p.literal().is_none()) {
+                return None;
+            }
+            *first = Arc::clone(state);
+            args
+        }
+    };
+    let call = render_aggregate_call(agg.fun().name(), &args, false)?;
+    let name = agg.name();
+    Some(if is_series_column(name) {
+        call
+    } else {
+        format!("{call} as {name}")
+    })
+}
+
+/// DataFusion's own text for an aggregate expression, which its private
+/// `format_aggregate_exec_expr` builds.
+fn stock_aggregate_expr(agg: &AggregateFunctionExpr) -> String {
+    match (agg.human_display_alias(), agg.human_display()) {
+        (Some(alias), Some(shown)) => format!("{shown} as {alias}"),
+        _ => agg.name().to_string(),
+    }
+}
+
+impl Arg for Arc<dyn PhysicalExpr> {
+    fn render(&self, _single_scan: bool) -> String {
+        self.call()
+            .and_then(|(name, args)| render_scalar_call(name, args, false))
+            .unwrap_or_else(|| self.to_string())
+    }
+
+    fn column_name(&self) -> Option<&str> {
+        self.downcast_ref::<PhysicalColumn>().map(|c| c.name())
+    }
+
+    fn literal(&self) -> Option<&ScalarValue> {
+        self.downcast_ref::<Literal>().map(|l| l.value())
+    }
+
+    fn call(&self) -> Option<(&str, &[Self])> {
+        self.downcast_ref::<ScalarFunctionExpr>()
+            .map(|f| (f.name(), f.args()))
     }
 }
 
@@ -1402,5 +1752,241 @@ mod tests {
             matcher(METRIC_NAME, MatchOp::Equal, "b"),
         ];
         assert_eq!(render_selector("a", &matchers), "a{__name__=\"b\"}");
+    }
+
+    fn label_names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// `e` lowered against a series batch carrying `names` as its labels,
+    /// so its columns get the indices a real plan would give them.
+    fn physical(e: Expr, names: &[&str]) -> Arc<dyn PhysicalExpr> {
+        let schema = series::schema(&label_names(names));
+        let schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone()).unwrap();
+        datafusion::physical_expr::create_physical_expr(
+            &e,
+            &schema,
+            &datafusion::execution::context::ExecutionProps::new(),
+        )
+        .unwrap()
+    }
+
+    fn field_of(names: &[&str], key: &str) -> Expr {
+        let pairs = names
+            .iter()
+            .map(|n| (n.to_string(), get_field_of(n)))
+            .collect();
+        datafusion::functions::core::expr_fn::get_field(labels::call(pairs), key)
+    }
+
+    #[test]
+    fn physical_columns_keep_their_index() {
+        let e = physical(col(series::BLOCK_END), &["pod"]);
+        assert_eq!(e.render(false), "block_end@3");
+    }
+
+    #[test]
+    fn physical_get_field_of_rebuilt_labels_reads_the_field() {
+        let e = physical(field_of(&["i", "pod"], "pod"), &["i", "pod"]);
+        assert_eq!(e.render(false), "labels@0.pod");
+    }
+
+    #[test]
+    fn logical_get_field_of_rebuilt_labels_reads_the_field() {
+        assert_eq!(
+            render_expr(&field_of(&["i", "pod"], "pod"), true),
+            "labels.pod"
+        );
+    }
+
+    #[test]
+    fn get_field_of_rebuilt_labels_keeps_a_value_it_would_canonicalise() {
+        let call = labels::call(vec![("pod".to_string(), lit("a"))]);
+        let e = datafusion::functions::core::expr_fn::get_field(call, "pod");
+        assert_eq!(render_expr(&e, true), "labels{pod: Utf8(\"a\")}.pod");
+    }
+
+    #[test]
+    fn get_field_of_rebuilt_labels_keeps_a_key_named_twice() {
+        let e = field_of(&["pod", "pod"], "pod");
+        assert_eq!(render_expr(&e, true), "labels{pod, pod}.pod");
+    }
+
+    #[test]
+    fn get_field_of_rebuilt_labels_keeps_a_key_it_does_not_name() {
+        let e = field_of(&["i"], "pod");
+        assert_eq!(render_expr(&e, true), "labels{i}.pod");
+    }
+
+    fn many(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("l{i}")).collect()
+    }
+
+    #[test]
+    fn labels_fold_a_long_run_of_keys() {
+        let names = many(FOLD_MIN);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let pairs = names
+            .iter()
+            .map(|n| (n.to_string(), get_field_of(n)))
+            .collect();
+        assert_eq!(
+            render_expr(&labels::call(pairs), true),
+            format!("labels{{l0 … l{} ({FOLD_MIN} labels)}}", FOLD_MIN - 1)
+        );
+    }
+
+    #[test]
+    fn labels_keep_a_short_run_of_keys() {
+        let names = many(FOLD_MIN - 1);
+        let pairs = names
+            .iter()
+            .map(|n| (n.to_string(), get_field_of(n)))
+            .collect();
+        assert_eq!(
+            render_expr(&labels::call(pairs), true),
+            format!("labels{{{}}}", names.join(", "))
+        );
+    }
+
+    fn entry(text: &str, shape: &str) -> Entry {
+        Entry {
+            text: text.to_string(),
+            shape: shape.to_string(),
+            tail: format!("tail of {text}"),
+        }
+    }
+
+    #[test]
+    fn fold_alike_breaks_a_run_at_another_shape() {
+        let mut entries: Vec<_> = (0..=FOLD_MIN)
+            .map(|i| entry(&format!("a{i}"), "a"))
+            .collect();
+        entries.insert(1, entry("odd", "b"));
+        entries.push(entry("last", "c"));
+        let folded = fold_alike(entries, "alike");
+        assert_eq!(
+            folded,
+            [
+                "a0".to_string(),
+                "odd".to_string(),
+                format!("a1 … tail of a{FOLD_MIN} ({FOLD_MIN} alike)"),
+                "last".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fold_alike_folds_a_run_only_from_fold_min() {
+        let entries = |n: usize| (0..n).map(|i| entry(&format!("a{i}"), "a")).collect();
+        assert_eq!(
+            fold_alike(entries(FOLD_MIN - 1), "alike").len(),
+            FOLD_MIN - 1
+        );
+        assert_eq!(fold_alike(entries(FOLD_MIN), "alike").len(), 1);
+    }
+
+    #[test]
+    fn shape_ignores_which_columns_an_expression_reads_but_not_what_it_does() {
+        use datafusion::arrow::datatypes::DataType;
+        let cast = |name: &str, to: DataType| {
+            let e = Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(get_field_of(name)),
+                to,
+            ));
+            shape_of(&physical(e, &["a", "b"]))
+        };
+        assert_eq!(cast("a", DataType::Utf8), cast("b", DataType::Utf8));
+        assert_ne!(
+            shape_of(&physical(get_field_of("a"), &["a"])),
+            shape_of(&physical(col(series::LABELS), &["a"]))
+        );
+        assert_ne!(cast("a", DataType::Utf8), cast("a", DataType::LargeUtf8));
+        assert_ne!(
+            shape_of(&physical(col(series::SAMPLES), &["a"])),
+            shape_of(&physical(lit("a"), &["a"]))
+        );
+    }
+
+    fn projection(exprs: Vec<(Expr, &str)>, names: &[&str]) -> String {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let input = Arc::new(EmptyExec::new(series::schema(&label_names(names))));
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = exprs
+            .into_iter()
+            .map(|(e, alias)| (physical(e, names), alias.to_string()))
+            .collect();
+        render_physical(&ProjectionExec::try_new(exprs, input).unwrap())
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn physical_projection_drops_the_series_aliases_in_series_order() {
+        let shown = projection(
+            vec![
+                (labels::call(vec![]), series::LABELS),
+                (col(series::SAMPLES), series::SAMPLES),
+                (col(series::BLOCK_START), series::BLOCK_START),
+                (col(series::BLOCK_END), series::BLOCK_END),
+            ],
+            &[],
+        );
+        assert_eq!(
+            shown,
+            "ProjectionExec: expr=[labels{}, samples@1, block_start@2, block_end@3]"
+        );
+    }
+
+    #[test]
+    fn physical_projection_keeps_a_series_alias_out_of_series_order() {
+        let shown = projection(
+            vec![
+                (col(series::SAMPLES), series::SAMPLES),
+                (labels::call(vec![]), series::LABELS),
+            ],
+            &[],
+        );
+        assert_eq!(
+            shown,
+            "ProjectionExec: expr=[samples@1, labels{} as labels]"
+        );
+    }
+
+    #[test]
+    fn physical_projection_keeps_a_rename() {
+        let shown = projection(vec![(get_field_of("pod"), "__group__pod")], &["pod"]);
+        assert_eq!(shown, "ProjectionExec: expr=[labels@0.pod as __group__pod]");
+    }
+
+    #[test]
+    fn physical_projection_folds_a_long_run_of_alike_outputs() {
+        let names = many(FOLD_MIN);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut exprs: Vec<(Expr, &str)> = names.iter().map(|n| (get_field_of(n), *n)).collect();
+        exprs.push((col(series::SAMPLES), series::SAMPLES));
+        let last = names[FOLD_MIN - 1];
+        assert_eq!(
+            projection(exprs, &names),
+            format!(
+                "ProjectionExec: expr=[labels@0.l0 as l0 … as {last} ({FOLD_MIN} alike), samples@1]"
+            )
+        );
+    }
+
+    #[test]
+    fn physical_nodes_this_does_not_know_print_as_datafusion_does() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::{displayable, ExecutionPlan};
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(series::schema(&label_names(&["pod"]))));
+        assert_eq!(
+            render_physical(plan.as_ref()),
+            displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+                .trim_end()
+        );
     }
 }

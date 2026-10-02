@@ -52,7 +52,7 @@ pub(crate) mod value_type;
 
 pub use engine::{check_selector_plans, Engine, RangeQuery};
 pub use error::EngineError;
-pub use explain::render as explain_plan;
+pub use explain::{render as explain_plan, render_physical as explain_physical_plan};
 pub use matcher::{CompiledMatcher, METRIC_NAME};
 pub use memory::MemorySeriesSource;
 pub use params::Params;
