@@ -172,6 +172,7 @@ fn a_parse_error_keeps_the_parsers_positions() {
         )
         .unwrap_err();
     assert!(matches!(err, EngineError::Parse(_)), "{err}");
+    assert!(err.is_user_error());
     let cause = std::error::Error::source(&err)
         .and_then(|e| e.downcast_ref::<promql_parser::ParseErrors>())
         .expect("the cause is the parser's own error");
@@ -190,6 +191,7 @@ fn a_bad_regex_keeps_its_cause() {
         )
         .unwrap_err();
     assert!(matches!(err, EngineError::Regex { .. }), "{err}");
+    assert!(err.is_user_error());
     assert!(std::error::Error::source(&err).is_some_and(|e| e.is::<regex::Error>()));
 }
 

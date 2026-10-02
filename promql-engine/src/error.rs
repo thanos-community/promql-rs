@@ -2,9 +2,10 @@
 //!
 //! The variants are kept apart because callers treat them differently: a
 //! differential test counts [`EngineError::Unsupported`] as "not built
-//! yet" and collapses it, [`EngineError::Query`] is an answer (the
-//! reference engine also rejects some queries), [`EngineError::Schema`] is
-//! a store's bug, and everything else is DataFusion's or this crate's.
+//! yet" and collapses it, a user error ([`EngineError::is_user_error`]) is
+//! an answer (the reference engine also rejects some queries),
+//! [`EngineError::Schema`] is a store's bug, and everything else is
+//! DataFusion's or this crate's.
 
 use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
@@ -140,6 +141,17 @@ impl From<DataFusionError> for EngineError {
 }
 
 impl EngineError {
+    /// Whether the query is at fault rather than the engine or the store,
+    /// the errors an HTTP front end answers with a 4xx. The enum is
+    /// `#[non_exhaustive]`, so a caller cannot list these variants itself
+    /// and stay correct; a new variant for a bad query belongs here.
+    pub fn is_user_error(&self) -> bool {
+        matches!(
+            self,
+            EngineError::Query(_) | EngineError::Parse(_) | EngineError::Regex { .. }
+        )
+    }
+
     /// Keep the context DataFusion wrapped an unwrapped engine error in.
     /// The message variants take it as a prefix so the variant survives;
     /// the ones holding a cause cannot, and go back inside DataFusion's
@@ -266,6 +278,42 @@ mod tests {
             shown.contains("while selecting") && shown.contains("pod"),
             "{shown}"
         );
+    }
+
+    fn regex_error() -> EngineError {
+        let pattern = String::from("(");
+        EngineError::Regex {
+            label: "pod".into(),
+            source: regex::Regex::new(&pattern).unwrap_err(),
+            pattern,
+        }
+    }
+
+    fn external(e: EngineError) -> DataFusionError {
+        DataFusionError::External(Box::new(e))
+    }
+
+    #[test]
+    fn only_a_bad_query_is_a_user_error() {
+        let parse = promql_parser::parse_expr("up{").unwrap_err();
+        for user in [
+            EngineError::Query("bad".into()),
+            EngineError::Parse(parse),
+            regex_error(),
+            EngineError::from(external(regex_error())),
+        ] {
+            assert!(user.is_user_error(), "{user:?}");
+        }
+        for other in [
+            EngineError::Unsupported("x".into()),
+            EngineError::Schema("x".into()),
+            EngineError::Source("x".into()),
+            EngineError::Arrow(ArrowError::ComputeError("x".into())),
+            EngineError::Runtime("x".into()),
+            EngineError::DataFusion(DataFusionError::Execution("x".into())),
+        ] {
+            assert!(!other.is_user_error(), "{other:?}");
+        }
     }
 
     #[test]
