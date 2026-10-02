@@ -39,8 +39,8 @@
 //!
 //! A `physical: |` block, added the same way, also pins the
 //! `ExecutionPlan`, rendered by `promql_engine::explain_physical_plan`:
-//! the calls read as in the logical plan, and every column keeps the
-//! `@index` the node evaluates. Only small cases can carry one: partition
+//! the calls read as in the logical plan, and every column printed keeps
+//! the `@index` the node evaluates. Only small cases can carry one: partition
 //! counts and repartitioning make larger physical plans too fragile to
 //! hold as text.
 //!
