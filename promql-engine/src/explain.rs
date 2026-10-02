@@ -52,7 +52,7 @@ use promql_common::model::Duration;
 use promql_parser::ast::LabelMatcher;
 
 use crate::matcher::METRIC_NAME;
-use crate::source::SelectorTable;
+use crate::source::{SelectHints, SelectorTable};
 use crate::{aggregate, labels, range, selector, series};
 
 /// Renders `plan` the way `tests/testdata/plans/` pins it. See the module doc
@@ -316,6 +316,47 @@ impl Arg for Expr {
             _ => None,
         }
     }
+}
+
+/// What a selector asked its store for, as `SeriesSetExec` prints it: the
+/// selector as its `TableScan` line spells it, then the query range and
+/// every hint `select` was given, an advisory one only when present. The
+/// store's own nodes below then read as its answer to exactly this.
+pub(crate) fn render_selection(
+    name: &str,
+    matchers: &[LabelMatcher],
+    hints: &SelectHints,
+) -> String {
+    let mut out = format!(
+        "{} {}..{} window={}",
+        render_selector(name, matchers),
+        hints.start_ms,
+        hints.end_ms,
+        span(hints.window_ms)
+    );
+    if let Some(step) = hints.step_ms {
+        out.push_str(&format!(" step={}", span(step)));
+    }
+    if let Some(range) = hints.range_ms {
+        out.push_str(&format!(" range={}", span(range)));
+    }
+    if let Some(func) = &hints.func {
+        out.push_str(&format!(" func={func}"));
+    }
+    if let Some(grouping) = &hints.grouping {
+        let word = if grouping.by { "by" } else { "without" };
+        out.push_str(&format!(" {word}=({})", grouping.labels.join(", ")));
+    }
+    if let Some(shard) = &hints.shard {
+        out.push_str(&format!(" shard={}/{}", shard.index, shard.count));
+    }
+    out
+}
+
+/// A span in Go's `Duration` spelling, or in milliseconds where Go's
+/// `Duration` cannot hold it.
+fn span(ms: i64) -> String {
+    Duration::from_millis(ms).map_or_else(|_| format!("{ms}ms"), |d| d.to_string())
 }
 
 /// One expression, recursively. Anything not recognised — a node this
@@ -1987,6 +2028,49 @@ mod tests {
                 .indent(true)
                 .to_string()
                 .trim_end()
+        );
+    }
+
+    fn up() -> Vec<LabelMatcher> {
+        vec![
+            matcher(METRIC_NAME, MatchOp::Equal, "up"),
+            matcher("job", MatchOp::Equal, "api"),
+        ]
+    }
+
+    #[test]
+    fn selection_prints_only_the_hints_it_was_given() {
+        let hints = SelectHints::range(300_000, 1_200_000).with_window_ms(300_000);
+        assert_eq!(
+            render_selection("up", &up(), &hints),
+            r#"up{job="api"} 300000..1200000 window=5m"#
+        );
+    }
+
+    #[test]
+    fn selection_prints_every_hint_it_was_given() {
+        use crate::source::{Grouping, Shard};
+        let hints = SelectHints::range(300_000, 1_200_000)
+            .with_window_ms(300_000)
+            .with_step_ms(30_000)
+            .with_range_ms(300_000)
+            .with_func("rate")
+            .with_grouping(Grouping::new(vec!["job".into(), "pod".into()], true))
+            .with_shard(Shard::new(1, 4));
+        assert_eq!(
+            render_selection("up", &up(), &hints),
+            r#"up{job="api"} 300000..1200000 window=5m step=30s range=5m func=rate by=(job, pod) shard=1/4"#
+        );
+    }
+
+    #[test]
+    fn selection_spells_without() {
+        use crate::source::Grouping;
+        let hints =
+            SelectHints::range(0, 1).with_grouping(Grouping::new(vec!["pod".into()], false));
+        assert_eq!(
+            render_selection("up", &up(), &hints),
+            r#"up{job="api"} 0..1 window=0s without=(pod)"#
         );
     }
 }

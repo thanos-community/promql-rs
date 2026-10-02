@@ -87,5 +87,5 @@ tests:
     physical: |
       ProjectionExec: expr=[labels@2{pod}, samples@3, block_start@0, block_end@1]
         AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[rate(samples@1[5m], 600000..1200000 step 30s)], ordering_mode=Sorted
-          SeriesSetExec
+          SeriesSetExec: x 300000..1200000 window=5m step=30s range=5m func=rate, partitioning=Hash([labels@0], 4)
             DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
