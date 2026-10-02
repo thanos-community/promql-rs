@@ -1,44 +1,11 @@
-# Expected LogicalPlan per query, and for small cases the ExecutionPlan.
-# See tests/plan.rs for what this is for and how to add a case.
-#
-# `defaults` is the one query range every case is planned with, so the
-# literals in a plan never differ between cases. Field names follow the
-# shared engine test-case format (thanos-io/promql-engine
-# testcases/range_queries.yaml), with `plan` added.
-#
-# `load` is per case because the projection's schema is derived from the
-# source's label names, sorted and deduplicated: the label set is part of
-# what is being pinned. One sample per series is enough because nothing
-# but the label set reaches the planner, and a second adds nothing; the
-# loader rejects a series carrying more unless the case sets `chunked_ms`,
-# where the samples decide how many batches the store hands over.
+# Plan pins for the topic of promql-conformance/testdata/prometheus/aggregators.test.
+# tests/plan.rs says what a case holds and how to add one.
 defaults:
   start_ms: 600000
   end_ms: 1200000
   step_ms: 30000
 
 tests:
-  - name: instant selector
-    description: >
-      The selector is an aggregate grouped by the whole labels struct, so
-      a label set split over several chunks is one group. The labels pass
-      through untouched: an instant selector keeps every label it was
-      given, __name__ included.
-    load:
-      - http_requests_total{job="api", pod="api-1"} 0
-      - http_requests_total{job="api", pod="api-2"} 0
-    query: |
-      http_requests_total{job="api"}
-    plan: |
-      Projection: labels, samples, block_start, block_end
-        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
-          TableScan: http_requests_total{job="api"}
-    physical: |
-      ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
-          SeriesSetExec
-            DataSourceExec: partitions=1, partition_sizes=[1]
-
   - name: aggregation over an instant selector
     description: >
       An ungrouped sum stacks on the selector aggregate: two aggregates,
@@ -54,52 +21,6 @@ tests:
           Projection: labels, samples, block_start, block_end
             Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
               TableScan: http_requests_total
-
-  - name: range function over a different label set
-    description: >
-      The range function is an aggregate grouped by the whole labels
-      struct, like the selector. rate drops __name__, so the labels are
-      rebuilt field by field above it: dropped below, two series differing
-      only in their name would fold into one group. The fields named here
-      are this case's own, which is what shows that the projection follows
-      the data rather than a fixed schema.
-    load:
-      - node_cpu_seconds_total{cpu="0", instance="a", mode="idle"} 0
-      - node_cpu_seconds_total{cpu="1", instance="a", mode="user"} 0
-    query: |
-      rate(node_cpu_seconds_total[5m])
-    plan: |
-      Projection: labels{cpu, instance, mode}
-        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
-          TableScan: node_cpu_seconds_total
-
-  - name: an elementwise function over a selector
-    description: >
-      One projection per function, each over the last: the operator
-      changes only the value, so the shape it runs on is the shape it
-      hands back. The subquery alias is what keeps the inner `labels`
-      and the rebuilt one apart when the two projections are merged.
-    load:
-      - temperature{city="oslo"} 0
-    query: |
-      abs(temperature)
-    plan: |
-      Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
-        SubqueryAlias: abs_0
-          Projection: labels, samples, block_start, block_end
-            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
-              TableScan: temperature
-
-  - name: vector of a scalar
-    description: >
-      vector(s) asks no store: it is the scalar's value under an empty
-      label set, which is the table a scalar plan already is.
-    load:
-      - temperature{city="oslo"} 0
-    query: |
-      vector(time())
-    plan: |
-      TableScan: scalar_0
 
   - name: grouped aggregation over a range function
     description: >
@@ -117,81 +38,6 @@ tests:
           Projection: labels{job, pod}
             Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: http_requests_total
-
-  - name: count over time
-    description: >
-      A counting function takes the same aggregate as rate; only the
-      function-name literal differs, so one registration serves the whole
-      family.
-    load:
-      - http_requests_total{job="api", pod="api-1"} 0
-      - http_requests_total{job="web", pod="web-1"} 0
-    query: |
-      count_over_time(http_requests_total[10m])
-    plan: |
-      Projection: labels{job, pod}
-        Aggregate: count_over_time(samples[10m], 600000..1200000 step 30s) per series per block
-          TableScan: http_requests_total
-
-  - name: range function with an offset
-    description: >
-      The offset is a literal argument of the aggregate, in the slot an @
-      fills too, so the shape does not change with either modifier.
-    load:
-      - http_requests_total{job="api", pod="api-1"} 0
-      - http_requests_total{job="web", pod="web-1"} 0
-    query: |
-      rate(http_requests_total[5m] offset 5m)
-    plan: |
-      Projection: labels{job, pod}
-        Aggregate: rate(samples[5m] offset 5m, 600000..1200000 step 30s) per series per block
-          TableScan: http_requests_total
-
-  - name: instant selector over chunks
-    description: >
-      The store hands each label set over as several chunks, each its own
-      batch, which only the physical plan shows as the number of batches
-      under SeriesSetExec. The logical plan is the whole-series case's: a
-      label set split over chunks is still one group of the Sorted
-      aggregate.
-    chunked_ms: 150000
-    load:
-      - x{pod="a"} 1+1x19
-      - x{pod="b"} 2+3x19
-    query: |
-      x
-    plan: |
-      Projection: labels, samples, block_start, block_end
-        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
-          TableScan: x
-    physical: |
-      ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
-          SeriesSetExec
-            DataSourceExec: partitions=1, partition_sizes=[4]
-
-  - name: range function over chunks in four partitions
-    description: >
-      Four store partitions, each series whole in one of them and chunked
-      within it. Each partition's Partial folds its own series Sorted and
-      emits them finished; a merge on labels hands them in order to one
-      Final, which stays Sorted too.
-    chunked_ms: 150000
-    partitions: 4
-    load:
-      - x{pod="a"} 1+1x19
-      - x{pod="b"} 2+3x19
-    query: |
-      rate(x[5m])
-    plan: |
-      Projection: labels{pod}
-        Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
-          TableScan: x
-    physical: |
-      ProjectionExec: expr=[promql_labels(pod, get_field(labels@2, pod)) as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_range_function(selector_0.samples, selector_0.block_start, selector_0.block_end, rate, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
-          SeriesSetExec
-            DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
   - name: grouped aggregation over chunks in four partitions
     description: >
@@ -297,32 +143,6 @@ tests:
                   SeriesSetExec
                     DataSourceExec: partitions=4, partition_sizes=[2, 2, 0, 0]
 
-  - name: instant selector over blocks and chunks
-    description: >
-      The store cuts the select into 200s blocks on top of 150s chunks,
-      so a label set arrives in several blocks and each block in several
-      chunks: the data ends at 570s, so the first block, reaching back
-      from 600s by the lookback, holds two chunks per series, the second
-      one, and the two after it nothing. The plan is the one-block
-      case's: the block is a group key the store fills, and the number of
-      batches is all that grows.
-    chunked_ms: 150000
-    blocks_ms: 200000
-    load:
-      - x{pod="a"} 1+1x19
-      - x{pod="b"} 2+3x19
-    query: |
-      x
-    plan: |
-      Projection: labels, samples, block_start, block_end
-        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
-          TableScan: x
-    physical: |
-      ProjectionExec: expr=[labels@2 as labels, samples@3 as samples, block_start@0 as block_start, block_end@1 as block_end]
-        AggregateExec: mode=SinglePartitioned, gby=[block_start@2 as block_start, block_end@3 as block_end, labels@0 as labels], aggr=[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, 600000, 1200000, 30000, 300000, 0, NULL) as samples], ordering_mode=Sorted
-          SeriesSetExec
-            DataSourceExec: partitions=1, partition_sizes=[6]
-
   - name: without resolves to the remaining keys at plan time
     description: >
       The planner turns without (pod) into by over whatever labels are
@@ -340,18 +160,3 @@ tests:
           Projection: labels{job, pod}
             Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: http_requests_total
-
-  - name: an at modifier on a range function
-    description: >
-      @ takes seconds in PromQL but the plan carries milliseconds, so the
-      pin shows the raw resolved timestamp the plan holds rather than the
-      query's own units.
-    load:
-      - http_requests_total{job="api", pod="api-1"} 0
-      - http_requests_total{job="web", pod="web-1"} 0
-    query: |
-      rate(http_requests_total[5m] @ 900)
-    plan: |
-      Projection: labels{job, pod}
-        Aggregate: rate(samples[5m] @ 900000, 600000..1200000 step 30s) per series per block
-          TableScan: http_requests_total
