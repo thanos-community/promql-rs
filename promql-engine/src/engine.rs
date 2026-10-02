@@ -37,7 +37,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::InterleaveExec;
-use datafusion::physical_plan::{self, displayable, ExecutionPlan, InputOrderMode, Partitioning};
+use datafusion::physical_plan::{self, ExecutionPlan, InputOrderMode, Partitioning};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::error::EngineError;
@@ -272,7 +272,7 @@ pub fn check_selector_plans(plan: &Arc<dyn ExecutionPlan>) -> Result<(), EngineE
     let refuse = |why: &str| {
         EngineError::Query(format!(
             "refusing a plan in which {why}:\n{}",
-            displayable(plan.as_ref()).indent(true)
+            crate::explain::render_physical(plan.as_ref())
         ))
     };
     let mut stack = vec![plan];
