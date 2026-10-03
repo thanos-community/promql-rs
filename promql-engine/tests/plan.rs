@@ -291,7 +291,7 @@ macro_rules! plan_files {
     };
 }
 
-plan_files!(aggregators, at_modifier, functions, selectors);
+plan_files!(aggregators, at_modifier, functions, operators, selectors);
 
 // The physical plan decides what the logical plan cannot: whether the
 // selector aggregate holds one open series per partition (Sorted) or every

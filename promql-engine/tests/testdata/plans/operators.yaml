@@ -1,0 +1,131 @@
+# Plan pins for the topic of promql-conformance/testdata/prometheus/operators.test.
+# tests/plan.rs says what a case holds and how to add one.
+defaults:
+  start_ms: 600000
+  end_ms: 1200000
+  step_ms: 30000
+
+tests:
+  - name: a vector against a scalar
+    description: >
+      The scalar is folded while planning, so the operator is the
+      elementwise kernel with one operand already a number and no
+      second input at all. __name__ is rebuilt away, as it is for any
+      arithmetic.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+    query: |
+      http_requests_total * 2
+    plan: |
+      Projection: labels{job, pod}, promql_elementwise(binary_0.samples, Utf8("*"), Float64(2), Float64(NULL))
+        SubqueryAlias: binary_0
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: http_requests_total
+
+  - name: a scalar on the left of a vector
+    description: >
+      Which side the scalar was written on survives as which argument
+      slot it lands in: upstream's swap, and the only thing that
+      separates this plan from the one above.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+    query: |
+      600 / http_requests_total
+    plan: |
+      Projection: labels{job, pod}, promql_elementwise(binary_0.samples, Utf8("/"), Float64(NULL), Float64(600))
+        SubqueryAlias: binary_0
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: http_requests_total
+
+  - name: a comparison between two vectors
+    description: >
+      A comparison without bool answers with the left sample as it
+      stood, __name__ and all — and __name__ is the one label the match
+      signature leaves out. So the aggregation answers with a series per
+      name instead of one per match group, and the two Unnest nodes open
+      that list into a row each before the top projection puts the name
+      back among the group keys.
+    load:
+      - requests{job="api", pod="api-1"} 0
+      - errors{job="api", pod="api-1"} 0
+    query: |
+      requests > errors
+    plan: |
+      Projection: labels{__name__: __pairs__.name, job: __group__job, pod: __group__pod}, __pairs__.samples, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+        Unnest: lists[] structs[__pairs__]
+          Unnest: lists[__pairs__|depth=1] structs[]
+            Aggregate: groupBy=[[labels.job AS __group__job, labels.pod AS __group__pod]], aggr=[[promql_binary(samples, __rhs, labels, Utf8(">"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+              Union
+                Projection: binary_0.labels{__name__, job, pod} AS labels, binary_0.samples, Boolean(false) AS __rhs
+                  SubqueryAlias: binary_0
+                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
+                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        TableScan: selector_0 requests
+                Projection: binary_1.labels{__name__, job, pod} AS labels, binary_1.samples, Boolean(true) AS __rhs
+                  SubqueryAlias: binary_1
+                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
+                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        TableScan: selector_1 errors
+
+  - name: two vectors matched one to one
+    description: >
+      Both sides widened to one label schema, unioned, and grouped by
+      the match signature — which for default matching is the result's
+      own label set. A label only one side carries is read as the empty
+      string on the other, which is how the shape spells absent.
+    load:
+      - requests{job="api", pod="api-1"} 0
+      - errors{job="api", zone="eu"} 0
+    query: |
+      requests / errors
+    plan: |
+      Projection: labels{job: __group__job, pod: __group__pod, zone: __group__zone}, __pairs__.samples, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+        Unnest: lists[] structs[__pairs__]
+          Unnest: lists[__pairs__|depth=1] structs[]
+            Aggregate: groupBy=[[labels.job AS __group__job, labels.pod AS __group__pod, labels.zone AS __group__zone]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("/"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+              Union
+                Projection: binary_0.labels{__name__, job, pod, zone: Utf8("")} AS labels, binary_0.samples, Boolean(false) AS __rhs
+                  SubqueryAlias: binary_0
+                    Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
+                      Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        TableScan: selector_0 requests
+                Projection: binary_1.labels{__name__, job, pod: Utf8(""), zone} AS labels, binary_1.samples, Boolean(true) AS __rhs
+                  SubqueryAlias: binary_1
+                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
+                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        TableScan: selector_1 errors
+
+  - name: a filtering comparison as an operand
+    description: >
+      The inner comparison keeps every label, __name__ included, and
+      still rebuilds the struct rather than passing the column through.
+      A passed-through column keeps the qualifier of the stage below
+      it, so this branch of the union would answer with binary_0.labels
+      where the other answers with labels, and the union would be
+      ambiguous. The promql_labels call that copies every field across
+      is what makes the name plain again.
+    load:
+      - requests{job="api", pod="api-1"} 0
+      - errors{job="api", pod="api-1"} 0
+    query: |
+      (requests > 100) + errors
+    plan: |
+      Projection: labels{job: __group__job, pod: __group__pod}, __pairs__.samples, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+        Unnest: lists[] structs[__pairs__]
+          Unnest: lists[__pairs__|depth=1] structs[]
+            Aggregate: groupBy=[[labels.job AS __group__job, labels.pod AS __group__pod]], aggr=[[promql_binary(samples, __rhs, labels, Utf8("+"), Int64(600000), Int64(1200000), Int64(30000)) AS __pairs__]]
+              Union
+                Projection: binary_1.labels{__name__, job, pod} AS labels, binary_1.samples, Boolean(false) AS __rhs
+                  SubqueryAlias: binary_1
+                    Projection: binary_0.labels{__name__, job, pod}, promql_elementwise(binary_0.samples, Utf8(">"), Float64(100), Float64(NULL))
+                      SubqueryAlias: binary_0
+                        Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end
+                          Aggregate: vector_selector(selector_0.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                            TableScan: selector_0 requests
+                Projection: binary_2.labels{__name__, job, pod} AS labels, binary_2.samples, Boolean(true) AS __rhs
+                  SubqueryAlias: binary_2
+                    Projection: selector_1.labels, samples, selector_1.block_start, selector_1.block_end
+                      Aggregate: vector_selector(selector_1.samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                        TableScan: selector_1 errors

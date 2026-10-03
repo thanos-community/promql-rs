@@ -121,18 +121,28 @@ impl Op {
 pub const MAX_STEPS: usize = 1_000_000;
 
 /// The query's step grid, which is what makes a timestamp an index.
+///
+/// `name` is the operator the messages speak for: two functions walk the
+/// same grid, and a complaint about a sample has to name the one the
+/// user's query reached.
 #[derive(Debug, Clone, Copy)]
-struct Grid {
+pub(crate) struct Grid {
+    name: &'static str,
     start_ms: i64,
     step_ms: i64,
     len: usize,
 }
 
 impl Grid {
-    fn new(start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
+    pub(crate) fn new(
+        name: &'static str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> Result<Self> {
         if step_ms <= 0 {
             return Err(DataFusionError::Execution(format!(
-                "{NAME}: step must be positive, got {step_ms}ms"
+                "{name}: step must be positive, got {step_ms}ms"
             )));
         }
         // The planner rejects an oversized grid too; again here because
@@ -140,17 +150,22 @@ impl Grid {
         let count = step_count(start_ms, end_ms, step_ms);
         if count > MAX_STEPS as i128 {
             return Err(DataFusionError::Execution(format!(
-                "{NAME}: {start_ms}..{end_ms} every {step_ms}ms is {count} steps, more than the {MAX_STEPS} this engine allows"
+                "{name}: {start_ms}..{end_ms} every {step_ms}ms is {count} steps, more than the {MAX_STEPS} this engine allows"
             )));
         }
         Ok(Self {
+            name,
             start_ms,
             step_ms,
             len: count as usize,
         })
     }
 
-    fn timestamp(&self, index: usize) -> i64 {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn timestamp(&self, index: usize) -> i64 {
         self.start_ms + index as i64 * self.step_ms
     }
 
@@ -159,7 +174,8 @@ impl Grid {
         // below the grid start to wrap `i64` is off the grid, not a panic.
         let off_grid = || {
             DataFusionError::Execution(format!(
-                "{NAME}: sample at {ts}ms is not on the step grid {}..{} every {}ms",
+                "{}: sample at {ts}ms is not on the step grid {}..{} every {}ms",
+                self.name,
                 self.start_ms,
                 self.timestamp(self.len.saturating_sub(1)),
                 self.step_ms
@@ -186,7 +202,11 @@ impl Grid {
     /// Ascending order is the store's obligation, but both callers are
     /// reachable from SQL over any list column, so a breach has to be an
     /// error rather than a run written at the wrong step.
-    fn runs(&self, timestamps: &[i64], mut run: impl FnMut(usize, usize, usize)) -> Result<()> {
+    pub(crate) fn runs(
+        &self,
+        timestamps: &[i64],
+        mut run: impl FnMut(usize, usize, usize),
+    ) -> Result<()> {
         if timestamps.is_empty() {
             return Ok(());
         }
@@ -198,7 +218,8 @@ impl Grid {
             }
             if timestamps[k] <= timestamps[k - 1] {
                 return Err(DataFusionError::Execution(format!(
-                    "{NAME}: samples must be in ascending timestamp order, got {}ms after {}ms",
+                    "{}: samples must be in ascending timestamp order, got {}ms after {}ms",
+                    self.name,
                     timestamps[k],
                     timestamps[k - 1]
                 )));
@@ -518,7 +539,7 @@ impl Grouped {
     pub fn new(op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> Result<Self> {
         Ok(Self {
             op,
-            grid: Grid::new(start_ms, end_ms, step_ms)?,
+            grid: Grid::new(NAME, start_ms, end_ms, step_ms)?,
             groups: 0,
             seen: BooleanBufferBuilder::new(0),
             lanes: Lanes::new(op),
