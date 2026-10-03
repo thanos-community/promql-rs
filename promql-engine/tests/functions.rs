@@ -240,6 +240,19 @@ fn vector_of_a_scalar_is_one_unlabelled_series() {
     assert_eq!(vector("abs(vector(-3))")[0].1, 3.0);
 }
 
+/// A scalar at the top of the query comes back as the one unlabelled
+/// series `vector()` would make of it, which is how upstream's
+/// evaluator carries one too; the expression's type, not the result,
+/// says it is a scalar.
+#[test]
+fn a_scalar_returning_call_is_one_unlabelled_series() {
+    let got = vector("time()");
+    assert_eq!(got.len(), 1);
+    assert!(got[0].0.is_empty());
+    assert_eq!(got[0].1, 150.0);
+    assert_eq!(vector("pi()")[0].1, std::f64::consts::PI);
+}
+
 /// Upstream evaluates a scalar argument per step; this engine folds it
 /// while planning, so one that moves is named rather than guessed at.
 /// A one-step query has nothing that can move — this is the range path.

@@ -573,6 +573,18 @@ impl Planner<'_> {
                 label_names: Vec::new(),
             });
         }
+        // `time()` and `pi()` are a value per step and nothing else, the
+        // table `scalar_series` builds, which the result then reads as a
+        // scalar. `scalar(v)` is typed the same and is not that: it reads
+        // a vector, and the fold names it as the gap it is.
+        let returns_scalar =
+            crate::function::signature(name).is_some_and(|s| s.return_type == ValueType::Scalar);
+        if returns_scalar {
+            return Ok(Planned {
+                plan: self.scalar_series(|ts| scalar::call(call, ts))?,
+                label_names: Vec::new(),
+            });
+        }
         if let Some(func) = elementwise::Func::parse(name) {
             return self.elementwise(call, func).await;
         }
@@ -1308,6 +1320,20 @@ mod tests {
 
     /// `year()` has no series to read, so no store is asked: the
     /// evaluation time comes from the grid the planner already holds.
+    /// `time()` at the top of a query is the scalar table and nothing
+    /// else; `scalar(up)` is typed the same and is still the gap it was.
+    #[tokio::test]
+    async fn a_scalar_returning_call_is_the_scalar_table() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        assert!(hints_of("time()", range).await.is_empty());
+        assert!(hints_of("pi()", range).await.is_empty());
+        let err = plan_of("scalar(up)", range).await.unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn a_date_function_without_a_vector_asks_no_store() {
         let range = RangeQuery::new(0, 60_000, 30_000);

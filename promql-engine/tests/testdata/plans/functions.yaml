@@ -52,6 +52,19 @@ tests:
     plan: |
       TableScan: scalar_0
 
+  - name: time at the top of the query
+    description: >
+      A scalar-returning call is a value per step and nothing else, so
+      it is the scalar table itself, with no function node over it; the
+      caller reads the one unlabelled series as a scalar by the
+      expression's type.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      time()
+    plan: |
+      TableScan: scalar_0
+
   - name: a date function over a selector
     description: >
       dateWrapper is simpleFloatFunc's shape with a calendar for the
