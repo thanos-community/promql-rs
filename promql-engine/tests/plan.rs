@@ -19,11 +19,12 @@
 //! Each file is named after the promqltest file in
 //! `promql-conformance/testdata/prometheus/` whose topic it covers, so a
 //! shape sits next to the evaluations that check its numbers. A file is
-//! self-contained like a `.test` file: its `defaults` are the one query
-//! range all its cases plan with, so the literals in a plan never differ
-//! within a file. Each file is its own `#[test]`, named after it, and a
-//! file missing from the list at the bottom fails the suite rather than
-//! never running.
+//! self-contained like a `.test` file: its `defaults` are the query range
+//! its cases plan with, so the literals in a plan never differ within a
+//! file unless a case sets a `range` of its own, for a shape that only
+//! exists at other bounds. Each file is its own `#[test]`, named after
+//! it, and a file missing from the list at the bottom fails the suite
+//! rather than never running.
 //!
 //! # Adding a case
 //!
@@ -59,7 +60,8 @@
 //!
 //! # Conventions borrowed
 //!
-//! The file layout — `defaults` holding the query range, `tests` holding
+//! The file layout — `defaults` holding the query range, which a case
+//! may override with a `range` of its own, `tests` holding
 //! `name`/`description`/`load`/`query` — is the shared engine test-case
 //! format that `promql-testcases` binds (thanos-io/promql-engine's
 //! `testcases/range_queries.yaml`), read with the same `serde_norway`,
@@ -113,12 +115,12 @@ fn nz64(n: u64) -> NonZeroU64 {
 
 #[derive(Debug, Deserialize)]
 struct Suite {
-    defaults: Defaults,
+    defaults: Bounds,
     tests: Vec<Case>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Defaults {
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct Bounds {
     start_ms: i64,
     end_ms: i64,
     step_ms: i64,
@@ -143,6 +145,10 @@ struct Case {
     blocks_ms: Option<u64>,
     /// [`MemorySeriesSource::partitions`].
     partitions: Option<usize>,
+    /// The default bounds, unless the shape only exists at other ones:
+    /// the ordering functions plan a `Sort` over an instant query and
+    /// nothing at all over a range.
+    range: Option<Bounds>,
 }
 
 fn plans_dir() -> PathBuf {
@@ -150,7 +156,9 @@ fn plans_dir() -> PathBuf {
 }
 
 /// The logical plan's text, and the physical plan's when `case` pins one.
-fn plan_of(case: &Case, range: &RangeQuery) -> (String, Option<String>) {
+fn plan_of(case: &Case, defaults: Bounds) -> (String, Option<String>) {
+    let b = case.range.unwrap_or(defaults);
+    let range = &RangeQuery::new(b.start_ms, b.end_ms, b.step_ms);
     let series: Vec<_> = case
         .load
         .iter()
@@ -221,18 +229,12 @@ fn check_plan_file(topic: &str) {
     let suite: Suite = serde_norway::from_str(&body).expect("the plans file parses");
     assert!(!suite.tests.is_empty(), "{} has no cases", path.display());
 
-    let range = RangeQuery::new(
-        suite.defaults.start_ms,
-        suite.defaults.end_ms,
-        suite.defaults.step_ms,
-    );
-
     // Every case is reported, not just the first: one planner change
     // usually moves several shapes, and seeing all of them is what makes
     // the update a single reviewable edit.
     let mut failures = Vec::new();
     for case in &suite.tests {
-        let (logical, physical) = plan_of(case, &range);
+        let (logical, physical) = plan_of(case, suite.defaults);
         let pairs = [
             ("plan", Some(case.plan.as_str()), Some(logical)),
             ("physical", case.physical.as_deref(), physical),

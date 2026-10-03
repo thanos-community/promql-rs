@@ -45,7 +45,7 @@ use crate::labelset;
 pub use crate::plan::RangeQuery;
 use crate::series::{self, LABELS};
 use crate::source::{SeriesSetExec, SeriesSource};
-use crate::{aggregate, binary, elementwise, labels, range, selector};
+use crate::{aggregate, binary, elementwise, labels, range, selector, sort};
 
 pub struct Engine {
     ctx: SessionContext,
@@ -96,6 +96,9 @@ impl Engine {
         ctx.register_udaf(range::udaf());
         ctx.register_udf(elementwise::udf());
         ctx.register_udaf(binary::udaf());
+        ctx.register_udf(sort::Value::udf());
+        ctx.register_udf(sort::Natural::udf());
+        ctx.register_udf(sort::Set::udf());
         Self { ctx, rt: None }
     }
 
@@ -141,6 +144,10 @@ impl Engine {
         range: &RangeQuery,
     ) -> Result<Arc<dyn ExecutionPlan>, EngineError> {
         let plan = self.plan_async(source, query, range).await?;
+        self.lower(plan).await
+    }
+
+    async fn lower(&self, plan: LogicalPlan) -> Result<Arc<dyn ExecutionPlan>, EngineError> {
         let exec = self
             .ctx
             .execute_logical_plan(plan)
@@ -153,7 +160,7 @@ impl Engine {
 
     /// Evaluate a range query. Batches are in the canonical schema
     /// ([`crate::series`]) with empty series already dropped, series in
-    /// Prometheus's label-set order; call
+    /// Prometheus's label-set order unless an ordering function set it; call
     /// [`series::decode`] to get [`Series`](crate::Series) instead.
     ///
     /// Must run on a Tokio runtime, see [`Self::plan_async`]. A single-partition
@@ -164,7 +171,12 @@ impl Engine {
         query: &str,
         range: &RangeQuery,
     ) -> Result<Vec<RecordBatch>, EngineError> {
-        let exec = self.physical_plan_async(source, query, range).await?;
+        let plan = self.plan_async(source, query, range).await?;
+        // Only sort, sort_desc and sort_by_label plan a Sort, and only at
+        // the root of an instant query: their order is the result, and
+        // Prometheus orders by label set only a matrix.
+        let ordered = matches!(plan, LogicalPlan::Sort(_));
+        let exec = self.lower(plan).await?;
         let batches = physical_plan::collect(exec, self.ctx.task_ctx())
             .await
             .map_err(lift)?;
@@ -184,6 +196,9 @@ impl Engine {
             })
             .collect::<Result<_, EngineError>>()?;
         labelset::reject_same_labelset(&batches)?;
+        if ordered {
+            return Ok(batches);
+        }
         labelset::sort_by_labelset(&batches)
     }
 
