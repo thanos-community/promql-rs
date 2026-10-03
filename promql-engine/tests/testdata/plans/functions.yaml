@@ -161,3 +161,24 @@ tests:
           Projection: labels{city}
             Aggregate: present_over_time(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: temperature{city="oslo"}
+
+  - name: sort over absent
+    description: >
+      The Sort sits on the row absent made, whose labels are literals and
+      whose samples are the kernel's: the value key reads the same column
+      it reads on a selected row.
+    range:
+      start_ms: 1200000
+      end_ms: 1200000
+      step_ms: 30000
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      sort(absent(temperature{city="oslo"}))
+    plan: |
+      Sort: isnan(get_field(array_element(samples, Int64(-1)), Utf8("value"))) ASC NULLS LAST, array_element(samples, Int64(-1)).value ASC NULLS LAST
+        Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+          Aggregate: absent(samples, 1200000..1200000 step 30s) over the whole range
+            Projection: labels, samples, block_start, block_end
+              Aggregate: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
+                TableScan: temperature{city="oslo"}

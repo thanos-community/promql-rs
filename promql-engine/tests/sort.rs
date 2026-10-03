@@ -173,3 +173,22 @@ fn the_argument_list_is_checked() {
         );
     }
 }
+
+/// The one row `absent` makes is a synthetic series under labels the
+/// planner derived, so the sort keys have to find a value in it and a
+/// label field on it like on any selected row. A label it does not
+/// carry is `""` for the key, as for any other input.
+#[test]
+fn the_absent_row_sorts_like_any_other() {
+    for query in [
+        r#"sort(absent(x{i="z"}))"#,
+        r#"sort_desc(absent(x{i="z"}))"#,
+        r#"sort_by_label(absent(x{i="z"}), "i")"#,
+        r#"sort_by_label_desc(absent(x{i="z"}), "job")"#,
+    ] {
+        assert_eq!(order(&VALUES, query, &["i"], INSTANT), ["z=1"], "{query}");
+    }
+    for query in ["sort(absent(x))", "absent(sort(x))"] {
+        assert!(order(&VALUES, query, &["i"], INSTANT).is_empty(), "{query}");
+    }
+}
