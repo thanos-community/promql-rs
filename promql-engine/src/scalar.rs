@@ -50,8 +50,7 @@ pub fn fold(expr: &Expr, ts_ms: i64) -> Result<f64, EngineError> {
             // answering the time.
             crate::function::check_call(c)?;
             match c.func.name.as_str() {
-                // Upstream's `funcTime`: the step in seconds, as a float.
-                "time" => Ok(ts_ms as f64 / 1000.0),
+                "time" => Ok(time(ts_ms)),
                 "pi" => Ok(std::f64::consts::PI),
                 name => Err(EngineError::Unsupported(format!("the {name} function"))),
             }
@@ -60,6 +59,11 @@ pub fn fold(expr: &Expr, ts_ms: i64) -> Result<f64, EngineError> {
         // the query's own step and range, which this fold does not see.
         other => Err(EngineError::Unsupported(describe(other))),
     }
+}
+
+/// Upstream's `funcTime`: the step in seconds, as a float.
+pub(crate) fn time(ts_ms: i64) -> f64 {
+    ts_ms as f64 / 1000.0
 }
 
 /// Upstream's `scalarBinop`, which is [`crate::binary::Op`] with the

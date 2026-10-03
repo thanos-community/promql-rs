@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **559 of 2098 evals pass** (26.6%), and **465** are blocked on the features below.
+Against the vendored corpus: **582 of 2098 evals pass** (27.7%), and **442** are blocked on the features below.
 
 ## Missing features
 
@@ -31,24 +31,16 @@ Against the vendored corpus: **559 of 2098 evals pass** (26.6%), and **465** are
 | 7 | the label_join function |
 | 6 | the quantile aggregation |
 | 5 | a string literal |
-| 4 | the day_of_year function |
-| 4 | the month function |
 | 4 | the stddev_over_time function |
-| 4 | the year function |
 | 3 | the bottomk aggregation |
 | 3 | the deriv function |
-| 3 | the minute function |
 | 3 | the stdvar_over_time function |
 | 3 | the ts_of_first_over_time function |
 | 2 | a range selector |
-| 2 | the day_of_month function |
-| 2 | the day_of_week function |
-| 2 | the days_in_month function |
 | 2 | the double_exponential_smoothing function |
 | 2 | the first_over_time function |
 | 2 | the histogram_count function |
 | 2 | the histogram_sum function |
-| 2 | the hour function |
 | 2 | the mad_over_time function |
 | 2 | the time function |
 | 2 | the ts_of_last_over_time function |
@@ -76,10 +68,10 @@ Against the vendored corpus: **559 of 2098 evals pass** (26.6%), and **465** are
 | operators | 213 | 105 (49%) |  |
 | aggregators | 160 | 77 (48%) |  |
 | selectors | 31 | 13 (42%) |  |
-| functions | 413 | 151 (37%) |  |
+| functions | 413 | 173 (42%) |  |
 | type_and_unit | 58 | 20 (34%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
-| at_modifier | 71 | 20 (28%) |  |
+| at_modifier | 71 | 21 (30%) |  |
 | literals | 25 | 7 (28%) |  |
 | duration_expression | 59 | 8 (14%) |  |
 | subquery | 34 | 2 (6%) |  |
