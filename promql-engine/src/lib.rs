@@ -29,6 +29,7 @@
 //! consumer that patches DataFusion to a fork, and every `RecordBatch` a
 //! store hands over would then be a type mismatch.
 
+pub mod absent;
 pub mod aggregate; // benches/kernels.rs
 pub mod binary; // benches/kernels.rs
 mod buffer;
