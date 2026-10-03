@@ -85,18 +85,54 @@ fn millis(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).expect("duration exceeds i64 millis")
 }
 
-pub async fn plan(
-    state: &dyn Session,
-    source: &dyn SeriesSource,
-    expr: &Expr,
-    query: &RangeQuery,
-) -> Result<LogicalPlan, EngineError> {
+/// Checks the caller's range and returns it with the lookback resolved.
+///
+/// The bound on `start_ms`, `end_ms` and `lookback_ms` is what keeps the
+/// kernels' `step - offset_ms - window_ms` (`selector.rs`, `buffer.rs`,
+/// `range.rs`) and `select_range` inside an `i64`: a step lies in
+/// `[start, end]` or is the `@` time, and each of the three terms is at most
+/// `MAX_TIME_MS`, so the sum stays below `3 * MAX_TIME_MS < i64::MAX`. The
+/// per-selector `@`, offset and range checks use the same bound, so the
+/// terms compose. The kernels saturate or wrap rather than fail, which
+/// would turn an out-of-range query into an empty result.
+fn validate(query: &RangeQuery) -> Result<RangeQuery, EngineError> {
     if query.step_ms <= 0 {
         return Err(EngineError::Query(format!(
             "step must be positive, got {}ms",
             query.step_ms
         )));
     }
+    // Without this the failure surfaces as a store ordering error, which
+    // blames the store for the caller's mistake.
+    if query.start_ms > query.end_ms {
+        return Err(EngineError::Query(format!(
+            "end {}ms is before start {}ms",
+            query.end_ms, query.start_ms
+        )));
+    }
+    check_time_bound("the start", query.start_ms)?;
+    check_time_bound("the end", query.end_ms)?;
+    let mut query = *query;
+    // Ports `Engine.NewRangeQuery` (`engine.go`): `lookbackDelta <= 0`
+    // takes the engine's value, which is 5m unless configured (`NewEngine`
+    // replaces 0 with `defaultLookbackDelta`). Zero would otherwise
+    // give every selector an empty window and no rows.
+    if query.lookback_ms <= 0 {
+        query.lookback_ms = millis(RangeQuery::DEFAULT_LOOKBACK);
+    }
+    check_time_bound("the lookback", query.lookback_ms)?;
+    Ok(query)
+}
+
+pub async fn plan(
+    state: &dyn Session,
+    source: &dyn SeriesSource,
+    expr: &Expr,
+    query: &RangeQuery,
+) -> Result<LogicalPlan, EngineError> {
+    // Every query comes through here, so this covers a `RangeQuery` built
+    // as a struct literal as well as through `new`.
+    let query = &validate(query)?;
     // `aggregate::Grid` checks the same constant; this half exists so
     // the user gets a query error naming the limit.
     let steps = step_count(query.start_ms, query.end_ms, query.step_ms);
