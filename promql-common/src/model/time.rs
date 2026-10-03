@@ -285,6 +285,16 @@ impl Duration {
     }
 }
 
+/// Float seconds as the milliseconds the engine plans with, rounded as
+/// `(secs * 1000.0).round()`. `None` for NaN, ±Inf and a result outside
+/// `i64`: `as i64` would saturate those or map NaN to 0, which turns a
+/// bad `@`, offset or range into a plausible timestamp.
+pub fn secs_to_millis(secs: f64) -> Option<i64> {
+    let ms = (secs * 1000.0).round();
+    // `i64::MAX as f64` is 2^63, itself out of range, hence `<`.
+    (ms >= i64::MIN as f64 && ms < i64::MAX as f64).then_some(ms as i64)
+}
+
 impl FromStr for Duration {
     type Err = ParseDurationError;
 
@@ -717,5 +727,21 @@ mod tests {
         // Beyond Go's i64-nanosecond range: `TimeDelta::MAX` is bounded
         // by `i64::MAX` *milliseconds*, far past `i64::MAX` nanoseconds.
         assert!(Duration::try_from(TimeDelta::MAX).is_err());
+    }
+
+    #[test]
+    fn secs_to_millis_rejects_what_as_i64_would_clamp() {
+        assert_eq!(secs_to_millis(1.0015), Some(1002));
+        assert_eq!(secs_to_millis(-1.5), Some(-1500));
+        for v in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e300,
+            -1e300,
+            1e16,
+        ] {
+            assert_eq!(secs_to_millis(v), None, "{v}");
+        }
     }
 }
