@@ -3,9 +3,9 @@
 //!
 //! These are the functions that look at one sample at a time and change
 //! nothing else: same series, same timestamps, a new value. Upstream
-//! writes them through `simpleFloatFunc`, `clamp` and `funcRound`
-//! (`promql/functions.go` at 83962c35), each mapping one `Sample` to one
-//! `Sample` with `DropName: true`.
+//! writes them through `simpleFloatFunc`, `clamp`, `funcRound` and
+//! `dateWrapper` (`promql/functions.go` at 83962c35), each mapping one
+//! `Sample` to one `Sample` with `DropName: true`.
 //!
 //! So the kernel here rebuilds only the value array and hands back the
 //! timestamps, offsets and validity it was given: the shape of the input
@@ -82,6 +82,14 @@ pub enum Func {
     Atanh,
     Deg,
     Rad,
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    DaysInMonth,
+    Hour,
+    Minute,
+    Month,
+    Year,
 }
 
 impl Func {
@@ -114,6 +122,14 @@ impl Func {
             "atanh" => Func::Atanh,
             "deg" => Func::Deg,
             "rad" => Func::Rad,
+            "day_of_month" => Func::DayOfMonth,
+            "day_of_week" => Func::DayOfWeek,
+            "day_of_year" => Func::DayOfYear,
+            "days_in_month" => Func::DaysInMonth,
+            "hour" => Func::Hour,
+            "minute" => Func::Minute,
+            "month" => Func::Month,
+            "year" => Func::Year,
             // Last, and reachable only from a plan's own literal: an
             // operator's spelling is never a function name, so no call
             // can land here.
@@ -154,6 +170,14 @@ impl Func {
             Func::Atanh => "atanh",
             Func::Deg => "deg",
             Func::Rad => "rad",
+            Func::DayOfMonth => "day_of_month",
+            Func::DayOfWeek => "day_of_week",
+            Func::DayOfYear => "day_of_year",
+            Func::DaysInMonth => "days_in_month",
+            Func::Hour => "hour",
+            Func::Minute => "minute",
+            Func::Month => "month",
+            Func::Year => "year",
         }
     }
 
@@ -237,9 +261,91 @@ impl Func {
             Func::Atanh => f64::atanh,
             Func::Deg => |v| v * 180.0 / std::f64::consts::PI,
             Func::Rad => |v| v * std::f64::consts::PI / 180.0,
+            Func::DayOfMonth => |v| f64::from(Civil::of(v).day),
+            Func::DayOfWeek => |v| f64::from(Civil::of(v).weekday),
+            Func::DayOfYear => |v| f64::from(Civil::of(v).year_day()),
+            Func::DaysInMonth => |v| f64::from(Civil::of(v).days_in_month()),
+            Func::Hour => |v| f64::from(Civil::of(v).hour),
+            Func::Minute => |v| f64::from(Civil::of(v).minute),
+            Func::Month => |v| f64::from(Civil::of(v).month),
+            Func::Year => |v| Civil::of(v).year as f64,
             Func::Binary { .. } | Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
                 unreachable!("{} takes its arguments through bind", self.as_str())
             }
+        }
+    }
+}
+
+/// `dateWrapper`'s `time.Unix(int64(v), 0).UTC()`, broken into the fields
+/// its eight callers read. Proleptic Gregorian in UTC, as Go's `time` is;
+/// the calendar arithmetic is Howard Hinnant's `civil_from_days`, which
+/// Go's `absDate` is a rearrangement of.
+///
+/// Go's `int64(v)` truncates toward zero, as `as i64` does. For a NaN, an
+/// infinity or a value past `i64`, Go's answer is whatever the CPU's
+/// conversion gives (`math.MinInt64` on amd64), where `as` saturates; no
+/// query in the corpus observes the difference and nothing here pins it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Civil {
+    year: i64,
+    month: u8,
+    day: u8,
+    /// Sunday is 0, as `time.Weekday` counts.
+    weekday: u8,
+    hour: u8,
+    minute: u8,
+}
+
+impl Civil {
+    fn of(v: f64) -> Civil {
+        const DAY: i64 = 86_400;
+        let secs = v as i64;
+        let days = secs.div_euclid(DAY);
+        let of_day = secs.rem_euclid(DAY);
+
+        // Days since 1970-01-01, shifted to count from 0000-03-01 so a
+        // leap day is the last day of the year and the eras of 400 years
+        // line up on the shift.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+        let year = yoe + era * 400 + i64::from(month <= 2);
+
+        Civil {
+            year,
+            month,
+            day,
+            // 1970-01-01 was a Thursday.
+            weekday: (days + 4).rem_euclid(7) as u8,
+            hour: (of_day / 3600) as u8,
+            minute: (of_day % 3600 / 60) as u8,
+        }
+    }
+
+    fn is_leap_year(&self) -> bool {
+        self.year % 4 == 0 && (self.year % 100 != 0 || self.year % 400 == 0)
+    }
+
+    /// `time.Time.YearDay`, 1-based.
+    fn year_day(&self) -> u16 {
+        const BEFORE_MONTH: [u16; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        let leap = u16::from(self.is_leap_year() && self.month > 2);
+        BEFORE_MONTH[usize::from(self.month - 1)] + leap + u16::from(self.day)
+    }
+
+    /// `funcDaysInMonth`'s `32 - time.Date(y, m, 32, …).Day()`: the
+    /// overflow Go lets `time.Date` normalise is the month's length.
+    fn days_in_month(&self) -> u8 {
+        match self.month {
+            2 if self.is_leap_year() => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
         }
     }
 }
@@ -630,6 +736,61 @@ mod tests {
         // A to_nearest of zero is an infinite inverse: upstream answers
         // NaN rather than refusing the call.
         assert!(round(1.0, Some(0.0)).is_nan());
+    }
+
+    /// The corpus's `functions.test` dates, each a Go `time` edge: the
+    /// leap second's two sides, a February 29th and the March 1st after
+    /// it, the 366th day, and a Monday against `time.Weekday`'s Sunday.
+    #[test]
+    fn the_date_functions_read_gos_utc_calendar() {
+        let at = |name: &str, secs: f64| value(name, secs);
+        // 2006-01-02 22:04:05 UTC, a Monday.
+        assert_eq!(at("year", 1_136_239_445.0), 2006.0);
+        assert_eq!(at("month", 1_136_239_445.0), 1.0);
+        assert_eq!(at("day_of_month", 1_136_239_445.0), 2.0);
+        assert_eq!(at("day_of_year", 1_136_239_445.0), 2.0);
+        assert_eq!(at("day_of_week", 1_136_239_445.0), 1.0);
+        assert_eq!(at("hour", 1_136_239_445.0), 22.0);
+        assert_eq!(at("minute", 1_136_239_445.0), 4.0);
+        // The epoch, a Thursday.
+        assert_eq!(at("year", 0.0), 1970.0);
+        assert_eq!(at("day_of_week", 0.0), 4.0);
+        assert_eq!(at("day_of_year", 0.0), 1.0);
+        // 2008-12-31 23:59:59 and 2009-01-01 00:00:00.
+        assert_eq!(at("year", 1_230_767_999.0), 2008.0);
+        assert_eq!(at("year", 1_230_768_000.0), 2009.0);
+        // 2016-02-29 23:59:59 and 2016-03-01 00:00:00.
+        assert_eq!(at("month", 1_456_790_399.0), 2.0);
+        assert_eq!(at("day_of_month", 1_456_790_399.0), 29.0);
+        assert_eq!(at("month", 1_456_790_400.0), 3.0);
+        assert_eq!(at("day_of_month", 1_456_790_400.0), 1.0);
+        // The last day of a leap year and of a common one.
+        assert_eq!(at("day_of_year", 1_483_191_420.0), 366.0);
+        assert_eq!(at("day_of_year", 1_672_493_820.0), 365.0);
+        // February 2016 and February 2017.
+        assert_eq!(at("days_in_month", 1_454_284_800.0), 29.0);
+        assert_eq!(at("days_in_month", 1_485_907_200.0), 28.0);
+        // A 30-day month, and a century year that is not a leap year.
+        assert_eq!(at("days_in_month", 1_491_004_800.0), 30.0);
+        assert_eq!(at("days_in_month", 4_105_123_200.0), 28.0);
+    }
+
+    /// `int64(v)` truncates toward zero: `-9.75` is `-9`, nine seconds
+    /// before the epoch, which is the last day of 1969 and not, as a
+    /// floor would make it, ten seconds before.
+    #[test]
+    fn a_fractional_timestamp_is_truncated_toward_zero() {
+        assert_eq!(value("year", -9.75), 1969.0);
+        assert_eq!(value("month", -9.75), 12.0);
+        assert_eq!(value("day_of_month", -9.75), 31.0);
+        assert_eq!(value("day_of_year", -9.75), 365.0);
+        assert_eq!(value("day_of_week", -9.75), 3.0);
+        assert_eq!(value("hour", -9.75), 23.0);
+        assert_eq!(value("minute", -9.75), 59.0);
+        assert_eq!(value("minute", 119.9), 1.0);
+        // Half a second before the epoch is still the epoch's second.
+        assert_eq!(value("year", -0.5), 1970.0);
+        assert_eq!(value("year", -1.0), 1969.0);
     }
 
     #[test]

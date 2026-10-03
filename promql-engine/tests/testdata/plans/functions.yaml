@@ -52,6 +52,37 @@ tests:
     plan: |
       TableScan: scalar_0
 
+  - name: a date function over a selector
+    description: >
+      dateWrapper is simpleFloatFunc's shape with a calendar for the
+      map, so it takes the elementwise projection abs takes, __name__
+      dropped above the selector.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      day_of_week(temperature)
+    plan: |
+      Projection: labels{city}, promql_elementwise(day_of_week_0.samples, Utf8("day_of_week"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: day_of_week_0
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: temperature
+
+  - name: a date function without a vector
+    description: >
+      With no vector, dateWrapper reads the evaluation time, which the
+      planner hands the same kernel as the vector(time()) table: no
+      store is asked, and the plan says which function ran rather than
+      folding the calendar into the table.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      year()
+    plan: |
+      Projection: labels{}, promql_elementwise(year_1.samples, Utf8("year"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: year_1
+          TableScan: scalar_0
+
   - name: count over time
     description: >
       A counting function takes the same aggregate as rate; only the

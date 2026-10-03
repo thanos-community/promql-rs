@@ -431,16 +431,20 @@ impl Planner<'_> {
     /// 83962c35), the scalar's value with an empty label set.
     ///
     /// Nothing here reads a series, so the values are folded while
-    /// planning ([`crate::scalar`]) and the plan is the table holding
-    /// them: no store is asked, and no kernel runs. The table is
+    /// planning (`value` is [`crate::scalar::fold`] over an expression,
+    /// or a function of the step alone) and the plan is the table
+    /// holding them: no store is asked, and no kernel runs. The table is
     /// numbered because a query can hold more than one of them —
     /// `vector(1) + vector(2)`, once binary operators land — and two
     /// scans of the same name in one plan are one scan.
-    fn scalar_series(&mut self, expr: &Expr) -> Result<LogicalPlan, EngineError> {
+    fn scalar_series(
+        &mut self,
+        value: impl Fn(i64) -> Result<f64, EngineError>,
+    ) -> Result<LogicalPlan, EngineError> {
         let mut timestamps = Vec::new();
         let mut values = Vec::new();
         for ts in grid_of(self.query).steps() {
-            values.push(scalar::fold(expr, ts)?);
+            values.push(value(ts)?);
             timestamps.push(ts);
         }
 
@@ -566,7 +570,7 @@ impl Planner<'_> {
         let name = call.func.name.as_str();
         if name == "vector" {
             return Ok(Planned {
-                plan: self.scalar_series(&call.args[0])?,
+                plan: self.scalar_series(|ts| scalar::fold(&call.args[0], ts))?,
                 label_names: Vec::new(),
             });
         }
@@ -631,20 +635,34 @@ impl Planner<'_> {
         func: elementwise::Func,
     ) -> Result<Planned, EngineError> {
         let mut args = Vec::new();
-        for arg in &call.args[1..] {
+        for arg in call.args.iter().skip(1) {
             args.push(self.constant(arg, &format!("the {} function", func.as_str()))?);
         }
-        // Upstream's `extractFuncFromPath` tells the store the innermost
-        // call it sits under, which for `abs(x)` is this one.
-        let input = self
-            .expr(
-                &call.args[0],
-                Above {
-                    func: Some(func.as_str()),
-                    grouping: None,
-                },
-            )
-            .await?;
+        let input = match call.args.first() {
+            // Upstream's `extractFuncFromPath` tells the store the
+            // innermost call it sits under, which for `abs(x)` is this
+            // one.
+            Some(vector) => {
+                self.expr(
+                    vector,
+                    Above {
+                        func: Some(func.as_str()),
+                        grouping: None,
+                    },
+                )
+                .await?
+            }
+            // `dateWrapper` with no vector reads the evaluation time as
+            // one unlabelled sample, which is what `vector(time())` is;
+            // `time.Unix(enh.Ts/1000, 0)` and `int64(float64(Ts)/1000)`
+            // both truncate toward zero, so the one kernel serves both
+            // forms. Only that family reaches here without a vector:
+            // `check_call` has held every other call to its arity.
+            None => Planned {
+                plan: self.scalar_series(|ts| Ok(scalar::time(ts)))?,
+                label_names: Vec::new(),
+            },
+        };
         let (labels_expr, label_names) = labels::keep(&input.label_names, |n| {
             !func.drops_metric_name() || n != METRIC_NAME
         });
@@ -692,7 +710,7 @@ impl Planner<'_> {
             // Two scalars are a value per step and nothing else, which
             // is the table [`Planner::scalar_series`] already builds.
             _ => Ok(Planned {
-                plan: self.scalar_series(expr)?,
+                plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                 label_names: Vec::new(),
             }),
         }
@@ -1354,6 +1372,17 @@ mod tests {
             .to_string();
         assert!(message.contains("@ modifier timestamp"), "{message}");
         assert!(message.contains(&MAX_TIME_MS.to_string()), "{message}");
+    }
+
+    /// `year()` has no series to read, so no store is asked: the
+    /// evaluation time comes from the grid the planner already holds.
+    #[tokio::test]
+    async fn a_date_function_without_a_vector_asks_no_store() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        assert!(hints_of("year()", range).await.is_empty());
+        let hints = hints_of("year(up)", range).await;
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].func.as_deref(), Some("year"));
     }
 
     #[tokio::test]
