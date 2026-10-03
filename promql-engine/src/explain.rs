@@ -40,7 +40,7 @@ use promql_parser::ast::LabelMatcher;
 
 use crate::matcher::METRIC_NAME;
 use crate::source::SelectorTable;
-use crate::{aggregate, labels, range, selector, series};
+use crate::{absent, aggregate, labels, range, selector, series};
 
 /// Renders `plan` the way `tests/testdata/plans/` pins it. See the module doc
 /// comment for what "readable" means and why it is safe to pin.
@@ -487,8 +487,25 @@ fn render_aggregate_function(f: &AggregateFunction, single_scan: bool) -> Option
         selector::NAME => render_vector_selector(&p.args, single_scan),
         range::NAME => render_range_function(&p.args, single_scan),
         aggregate::NAME => render_aggregate_call(&p.args, single_scan),
+        absent::NAME => render_absent_call(&p.args, single_scan),
         _ => None,
     }
+}
+
+/// `promql_absent(samples, start, end, step)` as
+/// `absent(samples, START..END step STEP)`.
+fn render_absent_call(args: &[Expr], single_scan: bool) -> Option<String> {
+    if args.len() != 4 {
+        return None;
+    }
+    let samples = render_expr(&args[0], single_scan);
+    let start = require_i64(&args[1])?;
+    let end = require_i64(&args[2])?;
+    let step = require_i64(&args[3])?;
+    Some(format!(
+        "absent({samples}, {start}..{end} step {})",
+        Duration::from_millis(step).ok()?
+    ))
 }
 
 /// `promql_aggregate(samples, '<op>', start, end, step)` as
@@ -552,6 +569,17 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
     let p = &f.params;
     if p.distinct || p.filter.is_some() || !p.order_by.is_empty() || p.null_treatment.is_some() {
         return None;
+    }
+
+    // `absent` is the one aggregate with no key at all, the block
+    // included: it has to answer when no row ever arrived, and a block no
+    // series reached is never sent.
+    if f.func.name() == absent::NAME {
+        if !agg.group_expr.is_empty() {
+            return None;
+        }
+        let call = render_absent_call(&p.args, single_scan)?;
+        return Some(format!("Aggregate: {call} over the whole range"));
     }
 
     let [first, second, rest @ ..] = agg.group_expr.as_slice() else {

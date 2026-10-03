@@ -110,3 +110,54 @@ tests:
         Projection: labels, samples, block_start, block_end
           Aggregate: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
             TableScan: http_requests_total
+  - name: absent of a selector
+    description: >
+      The one aggregate with no group key at all, the block included:
+      absent has to answer when no row ever arrived, and a block no series
+      reached is never sent. The labels are literals the planner read off
+      the selector's equality matchers, not fields of any input, and the
+      row is stamped with the whole range as a scalar's is.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      absent(temperature{city="oslo", region=~"eu.*"})
+    plan: |
+      Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+        Aggregate: absent(samples, 600000..1200000 step 30s) over the whole range
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: temperature{city="oslo",region=~"eu.*"}
+
+  - name: absent of an aggregation
+    description: >
+      Anything but a selector has no labels to read, so the struct is
+      empty, and the argument plans as it would anywhere else.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      absent(sum(temperature))
+    plan: |
+      Projection: labels{}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+        Aggregate: absent(samples, 600000..1200000 step 30s) over the whole range
+          Projection: labels{}
+            Aggregate: sum(samples, 600000..1200000 step 30s) per block
+              Projection: labels, samples, block_start, block_end
+                Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                  TableScan: temperature
+
+  - name: absent_over_time of a range selector
+    description: >
+      present_over_time below the same complement: upstream's
+      funcAbsentOverTime is 1 per non-empty window, and the engine then
+      complements the steps. The store is told absent_over_time, the name
+      whose samples it may skip.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      absent_over_time(temperature{city="oslo"}[5m])
+    plan: |
+      Projection: labels{city: Utf8("oslo")}, TimestampMillisecond(-9223372036854775808, None), TimestampMillisecond(9223372036854775807, None)
+        Aggregate: absent(samples, 600000..1200000 step 30s) over the whole range
+          Projection: labels{city}
+            Aggregate: present_over_time(samples[5m], 600000..1200000 step 30s) per series per block
+              TableScan: temperature{city="oslo"}
