@@ -2,4 +2,4 @@
 
 pub mod time;
 
-pub use time::{timestamp_from_float_seconds, Duration, ParseDurationError, TimestampOutOfBounds};
+pub use time::{secs_to_millis, Duration, ParseDurationError};

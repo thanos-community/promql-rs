@@ -267,32 +267,6 @@ impl Duration {
         Duration::try_from(td)
     }
 
-    /// Port of `time.Duration(math.Round(val * float64(time.Second)))`,
-    /// how upstream's `generated_parser.y` turns a number literal in an
-    /// `offset` or a range into a duration (`:578`, `:646`, `:663`).
-    /// `x offset 0.0015` is 1.5ms here, and the engine's
-    /// `durationMilliseconds` then truncates it to 1ms through
-    /// [`Duration::as_millis`]; rounding seconds × 1000 instead would
-    /// make it 2ms.
-    ///
-    /// Go leaves a float outside `int64` implementation-defined (amd64
-    /// gives `MinInt64`, arm64 saturates, and NaN differs again), so there
-    /// is nothing to match: NaN, ±Inf and anything beyond Go's
-    /// ±(1<<63−1)-nanosecond range is [`ParseDurationError::OutOfRange`].
-    pub fn from_secs_f64(val: f64) -> Result<Duration, ParseDurationError> {
-        // `f64::round` rounds half away from zero, as `math.Round` does.
-        let nanos = (val * 1e9).round();
-        if !nanos.is_finite() {
-            return Err(ParseDurationError::OutOfRange);
-        }
-        // Every finite f64 of this magnitude is an integer, so the i128
-        // is exact and the range check below sees the true value rather
-        // than a saturated `as i64`.
-        let nanos = nanos as i128;
-        let nanos = i64::try_from(nanos).map_err(|_| ParseDurationError::OutOfRange)?;
-        Duration::try_from(TimeDelta::nanoseconds(nanos))
-    }
-
     /// Port of `time.Duration.Seconds()`, the unit `promql-parser`'s
     /// grammar needs at its duration-literal and number-literal actions
     /// (upstream's pinned `generated_parser.y:1101,1120` feed
@@ -311,30 +285,14 @@ impl Duration {
     }
 }
 
-/// A timestamp the `@` modifier cannot take.
-#[derive(Debug, Error, PartialEq)]
-#[error("timestamp out of bounds for @ modifier: {0:.6}")]
-pub struct TimestampOutOfBounds(pub f64);
-
-/// Port of `timestamp.FromFloatSeconds` (`model/timestamp` in
-/// prometheus/prometheus, not in prometheus/common) behind the bounds
-/// check of `parser.setTimestamp`: `int64(math.Round(ts * 1000))`.
-/// Unlike a duration this rounds, so `@ 1.0015` is 1002ms.
-///
-/// `setTimestamp` rejects NaN, ±Inf and `ts >= MaxInt64` seconds, but
-/// `ts * 1000` can still leave `int64`, where Go's conversion is
-/// implementation-defined; that is an error here too rather than the
-/// clamped timestamp `as i64` would make of it.
-pub fn timestamp_from_float_seconds(ts: f64) -> Result<i64, TimestampOutOfBounds> {
-    if !ts.is_finite() || ts >= i64::MAX as f64 || ts <= i64::MIN as f64 {
-        return Err(TimestampOutOfBounds(ts));
-    }
-    let ms = (ts * 1000.0).round();
-    // `i64::MAX as f64` is 2^63, which is itself out of range.
-    if ms >= i64::MAX as f64 || ms < i64::MIN as f64 {
-        return Err(TimestampOutOfBounds(ts));
-    }
-    Ok(ms as i64)
+/// Float seconds as the milliseconds the engine plans with, rounded as
+/// `(secs * 1000.0).round()`. `None` for NaN, ±Inf and a result outside
+/// `i64`: `as i64` would saturate those or map NaN to 0, which turns a
+/// bad `@`, offset or range into a plausible timestamp.
+pub fn secs_to_millis(secs: f64) -> Option<i64> {
+    let ms = (secs * 1000.0).round();
+    // `i64::MAX as f64` is 2^63, itself out of range, hence `<`.
+    (ms >= i64::MIN as f64 && ms < i64::MAX as f64).then_some(ms as i64)
 }
 
 impl FromStr for Duration {
@@ -771,93 +729,10 @@ mod tests {
         assert!(Duration::try_from(TimeDelta::MAX).is_err());
     }
 
-    /// `time.Duration(math.Round(v*1e9))` and then
-    /// `durationMilliseconds`' integer division, which truncates toward
-    /// zero for negatives too.
     #[test]
-    fn from_secs_f64_rounds_nanos_then_truncates_millis() {
-        let ms = |v: f64| Duration::from_secs_f64(v).unwrap().as_millis();
-        assert_eq!(ms(0.0015), 1);
-        assert_eq!(ms(-0.0015), -1);
-        assert_eq!(ms(0.001999999), 1);
-        assert_eq!(ms(0.0009994), 0);
-        assert_eq!(ms(-0.0009994), 0);
-        // 999.9999ns of a millisecond rounds up to a whole one first.
-        assert_eq!(ms(0.0009999999), 1);
-        assert_eq!(ms(0.0), 0);
-        assert_eq!(ms(1.0), 1000);
-        assert_eq!(ms(300.0), 300_000);
-        assert_eq!(ms(-3.5), -3500);
-        // Half a nanosecond rounds away from zero before the truncation.
-        assert_eq!(
-            Duration::from_secs_f64(0.0000000005)
-                .unwrap()
-                .as_nanos_i64(),
-            1
-        );
-        assert_eq!(
-            Duration::from_secs_f64(-0.0000000005)
-                .unwrap()
-                .as_nanos_i64(),
-            -1
-        );
-        assert_eq!(
-            Duration::from_secs_f64(0.0000000004)
-                .unwrap()
-                .as_nanos_i64(),
-            0
-        );
-    }
-
-    #[test]
-    fn from_secs_f64_matches_integer_ms_durations() {
-        for raw in ["1ms", "5m", "1h30m", "250ms", "2w"] {
-            let d = Duration::parse(raw).unwrap();
-            assert_eq!(
-                Duration::from_secs_f64(d.as_secs_f64())
-                    .unwrap()
-                    .as_millis(),
-                d.as_millis(),
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn from_secs_f64_rejects_what_go_cannot_hold() {
-        for v in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            1e10,
-            -1e10,
-            9.3e9,
-        ] {
-            assert_eq!(
-                Duration::from_secs_f64(v),
-                Err(ParseDurationError::OutOfRange),
-                "{v}"
-            );
-        }
-        // The largest whole second count that fits int64 nanoseconds.
-        assert!(Duration::from_secs_f64(9_223_372_036.0).is_ok());
-        assert!(Duration::from_secs_f64(-9_223_372_036.0).is_ok());
-    }
-
-    /// `timestamp.FromFloatSeconds` rounds, unlike the duration path.
-    #[test]
-    fn timestamp_rounds_half_away_from_zero() {
-        assert_eq!(timestamp_from_float_seconds(1.0015), Ok(1002));
-        assert_eq!(timestamp_from_float_seconds(-1.0015), Ok(-1002));
-        assert_eq!(timestamp_from_float_seconds(1.0004), Ok(1000));
-        assert_eq!(timestamp_from_float_seconds(0.0), Ok(0));
-        assert_eq!(timestamp_from_float_seconds(1000.0), Ok(1_000_000));
-    }
-
-    /// `setTimestamp`'s check: NaN, ±Inf and `ts >= MaxInt64`, plus the
-    /// `ts * 1000` overflow Go leaves undefined.
-    #[test]
-    fn timestamp_rejects_non_finite_and_out_of_range() {
+    fn secs_to_millis_rejects_what_as_i64_would_clamp() {
+        assert_eq!(secs_to_millis(1.0015), Some(1002));
+        assert_eq!(secs_to_millis(-1.5), Some(-1500));
         for v in [
             f64::NAN,
             f64::INFINITY,
@@ -865,16 +740,8 @@ mod tests {
             1e300,
             -1e300,
             1e16,
-            -1e16,
         ] {
-            assert!(timestamp_from_float_seconds(v).is_err(), "{v}");
+            assert_eq!(secs_to_millis(v), None, "{v}");
         }
-        assert!(timestamp_from_float_seconds(9.0e15).is_ok());
-        assert_eq!(
-            timestamp_from_float_seconds(f64::NAN)
-                .unwrap_err()
-                .to_string(),
-            "timestamp out of bounds for @ modifier: NaN"
-        );
     }
 }

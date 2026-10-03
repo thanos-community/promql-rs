@@ -534,10 +534,10 @@ fn apply_offset(mut e: Expr, offset_secs: f64) -> Expr {
     e
 }
 
-/// `setTimestamp`: NaN, ±Inf and out-of-range seconds are a parse
-/// error, not a clamped timestamp.
+/// NaN, ±Inf and out-of-range seconds are a parse error, not a clamped
+/// timestamp (upstream's `setTimestamp` rejects them too).
 fn apply_at_timestamp(mut e: Expr, secs: f64) -> Result<Expr, ()> {
-    let ts_ms = promql_common::model::timestamp_from_float_seconds(secs).map_err(|_| ())?;
+    let ts_ms = promql_common::model::secs_to_millis(secs).ok_or(())?;
     match &mut e {
         Expr::VectorSelector(vs) => vs.timestamp = Some(ts_ms),
         Expr::MatrixSelector(ms) => {

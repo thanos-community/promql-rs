@@ -593,15 +593,11 @@ fn offset_ms(vs: &VectorSelector) -> Result<i64, EngineError> {
     duration_ms("the offset", vs.original_offset_secs)
 }
 
-/// A range or offset given as float seconds, in milliseconds the way
-/// Prometheus gets there: `time.Duration(math.Round(secs*1e9))` in the
-/// grammar, then `durationMilliseconds`' truncating division. Rounding
-/// `secs * 1000` instead turns `offset 0.0015` into 2ms where Prometheus
-/// has 1ms.
+/// A range or offset given as float seconds. Non-finite or `i64`-sized
+/// input is a query error rather than the clamped value `as i64` gives.
 fn duration_ms(what: &str, secs: f64) -> Result<i64, EngineError> {
-    promql_common::model::Duration::from_secs_f64(secs)
-        .map(|d| d.as_millis())
-        .map_err(|_| EngineError::Query(format!("{what} {secs}s is out of range")))
+    promql_common::model::secs_to_millis(secs)
+        .ok_or_else(|| EngineError::Query(format!("{what} {secs}s is out of range")))
 }
 
 /// The widest `@` timestamp, offset or range this engine will plan.
@@ -805,8 +801,8 @@ mod tests {
     #[tokio::test]
     async fn an_at_modifier_out_of_range_is_a_query_error() {
         let range = RangeQuery::new(0, 60_000, 30_000);
-        // Past `MAX_TIME_MS` but inside what the parser accepts; `1e30`
-        // never gets this far, `setTimestamp` rejects it.
+        // Past `MAX_TIME_MS` but inside `i64` milliseconds, so the parser
+        // accepts it; `1e30` never gets this far.
         let err = plan_of("up @ -4e15", range).await.unwrap_err();
         assert!(matches!(err, EngineError::Query(_)), "{err}");
         assert!(err.to_string().contains("@ modifier"), "{err}");
