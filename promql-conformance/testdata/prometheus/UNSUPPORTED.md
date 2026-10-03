@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **585 of 2098 evals pass** (27.9%), and **439** are blocked on the features below.
+Against the vendored corpus: **598 of 2098 evals pass** (28.5%), and **426** are blocked on the features below.
 
 ## Missing features
 
@@ -25,7 +25,6 @@ Against the vendored corpus: **585 of 2098 evals pass** (27.9%), and **439** are
 | 16 | the topk aggregation |
 | 13 | a scalar literal |
 | 13 | the absent function |
-| 13 | the timestamp function |
 | 9 | the predict_linear function |
 | 9 | the quantile_over_time function |
 | 7 | the label_join function |
@@ -65,11 +64,11 @@ Against the vendored corpus: **585 of 2098 evals pass** (27.9%), and **439** are
 | name_label_dropping | 30 | 16 (53%) |  |
 | operators | 213 | 105 (49%) |  |
 | aggregators | 160 | 77 (48%) |  |
-| functions | 413 | 175 (42%) |  |
+| at_modifier | 71 | 33 (46%) |  |
+| functions | 413 | 176 (43%) |  |
 | selectors | 31 | 13 (42%) |  |
 | type_and_unit | 58 | 20 (34%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
-| at_modifier | 71 | 21 (30%) |  |
 | literals | 25 | 7 (28%) |  |
 | duration_expression | 59 | 8 (14%) |  |
 | subquery | 34 | 2 (6%) |  |

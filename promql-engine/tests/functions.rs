@@ -179,6 +179,31 @@ fn a_date_function_without_a_vector_reads_the_evaluation_time() {
     }
 }
 
+/// Over a bare selector `timestamp` is the picked sample's own time: at
+/// 150s with a 10s offset the sample at 120s is picked, and 120 is the
+/// answer. Through another function the sample is the step's, so the
+/// same selector under `abs` answers 150, as upstream does.
+#[test]
+fn timestamp_is_the_samples_time_over_a_selector_and_the_steps_elsewhere() {
+    for (query, want) in [
+        ("timestamp(temperature)", 150.0),
+        ("timestamp(temperature offset 10s)", 120.0),
+        ("timestamp((temperature offset 10s))", 120.0),
+        ("timestamp(abs(temperature offset 10s))", 150.0),
+        ("timestamp(timestamp(temperature offset 10s))", 150.0),
+    ] {
+        let got = vector(query);
+        assert_eq!(got.len(), 2, "{query}");
+        assert_eq!(got[0].0, vec![("city".to_string(), "lima".to_string())]);
+        assert_eq!(got[0].1, want, "{query}");
+        assert_eq!(got[1].1, want, "{query}");
+    }
+    let got = vector("timestamp(vector(1))");
+    assert_eq!(got.len(), 1);
+    assert!(got[0].0.is_empty());
+    assert_eq!(got[0].1, 150.0);
+}
+
 /// A value a function has nothing to say about is still a sample: the
 /// series stays in the result carrying a NaN, as upstream's
 /// `simpleFloatFunc` leaves it.
@@ -312,7 +337,6 @@ fn a_call_prometheus_would_not_parse_is_a_query_error() {
 fn the_functions_that_are_not_elementwise_are_still_unsupported() {
     for (query, what) in [
         ("scalar(temperature)", "the scalar function"),
-        ("timestamp(temperature)", "the timestamp function"),
         ("absent(temperature)", "the absent function"),
     ] {
         let err = error(query);

@@ -3,9 +3,9 @@
 //!
 //! These are the functions that look at one sample at a time and change
 //! nothing else: same series, same timestamps, a new value. Upstream
-//! writes them through `simpleFloatFunc`, `clamp`, `funcRound` and
-//! `dateWrapper` (`promql/functions.go` at 83962c35), each mapping one
-//! `Sample` to one `Sample` with `DropName: true`.
+//! writes them through `simpleFloatFunc`, `clamp`, `funcRound`,
+//! `dateWrapper` and `funcTimestamp` (`promql/functions.go` at 83962c35),
+//! each mapping one `Sample` to one `Sample` with `DropName: true`.
 //!
 //! So the kernel here rebuilds only the value array and hands back the
 //! timestamps, offsets and validity it was given: the shape of the input
@@ -25,7 +25,9 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer};
 use datafusion::arrow::compute::FilterBuilder;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Float64Type};
+use datafusion::arrow::datatypes::{
+    DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
+};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -90,6 +92,12 @@ pub enum Func {
     Minute,
     Month,
     Year,
+    /// `funcTimestamp` over a vector that is not a bare selector: the
+    /// samples carry the step they were evaluated at, and that is the
+    /// answer. Over a bare selector the sample's own time is wanted
+    /// instead, which only the selector kernel still knows
+    /// ([`crate::selector::Pick`]); the planner sends that shape there.
+    Timestamp,
 }
 
 impl Func {
@@ -130,6 +138,7 @@ impl Func {
             "minute" => Func::Minute,
             "month" => Func::Month,
             "year" => Func::Year,
+            "timestamp" => Func::Timestamp,
             // Last, and reachable only from a plan's own literal: an
             // operator's spelling is never a function name, so no call
             // can land here.
@@ -178,6 +187,7 @@ impl Func {
             Func::Minute => "minute",
             Func::Month => "month",
             Func::Year => "year",
+            Func::Timestamp => "timestamp",
         }
     }
 
@@ -231,6 +241,7 @@ impl Func {
             Func::Clamp => Bound::clamp(a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN))?,
             Func::ClampMin => Bound::clamp(a.unwrap_or(f64::NAN), f64::INFINITY)?,
             Func::ClampMax => Bound::clamp(f64::NEG_INFINITY, a.unwrap_or(f64::NAN))?,
+            Func::Timestamp => Bound::Timestamp,
             other => Bound::Map(other.map_fn()),
         })
     }
@@ -269,7 +280,12 @@ impl Func {
             Func::Minute => |v| f64::from(Civil::of(v).minute),
             Func::Month => |v| f64::from(Civil::of(v).month),
             Func::Year => |v| Civil::of(v).year as f64,
-            Func::Binary { .. } | Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
+            Func::Binary { .. }
+            | Func::Round
+            | Func::Clamp
+            | Func::ClampMin
+            | Func::ClampMax
+            | Func::Timestamp => {
                 unreachable!("{} takes its arguments through bind", self.as_str())
             }
         }
@@ -383,6 +399,9 @@ pub enum Bound {
         min: f64,
         max: f64,
     },
+    /// Reads the timestamp column instead of the value column; see
+    /// [`Func::Timestamp`].
+    Timestamp,
 }
 
 impl Bound {
@@ -410,6 +429,7 @@ impl Bound {
             }
             Bound::Clamp { min, max } => go_max(*min, go_min(*max, v)),
             Bound::Binary { .. } => unreachable!("a binary operator runs over whole lanes"),
+            Bound::Timestamp => unreachable!("timestamp reads the timestamp column, not a value"),
         }
     }
 }
@@ -588,6 +608,13 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
                 Computed::Holds(holds) => return filtered(samples, timestamps, values, &holds),
             }
         }
+        // `float64(el.T) / 1000`: the sample's own time in seconds.
+        Bound::Timestamp => timestamps
+            .as_primitive::<TimestampMillisecondType>()
+            .values()
+            .iter()
+            .map(|t| *t as f64 / 1000.0)
+            .collect(),
         _ => values.values().iter().map(|v| bound.value(*v)).collect(),
     };
     let entries = StructArray::new(
@@ -791,6 +818,15 @@ mod tests {
         // Half a second before the epoch is still the epoch's second.
         assert_eq!(value("year", -0.5), 1970.0);
         assert_eq!(value("year", -1.0), 1969.0);
+    }
+
+    /// `funcTimestamp` answers with the sample's time, in seconds, and
+    /// never looks at its value.
+    #[test]
+    fn timestamp_reads_the_timestamp_column() {
+        let out = apply(&samples(), Func::Timestamp.bind(None, None)).unwrap();
+        assert_eq!(out.offsets(), samples().offsets());
+        assert_eq!(values_of(&out), vec![0.0, 0.001, 0.007]);
     }
 
     #[test]

@@ -96,6 +96,38 @@ tests:
         SubqueryAlias: year_1
           TableScan: scalar_0
 
+  - name: timestamp over a selector
+    description: >
+      The selector itself picks each sample's time, so there is no
+      function node: the pick is the selector's trailing argument, and
+      __name__ is dropped above the grouping as a range function drops it.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      timestamp(temperature)
+    plan: |
+      Projection: labels{city}
+        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block
+          TableScan: temperature
+
+  - name: timestamp over another function
+    description: >
+      Under abs the samples already carry the step, so timestamp is the
+      elementwise projection reading the timestamp column, and the
+      selector below it picks values as usual.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      timestamp(abs(temperature))
+    plan: |
+      Projection: labels{city}, promql_elementwise(timestamp_1.samples, Utf8("timestamp"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: timestamp_1
+          Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
+            SubqueryAlias: abs_0
+              Projection: labels, samples, block_start, block_end
+                Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                  TableScan: temperature
+
   - name: count over time
     description: >
       A counting function takes the same aggregate as rate; only the

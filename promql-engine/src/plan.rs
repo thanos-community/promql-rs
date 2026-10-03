@@ -468,7 +468,7 @@ impl Planner<'_> {
     fn expr<'f>(&'f mut self, expr: &'f Expr, above: Above<'f>) -> Planning<'f> {
         Box::pin(async move {
             match expr {
-                Expr::VectorSelector(vs) => self.selector(vs, above).await,
+                Expr::VectorSelector(vs) => self.selector(vs, above, selector::Pick::Value).await,
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c).await,
@@ -527,10 +527,14 @@ impl Planner<'_> {
         Ok((builder, label_names))
     }
 
+    /// `pick` is the value, except under `timestamp(x)`, where the
+    /// selector itself answers with each sample's time: see
+    /// [`Planner::timestamp`].
     async fn selector(
         &mut self,
         vs: &VectorSelector,
         above: Above<'_>,
+        pick: selector::Pick,
     ) -> Result<Planned, EngineError> {
         let params = Params {
             start_ms: self.query.start_ms,
@@ -545,21 +549,61 @@ impl Planner<'_> {
         let (builder, label_names) = self.scan(vs, hints).await?;
         // Grouped by the block and the whole label set, so every chunk of
         // a label set in a block folds into one group.
-        let plan = builder
-            .aggregate(
-                series_keys(),
-                vec![selector::call(
-                    col(SAMPLES),
-                    col(BLOCK_START),
-                    col(BLOCK_END),
-                    &params,
-                    selector::Pick::Value,
-                )
-                .alias(SAMPLES)],
-            )?
-            .project(canonical(col(LABELS)))?
-            .build()?;
+        let builder = builder.aggregate(
+            series_keys(),
+            vec![selector::call(
+                col(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+                &params,
+                pick,
+            )
+            .alias(SAMPLES)],
+        )?;
+        let (labels_expr, label_names) = match pick {
+            selector::Pick::Value => (col(LABELS), label_names),
+            // `funcTimestamp` emits with `DropName`. Above the grouping,
+            // as the range functions drop it: below, two series differing
+            // only in their name would fold into one group.
+            selector::Pick::Timestamp => {
+                let (expr, names) = labels::keep(&label_names, |n| n != METRIC_NAME);
+                (expr.alias(LABELS), names)
+            }
+        };
+        let plan = builder.project(canonical(labels_expr))?.build()?;
         Ok(Planned { plan, label_names })
+    }
+
+    /// `timestamp(v)`, which upstream evaluates two ways (the `Call` arm
+    /// of `eval`, `promql/engine.go` at 83962c35). Over a bare vector
+    /// selector, parentheses and all,
+    /// `rangeEvalTimestampFunctionOverVectorSelector` reads each picked
+    /// sample's own time. Over anything else the vector's samples carry
+    /// the step they were evaluated at, and `funcTimestamp` reads that;
+    /// `timestamp(abs(x))` is the step, where `timestamp(x)` is not.
+    async fn timestamp(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        let mut arg = &call.args[0];
+        loop {
+            arg = match arg {
+                Expr::Paren(p) => &p.expr,
+                Expr::StepInvariant(e) => e,
+                _ => break,
+            };
+        }
+        match arg {
+            Expr::VectorSelector(vs) => {
+                self.selector(
+                    vs,
+                    Above {
+                        func: Some("timestamp"),
+                        grouping: None,
+                    },
+                    selector::Pick::Timestamp,
+                )
+                .await
+            }
+            _ => self.elementwise(call, elementwise::Func::Timestamp).await,
+        }
     }
 
     /// One function call, sent to the operator its shape calls for.
@@ -588,6 +632,9 @@ impl Planner<'_> {
                 plan: self.scalar_series(|ts| scalar::call(call, ts))?,
                 label_names: Vec::new(),
             });
+        }
+        if name == "timestamp" {
+            return self.timestamp(call).await;
         }
         if let Some(func) = elementwise::Func::parse(name) {
             return self.elementwise(call, func).await;
@@ -1336,6 +1383,21 @@ mod tests {
             matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
             "{err}"
         );
+    }
+
+    /// The store hears `timestamp` only when the selector is what it
+    /// reads; through another function it hears that function, since
+    /// the time then comes from the step and not from the store.
+    #[tokio::test]
+    async fn timestamp_reaches_the_store_only_over_a_bare_selector() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for query in ["timestamp(x)", "timestamp(((x)))"] {
+            let hints = hints_of(query, range).await;
+            assert_eq!(hints.len(), 1, "{query}");
+            assert_eq!(hints[0].func.as_deref(), Some("timestamp"), "{query}");
+        }
+        let hints = hints_of("timestamp(abs(x))", range).await;
+        assert_eq!(hints[0].func.as_deref(), Some("abs"));
     }
 
     #[tokio::test]
