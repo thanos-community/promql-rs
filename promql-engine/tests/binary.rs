@@ -78,13 +78,6 @@ fn vector(query: &str) -> Vec<Row> {
     vector_of(source().as_ref(), query, &at_150s())
 }
 
-fn error(query: &str) -> EngineError {
-    Engine::blocking()
-        .unwrap()
-        .range_query(source().as_ref(), query, &at_150s())
-        .expect_err(query)
-}
-
 fn pod(name: &str) -> Vec<(String, String)> {
     vec![("pod".to_string(), name.to_string())]
 }
@@ -228,9 +221,30 @@ fn named(metric: &str, pod_name: &str) -> Vec<(String, String)> {
 /// and `c`, still called `requests`.
 #[test]
 fn a_filtering_comparison_can_be_an_operand() {
+    let named = |metric: &str, pod_name: &str| {
+        vec![
+            ("__name__".to_string(), metric.to_string()),
+            ("pod".to_string(), pod_name.to_string()),
+        ]
+    };
+
     // Arithmetic on either side: pod `b` is the only one both reach.
     assert_eq!(vector("(requests > 100) + errors"), [(pod("b"), 132.0)]);
     assert_eq!(vector("errors + (requests > 100)"), [(pod("b"), 132.0)]);
+
+    // Set operators, which keep the name the comparison kept.
+    assert_eq!(
+        vector("(requests > 100) or errors"),
+        [
+            (named("errors", "a"), 6.0),
+            (named("requests", "b"), 120.0),
+            (named("requests", "c"), 180.0),
+        ]
+    );
+    assert_eq!(
+        vector("(requests > 100) unless errors"),
+        [(named("requests", "c"), 180.0)]
+    );
 
     // And a function above it, which is the same shape one stage down.
     assert_eq!(
@@ -348,31 +362,415 @@ fn a_kept_name_splits_a_match_group_into_a_series_each() {
     assert_eq!(series[0].values(), [1.0, 1.0]);
 }
 
-/// The operators this commit does not implement are named one by one:
-/// the count per feature is what says which is worth doing next.
+/// Two metrics that agree on `pod` and nothing else, plus a per-pod
+/// one the fan-out modifiers have something to copy from.
+fn zoned() -> MemorySeriesSource {
+    MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"requests{pod="a", path="/x"} 10"#,
+            r#"requests{pod="a", path="/y"} 20"#,
+            r#"requests{pod="b", path="/x"} 30"#,
+            r#"limit{pod="a", zone="eu"} 2"#,
+            r#"limit{pod="b", zone="us"} 3"#,
+        ]),
+        30.0,
+    )
+}
+
+/// The result of `query` over `zoned()` at 0, as label sets with their
+/// value, sorted.
+fn matched(query: &str) -> Vec<Row> {
+    vector_of(&zoned(), query, &RangeQuery::new(0, 0, 30_000))
+}
+
+fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// `on(…)` matches on exactly those labels and the result keeps only
+/// them; `ignoring(…)` matches on everything else and the result keeps
+/// everything the left side had but those.
 #[test]
-fn the_rest_of_the_operators_are_unsupported_by_name() {
-    for (query, feature) in [
-        ("requests and errors", "the and set operator"),
-        ("requests or errors", "the or set operator"),
-        ("requests unless errors", "the unless set operator"),
-        ("requests / on(pod) errors", "the on modifier"),
-        ("requests / ignoring(zone) errors", "the ignoring modifier"),
-        (
-            "requests / on(pod) group_left errors",
-            "the group_left modifier",
+fn on_and_ignoring_decide_the_signature_and_the_result() {
+    // `path` would keep the two `requests` series apart, so `on(pod)`
+    // is what makes them one match group — and two of them, which is
+    // the error below. `pod="b"` is the one that is alone.
+    assert_eq!(
+        matched(r#"requests{path="/x", pod="b"} / on(pod) limit"#),
+        [(labels(&[("pod", "b")]), 10.0)]
+    );
+    // Without `on`, `ignoring` has to name every label the two sides
+    // disagree on, and the result keeps the rest of the left side's.
+    assert_eq!(
+        matched(r#"requests{path="/x"} / ignoring(path, zone) limit"#),
+        [
+            (labels(&[("pod", "a")]), 5.0),
+            (labels(&[("pod", "b")]), 10.0),
+        ]
+    );
+}
+
+/// `group_left` lets the left side be many: every one of its series
+/// pairs with the single right-hand one, keeps all of its own labels,
+/// and takes the named ones along from the right.
+#[test]
+fn group_left_fans_out_and_copies_the_named_labels() {
+    assert_eq!(
+        matched("requests / on(pod) group_left(zone) limit"),
+        [
+            (labels(&[("path", "/x"), ("pod", "a"), ("zone", "eu")]), 5.0),
+            (
+                labels(&[("path", "/x"), ("pod", "b"), ("zone", "us")]),
+                10.0
+            ),
+            (
+                labels(&[("path", "/y"), ("pod", "a"), ("zone", "eu")]),
+                10.0
+            ),
+        ]
+    );
+    // Without a label to copy, the fan-out is the only thing the
+    // modifier does.
+    assert_eq!(
+        matched("requests / on(pod) group_left limit"),
+        [
+            (labels(&[("path", "/x"), ("pod", "a")]), 5.0),
+            (labels(&[("path", "/x"), ("pod", "b")]), 10.0),
+            (labels(&[("path", "/y"), ("pod", "a")]), 10.0),
+        ]
+    );
+}
+
+/// `group_right` is the mirror image, and the operands keep the order
+/// the query wrote them in: this is limit divided by requests.
+#[test]
+fn group_right_lets_the_right_side_be_many() {
+    assert_eq!(
+        matched("limit / on(pod) group_right(zone) requests"),
+        [
+            (labels(&[("path", "/x"), ("pod", "a"), ("zone", "eu")]), 0.2),
+            (labels(&[("path", "/x"), ("pod", "b"), ("zone", "us")]), 0.1),
+            (labels(&[("path", "/y"), ("pod", "a"), ("zone", "eu")]), 0.1),
+        ]
+    );
+}
+
+/// A comparison keeps the many side's `__name__` through the fan-out,
+/// because `changesMetricSchema` is false for it.
+#[test]
+fn a_fan_out_comparison_keeps_the_metric_name() {
+    assert_eq!(
+        matched("requests > on(pod) group_left(zone) limit"),
+        [
+            (
+                labels(&[
+                    ("__name__", "requests"),
+                    ("path", "/x"),
+                    ("pod", "a"),
+                    ("zone", "eu")
+                ]),
+                10.0
+            ),
+            (
+                labels(&[
+                    ("__name__", "requests"),
+                    ("path", "/x"),
+                    ("pod", "b"),
+                    ("zone", "us")
+                ]),
+                30.0
+            ),
+            (
+                labels(&[
+                    ("__name__", "requests"),
+                    ("path", "/y"),
+                    ("pod", "a"),
+                    ("zone", "eu")
+                ]),
+                20.0
+            ),
+        ]
+    );
+}
+
+/// Every way a match can fail, in upstream's words.
+#[test]
+fn the_matching_errors_are_upstreams() {
+    let engine = Engine::blocking().unwrap();
+    let source = zoned();
+    // Every one of these is a rejection Prometheus also makes, so it has
+    // to reach the caller as `Query` and not as the DataFusion error the
+    // UDAF had no choice but to raise.
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    let fails = |query: &str| match engine.range_query(&source, query, &at_0).expect_err(query) {
+        EngineError::Query(message) => message,
+        other => panic!("{query}: expected a query error, got {other:?}"),
+    };
+
+    // Two left series in one match group, and no modifier saying so.
+    let err = fails("requests / on(pod) limit");
+    assert!(
+        err.contains(
+            "multiple matches for labels: many-to-one matching must be explicit \
+             (group_left/group_right)"
         ),
-        (
-            "requests / on(pod) group_right errors",
-            "the group_right modifier",
+        "{err}"
+    );
+
+    // Two right-hand series in one match group is many-to-many.
+    let err = fails("limit / on(pod) requests");
+    assert!(
+        err.contains("found duplicate series for the match group")
+            && err.contains("on the right hand-side of the operation: ["),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            ";many-to-many matching not allowed: matching labels must be unique on one side"
         ),
+        "{err}"
+    );
+
+    // group_right moves the "one" to the left, and the message with it.
+    let err = fails("requests / on(pod) group_right() limit");
+    assert!(
+        err.contains("on the left hand-side of the operation: ["),
+        "{err}"
+    );
+
+    // A fan-out whose result labels collide: the two left series
+    // differ only in `__name__`, which the division takes away.
+    let same = MemorySeriesSource::from_descriptions(
+        &load(&[r#"a{pod="x"} 1"#, r#"b{pod="x"} 2"#, r#"c{pod="x"} 4"#]),
+        30.0,
+    );
+    let err = match engine
+        .range_query(
+            &same,
+            r#"{__name__=~"a|b"} / on(pod) group_left() c"#,
+            &at_0,
+        )
+        .expect_err("the fan-out collides")
+    {
+        EngineError::Query(message) => message,
+        other => panic!("expected a query error, got {other:?}"),
+    };
+    assert!(
+        err.contains("multiple matches for labels: grouping labels must ensure unique matches"),
+        "{err}"
+    );
+}
+
+/// The set operators over `zoned()`: each of them asks only whether
+/// the other side has this signature at this step, and answers with
+/// the sample it was handed -- labels, `__name__` and value intact.
+#[test]
+fn a_set_operator_filters_by_signature_and_keeps_the_sample() {
+    let requests =
+        |pod: &str, path: &str| labels(&[("__name__", "requests"), ("path", path), ("pod", pod)]);
+
+    // Both pods have a limit, so every request series survives -- and
+    // `ignoring` names the same signature the other way round.
+    for query in [
+        "requests and on(pod) limit",
+        "requests and ignoring(path, zone) limit",
     ] {
-        let err = error(query);
-        assert!(
-            matches!(&err, EngineError::Unsupported(f) if f == feature),
-            "{query}: {err}"
+        assert_eq!(
+            matched(query),
+            [
+                (requests("a", "/x"), 10.0),
+                (requests("b", "/x"), 30.0),
+                (requests("a", "/y"), 20.0),
+            ],
+            "{query}"
         );
     }
+    assert!(matched("requests unless on(pod) limit").is_empty());
+
+    // A label one side does not carry is the empty string, which is a
+    // signature of its own: nothing matches on `zone`.
+    assert!(matched("requests and on(zone) limit").is_empty());
+    assert_eq!(matched("requests unless on(zone) limit").len(), 3);
+
+    // Default matching is every label but `__name__`, so this pairs on
+    // `{pod, path}` and only `/y` is left without a partner.
+    assert_eq!(
+        matched(r#"requests unless requests{path="/x"}"#),
+        [(requests("a", "/y"), 20.0)]
+    );
+}
+
+/// `or` is the left side whole plus the right side's series under the
+/// signatures the left side left empty, each keeping its own labels.
+#[test]
+fn or_fills_in_the_signatures_the_left_side_missed() {
+    let limit =
+        |pod: &str, zone: &str| labels(&[("__name__", "limit"), ("pod", pod), ("zone", zone)]);
+    let requests =
+        |pod: &str, path: &str| labels(&[("__name__", "requests"), ("path", path), ("pod", pod)]);
+
+    // Pod `a` is answered by the left side, so only pod `b`'s limit is
+    // filled in -- as `limit`, not as `requests`.
+    assert_eq!(
+        matched(r#"requests{path="/y"} or on(pod) limit"#),
+        [(limit("b", "us"), 3.0), (requests("a", "/y"), 20.0)]
+    );
+    // Every signature the right side has is already on the left.
+    assert_eq!(matched("requests or on(pod) limit").len(), 3);
+    // And with nothing on the left, `or` is the right side.
+    assert_eq!(
+        matched("missing or on(pod) limit"),
+        [(limit("a", "eu"), 2.0), (limit("b", "us"), 3.0)]
+    );
+}
+
+/// Upstream refuses both of these while parsing; this engine has to
+/// say so itself, in the same words.
+#[test]
+fn a_set_operator_takes_neither_a_group_modifier_nor_a_scalar() {
+    let engine = Engine::blocking().unwrap();
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    let fails = |query: &str| match engine.range_query(&zoned(), query, &at_0).expect_err(query) {
+        EngineError::Query(message) => message,
+        other => panic!("{query}: expected a query error, got {other:?}"),
+    };
+
+    assert_eq!(
+        fails("requests and on(pod) group_left() limit"),
+        r#"no grouping allowed for "and" operation"#
+    );
+    assert_eq!(
+        fails("limit or on(pod) group_right(path) requests"),
+        r#"no grouping allowed for "or" operation"#
+    );
+    assert_eq!(
+        fails("requests unless 1"),
+        r#"set operator "unless" not allowed in binary scalar expression"#
+    );
+    assert_eq!(
+        fails("2 and 3"),
+        r#"set operator "and" not allowed in binary scalar expression"#
+    );
+}
+
+/// A fill value answers for a side that has no series in a match
+/// group, where the same query without one drops the step. Over
+/// `zoned()`: pod `c` is on neither side, and `path`/`zone` are only on
+/// one each, so `on(pod)` is the signature that has something to fill.
+#[test]
+fn a_fill_value_answers_for_a_side_with_no_series() {
+    // Without a fill, only the pods both metrics know about answer.
+    assert_eq!(
+        matched(r#"requests{path="/x"} - on(pod) limit"#),
+        [(pod("a"), 8.0), (pod("b"), 27.0)]
+    );
+
+    // `fill_right(0)` stands in for the right operand, so pod `d`'s
+    // request -- which has no limit -- answers with its own value.
+    let source = MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"requests{pod="a", path="/x"} 10"#,
+            r#"requests{pod="d", path="/x"} 40"#,
+            r#"limit{pod="a", zone="eu"} 2"#,
+            r#"limit{pod="e", zone="us"} 5"#,
+        ]),
+        30.0,
+    );
+    let at = |query: &str| vector_of(&source, query, &RangeQuery::new(0, 0, 30_000));
+
+    assert_eq!(at("requests - on(pod) limit"), [(pod("a"), 8.0)]);
+    assert_eq!(
+        at("requests - on(pod) fill_right(0) limit"),
+        [(pod("a"), 8.0), (pod("d"), 40.0)]
+    );
+    // `fill_left(100)` answers for pod `e`, which only `limit` has.
+    assert_eq!(
+        at("requests - on(pod) fill_left(100) limit"),
+        [(pod("a"), 8.0), (pod("e"), 95.0)]
+    );
+    // `fill(0)` is both at once.
+    assert_eq!(
+        at("requests - on(pod) fill(0) limit"),
+        [(pod("a"), 8.0), (pod("d"), 40.0), (pod("e"), -5.0)]
+    );
+    // A filled-in side brings only the signature, so the labels that
+    // are not matched on are gone from the rows it answers for --
+    // `path` is on pod `d`'s request but not on the result.
+    assert!(at("requests - on(pod) fill(0) limit")
+        .iter()
+        .all(|(labels, _)| labels.iter().all(|(k, _)| k == "pod")));
+}
+
+/// A match group only one side ever reached is not a match, so its
+/// duplicates are nobody's error -- until a fill gives it the other
+/// side and it becomes one.
+#[test]
+fn a_group_with_no_left_side_is_empty_until_a_fill_answers_for_it() {
+    let engine = Engine::blocking().unwrap();
+    // Two `limit` series in one `on(pod)` group and no `requests` at
+    // all, which is a duplicate on the right waiting to be noticed.
+    let source = MemorySeriesSource::from_descriptions(
+        &load(&[
+            r#"limit{pod="a", zone="eu"} 2"#,
+            r#"limit{pod="a", zone="us"} 3"#,
+        ]),
+        30.0,
+    );
+
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    assert!(vector_of(&source, "requests + on(pod) limit", &at_0).is_empty());
+
+    let err = engine
+        .range_query(&source, "requests + on(pod) fill_left(0) limit", &at_0)
+        .expect_err("the fill makes it a match group");
+    assert!(
+        err.to_string()
+            .contains("found duplicate series for the match group"),
+        "{err}"
+    );
+}
+
+/// Upstream refuses a fill where there is nothing to fill in, and says
+/// so while parsing; this engine has to say it itself.
+#[test]
+fn a_fill_needs_two_vectors_and_a_value_operator() {
+    let engine = Engine::blocking().unwrap();
+    let at_0 = RangeQuery::new(0, 0, 30_000);
+    let fails = |query: &str| match engine.range_query(&zoned(), query, &at_0).expect_err(query) {
+        EngineError::Query(message) => message,
+        other => panic!("{query}: expected a query error, got {other:?}"),
+    };
+
+    assert_eq!(
+        fails("requests + fill(0) 1"),
+        "filling in missing series only allowed between instant vectors"
+    );
+    assert_eq!(
+        fails("requests and fill(0) limit"),
+        "filling in missing series not allowed for set operators"
+    );
+}
+
+/// Upstream's parser refuses a label that both picks the match and is
+/// copied across it; ours has to say so itself.
+#[test]
+fn a_label_cannot_be_matched_on_and_copied_at_once() {
+    let err = Engine::blocking()
+        .unwrap()
+        .range_query(
+            &zoned(),
+            "requests / on(pod) group_left(pod) limit",
+            &RangeQuery::new(0, 0, 30_000),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Query(q)
+            if q == "label \"pod\" must not occur in ON and GROUP clause at once"),
+        "{err}"
+    );
 }
 
 /// A scalar operand is folded while planning, so one that moves with

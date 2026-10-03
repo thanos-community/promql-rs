@@ -850,7 +850,8 @@ mod tests {
             .column_by_name(series::TIMESTAMP)
             .unwrap()
             .clone();
-        for op in crate::binary::Op::ALL {
+        // A set operator between a vector and a scalar is not a query.
+        for op in crate::binary::Op::ALL.into_iter().filter(|op| !op.is_set()) {
             for return_bool in [false, true] {
                 if return_bool && !op.is_comparison() {
                     continue;
