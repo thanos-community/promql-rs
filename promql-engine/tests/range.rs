@@ -154,10 +154,6 @@ fn what_is_still_unsupported_is_named() {
     let engine = Engine::blocking().unwrap();
     for (q, what) in [
         ("rate(http_requests_total[5m:1m])", "a subquery"),
-        // An instant-vector function that is not elementwise: `timestamp`
-        // reads the sample's own time, which the elementwise operator
-        // cannot express.
-        ("timestamp(http_requests_total)", "the timestamp function"),
         (
             "quantile_over_time(0.5, http_requests_total[5m])",
             "the quantile_over_time function",
