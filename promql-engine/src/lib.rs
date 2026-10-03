@@ -48,6 +48,7 @@ pub mod range; // benches/kernels.rs
 pub(crate) mod scalar;
 pub mod selector; // benches/kernels.rs
 pub mod series;
+pub(crate) mod sort;
 pub mod source;
 pub(crate) mod value_type;
 

@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **543 of 2098 evals pass** (25.9%), and **481** are blocked on the features below.
+Against the vendored corpus: **559 of 2098 evals pass** (26.6%), and **465** are blocked on the features below.
 
 ## Missing features
 
@@ -28,13 +28,11 @@ Against the vendored corpus: **543 of 2098 evals pass** (25.9%), and **481** are
 | 13 | the timestamp function |
 | 9 | the predict_linear function |
 | 9 | the quantile_over_time function |
-| 9 | the sort_by_label function |
 | 7 | the label_join function |
 | 6 | the quantile aggregation |
 | 5 | a string literal |
 | 4 | the day_of_year function |
 | 4 | the month function |
-| 4 | the sort_by_label_desc function |
 | 4 | the stddev_over_time function |
 | 4 | the year function |
 | 3 | the bottomk aggregation |
@@ -52,7 +50,6 @@ Against the vendored corpus: **543 of 2098 evals pass** (25.9%), and **481** are
 | 2 | the histogram_sum function |
 | 2 | the hour function |
 | 2 | the mad_over_time function |
-| 2 | the sort function |
 | 2 | the time function |
 | 2 | the ts_of_last_over_time function |
 | 1 | the changes function over a parenthesized expression |
@@ -63,7 +60,6 @@ Against the vendored corpus: **543 of 2098 evals pass** (25.9%), and **481** are
 | 1 | the limitk aggregation |
 | 1 | the pi function |
 | 1 | the rate function over a parenthesized expression |
-| 1 | the sort_desc function |
 | 1 | the ts_of_max_over_time function |
 | 1 | the ts_of_min_over_time function |
 
@@ -75,13 +71,13 @@ Against the vendored corpus: **543 of 2098 evals pass** (25.9%), and **481** are
 | collision | 2 | 2 (100%) | fully green |
 | fill-modifier | 45 | 44 (98%) |  |
 | trig_functions | 19 | 18 (95%) |  |
+| range_queries | 18 | 13 (72%) |  |
 | name_label_dropping | 30 | 16 (53%) |  |
 | operators | 213 | 105 (49%) |  |
 | aggregators | 160 | 77 (48%) |  |
-| range_queries | 18 | 8 (44%) |  |
 | selectors | 31 | 13 (42%) |  |
+| functions | 413 | 151 (37%) |  |
 | type_and_unit | 58 | 20 (34%) |  |
-| functions | 413 | 140 (34%) |  |
 | extended_vectors | 118 | 38 (32%) |  |
 | at_modifier | 71 | 20 (28%) |  |
 | literals | 25 | 7 (28%) |  |

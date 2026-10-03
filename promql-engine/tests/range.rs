@@ -158,10 +158,10 @@ fn what_is_still_unsupported_is_named() {
             "the absent_over_time function",
         ),
         ("rate(http_requests_total[5m:1m])", "a subquery"),
-        // Instant-vector functions that are not elementwise: `sort`
-        // reorders the result and `timestamp` reads the sample's own
-        // time, neither of which the elementwise operator can express.
-        ("sort(http_requests_total)", "the sort function"),
+        // Instant-vector functions that are not elementwise: `absent`
+        // invents a series and `timestamp` reads the sample's own time,
+        // neither of which the elementwise operator can express.
+        ("absent(http_requests_total)", "the absent function"),
         ("timestamp(http_requests_total)", "the timestamp function"),
         (
             "quantile_over_time(0.5, http_requests_total[5m])",

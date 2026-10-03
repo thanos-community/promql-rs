@@ -252,7 +252,6 @@ fn a_call_prometheus_would_not_parse_is_a_query_error() {
 fn the_functions_that_are_not_elementwise_are_still_unsupported() {
     for (query, what) in [
         ("scalar(temperature)", "the scalar function"),
-        ("sort(temperature)", "the sort function"),
         ("timestamp(temperature)", "the timestamp function"),
         ("year(temperature)", "the year function"),
         ("absent(temperature)", "the absent function"),
