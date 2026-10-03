@@ -75,6 +75,16 @@ use datafusion::arrow::datatypes::{
     TimestampMillisecondType,
 };
 
+use crate::error::SeriesError;
+
+/// A message-only [`SeriesError`]. A macro rather than a helper so each
+/// site keeps `format!`'s inline captures.
+macro_rules! invalid {
+    ($($arg:tt)*) => {
+        SeriesError::Invalid(format!($($arg)*))
+    };
+}
+
 pub const LABELS: &str = "labels";
 pub const SAMPLES: &str = "samples";
 pub const TIMESTAMP: &str = "timestamp";
@@ -159,7 +169,7 @@ impl Block {
 
 /// `batch` with its block columns set to `block`, for a store that cuts
 /// a batch it already holds into blocks.
-pub fn with_block(batch: &RecordBatch, block: Block) -> Result<RecordBatch, String> {
+pub fn with_block(batch: &RecordBatch, block: Block) -> Result<RecordBatch, SeriesError> {
     let [start, end] = block.columns(batch.num_rows());
     let columns: Vec<ArrayRef> = batch
         .schema()
@@ -172,7 +182,7 @@ pub fn with_block(batch: &RecordBatch, block: Block) -> Result<RecordBatch, Stri
             _ => Arc::clone(c),
         })
         .collect();
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| e.to_string())
+    RecordBatch::try_new(batch.schema(), columns).map_err(SeriesError::from)
 }
 
 /// The block of row `row` of a canonical batch.
@@ -197,10 +207,10 @@ pub fn block_of(batch: &RecordBatch, row: usize) -> Block {
 /// child, nanoseconds, plain `Utf8` — would otherwise fail somewhere
 /// inside a kernel with a downcast panic, far from the code that produced
 /// the batch.
-pub fn validate(schema: &Schema) -> Result<(), String> {
+pub fn validate(schema: &Schema) -> Result<(), SeriesError> {
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     if names != [LABELS, SAMPLES, BLOCK_START, BLOCK_END] {
-        return Err(format!(
+        return Err(invalid!(
             "expected exactly the columns `{LABELS}`, `{SAMPLES}`, `{BLOCK_START}` and \
              `{BLOCK_END}`, in that order, got {}",
             names.join(", ")
@@ -211,17 +221,17 @@ pub fn validate(schema: &Schema) -> Result<(), String> {
         .field_with_name(LABELS)
         .map_err(|_| format!("no `{LABELS}` column"))?;
     if labels.is_nullable() {
-        return Err(format!("`{LABELS}` must not be nullable"));
+        return Err(invalid!("`{LABELS}` must not be nullable"));
     }
     match labels.data_type() {
         DataType::Struct(fields) => {
             let mut prev: Option<&str> = None;
             for f in fields {
                 if f.is_nullable() {
-                    return Err(format!("label `{}` must not be nullable", f.name()));
+                    return Err(invalid!("label `{}` must not be nullable", f.name()));
                 }
                 if f.data_type() != &label_type() {
-                    return Err(format!(
+                    return Err(invalid!(
                         "label `{}` is {}, expected {}",
                         f.name(),
                         f.data_type(),
@@ -230,7 +240,7 @@ pub fn validate(schema: &Schema) -> Result<(), String> {
                 }
                 if let Some(p) = prev {
                     if p >= f.name().as_str() {
-                        return Err(format!(
+                        return Err(invalid!(
                             "label fields must be sorted by name and unique; `{p}` precedes `{}`",
                             f.name()
                         ));
@@ -239,17 +249,17 @@ pub fn validate(schema: &Schema) -> Result<(), String> {
                 prev = Some(f.name());
             }
         }
-        other => return Err(format!("`{LABELS}` is {other}, expected a struct")),
+        other => return Err(invalid!("`{LABELS}` is {other}, expected a struct")),
     }
 
     let samples = schema
         .field_with_name(SAMPLES)
         .map_err(|_| format!("no `{SAMPLES}` column"))?;
     if samples.is_nullable() {
-        return Err(format!("`{SAMPLES}` must not be nullable"));
+        return Err(invalid!("`{SAMPLES}` must not be nullable"));
     }
     if samples.data_type() != &samples_type() {
-        return Err(format!(
+        return Err(invalid!(
             "`{SAMPLES}` is {}, expected {}",
             samples.data_type(),
             samples_type()
@@ -258,10 +268,10 @@ pub fn validate(schema: &Schema) -> Result<(), String> {
     for name in [BLOCK_START, BLOCK_END] {
         let field = schema.field_with_name(name).expect("checked above");
         if field.is_nullable() {
-            return Err(format!("`{name}` must not be nullable"));
+            return Err(invalid!("`{name}` must not be nullable"));
         }
         if field.data_type() != &timestamp_type() {
-            return Err(format!(
+            return Err(invalid!(
                 "`{name}` is {}, expected {}",
                 field.data_type(),
                 timestamp_type()
@@ -307,18 +317,19 @@ impl Series {
         labels: &[(&str, &str)],
         timestamps: Vec<i64>,
         values: Vec<f64>,
-    ) -> Result<Series, String> {
+    ) -> Result<Series, SeriesError> {
         if timestamps.len() != values.len() {
-            return Err(format!(
+            return Err(invalid!(
                 "{} timestamps but {} values",
                 timestamps.len(),
                 values.len()
             ));
         }
         if let Some(w) = timestamps.windows(2).find(|w| w[0] >= w[1]) {
-            return Err(format!(
+            return Err(invalid!(
                 "timestamps must be strictly ascending; {} is followed by {}",
-                w[0], w[1]
+                w[0],
+                w[1]
             ));
         }
         let mut pairs: Vec<(&str, &str)> = labels
@@ -328,7 +339,7 @@ impl Series {
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
         if let Some(w) = pairs.windows(2).find(|w| w[0].0 == w[1].0) {
-            return Err(format!("label `{}` is given twice", w[0].0));
+            return Err(invalid!("label `{}` is given twice", w[0].0));
         }
 
         let fields: Fields = pairs
@@ -429,7 +440,11 @@ pub fn label_names_of(series: &[Series]) -> Vec<String> {
 /// silently dropping a label would merge two series into one. Two series
 /// with the same label set are an error too: with whole series this
 /// cannot be a second chunk, so it is one series split in two.
-pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<RecordBatch, String> {
+pub fn encode(
+    names: &[String],
+    series: &[Series],
+    block: Block,
+) -> Result<RecordBatch, SeriesError> {
     let mut names = names.to_vec();
     names.sort();
     names.dedup();
@@ -456,7 +471,7 @@ pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<Recor
         for (column, name) in columns.iter_mut().zip(&names) {
             if let Some((n, _)) = labels.peek() {
                 if *n < name.as_str() {
-                    return Err(format!("label `{n}` is not among the batch's label names"));
+                    return Err(invalid!("label `{n}` is not among the batch's label names"));
                 }
             }
             let value = match labels.peek() {
@@ -471,7 +486,7 @@ pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<Recor
             value.hash(&mut hasher);
         }
         if let Some((n, _)) = labels.next() {
-            return Err(format!("label `{n}` is not among the batch's label names"));
+            return Err(invalid!("label `{n}` is not among the batch's label names"));
         }
         let bucket = seen.entry(hasher.finish()).or_default();
         if bucket
@@ -479,7 +494,7 @@ pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<Recor
             .any(|&other| names.iter().all(|n| series[other].label(n) == s.label(n)))
         {
             let set: Vec<String> = s.labels().map(|(n, v)| format!("{n}={v:?}")).collect();
-            return Err(format!(
+            return Err(invalid!(
                 "two series in one batch share the label set {{{}}}",
                 set.join(", ")
             ));
@@ -509,7 +524,7 @@ pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<Recor
         new_empty_array(&DataType::Struct(sample_fields()))
     } else {
         let parts: Vec<&dyn Array> = series.iter().map(|s| &s.samples as &dyn Array).collect();
-        concat(&parts).map_err(|e| e.to_string())?
+        concat(&parts)?
     };
     let samples = ListArray::new(
         sample_item(),
@@ -522,7 +537,7 @@ pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<Recor
         schema(&names),
         vec![Arc::new(labels), Arc::new(samples), block_start, block_end],
     )
-    .map_err(|e| e.to_string())
+    .map_err(SeriesError::from)
 }
 
 /// The rows of canonical batches, as zero-copy slices, one [`Series`]
@@ -532,7 +547,7 @@ pub fn encode(names: &[String], series: &[Series], block: Block) -> Result<Recor
 /// plan, because the plan-side filter would sit above the projection that
 /// computes the samples and the optimizer may push it below, evaluating
 /// the kernel twice. An empty series is inert for every operator anyway.
-pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, String> {
+pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, SeriesError> {
     let mut out = Vec::new();
     for batch in batches {
         validate(&batch.schema())?;
@@ -560,19 +575,16 @@ pub fn decode(batches: &[RecordBatch]) -> Result<Vec<Series>, String> {
 /// blocks of a label set are consecutive and in time order, and joining
 /// them is one concat per label set. Timestamps stay strictly ascending
 /// because blocks do not overlap and a block answers each step once.
-pub fn coalesce(series: Vec<Series>) -> Result<Vec<Series>, String> {
+pub fn coalesce(series: Vec<Series>) -> Result<Vec<Series>, SeriesError> {
     let mut out: Vec<Series> = Vec::with_capacity(series.len());
     let mut run: Vec<Series> = Vec::new();
-    let flush = |run: &mut Vec<Series>, out: &mut Vec<Series>| -> Result<(), String> {
+    let flush = |run: &mut Vec<Series>, out: &mut Vec<Series>| -> Result<(), SeriesError> {
         match run.len() {
             0 => {}
             1 => out.push(run.pop().expect("one")),
             _ => {
                 let parts: Vec<&dyn Array> = run.iter().map(|s| &s.samples as &dyn Array).collect();
-                let samples = concat(&parts)
-                    .map_err(|e| e.to_string())?
-                    .as_struct()
-                    .clone();
+                let samples = concat(&parts)?.as_struct().clone();
                 out.push(Series {
                     labels: run[0].labels.clone(),
                     samples,
@@ -620,7 +632,7 @@ pub fn drop_empty(batch: &RecordBatch) -> RecordBatch {
 /// would make the schema depend on what else is in the store, so two
 /// stores holding the same series would answer one query with different
 /// schemas.
-pub fn drop_unused_labels(batch: &RecordBatch) -> Result<RecordBatch, String> {
+pub fn drop_unused_labels(batch: &RecordBatch) -> Result<RecordBatch, SeriesError> {
     let labels = batch.column_by_name(LABELS).expect("canonical").as_struct();
     let used: Vec<usize> = (0..labels.num_columns())
         .filter(|&i| {
@@ -663,7 +675,7 @@ fn replace_column(
     name: &str,
     field: Field,
     column: ArrayRef,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, SeriesError> {
     let fields: Vec<FieldRef> = batch
         .schema()
         .fields()
@@ -689,7 +701,7 @@ fn replace_column(
             }
         })
         .collect();
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| e.to_string())
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(SeriesError::from)
 }
 
 /// Keep only the samples in `[start_ms, end_ms]`.
@@ -700,7 +712,7 @@ fn replace_column(
 /// and the ones outside the range are never touched. A batch whose rows
 /// all lie inside the range — the common case for a store that already
 /// pruned by time — is handed back untouched.
-pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBatch, String> {
+pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBatch, SeriesError> {
     let samples = batch
         .column_by_name(SAMPLES)
         .expect("canonical")
@@ -745,8 +757,7 @@ pub fn clip(batch: &RecordBatch, start_ms: i64, end_ms: i64) -> Result<RecordBat
     }
     mask.append_n(entries.len() - cursor, false);
 
-    let entries =
-        filter(entries, &BooleanArray::new(mask.finish(), None)).map_err(|e| e.to_string())?;
+    let entries = filter(entries, &BooleanArray::new(mask.finish(), None))?;
     let samples = ListArray::new(
         sample_item(),
         OffsetBuffer::new(clipped.into()),
@@ -1012,7 +1023,7 @@ mod tests {
             series(&[("a", "1")], &[(5, 2.0)]),
         ];
         let err = encode(&label_names_of(&twice), &twice, ONE_BLOCK).unwrap_err();
-        assert!(err.contains(r#"a="1""#), "{err}");
+        assert!(err.to_string().contains(r#"a="1""#), "{err}");
 
         // The empty label set is a label set too.
         let bare = [series(&[], &[(0, 1.0)]), series(&[], &[(1, 1.0)])];
@@ -1022,7 +1033,7 @@ mod tests {
     #[test]
     fn a_label_outside_the_schema_is_rejected() {
         let err = encode(&["a".to_string()], &[series(&[("b", "x")], &[])], ONE_BLOCK).unwrap_err();
-        assert!(err.contains("`b`"), "{err}");
+        assert!(err.to_string().contains("`b`"), "{err}");
     }
 
     #[test]
@@ -1039,11 +1050,11 @@ mod tests {
     #[test]
     fn a_series_is_checked_once_when_built() {
         let err = Series::new(&[], vec![0, 1], vec![1.0]).unwrap_err();
-        assert!(err.contains("values"), "{err}");
+        assert!(err.to_string().contains("values"), "{err}");
         let err = Series::new(&[], vec![1, 1], vec![1.0, 2.0]).unwrap_err();
-        assert!(err.contains("ascending"), "{err}");
+        assert!(err.to_string().contains("ascending"), "{err}");
         let err = Series::new(&[("a", "1"), ("a", "2")], vec![], vec![]).unwrap_err();
-        assert!(err.contains("`a`"), "{err}");
+        assert!(err.to_string().contains("`a`"), "{err}");
 
         // Sorted by name, and "" is how PromQL spells an absent label.
         let s = series(&[("b", "2"), ("a", ""), ("c", "3")], &[]);
@@ -1106,7 +1117,10 @@ mod tests {
             Field::new(LABELS, labels_type(&["a".to_string()]), true),
             Field::new(SAMPLES, samples_type(), false),
         );
-        assert!(validate(&nullable).unwrap_err().contains("nullable"));
+        assert!(validate(&nullable)
+            .unwrap_err()
+            .to_string()
+            .contains("nullable"));
 
         let ns_item = Arc::new(Field::new(
             LIST_ITEM,
@@ -1124,7 +1138,10 @@ mod tests {
             Field::new(LABELS, labels_type(&[]), false),
             Field::new(SAMPLES, DataType::List(ns_item), false),
         );
-        assert!(validate(&nanos).unwrap_err().contains("expected"));
+        assert!(validate(&nanos)
+            .unwrap_err()
+            .to_string()
+            .contains("expected"));
 
         let plain = with_block(
             Field::new(
@@ -1134,7 +1151,10 @@ mod tests {
             ),
             Field::new(SAMPLES, samples_type(), false),
         );
-        assert!(validate(&plain).unwrap_err().contains("expected Utf8View"));
+        assert!(validate(&plain)
+            .unwrap_err()
+            .to_string()
+            .contains("expected Utf8View"));
 
         let dictionary = with_block(
             Field::new(
@@ -1150,6 +1170,7 @@ mod tests {
         );
         assert!(validate(&dictionary)
             .unwrap_err()
+            .to_string()
             .contains("expected Utf8View"));
 
         let unsorted = with_block(
@@ -1163,7 +1184,10 @@ mod tests {
             ),
             Field::new(SAMPLES, samples_type(), false),
         );
-        assert!(validate(&unsorted).unwrap_err().contains("sorted"));
+        assert!(validate(&unsorted)
+            .unwrap_err()
+            .to_string()
+            .contains("sorted"));
 
         let bare = || {
             vec![
@@ -1172,7 +1196,10 @@ mod tests {
             ]
         };
         let without_block = Schema::new(bare());
-        assert!(validate(&without_block).unwrap_err().contains("exactly"));
+        assert!(validate(&without_block)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly"));
 
         let extra = Schema::new(
             [
@@ -1182,11 +1209,15 @@ mod tests {
             ]
             .concat(),
         );
-        assert!(validate(&extra).unwrap_err().contains("exactly"));
+        assert!(validate(&extra)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly"));
 
         let nullable_block = Schema::new([bare(), block(true)].concat());
         assert!(validate(&nullable_block)
             .unwrap_err()
+            .to_string()
             .contains("must not be nullable"));
 
         let seconds = Schema::new(
@@ -1203,7 +1234,10 @@ mod tests {
             ]
             .concat(),
         );
-        assert!(validate(&seconds).unwrap_err().contains("expected"));
+        assert!(validate(&seconds)
+            .unwrap_err()
+            .to_string()
+            .contains("expected"));
     }
 
     /// The block columns travel with the rows through the store helpers

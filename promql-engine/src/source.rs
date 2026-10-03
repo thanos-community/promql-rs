@@ -262,7 +262,7 @@ impl SelectorTable {
     ) -> std::result::Result<Self, EngineError> {
         let plan = source.select(state, matchers, hints).await?;
         let schema = plan.schema();
-        series::validate(&schema).map_err(EngineError::Schema)?;
+        series::validate(&schema)?;
         Ok(Self {
             plan,
             schema,

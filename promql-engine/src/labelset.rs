@@ -49,7 +49,7 @@ pub fn reject_same_labelset(batches: &[RecordBatch]) -> Result<(), EngineError> 
     let labels = first
         .schema()
         .field_with_name(LABELS)
-        .map_err(|e| EngineError::Schema(e.to_string()))?
+        .map_err(EngineError::Arrow)?
         .data_type()
         .clone();
     // Row format rather than a hash: `create_hashes` would report a

@@ -225,7 +225,7 @@ impl Planner<'_> {
             timestamps.push(ts);
         }
 
-        let series = Series::new(&[], timestamps, values).map_err(EngineError::Schema)?;
+        let series = Series::new(&[], timestamps, values)?;
         // One block over the whole grid: the series is complete here, and
         // an aggregate above groups by block, so a split would only hand it
         // partials to fold back together.
@@ -233,7 +233,7 @@ impl Planner<'_> {
             start_ms: i64::MIN,
             end_ms: i64::MAX,
         };
-        let batch = series::encode(&[], &[series], block).map_err(EngineError::Schema)?;
+        let batch = series::encode(&[], &[series], block)?;
         let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
         // Not `selector_N`: nothing was selected, and a plan text that
         // said so would be misleading.

@@ -211,7 +211,8 @@ impl Engine for DataFusionEngine {
             Err(promql_engine::EngineError::Unsupported(feature)) => {
                 Err(EngineError::Unsupported(feature))
             }
-            Err(promql_engine::EngineError::Query(msg)) => Ok(QueryResult::Error(msg)),
+            // The text is what the corpus's expected errors are matched on.
+            Err(e) if e.is_user_error() => Ok(QueryResult::Error(e.to_string())),
             Err(other) => Err(EngineError::Other(other.to_string())),
         }
     }

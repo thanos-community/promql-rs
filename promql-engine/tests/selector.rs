@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use datafusion::logical_expr::LogicalPlan;
-use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery};
+use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery, Series, SeriesError};
 use promql_parser::SeriesDescription;
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
@@ -162,7 +162,7 @@ fn range_query_returns_validated_batches_with_no_empty_series() {
 }
 
 #[test]
-fn a_parse_error_is_a_query_error() {
+fn a_parse_error_keeps_the_parsers_positions() {
     let engine = Engine::blocking().unwrap();
     let err = engine
         .range_query(
@@ -171,7 +171,37 @@ fn a_parse_error_is_a_query_error() {
             &RangeQuery::new(0, 0, 30_000),
         )
         .unwrap_err();
-    assert!(matches!(err, EngineError::Query(_)), "{err}");
+    assert!(matches!(err, EngineError::Parse(_)), "{err}");
+    assert!(err.is_user_error());
+    let cause = std::error::Error::source(&err)
+        .and_then(|e| e.downcast_ref::<promql_parser::ParseErrors>())
+        .expect("the cause is the parser's own error");
+    assert!(!cause.is_empty());
+    assert!(cause.iter().all(|e| e.range.start <= e.range.end));
+}
+
+#[test]
+fn a_bad_regex_keeps_its_cause() {
+    let engine = Engine::blocking().unwrap();
+    let err = engine
+        .range_query(
+            envoy().as_ref(),
+            r#"http_requests_total{pod=~"("}"#,
+            &RangeQuery::new(0, 0, 30_000),
+        )
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Regex { .. }), "{err}");
+    assert!(err.is_user_error());
+    assert!(std::error::Error::source(&err).is_some_and(|e| e.is::<regex::Error>()));
+}
+
+/// A store built outside this crate has to be able to match on what the
+/// series functions reject, so the type must be nameable from here.
+#[test]
+fn a_label_set_given_twice_is_a_series_error() {
+    let up = || Series::new(&[("__name__", "up")], vec![0], vec![1.0]).unwrap();
+    let err = MemorySeriesSource::try_new(vec![up(), up()]).unwrap_err();
+    assert!(matches!(err, SeriesError::Invalid(_)), "{err}");
 }
 
 #[tokio::test]

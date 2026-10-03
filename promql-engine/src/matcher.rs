@@ -56,11 +56,10 @@ impl CompiledMatcher {
     pub fn compile(m: &LabelMatcher) -> Result<Self, EngineError> {
         let anchored = || {
             let anchored = format!("^(?:{})$", m.value);
-            Regex::new(&anchored).map_err(|e| {
-                EngineError::Query(format!(
-                    "invalid regular expression {:?} for label {:?}: {e}",
-                    m.value, m.name
-                ))
+            Regex::new(&anchored).map_err(|source| EngineError::Regex {
+                label: m.name.clone(),
+                pattern: m.value.clone(),
+                source,
             })
         };
         let kind = match m.op {
@@ -389,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_regex_is_a_query_error() {
+    fn an_invalid_regex_keeps_its_cause() {
         let err = CompiledMatcher::compile(&LabelMatcher {
             name: "k".into(),
             op: MatchOp::RegexEqual,
@@ -397,6 +396,7 @@ mod tests {
             pos_range: PositionRange::default(),
         })
         .unwrap_err();
-        assert!(matches!(err, EngineError::Query(_)), "{err}");
+        assert!(matches!(err, EngineError::Regex { .. }), "{err}");
+        assert!(std::error::Error::source(&err).is_some_and(|c| c.is::<regex::Error>()));
     }
 }
