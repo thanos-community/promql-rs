@@ -549,10 +549,14 @@ impl Planner<'_> {
         let plan = builder
             .aggregate(
                 series_keys(),
-                vec![
-                    selector::call(col(SAMPLES), col(BLOCK_START), col(BLOCK_END), &params)
-                        .alias(SAMPLES),
-                ],
+                vec![selector::call(
+                    col(SAMPLES),
+                    col(BLOCK_START),
+                    col(BLOCK_END),
+                    &params,
+                    selector::Pick::Value,
+                )
+                .alias(SAMPLES)],
             )?
             .project(canonical(col(LABELS)))?
             .build()?;
