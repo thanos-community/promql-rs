@@ -254,7 +254,6 @@ fn the_functions_that_are_not_elementwise_are_still_unsupported() {
         ("scalar(temperature)", "the scalar function"),
         ("timestamp(temperature)", "the timestamp function"),
         ("year(temperature)", "the year function"),
-        ("absent(temperature)", "the absent function"),
     ] {
         let err = error(query);
         assert!(
@@ -262,4 +261,74 @@ fn the_functions_that_are_not_elementwise_are_still_unsupported() {
             "{query}: {err}"
         );
     }
+}
+
+/// `absent` answers nothing while the series is there, whatever shape
+/// the argument takes.
+#[test]
+fn absent_is_empty_when_the_series_is_there() {
+    for query in [
+        "absent(temperature)",
+        r#"absent(temperature{city="oslo"})"#,
+        "absent(sum(temperature))",
+        "absent(temperature > -100)",
+        "absent(abs(temperature))",
+        r#"absent_over_time(temperature{city="oslo"}[1m])"#,
+        "absent_over_time(temperature[5m])",
+    ] {
+        assert_eq!(vector(query), vec![], "{query}");
+    }
+}
+
+/// With nothing there, the one series carries the labels upstream reads
+/// off the selector, not off any data: equality matchers only, a name
+/// matched twice dropped, nothing at all above a function or an
+/// aggregation.
+#[test]
+fn absent_carries_the_labels_the_selector_asked_for() {
+    let labelled = |pairs: &[(&str, &str)]| {
+        vec![(
+            pairs
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect::<Vec<_>>(),
+            1.0,
+        )]
+    };
+    assert_eq!(vector("absent(nonexistent)"), labelled(&[]));
+    assert_eq!(
+        vector(r#"absent(nonexistent{city="rome", region=~"eu.*"})"#),
+        labelled(&[("city", "rome")])
+    );
+    assert_eq!(
+        vector(r#"absent((nonexistent{city="rome"}))"#),
+        labelled(&[("city", "rome")])
+    );
+    assert_eq!(
+        vector(r#"absent(temperature{city="bergen", city="tromso", region="north"})"#),
+        labelled(&[("region", "north")])
+    );
+    assert_eq!(
+        vector(r#"absent(sum(nonexistent{city="rome"}))"#),
+        labelled(&[])
+    );
+    assert_eq!(
+        vector(r#"absent_over_time(nonexistent{city="rome", region!="eu"}[5m])"#),
+        labelled(&[("city", "rome")])
+    );
+    assert_eq!(
+        vector(r#"absent(temperature{city="oslo"} offset 1h)"#),
+        labelled(&[("city", "oslo")])
+    );
+}
+
+/// A subquery under `absent_over_time` is the gap it is everywhere
+/// else, named as such rather than answered with the wrong labels.
+#[test]
+fn absent_over_time_of_a_subquery_is_still_unsupported() {
+    let err = error("absent_over_time(rate(temperature[1m])[5m:30s])");
+    assert!(
+        matches!(&err, EngineError::Unsupported(f) if f == "a subquery"),
+        "{err}"
+    );
 }

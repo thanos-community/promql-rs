@@ -118,10 +118,6 @@ fn anything_but_a_selector_is_unsupported_by_name() {
     let engine = Engine::blocking().unwrap();
     for (query, what) in [
         ("topk(2, http_requests_total)", "the topk aggregation"),
-        (
-            "absent_over_time(http_requests_total[5m])",
-            "the absent_over_time function",
-        ),
         ("http_requests_total[5m]", "a range selector"),
     ] {
         let err = engine

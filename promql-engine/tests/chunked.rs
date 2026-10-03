@@ -459,3 +459,80 @@ fn series_come_back_in_label_set_order() {
         }
     }
 }
+
+/// `absent` and `absent_over_time` over a series that ends inside the
+/// range: present steps stay out of the row and the rest are 1, step by
+/// step, and the row is the same whether the store sends the series as
+/// one chunk, as chunks, in blocks, or over four partitions with blocks
+/// the series never reaches. `x` ends at 570s and the lookback is 5m,
+/// so `absent(x)` starts at 900s; the one-minute window of
+/// `absent_over_time` empties at 660s; shifted by 5m the series is
+/// also missing for the first five minutes of the range.
+#[test]
+fn absent_across_chunks_blocks_and_partitions() {
+    let range = RangeQuery::new(0, 1_200_000, 60_000);
+    let ones = |from_ms: i64| {
+        let ts: Vec<i64> = (from_ms..=1_200_000).step_by(60_000).collect();
+        let n = ts.len();
+        (ts, vec![1.0; n])
+    };
+    for (q, labels, expected) in [
+        ("absent(x)", vec![], ones(900_000)),
+        (r#"absent(x{pod="a"})"#, vec![("pod", "a")], ones(900_000)),
+        ("absent_over_time(x[1m])", vec![], ones(660_000)),
+        ("absent(x offset 5m)", vec![], {
+            let (mut ts, mut vs) = (
+                (0..=240_000).step_by(60_000).collect::<Vec<i64>>(),
+                vec![1.0; 5],
+            );
+            ts.push(1_200_000);
+            vs.push(1.0);
+            (ts, vs)
+        }),
+        ("absent(sum(x))", vec![], ones(900_000)),
+    ] {
+        let got = query(plain().as_ref(), q, range);
+        assert_eq!(got.len(), 1, "{q}: one series");
+        let series_labels: Vec<(String, String)> = got[0]
+            .labels()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        let labels: Vec<(String, String)> = labels
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(series_labels, labels, "{q}");
+        assert_eq!(got[0].timestamps(), expected.0, "{q}");
+        assert_eq!(got[0].values(), expected.1, "{q}");
+
+        assert_same_as_unchunked(q, range);
+        let partitioned = MemorySeriesSource::from_descriptions(&descriptions(), 30.0)
+            .chunked(CHUNK_MS)
+            .blocks(nz64(BLOCK_MS))
+            .rows_per_batch(nz(1))
+            .partitions(nz(4));
+        assert_same_on(&partitioned, q, range);
+    }
+}
+
+/// A store with nothing in it at all hands the plan zero batches in
+/// every partition, and the row still comes out.
+#[test]
+fn absent_over_an_empty_store() {
+    let range = RangeQuery::new(0, 120_000, 60_000);
+    for n in [1, 4] {
+        let source = MemorySeriesSource::try_new(Vec::new())
+            .unwrap()
+            .partitions(nz(n));
+        for q in [
+            r#"absent(x{pod="a"})"#,
+            "absent_over_time(x[5m])",
+            "absent(sum(x))",
+        ] {
+            let got = query(&source, q, range);
+            assert_eq!(got.len(), 1, "{q} over {n} partitions");
+            assert_eq!(got[0].timestamps(), [0, 60_000, 120_000], "{q}");
+            assert_eq!(got[0].values(), [1.0, 1.0, 1.0], "{q}");
+        }
+    }
+}

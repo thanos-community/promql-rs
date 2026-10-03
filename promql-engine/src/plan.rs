@@ -47,6 +47,7 @@ use promql_parser::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, VectorMatchCardinality, VectorSelector,
 };
 
+use crate::absent;
 use crate::aggregate::{self, Op};
 use crate::binary;
 use crate::elementwise;
@@ -569,6 +570,18 @@ impl Planner<'_> {
                 label_names: Vec::new(),
             });
         }
+        if name == "absent" {
+            let above = Above {
+                func: Some(name),
+                grouping: None,
+            };
+            let input = self.expr(&call.args[0], above).await?;
+            return self.absent(&call.args[0], input);
+        }
+        if name == "absent_over_time" {
+            let input = self.range_over(call, Func::PresentOverTime, name).await?;
+            return self.absent(&call.args[0], input);
+        }
         if let Some(func) = elementwise::Func::parse(name) {
             return self.elementwise(call, func).await;
         }
@@ -576,6 +589,37 @@ impl Planner<'_> {
             return self.sort(call, func).await;
         }
         self.range_function(call).await
+    }
+
+    /// `absent(v)` and `absent_over_time(x[5m])`: the one series over the
+    /// steps `input` reached none of, under the labels upstream reads off
+    /// the argument expression rather than off any series.
+    ///
+    /// The aggregate has no group key, not even the block: that is what
+    /// makes it answer when `input` has no rows at all, and the block it
+    /// stamps is the whole grid, as a scalar's is. The store partitions
+    /// meet in the Final it plans, which merges one presence set per
+    /// partition. Where every step was answered the row leaves with no
+    /// samples, and the output drops it as it drops any other empty
+    /// series.
+    fn absent(&mut self, arg: &Expr, input: Planned) -> Result<Planned, EngineError> {
+        let pairs = absent::labels_for(arg);
+        let label_names = pairs.iter().map(|(n, _)| n.clone()).collect();
+        let labels_expr = labels::call(pairs.into_iter().map(|(n, v)| (n, lit(v))).collect());
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .aggregate(
+                Vec::<datafusion::logical_expr::Expr>::new(),
+                vec![absent::call(
+                    col(SAMPLES),
+                    self.query.start_ms,
+                    self.query.end_ms,
+                    self.query.step_ms,
+                )
+                .alias(SAMPLES)],
+            )?
+            .project(whole_grid(labels_expr.alias(LABELS), col(SAMPLES)))?
+            .build()?;
+        Ok(Planned { plan, label_names })
     }
 
     /// A function applied to one sample at a time: `abs(x)` and its
@@ -884,6 +928,20 @@ impl Planner<'_> {
         let name = call.func.name.as_str();
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
+        self.range_over(call, func, name).await
+    }
+
+    /// `func` over the one range selector `call` takes, told to the store
+    /// as `name`: the function the user wrote, which is not always the
+    /// kernel that answers it. `absent_over_time` runs `present_over_time`
+    /// below its complement, and the store should still hear the name
+    /// whose samples it may skip.
+    async fn range_over(
+        &mut self,
+        call: &Call,
+        func: Func,
+        name: &str,
+    ) -> Result<Planned, EngineError> {
         let (ms, vs) = match call.args.as_slice() {
             [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
                 Expr::VectorSelector(vs) => (ms, vs),
@@ -934,7 +992,7 @@ impl Planner<'_> {
             &params,
             Some(params.window_ms),
             Above {
-                func: Some(func.as_str()),
+                func: Some(name),
                 grouping: None,
             },
         );
