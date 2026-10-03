@@ -1,11 +1,12 @@
 //! The vector selector as a DataFusion grouped aggregate function.
 //!
 //! `promql_vector_selector(samples, block_start, block_end, start, end,
-//! step, lookback, offset, at)` grouped by the block and `labels` folds
-//! one label set's chunks of one block, in arrival order, into that
-//! series' values on the steps the block answers: for every such step,
-//! the most recent sample no older than `lookback`, stamped with the
-//! step's timestamp.
+//! step, lookback, offset, at, timestamp)` grouped by the block and
+//! `labels` folds one label set's chunks of one block, in arrival order,
+//! into that series' values on the steps the block answers: for every
+//! such step, the most recent sample no older than `lookback`, stamped
+//! with the step's timestamp. With `timestamp` set the sample's own time
+//! is emitted in place of its value, see [`Pick`].
 //!
 //! An aggregate, because a series is one chunk of a label set, not the
 //! whole of it: only an aggregate sees a group's series in sequence and
@@ -23,6 +24,7 @@
 //! functions run in, and `advance_selector` is one series' walk across the
 //! grid.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, ListArray};
@@ -35,6 +37,8 @@ use datafusion::logical_expr::{
     lit, Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, Expr, GroupsAccumulator, Signature,
     Volatility,
 };
+use datafusion::physical_expr::expressions::Literal;
+use datafusion::physical_expr::PhysicalExpr;
 
 use crate::buffer::{BufferedSeriesIterator, Kernel};
 use crate::params::Params;
@@ -51,6 +55,29 @@ pub fn is_stale(v: f64) -> bool {
     v.to_bits() == STALE_NAN_BITS
 }
 
+/// What the selector emits for the sample it picked at a step.
+///
+/// `timestamp(x)` over a bare selector wants the sample's own time, and
+/// only this kernel still has it: every operator above stamps a sample
+/// with the step. Upstream keeps the two apart the same way, with
+/// `rangeEvalTimestampFunctionOverVectorSelector` reading `t` where
+/// `evalVectorSelector` reads `f`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Value,
+    /// `float64(t) / 1000`: the picked sample's time in seconds.
+    Timestamp,
+}
+
+impl Pick {
+    fn of(self, t: i64, v: f64) -> f64 {
+        match self {
+            Pick::Value => v,
+            Pick::Timestamp => t as f64 / 1000.0,
+        }
+    }
+}
+
 /// `vectorSelectorSingle` for every step the buffered samples can answer
 /// for good: those whose lookup time is at or before `last_t`, since a
 /// later sample is later than that.
@@ -63,6 +90,7 @@ pub(crate) fn advance_selector(
     it: &mut BufferedSeriesIterator,
     ts: &[i64],
     vs: &[f64],
+    pick: Pick,
     out: &mut SamplesBuilder,
 ) {
     let Some(last_t) = it.last_t else {
@@ -77,10 +105,10 @@ pub(crate) fn advance_selector(
         if it.next_step >= steps || at - p.offset_ms > last_t {
             return;
         }
-        if let Some(&v) = vs.last() {
+        if let (Some(&t), Some(&v)) = (ts.last(), vs.last()) {
             if !is_stale(v) {
                 for step in p.steps() {
-                    out.push(step, v);
+                    out.push(step, pick.of(t, v));
                 }
             }
         }
@@ -106,7 +134,7 @@ pub(crate) fn advance_selector(
         if h > 0 {
             let (t, v) = (ts[h - 1], vs[h - 1]);
             if t > ref_time - p.window_ms && !is_stale(v) {
-                out.push(step, v);
+                out.push(step, pick.of(t, v));
             }
         }
         next += 1;
@@ -329,6 +357,7 @@ impl Default for VectorSelector {
             series::timestamp_type(),
         ];
         args.extend(std::iter::repeat_n(DataType::Int64, 6));
+        args.push(DataType::Boolean);
         Self {
             signature: Signature::exact(args, Volatility::Immutable),
         }
@@ -340,8 +369,8 @@ pub fn udaf() -> AggregateUDF {
 }
 
 /// `promql_vector_selector(samples, block_start, block_end, start, end,
-/// step, lookback, offset, at)`.
-pub fn call(samples: Expr, block_start: Expr, block_end: Expr, p: &Params) -> Expr {
+/// step, lookback, offset, at, timestamp)`.
+pub fn call(samples: Expr, block_start: Expr, block_end: Expr, p: &Params, pick: Pick) -> Expr {
     udaf().call(vec![
         samples,
         block_start,
@@ -352,7 +381,22 @@ pub fn call(samples: Expr, block_start: Expr, block_end: Expr, p: &Params) -> Ex
         lit(p.window_ms),
         lit(p.offset_ms),
         lit(ScalarValue::Int64(p.at_ms)),
+        lit(pick == Pick::Timestamp),
     ])
+}
+
+/// The `timestamp` argument, a literal for the reason the parameters
+/// are: an accumulator is built once per plan.
+fn pick_from_literal(exprs: &[Arc<dyn PhysicalExpr>]) -> Result<Pick> {
+    let value = exprs
+        .get(9)
+        .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
+        .map(Literal::value);
+    match value {
+        Some(ScalarValue::Boolean(Some(true))) => Ok(Pick::Timestamp),
+        Some(ScalarValue::Boolean(Some(false))) => Ok(Pick::Value),
+        _ => plan_err!("{NAME}: argument 9 (timestamp) must be a Boolean literal"),
+    }
 }
 
 /// What a group with no rows yields: no samples.
@@ -417,7 +461,7 @@ impl AggregateUDFImpl for VectorSelector {
             return plan_err!("{NAME}: DISTINCT is not supported");
         }
         Ok(Box::new(EvalSeries::new(
-            Kernel::Selector,
+            Kernel::Selector(pick_from_literal(args.exprs)?),
             Params::from_literals(args.exprs, 3)?,
         )))
     }
@@ -441,7 +485,11 @@ mod tests {
 
     /// One series pushed as `chunks`, then closed.
     fn select(chunks: &[(&[i64], &[f64])], p: Params) -> Vec<(i64, f64)> {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector, p);
+        select_with(Pick::Value, chunks, p)
+    }
+
+    fn select_with(pick: Pick, chunks: &[(&[i64], &[f64])], p: Params) -> Vec<(i64, f64)> {
+        let mut it = BufferedSeriesIterator::new(Kernel::Selector(pick), p);
         let mut out = SamplesBuilder::default();
         for (ts, vs) in chunks {
             it.push(ts, vs, &mut out);
@@ -570,6 +618,54 @@ mod tests {
             },
         );
         assert_eq!(out, vec![(2 * M, 1.0), (3 * M, 1.0)]);
+    }
+
+    /// `timestamp(x)` over a bare selector: the same sample is picked at
+    /// each step and its own time, not the step's and not its value,
+    /// is what comes out. An offset moves which sample is picked and
+    /// leaves its time alone; a stale marker hides the series as it
+    /// does for the value; `@` repeats the pinned sample's time.
+    #[test]
+    fn the_timestamp_pick_emits_the_samples_own_time_in_seconds() {
+        let by_time = |chunks: &[(&[i64], &[f64])], p| select_with(Pick::Timestamp, chunks, p);
+        let out = by_time(
+            &[(&[10_000, 90_000], &[7.0, 8.0])],
+            Params {
+                end_ms: 2 * M,
+                ..params()
+            },
+        );
+        assert_eq!(out, vec![(M, 10.0), (2 * M, 90.0)]);
+
+        let out = by_time(
+            &[(&[10_000, 90_000], &[7.0, 8.0])],
+            Params {
+                offset_ms: M,
+                end_ms: 3 * M,
+                ..params()
+            },
+        );
+        assert_eq!(out, vec![(2 * M, 10.0), (3 * M, 90.0)]);
+
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let out = by_time(
+            &[(&[0, M], &[1.0, stale])],
+            Params {
+                end_ms: M,
+                ..params()
+            },
+        );
+        assert_eq!(out, vec![(0, 0.0)]);
+
+        let out = by_time(
+            &[(&[0, M, 2 * M], &[1.0, 2.0, 3.0])],
+            Params {
+                at_ms: Some(M + 1),
+                end_ms: 2 * M,
+                ..params()
+            },
+        );
+        assert_eq!(out, vec![(0, 60.0), (M, 60.0), (2 * M, 60.0)]);
     }
 
     #[test]
@@ -744,7 +840,7 @@ mod tests {
 
     fn accumulator() -> EvalSeries {
         EvalSeries::new(
-            Kernel::Selector,
+            Kernel::Selector(Pick::Value),
             Params {
                 end_ms: 2 * M,
                 ..params()
@@ -820,7 +916,7 @@ mod tests {
     #[test]
     fn the_open_series_is_reserved_the_steps_it_has_left() {
         let mut acc = EvalSeries::new(
-            Kernel::Selector,
+            Kernel::Selector(Pick::Value),
             Params {
                 end_ms: 999 * M,
                 ..params()
@@ -855,7 +951,7 @@ mod tests {
             end_ms: (crate::aggregate::MAX_STEPS as i64 - 1) * M,
             ..params()
         };
-        let mut acc = EvalSeries::new(Kernel::Selector, grid);
+        let mut acc = EvalSeries::new(Kernel::Selector(Pick::Value), grid);
         let at = |i: i64| column(&[&[(i * M, i as f64)]]);
         for i in 0..20i64 {
             acc.update_batch(&at(i), &[i as usize], None, i as usize + 1)

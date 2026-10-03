@@ -305,8 +305,9 @@ fn is_block_column(e: &Expr, name: &str) -> bool {
 }
 
 /// `promql_vector_selector(samples, block_start, block_end, start, end,
-/// step, lookback, offset, at)` as `vector_selector(samples[ offset
-/// OFFSET][ @ N], START..END step STEP, lookback LOOKBACK)` — PromQL has
+/// step, lookback, offset, at, timestamp)` as `vector_selector(samples[
+/// offset OFFSET][ @ N], START..END step STEP, lookback LOOKBACK[,
+/// timestamp])` — PromQL has
 /// no syntax for the evaluation range, so that stays a trailing argument
 /// on every call, but `offset` and `@` are PromQL's own selector
 /// modifiers and take PromQL's own order and spelling, attached to the
@@ -322,7 +323,7 @@ fn is_block_column(e: &Expr, name: &str) -> bool {
 /// than through `Duration`'s formatting: it names a point in time, not a
 /// span.
 fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
-    if args.len() != 9 {
+    if args.len() != 10 {
         return None;
     }
     if !is_block_column(&args[1], series::BLOCK_START)
@@ -338,9 +339,16 @@ fn render_vector_selector(args: &[Expr], single_scan: bool) -> Option<String> {
     let offset = require_i64(&args[7])?;
     let at = optional_i64(&args[8])?;
     push_offset_and_at(&mut samples, offset, at)?;
+    // Only the pick that is not the default prints: the value is what a
+    // selector is for, and a plan that said so on every line would hide
+    // the one that reads the time instead.
+    let pick = match require_bool(&args[9])? {
+        true => ", timestamp",
+        false => "",
+    };
 
     Some(format!(
-        "vector_selector({samples}, {start}..{end} step {}, lookback {})",
+        "vector_selector({samples}, {start}..{end} step {}, lookback {}{pick})",
         Duration::from_millis(step).ok()?,
         Duration::from_millis(lookback).ok()?
     ))
@@ -636,6 +644,13 @@ fn optional_i64(e: &Expr) -> Option<Option<i64>> {
     }
 }
 
+fn require_bool(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Literal(ScalarValue::Boolean(Some(b)), _) => Some(*b),
+        _ => None,
+    }
+}
+
 fn utf8_literal(e: &Expr) -> Option<&str> {
     match e {
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s.as_str()),
@@ -691,6 +706,7 @@ mod tests {
             col(series::BLOCK_START),
             col(series::BLOCK_END),
             &params(0, None),
+            selector::Pick::Value,
         );
         assert_eq!(
             render_expr(&call, true),
@@ -705,10 +721,28 @@ mod tests {
             col(series::BLOCK_START),
             col(series::BLOCK_END),
             &params(3_600_000, Some(900_000)),
+            selector::Pick::Value,
         );
         assert_eq!(
             render_expr(&call, true),
             "vector_selector(samples offset 1h @ 900000, 600000..1200000 step 30s, lookback 5m)"
+        );
+    }
+
+    /// The pick prints only when it is not the value, so every existing
+    /// selector line stays as it was.
+    #[test]
+    fn vector_selector_names_the_timestamp_pick() {
+        let call = selector::call(
+            col("samples"),
+            col(series::BLOCK_START),
+            col(series::BLOCK_END),
+            &params(0, None),
+            selector::Pick::Timestamp,
+        );
+        assert_eq!(
+            render_expr(&call, true),
+            "vector_selector(samples, 600000..1200000 step 30s, lookback 5m, timestamp)"
         );
     }
 
@@ -929,6 +963,7 @@ mod tests {
                     col(series::BLOCK_START),
                     col(series::BLOCK_END),
                     &params(3_600_000, Some(900_000)),
+                    selector::Pick::Value,
                 )
                 .alias(SAMPLES)],
             )
@@ -989,6 +1024,7 @@ mod tests {
                     col(series::BLOCK_START),
                     col(series::BLOCK_END),
                     &params(0, None),
+                    selector::Pick::Value,
                 )
                 .alias(SAMPLES)],
             )
@@ -1020,6 +1056,7 @@ mod tests {
             lit(300_000i64),
             lit(0i64),
             lit(ScalarValue::Int64(None)),
+            lit(false),
         ]);
         let plan = LogicalPlanBuilder::scan("selector_0", source, None)
             .unwrap()
@@ -1181,6 +1218,7 @@ mod tests {
                 col(series::BLOCK_START),
                 col(series::BLOCK_END),
                 &params(0, None),
+                selector::Pick::Value,
             )
             .alias(series::SAMPLES),
         ];

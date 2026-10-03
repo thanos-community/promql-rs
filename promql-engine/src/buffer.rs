@@ -25,11 +25,11 @@
 use crate::aggregate::MAX_STEPS;
 use crate::params::{step_count, Params};
 use crate::range::{advance_range, Func, Sweep};
-use crate::selector::{advance_selector, is_stale};
+use crate::selector::{advance_selector, is_stale, Pick};
 use crate::series::SamplesBuilder;
 
 pub(crate) enum Kernel {
-    Selector,
+    Selector(Pick),
     Range(Func),
 }
 
@@ -55,7 +55,7 @@ impl BufferedSeriesIterator {
     pub(crate) fn new(kernel: Kernel, params: Params) -> Self {
         let sweep = match kernel {
             Kernel::Range(func) => Sweep::new(func),
-            Kernel::Selector => None,
+            Kernel::Selector(_) => None,
         };
         Self {
             kernel,
@@ -144,7 +144,7 @@ impl BufferedSeriesIterator {
     /// buffer's or a chunk's.
     fn advance(&mut self, ts: &[i64], vs: &[f64], done: bool, out: &mut SamplesBuilder) {
         match self.kernel {
-            Kernel::Selector => advance_selector(self, ts, vs, out),
+            Kernel::Selector(pick) => advance_selector(self, ts, vs, pick, out),
             Kernel::Range(func) => advance_range(self, ts, vs, func, done, |t, v| out.push(t, v)),
         }
     }
@@ -163,7 +163,7 @@ impl BufferedSeriesIterator {
     /// so either goes through [`append`](Self::append).
     fn in_place(&self, vs: &[f64]) -> bool {
         self.params.at_ms.is_none()
-            && (matches!(self.kernel, Kernel::Selector) || !vs.iter().any(|v| is_stale(*v)))
+            && (matches!(self.kernel, Kernel::Selector(_)) || !vs.iter().any(|v| is_stale(*v)))
     }
 
     /// Walks the chunk's steps off the chunk itself, then copies what a
@@ -229,7 +229,7 @@ impl BufferedSeriesIterator {
         };
         match self.kernel {
             // Pinned, the selector reads only the latest sample of its window.
-            Kernel::Selector if p.at_ms.is_some() => {
+            Kernel::Selector(_) if p.at_ms.is_some() => {
                 if let (Some(&t), Some(&v)) = (ts.last(), vs.last()) {
                     self.ts.clear();
                     self.vs.clear();
@@ -237,7 +237,7 @@ impl BufferedSeriesIterator {
                     self.vs.push(v);
                 }
             }
-            Kernel::Selector => {
+            Kernel::Selector(_) => {
                 self.ts.extend_from_slice(ts);
                 self.vs.extend_from_slice(vs);
             }
@@ -299,7 +299,7 @@ mod tests {
 
     /// One series pushed as `chunks`, then closed.
     fn select(p: Params, chunks: &[(&[i64], &[f64])]) -> Vec<(i64, f64)> {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector, p);
+        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), p);
         let mut out = SamplesBuilder::default();
         for (ts, vs) in chunks {
             it.push(ts, vs, &mut out);
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn a_step_is_answered_before_the_series_closes() {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector, params());
+        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), params());
         let mut out = SamplesBuilder::default();
         it.push(&[0, 90_000], &[1.0, 2.0], &mut out);
         // 0 and 1m can no longer change once 90s is seen; 2m can.
@@ -382,7 +382,7 @@ mod tests {
             end_ms: 12 * M,
             ..params()
         };
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector, p);
+        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), p);
         let mut out = SamplesBuilder::default();
         it.push(&[0, 5 * M], &[1.0, 2.0], &mut out);
         assert!(it.ts.is_empty());
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn close_starts_the_next_series_from_nothing() {
-        let mut it = BufferedSeriesIterator::new(Kernel::Selector, params());
+        let mut it = BufferedSeriesIterator::new(Kernel::Selector(Pick::Value), params());
         let mut out = SamplesBuilder::default();
         it.push(&[0, 3 * M], &[1.0, 2.0], &mut out);
         it.close(&mut out);
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn the_buffer_holds_the_window_not_the_series() {
         let mut it = BufferedSeriesIterator::new(
-            Kernel::Selector,
+            Kernel::Selector(Pick::Value),
             Params {
                 end_ms: 1000 * M,
                 ..params()
@@ -520,7 +520,7 @@ mod tests {
     /// `None` is the selector: `Kernel` is not `Copy`, and every sweep below
     /// needs a fresh one per run.
     fn kernel(func: Option<Func>) -> Kernel {
-        func.map_or(Kernel::Selector, Kernel::Range)
+        func.map_or(Kernel::Selector(Pick::Value), Kernel::Range)
     }
 
     fn name(func: Option<Func>) -> &'static str {

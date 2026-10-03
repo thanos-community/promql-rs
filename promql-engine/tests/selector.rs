@@ -220,7 +220,7 @@ async fn the_plan_is_an_aggregate_over_a_scan_with_literal_parameters() {
 
     let rendered = plan.display_indent().to_string();
     assert!(
-        rendered.starts_with("Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end\n  Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(30000), Int64(NULL)) AS samples]]"),
+        rendered.starts_with("Projection: selector_0.labels, samples, selector_0.block_start, selector_0.block_end\n  Aggregate: groupBy=[[selector_0.block_start, selector_0.block_end, selector_0.labels]], aggr=[[promql_vector_selector(selector_0.samples, selector_0.block_start, selector_0.block_end, Int64(600000), Int64(1200000), Int64(30000), Int64(300000), Int64(30000), Int64(NULL), Boolean(false)) AS samples]]"),
         "{rendered}"
     );
     assert!(rendered.contains("TableScan: selector_0"), "{rendered}");
