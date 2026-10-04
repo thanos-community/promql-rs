@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, ListArray, StructArray,
     TimestampMillisecondArray,
@@ -272,14 +273,17 @@ impl Func {
             Func::Atanh => f64::atanh,
             Func::Deg => |v| v * 180.0 / std::f64::consts::PI,
             Func::Rad => |v| v * std::f64::consts::PI / 180.0,
-            Func::DayOfMonth => |v| f64::from(Civil::of(v).day),
-            Func::DayOfWeek => |v| f64::from(Civil::of(v).weekday),
-            Func::DayOfYear => |v| f64::from(Civil::of(v).year_day()),
-            Func::DaysInMonth => |v| f64::from(Civil::of(v).days_in_month()),
-            Func::Hour => |v| f64::from(Civil::of(v).hour),
-            Func::Minute => |v| f64::from(Civil::of(v).minute),
-            Func::Month => |v| f64::from(Civil::of(v).month),
-            Func::Year => |v| Civil::of(v).year as f64,
+            Func::DayOfMonth => |v| civil(v, |t| t.day()),
+            // Sunday is 0, as `time.Weekday` counts.
+            Func::DayOfWeek => |v| civil(v, |t| t.weekday().num_days_from_sunday()),
+            Func::DayOfYear => |v| civil(v, |t| t.ordinal()),
+            // `funcDaysInMonth`'s `32 - time.Date(y, m, 32, …).Day()`: the
+            // month's length, which chrono answers without the overflow trick.
+            Func::DaysInMonth => |v| civil(v, |t| t.num_days_in_month()),
+            Func::Hour => |v| civil(v, |t| t.hour()),
+            Func::Minute => |v| civil(v, |t| t.minute()),
+            Func::Month => |v| civil(v, |t| t.month()),
+            Func::Year => |v| civil(v, |t| t.year()),
             Func::Binary { .. }
             | Func::Round
             | Func::Clamp
@@ -292,78 +296,22 @@ impl Func {
     }
 }
 
-/// `dateWrapper`'s `time.Unix(int64(v), 0).UTC()`, broken into the fields
-/// its eight callers read. Proleptic Gregorian in UTC, as Go's `time` is;
-/// the calendar arithmetic is Howard Hinnant's `civil_from_days`, which
-/// Go's `absDate` is a rearrangement of.
+/// `dateWrapper`'s `time.Unix(int64(v), 0).UTC()` with one of its eight
+/// callers' field reads applied: proleptic Gregorian in UTC, as Go's
+/// `time` is and as chrono's `DateTime<Utc>` is.
 ///
 /// Go's `int64(v)` truncates toward zero, as `as i64` does. For a NaN, an
 /// infinity or a value past `i64`, Go's answer is whatever the CPU's
 /// conversion gives (`math.MinInt64` on amd64), where `as` saturates; no
 /// query in the corpus observes the difference and nothing here pins it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Civil {
-    year: i64,
-    month: u8,
-    day: u8,
-    /// Sunday is 0, as `time.Weekday` counts.
-    weekday: u8,
-    hour: u8,
-    minute: u8,
-}
-
-impl Civil {
-    fn of(v: f64) -> Civil {
-        const DAY: i64 = 86_400;
-        let secs = v as i64;
-        let days = secs.div_euclid(DAY);
-        let of_day = secs.rem_euclid(DAY);
-
-        // Days since 1970-01-01, shifted to count from 0000-03-01 so a
-        // leap day is the last day of the year and the eras of 400 years
-        // line up on the shift.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
-        let year = yoe + era * 400 + i64::from(month <= 2);
-
-        Civil {
-            year,
-            month,
-            day,
-            // 1970-01-01 was a Thursday.
-            weekday: (days + 4).rem_euclid(7) as u8,
-            hour: (of_day / 3600) as u8,
-            minute: (of_day % 3600 / 60) as u8,
-        }
-    }
-
-    fn is_leap_year(&self) -> bool {
-        self.year % 4 == 0 && (self.year % 100 != 0 || self.year % 400 == 0)
-    }
-
-    /// `time.Time.YearDay`, 1-based.
-    fn year_day(&self) -> u16 {
-        const BEFORE_MONTH: [u16; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-        let leap = u16::from(self.is_leap_year() && self.month > 2);
-        BEFORE_MONTH[usize::from(self.month - 1)] + leap + u16::from(self.day)
-    }
-
-    /// `funcDaysInMonth`'s `32 - time.Date(y, m, 32, …).Day()`: the
-    /// overflow Go lets `time.Date` normalise is the month's length.
-    fn days_in_month(&self) -> u8 {
-        match self.month {
-            2 if self.is_leap_year() => 29,
-            2 => 28,
-            4 | 6 | 9 | 11 => 30,
-            _ => 31,
-        }
-    }
+///
+/// chrono's calendar ends at the years ±262143, some 8.2 trillion seconds
+/// from the epoch, where Go's keeps counting. Past that edge the answer is
+/// NaN, the engine's value for "no number here", rather than a year
+/// nothing could have asked for: a timestamp cannot reach it, only a
+/// counter fed to a date function by mistake.
+fn civil<T: Into<f64>>(v: f64, read: impl FnOnce(DateTime<Utc>) -> T) -> f64 {
+    DateTime::from_timestamp(v as i64, 0).map_or(f64::NAN, |t| read(t).into())
 }
 
 /// `funcSgn`: zero and NaN come back as themselves, so the sign of `-0`
@@ -800,6 +748,19 @@ mod tests {
         // A 30-day month, and a century year that is not a leap year.
         assert_eq!(at("days_in_month", 1_491_004_800.0), 30.0);
         assert_eq!(at("days_in_month", 4_105_123_200.0), 28.0);
+    }
+
+    /// chrono stops at the years ±262143 and the engine answers NaN past
+    /// them, where the arithmetic this replaced kept counting; the last
+    /// second on each side is still a date.
+    #[test]
+    fn a_second_past_chronos_calendar_is_nan() {
+        assert_eq!(value("year", 8_210_266_876_799.0), 262_142.0);
+        assert_eq!(value("day_of_year", 8_210_266_876_799.0), 365.0);
+        assert!(value("year", 8_210_266_876_800.0).is_nan());
+        assert_eq!(value("year", -8_334_601_228_800.0), -262_143.0);
+        assert!(value("month", -8_334_601_228_801.0).is_nan());
+        assert!(value("hour", f64::INFINITY).is_nan());
     }
 
     /// `int64(v)` truncates toward zero: `-9.75` is `-9`, nine seconds

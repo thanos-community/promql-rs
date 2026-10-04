@@ -17,9 +17,10 @@ license = "Apache-2.0"
 anyhow = "1.0"
 async-trait = "0.1"
 cfgrammar = "0.13"
-# `TimeDelta` only; no clock/tz lookup, so the `clock` default feature
-# (which pulls in `iana-time-zone`) stays off.
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `TimeDelta` and the UTC calendar behind the date functions; no clock or
+# time-zone lookup, so the `clock` default feature (which pulls in
+# `iana-time-zone`) stays off. 0.4.41 is where `num_days_in_month` landed.
+chrono = { version = "0.4.41", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 # The same harness great lakes uses. Its `bencher` output format is what
 # the benchmark trackers ingest, so the benches can be tracked later
