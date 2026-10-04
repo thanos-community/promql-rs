@@ -260,6 +260,10 @@ fn eval_series(
         ScalarValue::Int64(Some(p.offset_ms)),
         ScalarValue::Int64(p.at_ms),
     ]);
+    // Only the selector picks between a sample's value and its time.
+    if func.is_none() {
+        args.push(ScalarValue::Boolean(Some(false)));
+    }
     let mut exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
         Arc::new(Column::new(series::SAMPLES, 0)),
         Arc::new(Column::new(series::BLOCK_START, 1)),
@@ -621,6 +625,44 @@ fn elementwise_binary(c: &mut Criterion) {
     g.finish();
 }
 
+/// `elementwise::apply` under a date extractor, the per-sample map path.
+/// The values are Unix timestamps a minute apart from early 2024, what
+/// `hour(timestamp(x))` hands the extractor, so the calendar arithmetic
+/// runs on the dates a real query reaches rather than on small integers.
+/// Ids are `elementwise/date/<function>/<rows>x<samples>`.
+fn elementwise_date(c: &mut Criterion) {
+    let (rows, samples) = (1_000usize, 1_440usize);
+    let all: Vec<(Vec<i64>, Vec<f64>)> = (0..rows)
+        .map(|i| {
+            let ts = (0..samples).map(|j| j as i64 * 60_000).collect();
+            let vs = (0..samples)
+                .map(|j| 1_704_067_200.0 + (i * 86_400 + j * 60) as f64)
+                .collect();
+            (ts, vs)
+        })
+        .collect();
+    let column = samples_of(&all);
+    let list: &ListArray = column.as_list::<i32>();
+    let mut g = c.benchmark_group("elementwise/date");
+    g.throughput(Throughput::Elements((rows * samples) as u64));
+    for name in [
+        "day_of_month",
+        "day_of_week",
+        "day_of_year",
+        "days_in_month",
+        "hour",
+        "minute",
+        "month",
+        "year",
+    ] {
+        let bound = elementwise::Func::parse(name).unwrap().bind(None, None);
+        g.bench_function(BenchmarkId::new(name, format!("{rows}x{samples}")), |b| {
+            b.iter(|| elementwise::apply(black_box(list), bound))
+        });
+    }
+    g.finish();
+}
+
 /// The two edges of the seam: rows into a batch and back, plus clipping
 /// one series to a range.
 fn series_encode_decode(c: &mut Criterion) {
@@ -661,6 +703,7 @@ criterion_group! {
         aggregate_state_merge,
         binary_pairing,
         elementwise_binary,
+        elementwise_date,
         series_encode_decode
 }
 criterion_main!(benches);
