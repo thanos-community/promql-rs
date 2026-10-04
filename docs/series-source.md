@@ -44,7 +44,7 @@ pub struct SelectHints {
     pub start_ms: i64,              // inclusive; binding, widened by the window
     pub end_ms: i64,                // inclusive; binding
     pub window_ms: i64,             // lookback delta or `[5m]`; binding at every block
-    pub step_ms: Option<i64>,       // step of the range query; None for instant
+    pub step_ms: Option<i64>,       // step of the range query; None when start_ms == end_ms
     pub range_ms: Option<i64>,      // window of a range selector, `[5m]`
     pub func: Option<String>,       // function or aggregation directly above
     pub grouping: Option<Grouping>, // `by`/`without` labels directly above
@@ -229,7 +229,8 @@ series_id    UInt64 | FixedSizeBinary(n)    optional; present only in keyed mode
 ```
 
 One series is one Arrow row: a label set and one chunk of its samples in one
-block. Nothing is nullable.
+block. Nothing is nullable. For a worked example of one query flowing through
+the engine, see [engine-trace.md](engine-trace.md).
 `block_start` and `block_end` may be plain or run-end encoded, the store's
 choice; at one Arrow row per chunk either costs next to nothing.
 
@@ -314,6 +315,9 @@ and build one `Series` per series and block from all of that series'
 chunks, sorted by first sample timestamp where the protocol does not
 promise it, never one `Series` per chunk, since `encode` refuses two series
 with one label set; then `encode`, stamping the block's edges on every series.
+Merging replicas is the source's job too: it puts the merge on top of its
+scan with `scan_node`, because the engine's first-chunk-wins only merges
+identical label sets, and replicas differ in exactly their replica label.
 
 **Streaming.** A plan may yield several batches, cut wherever suits the
 store, even inside a series. They must share one schema, so the store has

@@ -59,4 +59,6 @@ pub use matcher::{CompiledMatcher, METRIC_NAME};
 pub use memory::MemorySeriesSource;
 pub use params::Params;
 pub use series::Series;
-pub use source::{Grouping, SelectHints, SelectorTable, SeriesSource, Shard};
+pub use source::{
+    Grouping, SelectHints, SelectorExtension, SelectorNode, SelectorTable, SeriesSource, Shard,
+};

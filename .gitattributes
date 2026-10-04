@@ -28,3 +28,10 @@ promql-conformance/testdata/prometheus/*.test linguist-vendored=true
 # deliberate human edits that blessing preserves.
 promql-conformance/testdata/prometheus/SUPPORTED.toml   linguist-generated=true
 promql-conformance/testdata/prometheus/UNSUPPORTED.md   linguist-generated=true
+
+# Copies of thanos-io/thanos@<pinned sha> protos with the Go-only
+# gogoproto options removed; see thanos-store/proto/README.md.
+thanos-store/proto/**/*.proto  linguist-vendored=true
+
+# Emitted by scripts/gen-xor-fixtures from Prometheus's chunkenc.
+thanos-store/testdata/xor_chunks.json linguist-generated=true

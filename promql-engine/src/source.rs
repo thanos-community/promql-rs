@@ -45,6 +45,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -55,15 +56,21 @@ use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{SchemaRef, TimestampMillisecondType};
 use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::DFSchemaRef;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SessionState;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{
+    Expr, Extension, LogicalPlan, TableType, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, Statistics,
 };
+use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::{Stream, StreamExt};
 use promql_parser::ast::LabelMatcher;
 
@@ -97,8 +104,9 @@ pub struct SelectHints {
     /// run from `start_ms + window_ms` to `end_ms`, and each reaches back
     /// by this much so that it answers its steps alone.
     pub window_ms: i64,
-    /// Step of the enclosing range query; `None` for an instant query. A
-    /// store may read downsampled or step-aligned data.
+    /// Step of the enclosing range query; `None` when the query evaluates at
+    /// a single timestamp (start_ms == end_ms). A store may read downsampled
+    /// or step-aligned data.
     pub step_ms: Option<i64>,
     /// Window of a range selector such as `[5m]`; `None` for an instant
     /// selector. A store may prune chunks per window.
@@ -213,6 +221,184 @@ pub trait SeriesSource: fmt::Debug + Send + Sync {
         matchers: &[LabelMatcher],
         hints: SelectHints,
     ) -> Result<Arc<dyn ExecutionPlan>>;
+
+    /// Puts a source-owned node on top of a selector's `TableScan`, by
+    /// returning [`SelectorExtension::plan`] over `scan`. Called once per
+    /// selector, instant, range or inside a range function, before any
+    /// aggregate goes above it. `hints` is what `select` received, for a
+    /// source that only wants the node for some functions.
+    ///
+    /// The default returns `scan`, which leaves plans as they were.
+    fn scan_node(&self, scan: LogicalPlan, _hints: &SelectHints) -> Result<LogicalPlan> {
+        Ok(scan)
+    }
+}
+
+/// What a source puts on top of a selector's scan; see
+/// [`SeriesSource::scan_node`].
+///
+/// `wrap` runs beneath [`SeriesSetExec`], not above it. The engine owns that
+/// operator and `check_selector_plans` refuses any node between a selector
+/// aggregate and it, so an operator that sat above would be refused. The
+/// extension planner therefore rebuilds the scan as
+/// `SeriesSetExec -> wrap(store plan)`, and the order check still covers
+/// whatever `wrap` emits.
+pub trait SelectorNode: fmt::Debug + Send + Sync {
+    /// The exec to run between the store's plan and [`SeriesSetExec`]. It
+    /// must keep the scan's schema: the logical plan above was built from it.
+    fn wrap(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>>;
+
+    /// The node's line in logical `EXPLAIN`, e.g. `Dedup: replica_labels=[r]`.
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+
+    /// Identity for plan equality and hashing, which DataFusion needs of
+    /// every logical node. Must differ whenever `wrap` would behave
+    /// differently; a type name alone would equate two differently
+    /// configured nodes, so there is no default.
+    fn node_key(&self) -> String;
+}
+
+/// The logical node a [`SelectorNode`] travels in, with the scan as its
+/// one input.
+#[derive(Debug, Clone)]
+pub struct SelectorExtension {
+    node: Arc<dyn SelectorNode>,
+    scan: LogicalPlan,
+}
+
+impl SelectorExtension {
+    /// `node` over `scan`, as the plan [`SeriesSource::scan_node`] returns.
+    pub fn plan(node: Arc<dyn SelectorNode>, scan: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(Self { node, scan }),
+        })
+    }
+}
+
+impl PartialEq for SelectorExtension {
+    fn eq(&self, other: &Self) -> bool {
+        self.node.node_key() == other.node.node_key() && self.scan == other.scan
+    }
+}
+
+impl Eq for SelectorExtension {}
+
+impl Hash for SelectorExtension {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.node.node_key().hash(state);
+        self.scan.hash(state);
+    }
+}
+
+impl PartialOrd for SelectorExtension {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.node.node_key().cmp(&other.node.node_key()) {
+            Ordering::Equal => self.scan.partial_cmp(&other.scan),
+            ord => Some(ord),
+        }
+    }
+}
+
+impl UserDefinedLogicalNodeCore for SelectorExtension {
+    fn name(&self) -> &str {
+        "SelectorExtension"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.scan]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        self.scan.schema()
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.node.fmt_for_explain(f)
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<Expr>,
+        mut inputs: Vec<LogicalPlan>,
+    ) -> Result<Self> {
+        match (exprs.is_empty(), inputs.pop(), inputs.is_empty()) {
+            (true, Some(scan), true) => Ok(Self {
+                node: Arc::clone(&self.node),
+                scan,
+            }),
+            _ => Err(DataFusionError::Internal(
+                "SelectorExtension takes one input and no expressions".into(),
+            )),
+        }
+    }
+}
+
+/// Lowers a [`SelectorExtension`] to `SeriesSetExec -> wrap(store plan)`.
+///
+/// The input arrives already planned by [`SelectorTable::scan`] as
+/// `SeriesSetExec`, possibly under a `ProjectionExec` for pruned columns or
+/// a `CooperativeExec` that DataFusion adds around leaves. Those wrappers
+/// are rebuilt around the new `SeriesSetExec` rather than dropped, so the
+/// output keeps the column order the plan above was built against.
+pub(crate) struct SelectorExtensionPlanner;
+
+#[async_trait]
+impl ExtensionPlanner for SelectorExtensionPlanner {
+    async fn plan_extension(
+        &self,
+        _planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        _logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        _session_state: &SessionState,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(ext) = node.as_any().downcast_ref::<SelectorExtension>() else {
+            return Ok(None);
+        };
+        let [input] = physical_inputs else {
+            return Err(DataFusionError::Internal(
+                "SelectorExtension takes exactly one input".into(),
+            ));
+        };
+        lower_beneath_series_set(input, ext.node.as_ref()).map(Some)
+    }
+}
+
+fn lower_beneath_series_set(
+    plan: &Arc<dyn ExecutionPlan>,
+    node: &dyn SelectorNode,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(set) = plan.downcast_ref::<SeriesSetExec>() {
+        let input = Arc::clone(&set.input);
+        let wrapped = node.wrap(Arc::clone(&input))?;
+        // `SeriesSetExec::new` indexes the canonical columns, and the plan
+        // above is bound to the scan's column order; a wrapper that changes
+        // either is its bug and must not become a panic or a silent
+        // misread further up.
+        if wrapped.schema().fields() != input.schema().fields() {
+            return Err(DataFusionError::Plan(format!(
+                "{} changed the scan's schema; a selector node must keep its input's columns",
+                wrapped.name()
+            )));
+        }
+        return Ok(Arc::new(SeriesSetExec::new(wrapped)));
+    }
+    if plan.is::<ProjectionExec>() || plan.is::<CooperativeExec>() {
+        if let [child] = plan.children().as_slice() {
+            let lowered = lower_beneath_series_set(child, node)?;
+            return Arc::clone(plan).with_new_children(vec![lowered]);
+        }
+    }
+    Err(DataFusionError::Plan(format!(
+        "a selector node found {} where it expected a SeriesSetExec",
+        plan.name()
+    )))
 }
 
 /// One selector's scan, as a DataFusion table.

@@ -25,6 +25,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::DataFusionError;
+use datafusion::execution::context::{QueryPlanner, SessionState};
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
@@ -38,14 +40,34 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::InterleaveExec;
 use datafusion::physical_plan::{self, displayable, ExecutionPlan, InputOrderMode, Partitioning};
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::error::EngineError;
 use crate::labelset;
 pub use crate::plan::RangeQuery;
 use crate::series::{self, LABELS};
-use crate::source::{SeriesSetExec, SeriesSource};
+use crate::source::{SelectorExtensionPlanner, SeriesSetExec, SeriesSource};
 use crate::{aggregate, binary, elementwise, labels, range, selector, sort};
+
+/// The default physical planner plus [`SelectorExtensionPlanner`], which
+/// `SessionState` has no other way to take: extension planners are
+/// constructor arguments of `DefaultPhysicalPlanner`, not session settings.
+#[derive(Debug)]
+struct PromQLQueryPlanner;
+
+#[async_trait::async_trait]
+impl QueryPlanner for PromQLQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &SessionState,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(SelectorExtensionPlanner)])
+            .create_physical_plan(logical_plan, session_state)
+            .await
+    }
+}
 
 pub struct Engine {
     ctx: SessionContext,
@@ -89,7 +111,11 @@ impl Engine {
         // satisfied Hash(labels) input anyway, to reach target_partitions,
         // which splits the selector into Partial and FinalPartitioned.
         config.options_mut().optimizer.subset_repartition_threshold = 1;
-        let ctx = SessionContext::new_with_config(config);
+        let state = SessionStateBuilder::new_with_default_features()
+            .with_config(config)
+            .with_query_planner(Arc::new(PromQLQueryPlanner))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         ctx.register_udaf(selector::udaf());
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());

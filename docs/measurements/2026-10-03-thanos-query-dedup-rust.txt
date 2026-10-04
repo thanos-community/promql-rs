@@ -1,0 +1,53 @@
+goos: darwin
+goarch: arm64
+pkg: thanos-query-live
+BenchmarkInstantSumUp 1 70291083 ns/op
+BenchmarkInstantSumUp 1 59547917 ns/op
+BenchmarkInstantSumUp 1 58684292 ns/op
+BenchmarkInstantSumUp 1 61077334 ns/op
+BenchmarkInstantSumUp 1 59306292 ns/op
+BenchmarkInstantSumUp 1 56721292 ns/op
+BenchmarkInstantSumUp 1 64251875 ns/op
+BenchmarkInstantSumUp 1 70960541 ns/op
+BenchmarkInstantSumUp 1 58410875 ns/op
+BenchmarkInstantSumUp 1 61274250 ns/op
+BenchmarkInstantCountUp 1 64069791 ns/op
+BenchmarkInstantCountUp 1 65794542 ns/op
+BenchmarkInstantCountUp 1 77596958 ns/op
+BenchmarkInstantCountUp 1 74307750 ns/op
+BenchmarkInstantCountUp 1 82488000 ns/op
+BenchmarkInstantCountUp 1 90968541 ns/op
+BenchmarkInstantCountUp 1 82566083 ns/op
+BenchmarkInstantCountUp 1 71460792 ns/op
+BenchmarkInstantCountUp 1 84094833 ns/op
+BenchmarkInstantCountUp 1 77197792 ns/op
+BenchmarkRangeCountUp30d 1 10534283708 ns/op 794935296 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 10917730042 ns/op 806682624 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 11971325458 ns/op 746504192 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 17560014917 ns/op 773996544 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 10492940834 ns/op 771964928 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 11029153125 ns/op 791248896 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 10896986167 ns/op 787857408 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 10692030708 ns/op 787972096 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 10416651583 ns/op 792166400 peak-rss-bytes
+BenchmarkRangeCountUp30d 1 10822223041 ns/op 817037312 peak-rss-bytes
+BenchmarkLabels7d 1 24965500 ns/op
+BenchmarkLabels7d 1 25712834 ns/op
+BenchmarkLabels7d 1 23640500 ns/op
+BenchmarkLabels7d 1 27988709 ns/op
+BenchmarkLabels7d 1 25816125 ns/op
+BenchmarkLabels7d 1 23693292 ns/op
+BenchmarkLabels7d 1 23966916 ns/op
+BenchmarkLabels7d 1 23560666 ns/op
+BenchmarkLabels7d 1 23717709 ns/op
+BenchmarkLabels7d 1 22981875 ns/op
+BenchmarkLabelValuesJob7d 1 22800334 ns/op
+BenchmarkLabelValuesJob7d 1 21486167 ns/op
+BenchmarkLabelValuesJob7d 1 21511167 ns/op
+BenchmarkLabelValuesJob7d 1 22134083 ns/op
+BenchmarkLabelValuesJob7d 1 32334625 ns/op
+BenchmarkLabelValuesJob7d 1 22520000 ns/op
+BenchmarkLabelValuesJob7d 1 23436208 ns/op
+BenchmarkLabelValuesJob7d 1 22852542 ns/op
+BenchmarkLabelValuesJob7d 1 22827250 ns/op
+BenchmarkLabelValuesJob7d 1 23895000 ns/op

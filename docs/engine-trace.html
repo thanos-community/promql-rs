@@ -1,0 +1,1303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rate Pipeline Trace</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;0,6..72,700;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f2f4f5;
+  --surface:#ffffff;
+  --surface-2:#e9edef;
+  --text:#1a2129;
+  --text-dim:#57626c;
+  --text-faint:#7c8790;
+  --border:#d6dce0;
+  --border-strong:#b9c2c8;
+  --accent:#a6531f;
+  --accent-dim:#c98551;
+  --accent-bg:#fbeee4;
+  --accent-bg-strong:#f3dcc7;
+  --ok:#3a7d5c;
+  --ok-bg:#e6f2ec;
+  --absent:#8a5a1f;
+  --absent-bg:#f7ecd9;
+  --code-bg:#eef1f2;
+  --shadow:0 1px 2px rgba(20,30,38,0.06);
+  --s1:#1f66a8;
+  --s2:#1a7a63;
+  --s3:#9c3b78;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#12171c;
+    --surface:#1a2129;
+    --surface-2:#212a32;
+    --text:#e4e9ec;
+    --text-dim:#a7b2ba;
+    --text-faint:#7c8790;
+    --border:#2d3740;
+    --border-strong:#3c4a54;
+    --accent:#dd9057;
+    --accent-dim:#b97440;
+    --accent-bg:#33261c;
+    --accent-bg-strong:#432f1e;
+    --ok:#6fbf95;
+    --ok-bg:#1c2e26;
+    --absent:#d9ab5f;
+    --absent-bg:#332912;
+    --code-bg:#0f1418;
+    --shadow:0 1px 3px rgba(0,0,0,0.4);
+    --s1:#6fa8e0;
+    --s2:#4cc0a4;
+    --s3:#e07ab4;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#12171c;
+  --surface:#1a2129;
+  --surface-2:#212a32;
+  --text:#e4e9ec;
+  --text-dim:#a7b2ba;
+  --text-faint:#7c8790;
+  --border:#2d3740;
+  --border-strong:#3c4a54;
+  --accent:#dd9057;
+  --accent-dim:#b97440;
+  --accent-bg:#33261c;
+  --accent-bg-strong:#432f1e;
+  --ok:#6fbf95;
+  --ok-bg:#1c2e26;
+  --absent:#d9ab5f;
+  --absent-bg:#332912;
+  --code-bg:#0f1418;
+  --shadow:0 1px 3px rgba(0,0,0,0.4);
+  --s1:#6fa8e0;
+  --s2:#4cc0a4;
+  --s3:#e07ab4;
+}
+
+*{box-sizing:border-box;}
+html,body{background:var(--bg);}
+body{
+  margin:0;
+  padding-inline:max(16px, calc((100vw - 920px)/2));
+  padding-block:2.5rem 4rem;
+  font-family:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  color:var(--text);
+  font-size:16px;
+  line-height:1.55;
+}
+main{max-width:920px; margin:0 auto;}
+
+h1,h2,h3{
+  font-family:"Newsreader", ui-serif, Georgia, serif;
+  font-weight:600;
+  color:var(--text);
+  text-wrap:balance;
+  line-height:1.15;
+}
+h1{font-size:2.05rem; margin:0 0 .3rem;}
+h2{
+  font-size:1.4rem;
+  margin:2.6rem 0 .9rem;
+  padding-top:1.1rem;
+  border-top:1px solid var(--border);
+}
+h2 .num{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:.5rem; font-style:italic; font-weight:500;}
+h3{font-size:1.05rem; margin:1.6rem 0 .6rem; color:var(--text);}
+h3 code{font-size:.92em;}
+
+p{margin:.7rem 0; max-width:70ch;}
+p.lede{
+  color:var(--text-dim);
+  font-size:1.05rem;
+  max-width:68ch;
+  margin-top:.9rem;
+}
+
+a{color:var(--accent);}
+
+code, .fl, pre, .mono{
+  font-family:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+code{
+  background:var(--code-bg);
+  border:1px solid var(--border);
+  border-radius:4px;
+  padding:.05em .35em;
+  font-size:.86em;
+}
+
+/* file:line tag */
+.fl{
+  display:inline-block;
+  background:var(--accent-bg);
+  color:var(--accent);
+  border:1px solid var(--accent-bg-strong);
+  border-radius:4px;
+  padding:.06em .4em;
+  font-size:.78rem;
+  font-weight:500;
+  white-space:nowrap;
+  line-height:1.6;
+}
+
+.byline{
+  color:var(--text-faint);
+  font-size:.85rem;
+  margin-top:.15rem;
+}
+
+.query-banner{
+  margin-top:1.4rem;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-left:3px solid var(--accent);
+  border-radius:6px;
+  padding:.9rem 1.1rem;
+  box-shadow:var(--shadow);
+}
+.query-banner code{
+  background:none; border:none; padding:0;
+  font-size:1.05rem; font-weight:500; color:var(--text);
+}
+
+nav.toc{
+  display:flex;
+  flex-wrap:wrap;
+  gap:.4rem .5rem;
+  margin:1.6rem 0 0;
+  padding:0;
+  list-style:none;
+}
+nav.toc a{
+  display:inline-block;
+  font-size:.82rem;
+  text-decoration:none;
+  color:var(--text-dim);
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:999px;
+  padding:.3rem .75rem;
+}
+nav.toc a:hover{border-color:var(--accent-dim); color:var(--accent);}
+
+.tablewrap{
+  overflow-x:auto;
+  border:1px solid var(--border);
+  border-radius:8px;
+  margin:1rem 0 1.5rem;
+  background:var(--surface);
+}
+table{
+  border-collapse:collapse;
+  width:100%;
+  font-size:.88rem;
+  min-width:480px;
+}
+table.wide{min-width:720px;}
+th,td{
+  text-align:left;
+  padding:.5rem .7rem;
+  border-bottom:1px solid var(--border);
+  vertical-align:top;
+  white-space:nowrap;
+}
+td.wrap, th.wrap{white-space:normal;}
+thead th{
+  background:var(--surface-2);
+  color:var(--text-dim);
+  font-weight:600;
+  font-size:.76rem;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+  position:sticky; top:0;
+}
+tbody tr:last-child td{border-bottom:none;}
+tbody tr:hover{background:var(--surface-2);}
+td.num, th.num{font-variant-numeric:tabular-nums; font-family:"IBM Plex Mono", monospace; font-size:.85rem;}
+td.dash{color:var(--text-faint);}
+
+.centerpiece thead th{position:static;}
+.centerpiece td:nth-child(2){white-space:nowrap;}
+.centerpiece td:nth-child(1){font-weight:600; white-space:nowrap;}
+
+pre.codeblock{
+  overflow-x:auto;
+  background:var(--code-bg);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:.9rem 1.1rem;
+  font-size:.82rem;
+  line-height:1.6;
+  margin:1rem 0 1.5rem;
+}
+pre.codeblock code{background:none; border:none; padding:0; font-size:1em;}
+.annot{
+  margin:0 0 1.5rem;
+  padding-left:1.1rem;
+  border-left:2px solid var(--border-strong);
+}
+.annot li{margin:.35rem 0; font-size:.92rem; color:var(--text-dim);}
+.annot li b{color:var(--text); font-weight:600;}
+
+.stage-card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:1.1rem 1.3rem;
+  margin:1rem 0 1.6rem;
+  box-shadow:var(--shadow);
+}
+.stage-card h3{margin-top:0;}
+
+.pill{
+  display:inline-block;
+  font-size:.72rem;
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:.03em;
+  padding:.15rem .55rem;
+  border-radius:999px;
+}
+.pill.absent{background:var(--absent-bg); color:var(--absent);}
+.pill.ok{background:var(--ok-bg); color:var(--ok);}
+
+ul.plain{padding-left:1.2rem; margin:.6rem 0;}
+ul.plain li{margin:.4rem 0;}
+
+details{margin:.8rem 0 1.2rem;}
+details > summary{
+  cursor:pointer;
+  color:var(--text-dim);
+  font-size:.86rem;
+  list-style:none;
+  display:inline-flex;
+  align-items:baseline;
+  gap:.4rem;
+}
+details > summary::-webkit-details-marker{display:none;}
+details > summary::before{
+  content:"\25B8";
+  color:var(--accent);
+  font-size:.7em;
+}
+details[open] > summary::before{content:"\25BE";}
+details > summary:hover{color:var(--accent);}
+details[open] > summary{margin-bottom:.3rem;}
+
+.footnote{
+  margin-top:2.6rem;
+  padding-top:1rem;
+  border-top:1px dashed var(--border-strong);
+  color:var(--text-dim);
+  font-size:.88rem;
+}
+
+.mermaid{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:1rem;
+  margin:1rem 0 1.5rem;
+  overflow-x:auto;
+}
+
+/* ---- pipeline animation ---- */
+.anim{
+  --adur:400ms;
+  margin:1.6rem 0 .6rem;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:.8rem .9rem .9rem;
+  box-shadow:var(--shadow);
+}
+.anim-bar{display:flex; flex-wrap:wrap; gap:.35rem; align-items:center; margin-bottom:.6rem;}
+.anim-bar button{
+  font:500 .78rem "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  color:var(--text-dim);
+  background:var(--surface-2);
+  border:1px solid var(--border);
+  border-radius:5px;
+  padding:.25rem .6rem;
+  cursor:pointer;
+}
+.anim-bar button:hover{border-color:var(--accent-dim); color:var(--accent);}
+.anim-now{
+  margin-left:auto;
+  font-family:"IBM Plex Mono", monospace;
+  font-size:.76rem;
+  color:var(--text-faint);
+  font-variant-numeric:tabular-nums;
+}
+.anim-scroll{overflow-x:auto;}
+/* width:100% + viewBox ratio reserves the height, so nothing below shifts while animating */
+#anim-svg{display:block; width:100%; min-width:660px; height:auto;}
+#anim-svg text{font-family:"IBM Plex Mono", ui-monospace, monospace; fill:var(--text-dim);}
+#anim-svg .lane-lbl text{fill:var(--text-dim);}
+#anim-svg .chip rect{fill:var(--code-bg); stroke:var(--border);}
+#anim-svg .chip text{fill:var(--text-dim);}
+#anim-svg .chip-name rect{fill:var(--accent-bg); stroke:var(--accent-bg-strong);}
+#anim-svg .chip-name text{fill:var(--accent);}
+#anim-svg .axis{stroke:var(--border-strong); fill:none;}
+#anim-svg .grid{stroke:var(--border); stroke-dasharray:2 4; fill:none;}
+#anim-svg .dot{transition:opacity var(--adur) ease, r var(--adur) ease;}
+#anim-svg .g,#anim-svg .chip,#anim-svg .tag,#anim-svg .lane{transition:opacity var(--adur) ease;}
+#anim-svg .gone{opacity:0 !important;}
+#anim-svg .lane rect{fill:var(--surface-2); stroke:var(--border);}
+#anim-svg .lane.dim{opacity:.35;}
+#anim-svg .win{fill:var(--accent); opacity:.12;}
+#anim-svg .win-r{stroke:var(--accent); stroke-width:1.5; fill:none;}
+#anim-svg .win-l{stroke:var(--accent); stroke-width:1.5; stroke-dasharray:3 3; fill:none;}
+#anim-svg .brk{stroke:var(--ok); stroke-width:1.4; fill:none;}
+#anim-svg .brk-t{fill:var(--ok); font-size:8.5px;}
+#anim-svg .tag text{font-size:7.5px;}
+#anim-svg .hollow{fill:none; stroke-dasharray:2 2; stroke-width:1.2;}
+#anim-svg.pulse .dot.in{animation:animPulse .55s ease 1;}
+@keyframes animPulse{50%{r:6.4px;}}
+.anim-cap{
+  min-height:3.4rem;
+  margin-top:.55rem;
+  padding-top:.55rem;
+  border-top:1px solid var(--border);
+  font-size:.85rem;
+  color:var(--text-dim);
+}
+.anim-cap b{color:var(--text); font-weight:600;}
+/* ---- Arrow batch inspector ---- */
+.insp-h{margin:1.4rem 0 .3rem; font-size:1rem;}
+.insp-lede{font-size:.85rem; color:var(--text-dim); margin:.2rem 0 .7rem; max-width:74ch;}
+#insp-svg{display:block; width:100%; min-width:660px; height:auto;}
+#insp-svg text{font-family:"IBM Plex Mono", ui-monospace, monospace; fill:var(--text-dim);}
+#insp-svg .ucell{fill:var(--surface-2); stroke:var(--border);}
+#insp-svg .iblk{transition:opacity var(--adur) ease, transform var(--adur) ease;}
+#insp-svg .cell,#insp-svg .obox{transition:opacity var(--adur) ease, transform var(--adur) ease;}
+#insp-svg .g,#insp-svg .slice{transition:opacity var(--adur) ease;}
+#insp-svg .gone{opacity:0 !important;}
+#insp-svg .dim{opacity:.32;}
+#insp-svg .obox rect{fill:var(--accent-bg); stroke:var(--accent-bg-strong);}
+#insp-svg .obox text{fill:var(--accent);}
+#insp-svg .otick{stroke:var(--accent-bg-strong); stroke-width:1; fill:none;}
+#insp-svg .slice rect{fill:var(--accent); opacity:.16; transition:x var(--adur) ease, width var(--adur) ease;}
+#insp-svg .slice text{fill:var(--accent); font-size:7.5px;}
+#insp-svg .empty{fill:none; stroke-dasharray:2 2;}
+#insp-svg .hdr{fill:var(--text-faint);}
+
+@media (prefers-reduced-motion: reduce){
+  .anim{--adur:1ms;}
+  #anim-svg.pulse .dot.in{animation:none;}
+}
+
+@media (max-width:520px){
+  h1{font-size:1.6rem;}
+  body{font-size:15px;}
+  .query-banner code{font-size:.92rem;}
+}
+</style>
+</head>
+<body>
+
+<main>
+
+<h1>How <code>sum(rate(http_requests_total[1m]))</code> flows</h1>
+<p class="byline">promql-engine internals · branch <span class="fl">engine</span> @ <span class="fl">51d4547</span></p>
+
+<p class="lede">One query traced end to end: in-memory source &rarr; scan &rarr; <code>rate()</code> &rarr; <code>sum()</code> &rarr; decode, every number engine-verified (see <a href="#verification">verification</a>).</p>
+
+<div class="query-banner">
+  <code>sum(rate(http_requests_total[1m]))</code>
+</div>
+
+<section id="anim" class="anim">
+  <div class="anim-bar">
+    <button type="button" id="anim-play">Play</button>
+    <button type="button" id="anim-prev">&larr; Step</button>
+    <button type="button" id="anim-next">Step &rarr;</button>
+    <button type="button" id="anim-restart">Restart</button>
+    <button type="button" id="anim-speed">1&times;</button>
+    <span class="anim-now" id="anim-now">1 / 6 &middot; Source</span>
+  </div>
+  <div class="anim-scroll">
+    <svg id="anim-svg" viewBox="0 0 900 452" role="img" aria-label="Animated trace of three series through the rate and sum pipeline"></svg>
+  </div>
+  <p class="anim-cap" id="anim-cap"></p>
+
+  <h3 class="insp-h" id="inspector">The same data, as Arrow sees it</h3>
+  <p class="insp-lede">The same scene, drawn as the <code>RecordBatch</code> the stage is holding: label columns, one <code>samples</code> list column, and under it the offsets buffer &mdash; the only thing that says where one row's run of samples ends and the next begins.</p>
+  <div class="anim-scroll">
+    <svg id="insp-svg" viewBox="0 0 900 356" role="img" aria-label="The Arrow RecordBatch each pipeline stage is operating on, drawn as label columns, an offsets buffer and flat child buffers"></svg>
+  </div>
+  <p class="anim-cap" id="insp-cap"></p>
+
+<script>
+(function(){
+  "use strict";
+  var NS = "http://www.w3.org/2000/svg";
+  var svg = document.getElementById("anim-svg");
+  var sec = document.getElementById("anim");
+  var cap = document.getElementById("anim-cap");
+  var now = document.getElementById("anim-now");
+
+  function mk(tag, attrs, parent, text){
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    (parent || svg).appendChild(e);
+    return e;
+  }
+  function cls(el, name, on){ el.classList.toggle(name, !!on); }
+
+  /* Time maps to x with t = -60s pinned at X0, so the first rate window
+     (-60000, 0] is fully on screen. All y values are absolute user units. */
+  // escaped so the file stays pure ASCII regardless of the charset it is served with
+  var MINUS = String.fromCharCode(8722), ARROW = String.fromCharCode(8594);
+  var X0 = 185, PXMS = 684 / 360000;
+  function X(t){ return X0 + (t + 60000) * PXMS; }
+  var AXIS_Y = 176;
+  var IN_Y   = [48, 94, 140];
+  var OUT_TOP = [212, 268, 324], SUM_TOP = 388;
+  /* Inside an output lane: value 0 sits 38px below the lane top; the gridline
+     at 0.2 is the full scale, so envoy-1 reads as a sixth of envoy-2. */
+  function YV(top, v){ return top + 38 - (v / 0.2) * 32; }
+
+  var STEP = 30000, NSTEPS = 11, END = 300000;
+  function fill(o, a, b, v){ for (var j = a; j <= b; j++) o[j] = v; return o; }
+
+  /* t0 is the scrape phase: envoy-1 lands 6 s into every 30 s slot, envoy-2 3 s,
+     envoy-3 on the grid. `miss` names the steps whose window cannot yield a
+     point, and why, since the reason differs per series. */
+  var NOSAMP = "no sample " + ARROW + " none", ONESAMP = "1 sample " + ARROW + " none";
+  var SER = [
+    {pod:"pod=envoy-1", route:"route=/",    key:"s1", t0:6000, n:11,
+     val:function(i){ return i + 1; },     rate:fill({}, 2, 10, 0.0333333333),
+     miss:[{j:0, txt:NOSAMP}, {j:1, txt:ONESAMP}]},
+    {pod:"pod=envoy-2", route:"route=/",    key:"s2", t0:3000, n:11,
+     val:function(i){ return 1 + 5 * i; }, rate:fill({}, 2, 10, 0.1666666667),
+     miss:[{j:0, txt:NOSAMP}, {j:1, txt:ONESAMP}]},
+    {pod:"pod=envoy-3", route:"route=/api", key:"s3", t0:0,    n:4,
+     val:function(){ return 100; },        rate:fill({}, 1, 3, 0),
+     miss:[{j:0, txt:ONESAMP}]}
+  ];
+  // t = 30 s is a real 0.0: envoy-3 reached it, and a flat counter rates to zero.
+  var SUMV = fill({1:0}, 2, 10, 0.2);
+
+  var SCENES = [
+    {name:"Source", steps:1,
+     say:"<b>MemorySeriesSource::try_new</b> loads 26 raw samples at 30&thinsp;s scrapes, each series on its own phase: envoy-1 at 6&thinsp;s, envoy-2 at 3&thinsp;s, envoy-3 on the grid and stopping at t&nbsp;=&nbsp;90&thinsp;s."},
+    {name:"Scan &amp; clip", steps:1,
+     say:"<b>Params::select_range</b> widens the scan to <b>lo = start &minus; (window_ms &minus; 1&thinsp;ms) = &minus;59.999&thinsp;s</b>, hi = 300&thinsp;s. That drops envoy-1's sample at 306&thinsp;s and envoy-2's at 303&thinsp;s &mdash; 24 of 26 survive &mdash; and the 5&thinsp;m lookback plays no part when a range window is present."},
+    {name:"Rate", steps:NSTEPS,
+     say:"Per step the window is <b>(t &minus; 60&thinsp;s, t]</b> &mdash; open at the start, closed at the end. Off-grid scrapes mean each series meets those two edges at its own distance."},
+    {name:"Drop metric name", steps:1,
+     say:"<b>Func::drops_metric_name</b> is true for <code>rate</code>, so the rebuilt label struct leaves <code>__name__</code> out. Every output series loses the same chip at the same moment."},
+    {name:"Sum", steps:1,
+     say:"<b>groupBy=[[]]</b> puts all three rows in one accumulator; each step is an array index, added with <b>Kahan&ndash;Neumaier</b> compensation. t&nbsp;=&nbsp;0 and t&nbsp;=&nbsp;30&thinsp;s show the distinction: the first is absent because nothing reached it, the second is a real 0.0 because envoy-3 did."},
+    {name:"Decode", steps:1,
+     say:"The engine hands back Arrow batches with empty series already dropped; <b>series::decode</b> turns the one remaining row into a <code>Series</code> of 10 points with the empty label set."}
+  ];
+  var TOTAL = SCENES.reduce(function(a, s){ return a + s.steps; }, 0);
+  function locate(f){
+    var a = f;
+    for (var i = 0; i < SCENES.length; i++){ if (a < SCENES[i].steps) return [i, a]; a -= SCENES[i].steps; }
+    return [SCENES.length - 1, 0];
+  }
+  function sceneStart(i){ var a = 0; for (var k = 0; k < i; k++) a += SCENES[k].steps; return a; }
+
+  /* ---- build ---- */
+  function chip(x, y, txt, klass, parent){
+    var w = txt.length * 5.4 + 9;
+    var g = mk("g", {"class": "chip " + (klass || "")}, parent);
+    mk("rect", {x:x, y:y, width:w.toFixed(1), height:14, rx:3}, g);
+    mk("text", {x:x + 4.5, y:y + 10, "font-size":8.5}, g, txt);
+    return {g:g, w:w};
+  }
+  function chipSet(yc, parent, s, withName){
+    var g = mk("g", {}, parent), name = null;
+    if (withName) name = chip(10, yc - 16, "http_requests_total", "chip-name", g).g;
+    var p = chip(10, yc + 1, s.pod, "", g);
+    chip(10 + p.w + 4, yc + 1, s.route, "", g);
+    return {g:g, name:name};
+  }
+
+  var gScan = mk("g", {}), gWin = mk("g", {"class":"g"}), gAxis = mk("g", {});
+  var gIn = [], gOut = [], gSum = mk("g", {"class":"lane"});
+
+  // axis, from -60s to 300s
+  mk("path", {"class":"axis", d:"M" + X(-60000) + " " + AXIS_Y + "H" + X(300000)}, gAxis);
+  for (var q = -1; q < NSTEPS; q++){
+    var t = q * STEP;
+    mk("path", {"class":"axis", d:"M" + X(t) + " " + AXIS_Y + "v6"}, gAxis);
+    mk("text", {x:X(t), y:AXIS_Y + 16, "font-size":8, "text-anchor":"middle"}, gAxis, q < 0 ? MINUS + "60" : String(q * 30));
+  }
+  mk("text", {x:X(300000) + 22, y:AXIS_Y + 16, "font-size":8, "text-anchor":"end"}, gAxis, "s");
+
+  // scan bracket [-59.999 s, 300 s]
+  mk("path", {"class":"brk", d:"M" + X(-59999) + " 168v-8h684v8"}, gScan);
+  mk("text", {"class":"brk-t", x:X(-59999) + 4, y:157}, gScan, "scan [" + MINUS + "59.999 s, 300 s]");
+
+  // rate window: translucent body, dashed left edge (open), solid right edge (closed)
+  var winBody = mk("rect", {"class":"win", x:X(-60000), y:26, width:(60000 * PXMS).toFixed(1), height:136}, gWin);
+  var winL = mk("path", {"class":"win-l", d:""}, gWin);
+  var winR = mk("path", {"class":"win-r", d:""}, gWin);
+  var winT = mk("text", {"class":"brk-t", x:0, y:22, "text-anchor":"middle", fill:"var(--accent)"}, gWin, "");
+
+  var inDot = [], inSamp = [], outDot = [], ghost = [], outChips = [], miss = [];
+  SER.forEach(function(s, i){
+    // starts hidden so the first render fades the raw samples in (scene 1)
+    var g = mk("g", {"class":"lane gone"});
+    gIn.push(g);
+    chipSet(IN_Y[i], g, s, true);
+    var dots = [], samps = [];
+    for (var k = 0; k < s.n; k++){
+      var tt = s.t0 + k * STEP;
+      // dot and value share a group so the scan can retire both at once
+      var sg = mk("g", {"class":"g"}, g);
+      mk("text", {x:X(tt), y:IN_Y[i] - 9, "font-size":7.5, "text-anchor":"middle"}, sg, String(s.val(k)));
+      var d = mk("circle", {"class":"dot in", cx:X(tt), cy:IN_Y[i], r:3.4, fill:"var(--" + s.key + ")"}, sg);
+      d.style.transitionDelay = (k * 35) + "ms";
+      dots.push(d);
+      samps.push({g:sg, t:tt});
+    }
+    inDot.push(dots);
+    inSamp.push(samps);
+  });
+
+  SER.forEach(function(s, i){
+    var g = mk("g", {"class":"lane"});
+    gOut.push(g);
+    mk("rect", {x:X(-60000), y:OUT_TOP[i], width:684, height:46, rx:4}, g);
+    mk("path", {"class":"grid", d:"M" + X(-60000) + " " + YV(OUT_TOP[i], 0.2) + "h684"}, g);
+    mk("text", {x:X(-60000) - 4, y:YV(OUT_TOP[i], 0.2) + 3, "font-size":7.5, "text-anchor":"end"}, g, "0.2");
+    // zero baseline, so a small rate is visibly not a flat one
+    mk("path", {"class":"grid", d:"M" + X(-60000) + " " + YV(OUT_TOP[i], 0) + "h684"}, g);
+    mk("text", {x:X(-60000) - 4, y:YV(OUT_TOP[i], 0) + 3, "font-size":7.5, "text-anchor":"end"}, g, "0");
+    outChips.push(chipSet(OUT_TOP[i] + 22, g, s, true));
+    var dots = {}, gh = {};
+    Object.keys(s.rate).forEach(function(j){
+      var v = s.rate[j], x = X(j * STEP), y = YV(OUT_TOP[i], v);
+      dots[j] = mk("circle", {"class":"dot", cx:x, cy:y, r:3.4, fill:"var(--" + s.key + ")"}, g);
+      gh[j] = mk("circle", {"class":"ghost", cx:x, cy:y, r:3.4, fill:"var(--" + s.key + ")", opacity:0}, g);
+    });
+    outDot.push(dots); ghost.push(gh);
+    // The steps whose window cannot yield a point, each with its reason.
+    var ms = {};
+    s.miss.forEach(function(m){
+      var mg = mk("g", {"class":"g"}, g), mx = X(m.j * STEP), my = YV(OUT_TOP[i], 0.05);
+      mk("circle", {"class":"dot hollow", cx:mx, cy:my, r:4, stroke:"var(--" + s.key + ")"}, mg);
+      var tg = mk("g", {"class":"tag"}, mg);
+      mk("text", {x:mx + 8, y:my + 3}, tg, m.txt);
+      ms[m.j] = mg;
+    });
+    miss.push(ms);
+  });
+
+  // sits below the dot row so it can stay on screen for the rest of the run
+  var clipTag = mk("g", {"class":"tag"}, gOut[1]);
+  mk("path", {d:"M" + X(60000) + " " + (YV(OUT_TOP[1], 0.1666666667) + 5) + "V" + (OUT_TOP[1] + 33),
+              stroke:"var(--s2)", "stroke-width":1.2}, clipTag);
+  mk("text", {x:X(60000) + 5, y:OUT_TOP[1] + 38, fill:"var(--s2)"},
+     clipTag, "to_start 3 s, counter zero 6 s back: no clip on [1m]");
+
+  mk("rect", {x:X(-60000), y:SUM_TOP, width:684, height:46, rx:4}, gSum);
+  mk("path", {"class":"grid", d:"M" + X(-60000) + " " + YV(SUM_TOP, 0.2) + "h684"}, gSum);
+  mk("text", {x:X(-60000) - 4, y:YV(SUM_TOP, 0.2) + 3, "font-size":7.5, "text-anchor":"end"}, gSum, "0.2");
+  mk("path", {"class":"grid", d:"M" + X(-60000) + " " + YV(SUM_TOP, 0) + "h684"}, gSum);
+  mk("text", {x:X(-60000) - 4, y:YV(SUM_TOP, 0) + 3, "font-size":7.5, "text-anchor":"end"}, gSum, "0");
+  var sumChip = chip(10, SUM_TOP + 16, "{}", "chip-name", gSum);
+  var gSumDots = mk("g", {"class":"g"}, gSum), sumDot = {};
+  Object.keys(SUMV).forEach(function(j){
+    var v = SUMV[j], x = X(j * STEP), y = YV(SUM_TOP, v);
+    sumDot[j] = mk("circle", {"class":"dot", cx:x, cy:y, r:4, fill:"var(--accent)"}, gSumDots);
+    mk("text", {x:x, y:y + 14, "font-size":7.5, "text-anchor":"middle", fill:"var(--accent)"},
+       gSumDots, j === "1" ? "0.0" : "0.2");
+  });
+  var zeroTag = mk("g", {"class":"tag"}, gSum);
+  mk("text", {x:X(30000) + 9, y:YV(SUM_TOP, 0) + 3, "font-size":8.5, fill:"var(--accent)"},
+     zeroTag, "a real 0.0, not absent: only envoy-3 reached this step");
+  var sumCount = mk("text", {"class":"tag", x:X(300000), y:SUM_TOP + 57, "font-size":8.5, "text-anchor":"end"}, gSum, "10 points");
+
+  /* ---- Arrow batch inspector ------------------------------------------
+     Driven by the same frame state as the pipeline above. It exists to make
+     two things hard to miss: a row's samples are a contiguous run in one
+     flat child buffer, so a rate window is a slice between two partition
+     points rather than a lookup; and the offsets buffer is the only place
+     the row boundaries live, which is why clipping two samples moves the
+     whole tail of the child left. Offsets below are the engine's own
+     (`batch.column(1).as_list::<i32>().offsets()` at each stage). */
+  var isvg = document.getElementById("insp-svg");
+  var icap = document.getElementById("insp-cap");
+  var IBX = 168, ICW = 26, BAND2 = 186, TS_Y = 116, VAL_Y = 133;
+
+  function svar(k){ return "var(--" + k + ")"; }
+
+  /* One batch, drawn as columns: label columns as cells, then the samples
+     list as an offsets buffer sitting on two flat child buffers. */
+  function sampleBlock(o){
+    var g = mk("g", {"class":"iblk"}, isvg);
+    var title = mk("text", {x:10, y:9, "font-size":9, fill:"var(--text)"}, g, o.title);
+    var cx = 10, cols = [];
+    o.cols.forEach(function(c){
+      var cg = mk("g", {"class":"g"}, g);
+      mk("text", {"class":"hdr", x:cx + 3, y:22, "font-size":7}, cg, c.name);
+      c.vals.forEach(function(v, i){
+        mk("rect", {"class":"ucell", x:cx, y:26 + i * 17, width:c.w, height:15, rx:2}, cg);
+        mk("text", {x:cx + 4, y:26 + i * 17 + 10.5, "font-size":7.5, fill:"var(--text)"}, cg, v);
+      });
+      cols.push(cg);
+      cx += c.w + 5;
+    });
+    mk("text", {"class":"hdr", x:10, y:88, "font-size":7}, g, o.samplesLbl ||
+       "samples  List<Struct<timestamp, value>>");
+    mk("text", {x:IBX - 22, y:104.5, "font-size":7.5, "text-anchor":"end"}, g, "offsets");
+    mk("text", {x:IBX - 6, y:TS_Y + 11, "font-size":7.5, "text-anchor":"end"}, g, "timestamp");
+    mk("text", {x:IBX - 6, y:VAL_Y + 11, "font-size":7.5, "text-anchor":"end"}, g, "value");
+
+    var cells = [], idx = 0;
+    o.rows.forEach(function(r){
+      r.ts.forEach(function(t, j){
+        var cg = mk("g", {"class":"cell"}, g), x = IBX + idx * o.cw, mid = x + o.cw / 2 - 0.5;
+        mk("rect", {x:x, y:TS_Y, width:o.cw - 1, height:15, rx:2,
+                    fill:svar(r.key), "fill-opacity":0.13, stroke:svar(r.key)}, cg);
+        mk("text", {x:mid, y:TS_Y + 10.5, "font-size":7, "text-anchor":"middle", fill:"var(--text)"}, cg, t);
+        mk("rect", {x:x, y:VAL_Y, width:o.cw - 1, height:15, rx:2,
+                    fill:svar(r.key), "fill-opacity":0.05, stroke:svar(r.key), "stroke-opacity":0.5}, cg);
+        mk("text", {x:mid, y:VAL_Y + 10.5, "font-size":7, "text-anchor":"middle", fill:"var(--text)"},
+           cg, r.vals[j]);
+        cells.push(cg);
+        idx++;
+      });
+    });
+
+    var boxes = [];
+    for (var b = 0; b <= o.rows.length; b++){
+      var bg = mk("g", {"class":"obox"}, g);
+      mk("rect", {x:-11, y:94, width:22, height:14, rx:3}, bg);
+      mk("path", {"class":"otick", d:"M0 108V" + TS_Y}, bg);
+      boxes.push({g:bg, txt:mk("text", {x:0, y:104.5, "font-size":7.5, "text-anchor":"middle"}, bg, "")});
+    }
+    function setOffsets(vals){
+      boxes.forEach(function(bx, i){
+        bx.g.setAttribute("transform", "translate(" + (IBX + vals[i] * o.cw) + ",0)");
+        bx.txt.textContent = String(vals[i]);
+      });
+    }
+    var note = mk("text", {x:10, y:162, "font-size":7.5}, g, o.note || "");
+    return {g:g, title:title, cols:cols, cells:cells, setOffsets:setOffsets, note:note,
+            at:function(y){ g.setAttribute("transform", "translate(0," + y + ")"); }};
+  }
+
+  function seq(a, b, s){ var o = []; for (var v = a; v <= b; v += s) o.push(String(v)); return o; }
+  function rep(n, v){ var o = []; for (var i = 0; i < n; i++) o.push(v); return o; }
+
+  /* input batch: 26 raw samples, three runs */
+  var IN_TS = [
+    [6000, 36000, 66000, 96000, 126000, 156000, 186000, 216000, 246000, 276000, 306000],
+    [3000, 33000, 63000, 93000, 123000, 153000, 183000, 213000, 243000, 273000, 303000],
+    [0, 30000, 60000, 90000]
+  ];
+  var blkIn = sampleBlock({
+    title: "input batch: 3 rows, one per series",
+    cols: [
+      {name:"__name__ Utf8View", w:100, vals:rep(3, "http_requests_total")},
+      {name:"pod Utf8View", w:48, vals:["envoy-1", "envoy-2", "envoy-3"]},
+      {name:"route Utf8View", w:38, vals:["/", "/", "/api"]}
+    ],
+    cw: ICW,
+    rows: [
+      {key:"s1", ts:seq(6, 306, 30), vals:seq(1, 11, 1)},
+      {key:"s2", ts:seq(3, 303, 30), vals:seq(1, 51, 5)},
+      {key:"s3", ts:["0", "30", "60", "90"], vals:rep(4, "100")}
+    ],
+    note: ""
+  });
+  blkIn.at(0);
+  // The two samples the scan clips, and how far each cell slides left when they go.
+  var DROP = {10:1, 21:1};
+  var SHIFT = [];
+  for (var ci = 0, sh = 0; ci < 26; ci++){ SHIFT.push(sh); if (DROP[ci]) sh++; }
+
+  /* the window as a slice of the child buffer */
+  var RUN0 = [0, 10, 20], KEEP = [IN_TS[0].slice(0, 10), IN_TS[1].slice(0, 10), IN_TS[2]];
+  var slices = KEEP.map(function(ts, i){
+    var sg = mk("g", {"class":"slice"}, blkIn.g);
+    return {g:sg,
+            rect:mk("rect", {x:0, y:TS_Y - 3, width:0, height:40, rx:3}, sg),
+            txt:mk("text", {x:0, y:TS_Y - 6, "text-anchor":"middle"}, sg, ""),
+            ts:ts, run:RUN0[i]};
+  });
+
+  /* rate output batch */
+  var RATE_ROWS = [
+    {key:"s1", ts:seq(60, 300, 30), vals:rep(9, "0.033"), step0:2},
+    {key:"s2", ts:seq(60, 300, 30), vals:rep(9, "0.167"), step0:2},
+    {key:"s3", ts:["30", "60", "90"], vals:rep(3, "0"), step0:1}
+  ];
+  var blkRate = sampleBlock({
+    title: "rate output batch: 3 rows again, one column fewer",
+    cols: [
+      {name:"pod Utf8View", w:48, vals:["envoy-1", "envoy-2", "envoy-3"]},
+      {name:"route Utf8View", w:38, vals:["/", "/", "/api"]}
+    ],
+    cw: ICW,
+    rows: RATE_ROWS,
+    note: "values to 3 d.p., exact figures in section 3b. One call per row fills a whole row; the cells light up per step only to line up with the window above."
+  });
+  blkRate.setOffsets([0, 9, 18, 21]);
+  var RSTEP = [];
+  RATE_ROWS.forEach(function(r){ r.ts.forEach(function(t, j){ RSTEP.push(r.step0 + j); }); });
+
+  /* final batch */
+  var blkFinal = sampleBlock({
+    title: "output batch: 1 row, the empty label set",
+    cols: [{name:"labels Struct<>", w:150, vals:["(no fields)"]}],
+    cw: ICW,
+    rows: [{key:"accent", ts:seq(30, 300, 30), vals:["0.0"].concat(rep(9, "0.2"))}],
+    note: "series::drop_empty has already run, so every row here carries samples."
+  });
+  blkFinal.setOffsets([0, 10]);
+  blkFinal.at(0);
+
+  /* accumulator lanes: one row per group, one cell per step */
+  var LCW = 36, LBX = 168;
+  var gLanes = mk("g", {"class":"iblk"}, isvg);
+  gLanes.setAttribute("transform", "translate(0," + BAND2 + ")");
+  mk("text", {x:10, y:9, "font-size":9, fill:"var(--text)"}, gLanes,
+     "group state: flat lanes over group " + String.fromCharCode(215) + " steps + step, 1 group " + String.fromCharCode(215) + " 11 steps");
+  var STRIP_Y = [15, 21, 27];
+  var RUNS = [[2, 10], [2, 10], [1, 3]];
+  var strips = RUNS.map(function(r, i){
+    var sg = mk("g", {"class":"g"}, gLanes);
+    mk("text", {x:LBX - 6, y:STRIP_Y[i] + 5, "font-size":6.5, "text-anchor":"end", fill:svar(SER[i].key)},
+       sg, SER[i].pod.slice(4) + " " + ARROW + " " + r[0] + ".." + r[1]);
+    var rc = mk("rect", {x:LBX + r[0] * LCW, y:STRIP_Y[i], width:(r[1] - r[0] + 1) * LCW, height:5, rx:2,
+                         fill:svar(SER[i].key), "fill-opacity":0.55, stroke:"none"}, sg);
+    return {g:sg, rect:rc, dy:TS_Y - (BAND2 + STRIP_Y[i])};
+  });
+  for (var j = 0; j < NSTEPS; j++){
+    mk("text", {"class":"hdr", x:LBX + j * LCW + LCW / 2, y:41, "font-size":6.5, "text-anchor":"middle"},
+       gLanes, String(j * 30));
+  }
+  function lane(y, label, txt, hollow){
+    mk("text", {x:LBX - 6, y:y + 11, "font-size":7.5, "text-anchor":"end"}, gLanes, label);
+    for (var k = 0; k < NSTEPS; k++){
+      var empty = k === 0;
+      mk("rect", {"class": empty ? "empty" : "", x:LBX + k * LCW, y:y, width:LCW - 1, height:hollow ? 12 : 15, rx:2,
+                  fill: empty ? "none" : "var(--accent)", "fill-opacity": empty ? 1 : 0.1,
+                  stroke: empty ? "var(--border-strong)" : "var(--accent)"}, gLanes);
+      mk("text", {x:LBX + k * LCW + LCW / 2 - 0.5, y:y + (hollow ? 8.5 : 10.5), "font-size":7,
+                  "text-anchor":"middle", fill:"var(--text)"}, gLanes, txt(k));
+    }
+  }
+  lane(45, "sum", function(k){ return k === 0 ? "" : k === 1 ? "0.0" : "0.2"; }, false);
+  lane(62, "c", function(k){ return k === 0 ? "" : "~0"; }, false);
+  lane(79, "seen", function(k){ return k === 0 ? "0" : "1"; }, true);
+  mk("text", {x:10, y:104, "font-size":7.5}, gLanes,
+     "emit: walk the seen bits once, reading the lanes in the same pass " + ARROW + " one list per group");
+  var eBoxes = [[0, 0], [10, 10]].map(function(v){
+    var bg = mk("g", {"class":"obox"}, gLanes);
+    bg.setAttribute("transform", "translate(" + (IBX + v[0] * ICW) + ",0)");
+    mk("rect", {x:-11, y:110, width:22, height:14, rx:3}, bg);
+    mk("path", {"class":"otick", d:"M0 124V130"}, bg);
+    mk("text", {x:0, y:120.5, "font-size":7.5, "text-anchor":"middle"}, bg, String(v[1]));
+    return bg;
+  });
+  mk("text", {x:IBX - 22, y:121, "font-size":7.5, "text-anchor":"end"}, gLanes, "offsets");
+  mk("text", {x:IBX - 6, y:141, "font-size":7.5, "text-anchor":"end"}, gLanes, "value");
+  for (var e = 0; e < 10; e++){
+    mk("rect", {x:IBX + e * ICW, y:130, width:ICW - 1, height:15, rx:2,
+                fill:"var(--accent)", "fill-opacity":0.1, stroke:"var(--accent)"}, gLanes);
+    mk("text", {x:IBX + e * ICW + ICW / 2 - 0.5, y:140.5, "font-size":7, "text-anchor":"middle",
+                fill:"var(--text)"}, gLanes, e === 0 ? "0.0" : "0.2");
+    mk("text", {"class":"hdr", x:IBX + e * ICW + ICW / 2 - 0.5, y:154, "font-size":6.5,
+                "text-anchor":"middle"}, gLanes, String(30 + e * 30));
+  }
+  mk("text", {"class":"hdr", x:IBX - 6, y:154, "font-size":6.5, "text-anchor":"end"}, gLanes, "step (s)");
+
+  var ICAP = [
+    "One <b>RecordBatch</b>. Three <code>Utf8View</code> label columns with one cell per row, and one <code>samples</code> column: an offsets buffer over two flat child buffers of 26 entries each. Row 3 is the short one, and only the offsets say so.",
+    "<b>clip</b> runs two <code>partition_point</code> searches per row and one <code>filter</code> over the shared child, so the tail slides left and the offsets become <code>[0, 10, 20, 24]</code>. <code>__name__</code> stays: every row carries it and it is the matcher target &mdash; <code>drop_unused_labels</code> only removes a column no row carries.",
+    "A window is a <b>contiguous slice of the child buffer</b>, between two partition points, not a lookup. Each row's slice is labelled with its own two indices; the output offsets are already <code>[0, 9, 18, 21]</code>.",
+    "Same three rows, one label column fewer. <code>rate</code> drops <code>__name__</code>, so the rebuilt struct has two fields &mdash; the samples buffers are untouched by that.",
+    "Two flat lanes and a <b>seen</b> bitmap, 11 positions each, indexed <code>group &times; steps + step</code>. Each input row lands on its own run of positions; the emit then walks the set bits once.",
+    "One row: <code>labels Struct&lt;&gt;</code> with no fields, offsets <code>[0, 10]</code>, ten timestamp and value cells. Arrow in, Arrow out."
+  ];
+
+  function renderInsp(si, sub, wt){
+    var clipped = si >= 1;
+    cls(blkIn.g, "gone", si > 3);
+    blkIn.cells.forEach(function(c, k){
+      cls(c, "gone", clipped && !!DROP[k]);
+      c.setAttribute("transform", "translate(" + (clipped ? -SHIFT[k] * ICW : 0) + ",0)");
+    });
+    blkIn.setOffsets(clipped ? [0, 10, 20, 24] : [0, 11, 22, 26]);
+    cls(blkIn.cols[0], "dim", si >= 3);
+    blkIn.title.textContent = si === 0
+      ? "input batch: 3 rows, one per series, 26 samples"
+      : "scanned batch: same 3 rows, 24 samples";
+    blkIn.note.textContent = si === 0
+      ? "one ListArray over a shared child, so the 26 samples are two flat buffers and four offsets"
+      : "the clip drops 306 s and 303 s; the child compacts and every later cell slides one place left";
+
+    slices.forEach(function(s){
+      if (si !== 2){ cls(s.g, "gone", true); return; }
+      var lo = 0, hi = 0, m;
+      for (m = 0; m < s.ts.length; m++){
+        if (s.ts[m] <= wt - 60000) lo++;
+        if (s.ts[m] <= wt) hi++;
+      }
+      cls(s.g, "gone", hi <= lo);
+      var x = IBX + (s.run + lo) * ICW, w = (hi - lo) * ICW - 1;
+      s.rect.setAttribute("x", x);
+      s.rect.setAttribute("width", Math.max(w, 0));
+      s.txt.setAttribute("x", x + w / 2);
+      s.txt.textContent = "[" + lo + ", " + hi + ")";
+    });
+
+    cls(blkRate.g, "gone", si < 2 || si > 4);
+    blkRate.at(si >= 4 ? 0 : BAND2);
+    blkRate.cells.forEach(function(c, k){
+      cls(c, "gone", si === 2 && RSTEP[k] > sub);
+    });
+    blkRate.title.textContent = si >= 4
+      ? "the aggregation's input: 3 rows, every step of a row produced in one pass"
+      : "rate output batch: 3 rows again, one column fewer";
+
+    cls(gLanes, "gone", si !== 4);
+    eBoxes.forEach(function(b){ cls(b, "gone", si !== 4); });
+    cls(blkFinal.g, "gone", si !== 5);
+    icap.innerHTML = ICAP[si];
+  }
+
+  /* The three input rows sliding down onto their lane positions. */
+  function landIn(){
+    var d = reduced ? 1 : 520 / speed;
+    strips.forEach(function(s, i){
+      s.rect.animate(
+        [{transform:"translate(0px," + s.dy + "px)", opacity:0},
+         {transform:"translate(0px,0px)", opacity:1}],
+        {duration:d, delay:(reduced ? 0 : i * 130), easing:"cubic-bezier(.4,0,.2,1)", fill:"none"}
+      );
+    });
+  }
+
+  /* ---- state ---- */
+  var frame = 0, playing = false, speed = 1, last = -1, timer = null;
+  var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function dur(){ return reduced ? 1 : 420 / speed; }
+  function dwell(si){ return (reduced ? 420 : (si === 1 ? 900 : si === 2 ? 820 : 1400)) / speed; }
+
+  function render(){
+    var loc = locate(frame), si = loc[0], sub = loc[1];
+    sec.style.setProperty("--adur", dur() + "ms");
+
+    cls(svg, "pulse", si === 1);
+    cls(gScan, "gone", si < 1);
+    cls(gWin, "gone", si !== 2);
+
+    var wt = sub * STEP;
+    if (si === 2){
+      winBody.setAttribute("x", X(wt - 60000));
+      winL.setAttribute("d", "M" + X(wt - 60000) + " 26v136");
+      winR.setAttribute("d", "M" + X(wt) + " 26v136");
+      winT.setAttribute("x", (X(wt - 60000) + X(wt)) / 2);
+      var ws = (wt - 60000) / 1000;
+      winT.textContent = "(" + (ws < 0 ? MINUS + (-ws) : ws) + " s, " + wt / 1000 + " s]";
+    }
+
+    SER.forEach(function(s, i){
+      for (var k = 0; k < s.n; k++){
+        var tt = inSamp[i][k].t, inWin = si === 2 && tt > wt - 60000 && tt <= wt;
+        inDot[i][k].setAttribute("r", inWin ? 5.6 : 3.4);
+        // the two samples past 300 s leave with the scan clip
+        cls(inSamp[i][k].g, "gone", si >= 1 && tt > END);
+      }
+      // envoy-3's window is empty from t = 120 s on
+      var dead = i === 2 && ((si === 2 && sub >= 4) || si > 2);
+      cls(gIn[i], "dim", dead);
+      cls(gOut[i], "dim", dead);
+      cls(gOut[i], "gone", si < 2);
+      Object.keys(s.rate).forEach(function(j){
+        cls(outDot[i][j], "gone", !(si > 2 || (si === 2 && Number(j) <= sub)));
+      });
+      s.miss.forEach(function(m){ cls(miss[i][m.j], "gone", !(si === 2 && sub === m.j)); });
+      if (outChips[i].name) cls(outChips[i].name, "gone", si >= 3);
+      cls(outChips[i].g, "gone", si >= 5);
+    });
+
+    cls(clipTag, "gone", !((si === 2 && sub >= 2) || si > 2));
+    cls(zeroTag, "gone", si < 4);
+    cls(gSum, "gone", si < 4);
+    cls(gSumDots, "gone", si < 4);
+    gSumDots.style.transitionDelay = (si === 4 && last !== 4 ? dur() : 0) + "ms";
+    cls(sumChip.g, "gone", false);
+    cls(sumCount, "gone", si < 5);
+
+    renderInsp(si, sub, wt);
+    if (si === 4 && last !== 4){ mergeIn(); landIn(); }
+
+    var sc = SCENES[si];
+    var extra = "";
+    if (si === 2){
+      extra = " &middot; <b>t = " + (wt / 1000) + "&thinsp;s</b>";
+      if (sub === 0) extra += " &mdash; the two offset series have no sample here at all, envoy-3 has one. <code>None</code> everywhere: no step at t&nbsp;=&nbsp;0.";
+      else if (sub === 1) extra += " &mdash; envoy-1 and envoy-2 have caught one sample each, <code>n == 1</code> &rArr; <code>None</code>. Only envoy-3 has two, and a flat counter rates to 0.";
+      else if (sub === 2) extra += " &mdash; the first full step. envoy-1 sits 6&thinsp;s from the open edge and 24&thinsp;s from the closed one, envoy-2 3&thinsp;s and 27&thinsp;s; both sum to one interval, so both extrapolate by exactly 2.";
+      else if (sub === 4) extra += " &mdash; envoy-3's window holds only (90&thinsp;s,&nbsp;100): one sample, so it stops contributing here.";
+    }
+    cap.innerHTML = "<b>" + sc.name + ".</b> " + sc.say + extra;
+    now.innerHTML = (si + 1) + " / " + SCENES.length + " &middot; " + sc.name +
+      (si === 2 ? " (" + (sub + 1) + "/" + NSTEPS + ")" : "");
+    last = si;
+  }
+
+  /* Two rAFs, so the hidden state is painted once before the opacity transition starts. */
+  function revealInputs(){
+    gIn.forEach(function(g){ g.classList.add("gone"); });
+    requestAnimationFrame(function(){
+      requestAnimationFrame(function(){ gIn.forEach(function(g){ g.classList.remove("gone"); }); });
+    });
+  }
+
+  /* One-shot merge: clones of the per-series dots slide down onto the sum lane. */
+  function mergeIn(){
+    var d = reduced ? 1 : 520 / speed;
+    SER.forEach(function(s, i){
+      Object.keys(s.rate).forEach(function(j){
+        var dy = YV(SUM_TOP, SUMV[j]) - YV(OUT_TOP[i], s.rate[j]);
+        ghost[i][j].animate(
+          [{transform:"translate(0px,0px)", opacity:1}, {transform:"translate(0px," + dy + "px)", opacity:0}],
+          {duration:d, easing:"cubic-bezier(.4,0,.2,1)", fill:"none"}
+        );
+      });
+    });
+  }
+
+  /* ---- controls ---- */
+  var btnPlay = document.getElementById("anim-play");
+  function stop(){ playing = false; btnPlay.textContent = "Play"; if (timer) clearTimeout(timer); timer = null; }
+  function tick(){
+    if (!playing) return;
+    if (frame >= TOTAL - 1){ stop(); return; }
+    frame++; render();
+    timer = setTimeout(tick, dwell(locate(frame)[0]));
+  }
+  function play(){
+    if (playing){ stop(); return; }
+    if (frame >= TOTAL - 1) frame = 0, render();
+    playing = true; btnPlay.textContent = "Pause";
+    timer = setTimeout(tick, dwell(locate(frame)[0]));
+  }
+  function goto(f){ stop(); frame = Math.max(0, Math.min(TOTAL - 1, f)); render(); }
+  btnPlay.addEventListener("click", play);
+  document.getElementById("anim-next").addEventListener("click", function(){ goto(frame + 1); });
+  document.getElementById("anim-prev").addEventListener("click", function(){ goto(frame - 1); });
+  document.getElementById("anim-restart").addEventListener("click", function(){ goto(0); revealInputs(); });
+  var btnSpeed = document.getElementById("anim-speed");
+  btnSpeed.addEventListener("click", function(){
+    speed = speed === 1 ? 2 : 1;
+    btnSpeed.innerHTML = speed + "&times;";
+    sec.style.setProperty("--adur", dur() + "ms");
+  });
+  document.addEventListener("keydown", function(e){
+    if (!sec.contains(document.activeElement) && document.activeElement !== document.body) return;
+    if (e.key === " "){ e.preventDefault(); play(); }
+    else if (e.key === "ArrowRight"){ e.preventDefault(); goto(frame + 1); }
+    else if (e.key === "ArrowLeft"){ e.preventDefault(); goto(frame - 1); }
+  });
+
+  render();
+  revealInputs();
+})();
+</script>
+</section>
+
+<p>PromQL compiles to a DataFusion plan over one fixed Arrow shape &mdash; one row per series, <code>labels Struct&lt;name: Utf8View, &hellip;&gt;</code> plus <code>samples List&lt;Struct&lt;timestamp, value&gt;&gt;</code>, non-nullable, ascending &mdash; which every stage consumes and re-emits, so they stack without a per-stage format.</p>
+
+<nav class="toc">
+  <a href="#inspector">Arrow view</a>
+  <a href="#vsgo">0. Against the Go engine</a>
+  <a href="#fixture">1. Fixture</a>
+  <a href="#plan">2. Query &amp; plan</a>
+  <a href="#scan">3a. Scan</a>
+  <a href="#range">3b. Rate</a>
+  <a href="#agg">3c. Aggregate</a>
+  <a href="#output">3d. Output</a>
+  <a href="#changes">4. Where samples change</a>
+  <a href="#divergences">5. Divergences</a>
+  <a href="#verification">6. Verification</a>
+</nav>
+
+<h2 id="vsgo"><span class="num">0</span>Against the Go engine</h2>
+<p>Every number on this page is the same number Prometheus produces; the reference implementation is the oracle, not the competition. What differs is the shape the work is done in, and that difference is the reason for the Arrow view above.</p>
+
+<div class="tablewrap">
+<table class="wide">
+<thead><tr><th></th><th class="wrap">Prometheus, <code>promql/</code></th><th class="wrap">this engine</th></tr></thead>
+<tbody>
+<tr>
+  <td>data shape</td>
+  <td class="wrap">A <code>Matrix</code> is a slice of <code>Series{Metric labels.Labels, Floats []FPoint}</code> &mdash; one Go struct per series, its own label value and its own points slice, and a <code>Vector</code> of per-series samples built for each step (the backing slices are pooled and returned).</td>
+  <td class="wrap">One <code>RecordBatch</code>: one row per series, <code>labels Struct&lt;name: Utf8View, &hellip;&gt;</code> beside <code>samples List&lt;Struct&lt;timestamp, value&gt;&gt;</code>. All 26 samples of all three series live in two flat buffers with four offsets, and a <code>Utf8View</code> column stores the repeated metric name once.</td>
+</tr>
+<tr>
+  <td>evaluation order</td>
+  <td class="wrap"><code>rangeEval</code> in <code>promql/engine.go</code> is an outer loop over steps: at each timestamp it evaluates the expression, producing one <code>Vector</code> across all series, with the per-series work inside.</td>
+  <td class="wrap">Inverted. One pass per row, over a window whose two edges only ever move forward, emitting every step of that series before the next row is touched &mdash; which is what lets <code>rate</code> carry reset state across steps instead of refolding the window.</td>
+</tr>
+<tr>
+  <td>aggregation state</td>
+  <td class="wrap"><code>map[uint64]*groupedAggregation</code>, keyed by a hash of the grouping labels, populated again at each step of the range.</td>
+  <td class="wrap">Flat lanes indexed <code>group &times; steps + step</code> with a <code>seen</code> bitmap, held by one <code>GroupsAccumulator</code> for the whole range. A timestamp is an array index, so there is no hash and no per-step rebuild.</td>
+</tr>
+<tr>
+  <td class="wrap">what crosses between operators</td>
+  <td class="wrap">In-memory <code>Matrix</code> and <code>Vector</code> values, passed between evaluator methods inside one process.</td>
+  <td class="wrap">RecordBatches. So DataFusion's partitioning, its partial-state merge across partitions, and execution on another machine are properties of the plan rather than things the engine has to build.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<p>The arithmetic is deliberately not re-derived: <code>extrapolated_rate</code> reproduces <code>extrapolatedRate</code> in <code>promql/functions.go</code> term for term, including the 1.1&times; threshold, the half-interval guess and the zero clip, and the aggregation reproduces <code>kahansum</code>'s compensation. Section 5 lists where the two diverge on purpose.</p>
+
+<p>What Go does that this does not: native histograms, the full function and operator set (binary and unary operators, subqueries, <code>topk</code> and friends), and sorted output. Those are the count in section 5, not a design difference. The columnar shape is not free either &mdash; a label struct has to be rebuilt whenever a projection changes the label set, where Go can hand a <code>labels.Labels</code> around unchanged.</p>
+
+<h2 id="fixture"><span class="num">1</span>Fixture</h2>
+<p>Three series, each scraped every 30&nbsp;s on its own phase, so no two land on the same second and only one lands on the step grid.</p>
+
+<div class="tablewrap">
+<table class="wide">
+<thead><tr><th>series</th><th>labels</th><th>scrapes at (s)</th><th>values</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td><code>pod=envoy-1, route=/</code></td><td class="num">6, 36, 66 &hellip; 306 (11 pts)</td><td class="num">1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11</td></tr>
+<tr><td class="num">2</td><td><code>pod=envoy-2, route=/</code></td><td class="num">3, 33, 63 &hellip; 303 (11 pts)</td><td class="num">1, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51</td></tr>
+<tr><td class="num">3</td><td><code>pod=envoy-3, route=/api</code></td><td class="num">0, 30, 60, 90 (4 pts)</td><td class="num">100, 100, 100, 100</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The phases are the point: on-grid scrapes hide the interaction between the range window and the step grid, since every window then meets its samples at the same two distances. Series 3 ends at t&nbsp;=&nbsp;90&nbsp;s, exercising a series ending mid-query.</p>
+
+<p><b>Built by hand, not by the loader.</b> <code>from_descriptions</code> cannot express a phase &mdash; it pins value index <i>i</i> to timestamp <i>i&nbsp;&times;&nbsp;interval</i>, epoch-anchored, as upstream's <code>load</code> does. So each row is a <code>Series::new(&amp;labels, timestamps, values)</code> handed to <code>try_new</code>, fallible because two series sharing a label set is one series split in two.</p>
+
+<details>
+<summary>Arrow layout</summary>
+<p>Through <code>from_descriptions</code>, duplicate label names and lines sharing a label set both collapse last-wins into one <code>BTreeMap&lt;i64,f64&gt;</code>; <code>try_new</code> rejects the collision instead. Either way on the wire: one <code>ListArray</code> (offsets <code>[0,11,22,26]</code>) over a shared struct of 26 entries, and <code>Utf8View</code> label columns dedupe per batch, so the 20-byte metric name is stored once.</p>
+</details>
+
+<h2 id="plan"><span class="num">2</span>Query and plan</h2>
+<p><code>RangeQuery::new(0, 300_000, 30_000)</code> &mdash; 0&nbsp;s to 300&nbsp;s, step 30&nbsp;s, the constructor's unit being milliseconds &mdash; planned bottom-up, <code>scan() &rarr; call() &rarr; aggregate()</code>:</p>
+
+<pre class="codeblock"><code>Projection: promql_labels() AS labels, samples
+  Aggregate: groupBy=[[]], aggr=[[promql_aggregate(samples, Utf8("sum"), Int64(0), Int64(300000), Int64(30000)) AS samples]]
+    Projection: promql_labels(Utf8("pod"), get_field(selector_0.labels, Utf8("pod")), Utf8("route"), get_field(selector_0.labels, Utf8("route"))) AS labels, promql_range_function(selector_0.samples, Utf8("rate"), Int64(0), Int64(300000), Int64(30000), Int64(60000), Int64(0), Int64(NULL)) AS samples
+      TableScan: selector_0</code></pre>
+
+<details>
+<summary>What each logical operator does</summary>
+<ul class="annot">
+  <li><b><code>TableScan: selector_0</code></b> is a <code>SelectorTable</code> built eagerly, because a <code>TableProvider</code> must know its label-name schema before any scan; named off a per-query counter.</li>
+  <li><b>Inner <code>promql_labels(&hellip;)</code></b> rebuilds the label struct without <code>__name__</code>: <code>Func::drops_metric_name()</code> is true for everything but <code>last_over_time</code>.</li>
+  <li><b><code>groupBy=[[]]</code></b> from <code>group_keys(input, [], false) = []</code>. <code>sum by (route)</code> emits <code>get_field(&hellip;) AS __group__route</code> instead; the prefix stops a label named <code>labels</code> or <code>samples</code> colliding with engine columns.</li>
+  <li><b><code>SelectHints</code></b>: binding <code>start_ms</code>/<code>end_ms</code>, advisory <code>step_ms</code>, <code>range_ms = 60_000</code>, <code>func = "rate"</code>. Only <code>shard</code> and <code>grouping</code> are absent, the latter because the selector's direct parent is <code>rate</code>, not the <code>sum</code> &mdash; upstream's <code>extractGroupsFromPath</code> rule.</li>
+</ul>
+</details>
+
+<h3>The physical plan</h3>
+<p>What DataFusion makes of it, from <code>create_physical_plan</code> on the same session state and <code>displayable(plan).indent(true)</code>:</p>
+
+<pre class="codeblock"><code>ProjectionExec: expr=[{} as labels, samples@0 as samples]
+  AggregateExec: mode=Single, gby=[], aggr=[promql_aggregate(samples, sum, 0, 300000, 30000) as samples]
+    ProjectionExec: expr=[promql_range_function(samples@1, rate, 0, 300000, 30000, 60000, 0, NULL) as samples]
+      DataSourceExec: partitions=1, partition_sizes=[1]</code></pre>
+
+<ul class="annot">
+  <li><b><code>DataSourceExec: partitions=1</code></b> is whatever <code>SelectorTable::scan</code> handed back. No filter or range shows on the node: the <code>SelectHints</code> were consumed at plan time, so the store had already applied them.</li>
+  <li><b>The lower <code>ProjectionExec</code></b> is the range kernel as an ordinary scalar UDF over a whole batch. One call covers every row, and each row's entire grid is produced inside it; there is no step loop above this node.</li>
+  <li><b>The inner <code>promql_labels(&hellip;)</code> is gone.</b> Projection pushdown dropped it, since <code>groupBy=[[]]</code> reads no label &mdash; so <code>rate</code>'s label rebuild never runs for this query. The <code>{}</code> at the top is the const-folded empty struct that replaced the outer <code>promql_labels()</code>.</li>
+  <li><b><code>AggregateExec: mode=Single</code></b>: one input partition and no grouping keys, so neither a repartition nor a two-phase split is needed. <code>Grouped</code> sees only <code>update_batch</code> and <code>evaluate</code>.</li>
+  <li><b><code>sum by (route)</code> on the same fixture takes the two-phase form</b>: <code>mode=Partial</code>, then <code>RepartitionExec: partitioning=Hash([__group__route@0], 10), input_partitions=1</code>, then <code>mode=FinalPartitioned</code>. That is where <code>state()</code> and <code>merge_batch</code> are called, and what crosses the boundary is partial state as a list of <code>(timestamp, a, b, n, m)</code> structs.</li>
+  <li><b>That boundary is the whole distribution story</b>: partitioned and remote execution are the same path, Arrow partial state in and out, with no engine code that knows which of the two it is. The <code>10</code> is <code>target_partitions</code>, the core count of the machine that printed this, not a constant of the engine.</li>
+</ul>
+
+<h2 id="scan"><span class="num">3a</span>Selector / scan</h2>
+<div class="stage-card">
+<p><code>Params::select_range()</code> gives <code>lo = start &minus; (window_ms &minus; 1) &minus; offset</code> and <code>hi = end &minus; offset</code>: here <b>&minus;59.999&nbsp;s to 300&nbsp;s</b>. The odd millisecond is the strict lower bound, in the unit the code counts in &mdash; a sample exactly <code>window_ms</code> old is never read.</p>
+<p>envoy-1's sample at 306&nbsp;s and envoy-2's at 303&nbsp;s fall outside; 24 of the 26 reach the kernel. Neither loss shows in the answer, since the last step's window closes at 300&nbsp;s &mdash; move <code>end</code> to 330&nbsp;s and both reappear. The 5-minute lookback plays no part: it applies only to a bare instant selector.</p>
+
+<details>
+<summary>Matchers and clip</summary>
+<p>One <code>Params</code> serves the instant selector, the range functions and the aggregation's step count, so <code>window_ms</code> is the lookback delta in one and the <code>[1m]</code> in the other; there is no separate lookback field. <code>effective_matchers</code> synthesizes <code>__name__="http_requests_total"</code> from the bare metric name. <code>MemorySeriesSource::select</code> compiles matchers as anchored regexes, masks the whole label column, drops the label columns no surviving row carries, then <code>clip</code>s to <code>[-59_999, 300_000]</code>&nbsp;ms: two <code>partition_point</code> searches per row and one <code>filter</code> over the shared child, with a batch already inside the range handed straight back.</p>
+</details>
+</div>
+
+<h2 id="range"><span class="num">3b</span>Range selection and <code>rate</code></h2>
+<div class="stage-card">
+<p>Kernel is <code>range_function</code>; per step <i>t</i> the window is <code>(t &minus; 60&nbsp;s, t]</code>. Out of phase with the step grid, each series meets those two edges at its own distance &mdash; what <code>duration_to_start</code> and <code>duration_to_end</code> measure, here no longer 30&nbsp;s and 0.</p>
+
+<h3>t = 60 s &mdash; window (0 s, 60 s]</h3>
+<p>The first step every series can answer: all three land on factor&nbsp;2, and no two get there the same way.</p>
+<div class="tablewrap">
+<table class="wide">
+<thead><tr><th>series</th><th>window</th><th>result</th><th>to_start</th><th>zero clip</th><th>to_end</th><th>factor</th><th>increase</th><th>rate</th></tr></thead>
+<tbody>
+<tr><td>envoy-1</td><td class="num">(6&nbsp;s,1),(36&nbsp;s,2)</td><td class="num">1</td><td class="num">6&nbsp;s (6&lt;33)</td><td class="wrap">30&times;(1/1)=30&nbsp;s, no bite</td><td class="num">24&nbsp;s (24&lt;33)</td><td class="num">(30+6+24)/30 = 2</td><td class="num">2</td><td class="num"><b>0.0333333&hellip;</b></td></tr>
+<tr><td>envoy-2</td><td class="num">(3&nbsp;s,1),(33&nbsp;s,6)</td><td class="num">5</td><td class="num">3&nbsp;s</td><td class="wrap">30&times;(1/5)=6&nbsp;s, no bite</td><td class="num">27&nbsp;s</td><td class="num">(30+3+27)/30 = 2</td><td class="num">10</td><td class="num"><b>0.1666666&hellip;</b></td></tr>
+<tr><td>envoy-3</td><td class="num">(30&nbsp;s,100),(60&nbsp;s,100)</td><td class="num">0</td><td class="num">30&nbsp;s</td><td class="wrap"><code>result&gt;0</code> false, no clip</td><td class="num">0&nbsp;s</td><td class="num">(30+30+0)/30 = 2</td><td class="num">0</td><td class="num"><b>0</b></td></tr>
+</tbody>
+</table>
+</div>
+<p>A series scraped 30&nbsp;s apart is never more than 30&nbsp;s from either edge of a 60&nbsp;s window and the two distances always add up to one interval, so the phase moves where the extrapolation happens without changing how much of it there is. Every <code>[1m]</code> step from t&nbsp;=&nbsp;60&nbsp;s on repeats this table.</p>
+
+<p><b>The zero clip does not bite on <code>[1m]</code>, and that is the interesting part.</b> envoy-2 climbs 5 per scrape from 1, so <code>duration_to_zero = sampled_interval &times; (first_value / result) = 30&times;(1/5) = 6</code>&nbsp;s. The clip only ever shortens <code>to_start</code>, which here is 3&nbsp;s, already inside 6. On the grid it would have asked for 30&nbsp;s and been cut to 6, changing the answer; the phase is what defuses it.</p>
+<p>Widen to <code>[2m]</code> and the two guards compose. At t&nbsp;=&nbsp;60&nbsp;s envoy-2's first sample is 63&nbsp;s from the open edge, past the 33&nbsp;s threshold, so <code>to_start</code> becomes the half-interval guess of 15&nbsp;s &mdash; outside the 6&nbsp;s to zero, so the clip cuts it back to 6. Factor <code>(30+6+27)/30 = 2.1</code>, increase 10.5, rate <b>0.0875</b>, where the clamp alone gives factor 2.4 and 0.1. The same at t&nbsp;=&nbsp;90&nbsp;s; from t&nbsp;=&nbsp;120&nbsp;s the window starts inside the series, <code>to_start</code> is 3&nbsp;s, and the clip goes quiet. So the clip only matters once the clamp has already moved the edge &mdash; which is why it is applied after it.</p>
+
+<details>
+<summary>Extrapolation arithmetic, and why <code>rate</code> does not refold the window</summary>
+<p><code>apply</code> runs <code>range_function</code> once per row. <code>raw_increase</code> gives <code>result = last &minus; first</code>, adding the pre-reset value back at every descending adjacent pair; <code>extrapolated_rate</code> takes that and the window's endpoints, with <code>average = sampled_interval/(n&minus;1)</code> and <code>threshold = 1.1&times;average</code>.</p>
+<p>A 5&thinsp;m window on a 15&thinsp;s step overlaps its predecessor twenty to one, so refolding per step pays for the same samples twenty times. Two families carry state across the step instead &mdash; <code>Sweep::Counter</code> for <code>rate</code> and <code>increase</code>, tracking where the counter reset, and <code>Sweep::Extremum</code> for <code>min_over_time</code> and <code>max_over_time</code>, on a monotone candidate queue &mdash; and measured 60&ndash;78&thinsp;% off. The other twelve refold through <code>evaluate(func, &amp;Window)</code> on a monotonic <code>lo</code>/<code>hi</code> pair. Choosing between the two walks is a <code>match</code> above the step loop, not a branch inside it, and both are pinned against a fresh-window-per-step oracle and a 400-case fuzz over all fourteen functions.</p>
+</details>
+
+<details>
+<summary>Other steps: t = 30 s, t = 0, t &ge; 120 s</summary>
+
+<h3>t = 30 s &mdash; one series answers <span class="pill ok">sum = 0.0</span></h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>series</th><th>window (&minus;30 s, 30 s]</th><th>n</th><th>to_start</th><th>to_end</th><th>factor</th><th>rate</th></tr></thead>
+<tbody>
+<tr><td>envoy-1</td><td class="num">(6&nbsp;s,1)</td><td class="num">1</td><td class="dash">&mdash;</td><td class="dash">&mdash;</td><td class="dash">&mdash;</td><td class="dash">absent</td></tr>
+<tr><td>envoy-2</td><td class="num">(3&nbsp;s,1)</td><td class="num">1</td><td class="dash">&mdash;</td><td class="dash">&mdash;</td><td class="dash">&mdash;</td><td class="dash">absent</td></tr>
+<tr><td>envoy-3</td><td class="num">(0&nbsp;s,100),(30&nbsp;s,100)</td><td class="num">2</td><td class="num">30&nbsp;s</td><td class="num">0&nbsp;s</td><td class="num">2</td><td class="num"><b>0</b></td></tr>
+</tbody>
+</table>
+</div>
+<p>The sum at this step is <b>0.0 and present</b> &mdash; the clearest case on the page of a zero that is not an absence.</p>
+
+<h3>t = 0 &mdash; nothing at all <span class="pill absent">no output</span></h3>
+<p>Window <code>(&minus;60 s, 0]</code>: envoy-1's first scrape is at 6&nbsp;s and envoy-2's at 3&nbsp;s, so neither has <i>any</i> sample in it; envoy-3 has exactly one. Two series miss on emptiness and one on <code>n == 1</code> &mdash; two rules an on-grid fixture would have collapsed into one.</p>
+
+<h3>t &ge; 120 s &mdash; series ending mid-query</h3>
+<p>envoy-3's window at t&nbsp;=&nbsp;120&nbsp;s holds only <code>(90 s, 100)</code>; its last contributing step is t&nbsp;=&nbsp;90&nbsp;s. <code>apply</code> writes results into a fresh <code>ListArray</code>, one output row per input row, inheriting the input's null buffer; a null row is skipped and its offsets collapse.</p>
+</details>
+</div>
+
+<h2 id="agg"><span class="num">3c</span>Aggregation</h2>
+<div class="stage-card">
+<p><code>promql_aggregate</code> is a UDAF whose accumulator is <code>Grouped</code>: everything below it already emits at <code>start + i&middot;step</code>, so a timestamp <i>is</i> an array index and group state is flat lanes over <code>group &times; steps + step</code> plus a <code>seen</code> bitmap, not a map per group. A step no series reached stays <b>absent</b> rather than zero, which is what the bitmap is for and not something a sentinel value could say. Both ideas sit in the table below: t&nbsp;=&nbsp;0 absent, t&nbsp;=&nbsp;30&nbsp;s a real 0.0.</p>
+
+<div class="tablewrap">
+<table class="wide centerpiece">
+<thead><tr><th>step (s)</th><th class="num">envoy-1</th><th class="num">envoy-2</th><th class="num">envoy-3</th><th class="num">sum(rate(&hellip;[1m]))</th></tr></thead>
+<tbody>
+<tr><td>0</td><td class="dash">absent</td><td class="dash">absent</td><td class="dash">absent</td><td class="dash"><span class="pill absent">absent</span></td></tr>
+<tr><td>30</td><td class="dash">absent</td><td class="dash">absent</td><td class="num">0.0</td><td class="num"><b>0.0</b> <span class="pill ok">present</span></td></tr>
+<tr><td>60</td><td class="num">0.0333333333</td><td class="num">0.1666666667</td><td class="num">0.0</td><td class="num"><b>0.2</b></td></tr>
+<tr><td>90</td><td class="num">0.0333333333</td><td class="num">0.1666666667</td><td class="num">0.0</td><td class="num"><b>0.2</b></td></tr>
+<tr><td>120 &ndash; 300</td><td class="num">0.0333333333</td><td class="num">0.1666666667</td><td class="dash">absent</td><td class="num"><b>0.2</b></td></tr>
+</tbody>
+</table>
+</div>
+
+<details>
+<summary>Lanes, runs, merge, and the emit</summary>
+<p><b>Grid.</b> <code>Grid::new</code> rejects a non-positive step and caps at <code>MAX_STEPS = 1_000_000</code>; here <code>len = 300&nbsp;s / 30&nbsp;s + 1 = 11</code>. Sum is Kahan&ndash;Neumaier per step, with no loop-carried dependency across steps.</p>
+<p><b>Lanes.</b> Which lanes an operator wants is decided once, in <code>Lanes::new</code> &mdash; two for <code>sum</code> (<code>sum</code>, <code>c</code>), three for <code>avg</code> and the variances, one for <code>count</code>/<code>min</code>/<code>max</code>, none for <code>group</code>, plus a bit lane for <code>avg</code>'s "already gone incremental" flag &mdash; so growing, dropping an emitted prefix and measuring the state never match on the operator again. Only <code>min</code> and <code>max</code> fill a fresh position with anything but zero: the NaN the first real value beats.</p>
+<p><b>Runs.</b> <code>Grid::runs</code> cuts a series' ascending timestamps into maximal runs of consecutive grid positions. Stepping by <code>step_ms</code> finds the edges without a division per sample, and only the ends go through <code>Grid::index</code>, which is what proves the whole run is on the grid. <code>add_series</code> and <code>merge_batch</code> share it, so the two cannot drift, and non-ascending timestamps are an execution error rather than a run written at the wrong step. Here envoy-1 and envoy-2 span 2..10, envoy-3 spans 1..3.</p>
+<p><b>Emit.</b> <code>finish</code> and <code>partial</code> walk the group's slice of the bitmap and read the lanes in that same pass: no dense fast path, no gather through an index list, nothing moved out of a lane, and the bitmap materialized once and shared with <code>release</code>. All five state children are declared non-nullable, so an unused lane is a buffer of zeros or a <code>BooleanBuffer::new_unset</code>, never nulls.</p>
+<p><b>Merge.</b> Partial state is read back by name and type-checked, so a peer encoding another version is a query error rather than a worker panic. Merging into a position nothing has reached copies the incoming values verbatim, since merging into a fresh Kahan or Welford state is not bit-identical to a copy. The one-sample-at-a-time <code>State</code> enum, restating every operator in upstream's <code>groupedAggregation</code> value types, exists only in the test module as the oracle the lane kernels are pinned against.</p>
+</details>
+</div>
+
+<h2 id="output"><span class="num">3d</span>Output</h2>
+<div class="stage-card">
+<p><code>Grouped::evaluate</code> emits one canonical <code>samples</code> list per group in step order; <code>is_nullable</code> is false and a group-less aggregation's <code>default_value</code> is an empty list. The top <code>Projection</code> builds the empty label set: one row, <code>labels Struct&lt;&gt;</code>, <code>samples</code> of 10 entries.</p>
+<p><code>Engine::range_query</code> hands back <code>Vec&lt;RecordBatch&gt;</code>, schema validated once and <code>series::drop_empty</code> applied; a caller wanting <code>Series</code> calls <code>series::decode</code> itself, which re-validates and slices each row zero-copy. <b>Empty series are dropped in that one step</b>, deliberately not in the plan, since a plan-side filter could be pushed below the projection and run the kernel twice. Row order is DataFusion's hash-group order; there is no sort.</p>
+</div>
+
+<pre class="mermaid">
+flowchart LR
+  A["MemorySeriesSource\nclip + encode"] -->|"labels, samples\n(26 raw pts, 24 after clip)"| B["promql_range_function\nrate, window per step"]
+  B -->|"labels(no __name__), samples\n(9, 9 and 3 pts; t=0 and 30 s thin)"| C["promql_aggregate\nsum, groupBy=[[]]"]
+  C -->|"samples\n(1 group, 10 steps)"| D["promql_labels()\nempty label struct"]
+  D --> E["Engine::range_query\ndrop_empty, Arrow out"]
+</pre>
+
+<h2 id="changes"><span class="num">4</span>Where samples change</h2>
+<p>Every point that adds, drops, or rewrites a sample, in pipeline order.</p>
+
+<div class="tablewrap">
+<table class="wide">
+<thead><tr><th>stage</th><th class="wrap">what changes</th><th class="wrap">why</th></tr></thead>
+<tbody>
+<tr><td>load</td><td class="wrap"><code>from_descriptions</code>: value index &rarr; timestamp <code>i&times;interval</code>; <code>_</code> (omitted) emits nothing. Not used by this fixture, which needs off-grid timestamps</td><td class="wrap">promqltest <code>load</code> semantics</td></tr>
+<tr><td>load</td><td class="wrap"><code>from_descriptions</code>: duplicate lines merged, later value wins a shared timestamp; duplicate label names last-wins</td><td class="wrap">corpus repeats lines on purpose; keeps <code>encode</code> from seeing one label set twice</td></tr>
+<tr><td>load</td><td class="wrap"><code>try_new</code>: two ready-built series sharing a label set are rejected rather than merged</td><td class="wrap">one series split in two is a caller bug, caught once instead of per query</td></tr>
+<tr><td>build</td><td class="wrap">non-ascending timestamps rejected at construction</td><td class="wrap">the whole stack binary-searches them</td></tr>
+<tr><td>build</td><td class="wrap">labels with <code>""</code> value are not stored</td><td class="wrap"><code>""</code> is how PromQL spells an absent label</td></tr>
+<tr><td>scan</td><td class="wrap"><code>drop_unused_labels</code> removes label columns no selected row carries</td><td class="wrap">the answer must not depend on what else the store holds</td></tr>
+<tr><td>scan</td><td class="wrap"><code>clip(start,end)</code> drops samples outside the inclusive range: two binary searches per row, then one <code>filter</code>. Here it drops the scrapes at 303&nbsp;s and 306&nbsp;s</td><td class="wrap">store obligation #1</td></tr>
+<tr><td>scan</td><td class="wrap">series lacking a batch label gets synthesized <code>""</code></td><td class="wrap">union schema across rows</td></tr>
+<tr><td>scan</td><td class="wrap">per-series sample arrays concatenated into one entries array with an offsets buffer</td><td class="wrap">one Arrow list column</td></tr>
+<tr><td>range</td><td class="wrap">scan window widened by <code>window_ms&minus;1</code> ms and shifted by offset; saturating arithmetic</td><td class="wrap"><code>getTimeRangesForSelector</code>; clamp an absurd <code>@</code>/offset instead of panicking</td></tr>
+<tr><td>range</td><td class="wrap">StaleNaN samples removed before any arithmetic, once over the whole batch</td><td class="wrap"><code>matrixIterSlice</code>: staleness markers are not samples</td></tr>
+<tr><td>range</td><td class="wrap">per step, samples outside <code>(range_end&minus;window, range_end]</code> excluded</td><td class="wrap">half-open window, Prometheus-exact</td></tr>
+<tr><td>range</td><td class="wrap">counter reset adds back the pre-reset value</td><td class="wrap"><code>extrapolatedRate</code></td></tr>
+<tr><td>range</td><td class="wrap"><code>duration_to_start</code>/<code>_end</code> synthesized: clamped to half an average interval past 1.1&times; threshold</td><td class="wrap">extrapolation to the window edges</td></tr>
+<tr><td>range</td><td class="wrap"><code>duration_to_start</code> clipped so a counter is never extrapolated below zero &mdash; after the threshold clamp</td><td class="wrap"><code>extrapolatedRate</code></td></tr>
+<tr><td>range</td><td class="wrap">a one-sample window yields no sample (rate/increase/delta)</td><td class="wrap">cannot slope from one point</td></tr>
+<tr><td>range</td><td class="wrap">divide by <code>window_ms/1000</code> for <code>rate</code> only</td><td class="wrap">rate is per second</td></tr>
+<tr><td>range</td><td class="wrap">output timestamps are step timestamps, not sample timestamps</td><td class="wrap">alignment to the step grid</td></tr>
+<tr><td>range</td><td class="wrap">null input row &rArr; null output row; its spanned samples excluded</td><td class="wrap">validity mirrors the input</td></tr>
+<tr><td>range/labels</td><td class="wrap"><code>__name__</code> dropped from the label struct</td><td class="wrap"><code>dropName</code> in <code>evalCall</code></td></tr>
+<tr><td>labels</td><td class="wrap">non-<code>Utf8View</code> values cast; NULL &rarr; <code>""</code></td><td class="wrap">canonical leaf type, no NULL parents</td></tr>
+<tr><td>aggregate</td><td class="wrap">timestamp &rarr; grid index; off-grid / out-of-range is an execution error</td><td class="wrap">reachable from SQL over any list column</td></tr>
+<tr><td>aggregate</td><td class="wrap"><code>Grid::runs</code> cuts a series into consecutive-position runs; non-ascending timestamps are an error, not a run at the wrong step</td><td class="wrap">one walk for <code>add_series</code> and <code>merge_batch</code>, so the two cannot drift</td></tr>
+<tr><td>aggregate</td><td class="wrap">step &le; 0 and &gt; <code>MAX_STEPS</code> rejected, counted in <code>i128</code></td><td class="wrap">an <code>i64</code>-wide range is a number to compare, not an overflow</td></tr>
+<tr><td>aggregate</td><td class="wrap">Kahan&ndash;Neumaier compensation added to the sum (two lanes: sum + c)</td><td class="wrap">Prometheus's <code>kahansum.Inc</code></td></tr>
+<tr><td>aggregate</td><td class="wrap">a merged run splits at the bitmap: reached positions merge, unreached ones copy the incoming state verbatim</td><td class="wrap">merging into a fresh Kahan state is not bit-identical to a copy</td></tr>
+<tr><td>aggregate</td><td class="wrap">a step no series reached is absent, distinct from a zero sum</td><td class="wrap"><code>seen</code> bitmap, not a sentinel</td></tr>
+<tr><td>aggregate</td><td class="wrap">null rows and <code>FILTER</code>ed rows skipped in both <code>update_batch</code> and <code>merge_batch</code></td><td class="wrap">absent series, not empty ones</td></tr>
+<tr><td>plan</td><td class="wrap"><code>@</code>, offset and range each bounded to <code>i64::MAX/4</code></td><td class="wrap">three terms meet in one <code>i64</code> in <code>select_range</code></td></tr>
+<tr><td>plan</td><td class="wrap"><code>range_secs</code>/<code>original_offset_secs</code> floats &times;1000, rounded to i64 ms</td><td class="wrap">ms is Prometheus's unit</td></tr>
+<tr><td>output</td><td class="wrap">series with zero samples dropped from the returned batches</td><td class="wrap">a plan-side filter could be pushed below the projection</td></tr>
+<tr><td>decode</td><td class="wrap">a NULL label value would read as <code>""</code> rather than panic</td><td class="wrap">belt and braces over the non-nullable schema</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="divergences"><span class="num">5</span>Divergences and TODOs</h2>
+<ul class="plain">
+<li><b>Native histograms are absent</b> &mdash; floats only, and created-timestamp anchoring of a single-sample window is unimplemented, so such a window is always <code>None</code>.</li>
+<li><b>Only 8 aggregations and 14 range functions</b> &mdash; <code>topk</code>/<code>bottomk</code>/<code>quantile</code>/<code>count_values</code>/<code>limitk</code>/<code>limit_ratio</code>, binary and unary operators, subqueries, scalar literals, and duration-expression ranges/offsets are all unsupported. Every refusal is named, so the untouched remainder is a count per feature rather than "red".</li>
+<li><b>The only hint still never filled is <code>shard</code></b>. <code>grouping</code> is filled only for <code>by</code>, and only when the aggregation is the selector's direct parent: <code>without</code> names what to drop, which tells a store nothing it can act on, and an intervening <code>rate</code> means the grouping no longer describes the selector's parent. That is upstream's <code>extractGroupsFromPath</code> rule.</li>
+<li><b><code>@</code> out of range</b> is rejected by the planner rather than at parse time as upstream: same outcome, different error site.</li>
+<li><b><code>MAX_STEPS = 1_000_000</code></b> is this engine's own cap, not Prometheus's 11,000-point API limit.</li>
+<li><b>Output ordering is unspecified</b> &mdash; batches come back in DataFusion's hash-group order, while Prometheus's API sorts.</li>
+<li><b>Splitting one long series across batches</b> is explicitly left open.</li>
+<li><b><code>@</code> inside a range function</b> repeats one window's value across every step, but applies <code>offset</code> inside the pinned window (<code>at - offset</code>), worth a differential check.</li>
+</ul>
+
+<h3>Settled since the last pass</h3>
+<ul class="plain">
+<li><b>Dense group state was researched and rejected.</b> The idea was to drop the bitmap and emit whole grids: it does not work. A Kahan merge of the positions nothing reached is not a no-op, so the arithmetic would change; and <code>StateFieldsArgs</code> carries no operator literal, so the state schema cannot be narrowed to the lanes the operator actually uses. The bitmap stays, and the emit now walks it directly.</li>
+<li><b>The promqltest gate is 259 / 259 green.</b> The 1,044 evals still outside the allowlist are the roadmap, not a regression: each is an <code>Unsupported</code> with a feature name, which is what makes the remainder countable.</li>
+</ul>
+
+<div class="footnote" id="verification">
+<p><b>How this was verified.</b> The offset fixture was run against <span class="fl">51d4547</span> from a throwaway crate outside the repository, depending on <code>promql-engine</code> by path, so the working tree was never touched. It built the three series with <code>Series::new</code> and <code>MemorySeriesSource::try_new</code>, then printed the plan, the per-series <code>rate</code> and <code>increase</code>, the <code>sum</code>, an instant evaluation and a <code>[2m]</code> run.</p>
+<p>What came back: envoy-1 flat at 0.0333333333 and envoy-2 flat at 0.1666666667, both from t&nbsp;=&nbsp;60&nbsp;s through t&nbsp;=&nbsp;300&nbsp;s and absent before; envoy-3 at 0.0 for t&nbsp;=&nbsp;30, 60 and 90&nbsp;s only; <code>increase</code> of 2 and 10 on the same steps. The sum is 0.0 at t&nbsp;=&nbsp;30&nbsp;s and 0.2 from t&nbsp;=&nbsp;60&nbsp;s on, ten points, with nothing at t&nbsp;=&nbsp;0. The instant query at 60&nbsp;s gives the single point <code>{} 0.2</code>. The plan printed byte-identical to the one above, which is expected: the label sets did not change, only the timestamps.</p>
+<p>Two checks on the reasoning rather than the result. The <code>[2m]</code> run exercises both the threshold clamp and the zero clip, neither of which <code>[1m]</code> reaches: sum 0.0 at t&nbsp;=&nbsp;30&nbsp;s, 0.1066666667 at 60&nbsp;s, 0.1566666667 at 90&nbsp;s, then 0.2; per series, envoy-1 goes 0.0191666667, 0.0275, then flat at 0.0333333333, and envoy-2 0.0875, 0.1291666667, then 0.1666666667. Those two envoy-2 values are the clipped ones, and they match the hand arithmetic above to the digit. Moving <code>end</code> to 330&nbsp;s brings back the two scrapes the 300&nbsp;s scan clipped, with the same <code>increase</code> of 2 and 10, confirming they were present in the source and lost only to the clip.</p>
+</div>
+
+</main>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+mermaid.initialize({startOnLoad:true, theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "neutral"});
+</script>
+</body>
+</html>

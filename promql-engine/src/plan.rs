@@ -478,17 +478,19 @@ impl Planner<'_> {
     /// it must honour, and whatever else may let it read less.
     ///
     /// `range_ms` is the `[5m]` of a range selector, absent for an
-    /// instant one. `step_ms` is always the step the caller passed: this
-    /// engine has one entry point, so a query whose bounds happen to be
-    /// equal is a one-step range query, not an instant one, and guessing
-    /// otherwise would withhold a grid the store can still align to.
+    /// instant one. `step_ms` is `None` when start equals end: that is one
+    /// evaluation timestamp and no grid, whatever step the caller passed
+    /// (Prometheus `populateSeries` takes `Step` from the statement
+    /// interval, 0 for an instant query). Forwarding the step would tell a
+    /// store that downsamples or aligns blocks to align to a grid that
+    /// does not exist.
     fn hints(&self, params: &Params, range_ms: Option<i64>, above: Above) -> SelectHints {
         let (start_ms, end_ms) = params.select_range();
         SelectHints {
             start_ms,
             end_ms,
             window_ms: params.window_ms,
-            step_ms: Some(self.query.step_ms),
+            step_ms: (self.query.start_ms != self.query.end_ms).then_some(self.query.step_ms),
             range_ms,
             func: above.func.map(str::to_string),
             grouping: above.grouping.cloned(),
@@ -509,18 +511,23 @@ impl Planner<'_> {
             self.source,
             &vs.name,
             &effective_matchers(vs),
-            hints,
+            hints.clone(),
         )
         .await?;
         let label_names = table.label_names();
         let index = self.selectors;
         self.selectors += 1;
-        let builder = LogicalPlanBuilder::scan(
+        let scan = LogicalPlanBuilder::scan(
             format!("selector_{index}"),
             provider_as_source(Arc::new(table)),
             None,
-        )?;
-        Ok((builder, label_names))
+        )?
+        .build()?;
+        // Here and not at the callers: the instant and the range-function
+        // selector both build their scan through this, and a source's node
+        // must be on every one of them.
+        let scan = self.source.scan_node(scan, &hints)?;
+        Ok((LogicalPlanBuilder::from(scan), label_names))
     }
 
     async fn selector(
@@ -1214,11 +1221,15 @@ mod tests {
         assert_eq!(hints[0].func.as_deref(), Some("count"));
         assert_eq!(hints[0].grouping, None);
 
-        // Equal bounds are a one-step range query, not an instant one:
-        // the step is still the grid the caller asked for.
-        let one_step = RangeQuery::new(600_000, 600_000, 30_000);
-        let hints = hints_of("x", one_step).await;
-        assert_eq!(hints[0].step_ms, Some(30_000));
+        // Equal bounds evaluate at a single timestamp: no grid, so step_ms is None.
+        let instant = RangeQuery::new(600_000, 600_000, 30_000);
+        let hints = hints_of("x", instant).await;
+        assert_eq!(hints[0].step_ms, None);
+
+        // A range function with equal bounds: one evaluation timestamp, no grid.
+        let hints = hints_of("rate(x[5m])", instant).await;
+        assert_eq!(hints[0].step_ms, None);
+        assert_eq!(hints[0].range_ms, Some(300_000));
     }
 
     /// Plan `query` against an empty store: every guard here runs before

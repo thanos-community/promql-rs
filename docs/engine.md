@@ -382,6 +382,16 @@ range functions filter it out, because a store's merge drops repeated
 timestamps before PromQL sees staleness: a marker in the first chunk must not
 let a real sample at the same timestamp through from the second.
 
+**Source nodes.** A source may put a node of its own on top of a
+selector's scan (`SeriesSource::scan_node`, carried by a `SelectorNode`),
+for work only it can do, such as merging replicas whose label sets differ
+and so never meet in the engine's own merge. The engine lowers that node
+beneath `SeriesSetExec`, not above it: `check_selector_plans` refuses
+anything between a selector aggregate and `SeriesSetExec`, so a node
+placed above would be rejected. Beneath it, the order check covers what the
+node emits, and a node that breaks the contract is caught like a store that
+does.
+
 ## The correctness net
 
 `labelset::reject_same_labelset` (`labelset.rs`) runs on each block's
