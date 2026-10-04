@@ -283,7 +283,7 @@ impl Func {
             Func::Hour => |v| civil(v, |t| t.hour()),
             Func::Minute => |v| civil(v, |t| t.minute()),
             Func::Month => |v| civil(v, |t| t.month()),
-            Func::Year => |v| civil(v, |t| t.year()),
+            Func::Year => year,
             Func::Binary { .. }
             | Func::Round
             | Func::Clamp
@@ -298,20 +298,84 @@ impl Func {
 
 /// `dateWrapper`'s `time.Unix(int64(v), 0).UTC()` with one of its eight
 /// callers' field reads applied: proleptic Gregorian in UTC, as Go's
-/// `time` is and as chrono's `DateTime<Utc>` is.
+/// `time` is and as chrono's `DateTime<Utc>` is. The year is the one
+/// field that does not go through here, see [`year`].
 ///
-/// Go's `int64(v)` truncates toward zero, as `as i64` does. For a NaN, an
-/// infinity or a value past `i64`, Go's answer is whatever the CPU's
-/// conversion gives (`math.MinInt64` on amd64), where `as` saturates; no
-/// query in the corpus observes the difference and nothing here pins it.
+/// Go's `int64(v)` truncates toward zero, as `as i64` does, and leaves a
+/// NaN, an infinity or a value past `int64` to the CPU. `as` saturates
+/// those to the nearer end, which is Go's own answer on arm64, and on
+/// amd64 for everything but NaN: there the CPU answers `math.MinInt64`
+/// for all of them, which reads as the same date as `MaxInt64` because
+/// Go's wrap puts the first second of `int64` one second after its last
+/// (see [`beyond_chrono`]), where `as` makes a NaN zero and so the
+/// epoch. No query in the corpus observes the difference, and a check
+/// for it on every sample is not worth one CPU's answer to a NaN date.
 ///
-/// chrono's calendar ends at the years ±262143, some 8.2 trillion seconds
-/// from the epoch, where Go's keeps counting. Past that edge the answer is
-/// NaN, the engine's value for "no number here", rather than a year
-/// nothing could have asked for: a timestamp cannot reach it, only a
-/// counter fed to a date function by mistake.
+/// The match is written out here and in [`year`] rather than behind one
+/// shared function so that the hot arm stays the two calls it was: with
+/// the fallback's arithmetic in the same body the compiler stopped
+/// fusing chrono's field read with `from_timestamp`, and every extractor
+/// paid a tenth more per sample for a branch it never takes.
 fn civil<T: Into<f64>>(v: f64, read: impl FnOnce(DateTime<Utc>) -> T) -> f64 {
-    DateTime::from_timestamp(v as i64, 0).map_or(f64::NAN, |t| read(t).into())
+    let secs = v as i64;
+    match DateTime::from_timestamp(secs, 0) {
+        Some(t) => read(t).into(),
+        None => read(beyond_chrono(secs).0).into(),
+    }
+}
+
+/// `funcYear`: the one field the 400-year shift in [`beyond_chrono`]
+/// moves, so it alone restores the shift.
+fn year(v: f64) -> f64 {
+    let secs = v as i64;
+    match DateTime::from_timestamp(secs, 0) {
+        Some(t) => f64::from(t.year()),
+        None => {
+            let (t, cycles) = beyond_chrono(secs);
+            (i64::from(t.year()) + 400 * cycles) as f64
+        }
+    }
+}
+
+/// Seconds in Gregorian 400-year cycle: 146,097 days, which is also a
+/// whole number of weeks, so a date shifted by whole cycles keeps its
+/// month, day, weekday, day of the year, leap-year status and time of
+/// day, and moves only in its year.
+const CYCLE_SECS: i128 = 146_097 * 86_400;
+
+/// 2000-01-01 UTC, the first second of a cycle that chrono's calendar
+/// holds whole.
+const CYCLE_ANCHOR_SECS: i128 = 946_684_800;
+
+/// Go's `unixToAbsolute` (`time/time.go`, Go 1.25 as Prometheus pins):
+/// the seconds from its absolute zero, March 1 of the year
+/// -292277022400, to the Unix epoch.
+const UNIX_TO_ABSOLUTE: i128 = 9_223_372_028_741_760_000;
+
+/// `time.Unix(secs, 0).UTC()` for a second chrono's calendar does not
+/// hold, as a chrono time in the years 2000 to 2399 plus the number of
+/// 400-year cycles it was moved by to get there.
+///
+/// chrono's calendar ends at the years ±262143, some 8.2 trillion
+/// seconds from the epoch, where Go's keeps counting to the ends of
+/// `int64`. Moved by whole cycles a date keeps every field but its year,
+/// so the fields are read where chrono can read them and only [`year`]
+/// has anything to restore.
+///
+/// Go's `time` counts seconds from its absolute zero in a `uint64`, and
+/// its `int64` addition on the way wraps rather than fails, so the last
+/// 257 years of `int64` before the zero come out as the years after its
+/// end instead (`Time.absSec`); the modulus here is that wrap, and it
+/// is what makes an infinity, saturated to either end, read as one date.
+#[cold]
+#[inline(never)]
+fn beyond_chrono(secs: i64) -> (DateTime<Utc>, i64) {
+    let unix = (i128::from(secs) + UNIX_TO_ABSOLUTE).rem_euclid(1 << 64) - UNIX_TO_ABSOLUTE;
+    let cycles = (unix - CYCLE_ANCHOR_SECS).div_euclid(CYCLE_SECS);
+    let shifted = (unix - cycles * CYCLE_SECS) as i64;
+    let t = DateTime::from_timestamp(shifted, 0)
+        .expect("a second in the years 2000 to 2399 is a chrono date");
+    (t, cycles as i64)
 }
 
 /// `funcSgn`: zero and NaN come back as themselves, so the sign of `-0`
@@ -750,17 +814,83 @@ mod tests {
         assert_eq!(at("days_in_month", 4_105_123_200.0), 28.0);
     }
 
-    /// chrono stops at the years ±262143 and the engine answers NaN past
-    /// them, where the arithmetic this replaced kept counting; the last
-    /// second on each side is still a date.
+    /// Every field of one date, in the order the extractors are named.
+    fn fields(secs: f64) -> [f64; 8] {
+        [
+            "day_of_month",
+            "day_of_week",
+            "day_of_year",
+            "days_in_month",
+            "hour",
+            "minute",
+            "month",
+            "year",
+        ]
+        .map(|name| value(name, secs))
+    }
+
+    /// chrono's calendar stops at the years ±262143 and Go's does not.
+    /// The expectations here and below are Go 1.25's `time` run by hand
+    /// (`absSeconds.days().split()`, `time/time.go`), the calendar
+    /// Prometheus at 83962c35 answers with.
     #[test]
-    fn a_second_past_chronos_calendar_is_nan() {
-        assert_eq!(value("year", 8_210_266_876_799.0), 262_142.0);
-        assert_eq!(value("day_of_year", 8_210_266_876_799.0), 365.0);
-        assert!(value("year", 8_210_266_876_800.0).is_nan());
-        assert_eq!(value("year", -8_334_601_228_800.0), -262_143.0);
-        assert!(value("month", -8_334_601_228_801.0).is_nan());
-        assert!(value("hour", f64::INFINITY).is_nan());
+    fn the_calendar_continues_past_chronos_edges() {
+        // The last second chrono holds on each side, and the first it
+        // does not: 262142-12-31 23:59:59, then 262143-01-01, and
+        // -262143-01-01 00:00:00, then the leap day's year before it.
+        assert_eq!(
+            fields(8_210_266_876_799.0),
+            [31.0, 1.0, 365.0, 31.0, 23.0, 59.0, 12.0, 262_142.0]
+        );
+        assert_eq!(
+            fields(8_210_266_876_800.0),
+            [1.0, 2.0, 1.0, 31.0, 0.0, 0.0, 1.0, 262_143.0]
+        );
+        assert_eq!(
+            fields(-8_334_601_228_800.0),
+            [1.0, 4.0, 1.0, 31.0, 0.0, 0.0, 1.0, -262_143.0]
+        );
+        assert_eq!(
+            fields(-8_334_601_228_801.0),
+            [31.0, 3.0, 366.0, 31.0, 23.0, 59.0, 12.0, -262_144.0]
+        );
+    }
+
+    /// Ten trillion seconds either side of the epoch: 318857-05-20
+    /// 17:46:40, a Sunday, and -314918-08-13 06:13:20, also a Sunday.
+    #[test]
+    fn a_far_date_keeps_every_field_but_the_year_from_its_cycle() {
+        assert_eq!(
+            fields(10_000_000_000_000.0),
+            [20.0, 0.0, 140.0, 31.0, 17.0, 46.0, 5.0, 318_857.0]
+        );
+        assert_eq!(
+            fields(-10_000_000_000_000.0),
+            [13.0, 0.0, 225.0, 31.0, 6.0, 13.0, 8.0, -314_918.0]
+        );
+    }
+
+    /// `int64`'s last second is 292277026596-12-04 15:30:07, Go's
+    /// documented end of time. Its first second is one second later by
+    /// Go's wrap, so an infinity or a float past `int64` lands on the
+    /// same date whichever end the conversion saturates it to. A NaN is
+    /// the one input where Go's answer is the CPU's: zero on arm64 and
+    /// here, the epoch; `MinInt64` on amd64, which is this same end.
+    #[test]
+    fn the_ends_of_int64_meet_where_go_wraps() {
+        let end = [4.0, 0.0, 339.0, 31.0, 15.0, 30.0, 12.0, 292_277_026_596.0];
+        assert_eq!(fields(9_223_372_036_854_775_807.0), end);
+        assert_eq!(fields(-9_223_372_036_854_775_808.0), end);
+        for v in [f64::INFINITY, f64::NEG_INFINITY, 1e19, -1e19] {
+            assert_eq!(fields(v), end, "{v}");
+        }
+        assert_eq!(fields(f64::NAN), fields(0.0));
+        // One second before the wrap is Go's absolute zero, March 1 of
+        // the year -292277022400, a Wednesday.
+        assert_eq!(
+            fields(-9_223_372_028_741_760_000.0),
+            [1.0, 3.0, 61.0, 31.0, 0.0, 0.0, 3.0, -292_277_022_400.0]
+        );
     }
 
     /// `int64(v)` truncates toward zero: `-9.75` is `-9`, nine seconds

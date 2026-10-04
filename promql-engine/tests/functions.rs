@@ -156,6 +156,23 @@ fn the_date_functions_read_the_value_as_unix_seconds() {
     }
 }
 
+/// A value past chrono's calendar is still a date upstream, and here:
+/// ten trillion seconds is the year 318857, and as many before the
+/// epoch the year -314918.
+#[test]
+fn a_date_past_chronos_calendar_is_still_answered() {
+    for (query, want) in [
+        ("year(vector(10000000000000))", 318_857.0),
+        ("month(vector(10000000000000))", 5.0),
+        ("hour(vector(10000000000000))", 17.0),
+        ("year(vector(-10000000000000))", -314_918.0),
+    ] {
+        let got = vector(query);
+        assert_eq!(got.len(), 1, "{query}");
+        assert_eq!(got[0].1, want, "{query}");
+    }
+}
+
 /// Without a vector the date functions read the evaluation time, here
 /// 150s into the epoch, as one unlabelled sample: `minute()` is
 /// `minute(vector(time()))`, and must agree with it on every step.
