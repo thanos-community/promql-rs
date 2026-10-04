@@ -45,7 +45,7 @@ use crate::labelset;
 pub use crate::plan::RangeQuery;
 use crate::series::{self, LABELS};
 use crate::source::{SeriesSetExec, SeriesSource};
-use crate::{aggregate, binary, elementwise, labels, range, selector, sort};
+use crate::{absent, aggregate, binary, elementwise, labels, range, selector, sort};
 
 pub struct Engine {
     ctx: SessionContext,
@@ -94,6 +94,7 @@ impl Engine {
         ctx.register_udf(labels::udf());
         ctx.register_udaf(aggregate::udaf());
         ctx.register_udaf(range::udaf());
+        ctx.register_udaf(absent::udaf());
         ctx.register_udf(elementwise::udf());
         ctx.register_udaf(binary::udaf());
         ctx.register_udf(sort::Natural::udf());
