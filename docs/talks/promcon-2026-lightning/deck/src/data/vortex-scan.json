@@ -1,0 +1,1 @@
+"DataSourceExec: file_groups={1 group: [[dataset=default/delta=true/…/test.vortex]]}, projection=[attributes@0 IS NULL as __common_expr_1, dataset, …, get_field(attributes@0, comm) as __datafusion_extracted_2, …], file_type=vortex, predicate: timestamp@12 >= 1788363877766000000 AND timestamp@12 < 1788364177767000000"

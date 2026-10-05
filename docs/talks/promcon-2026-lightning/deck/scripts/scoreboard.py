@@ -56,8 +56,10 @@ def passing_count(cell):
     return int(cell.split()[0])
 
 
-def main():
-    text = (ROOT / SOURCE).read_text()
+def counts(text):
+    """(passing, total, missing) of one UNSUPPORTED.md. conformance-history.py
+    reads every committed version through this too, so a version whose
+    headline and tables disagree is refused there as well as here."""
     t = tables(text)
     missing = [(int(n), feature) for n, feature in t["Missing features"]]
     by_file = t["By file"]
@@ -68,13 +70,22 @@ def main():
 
     head = HEADLINE.search(text)
     if not head:
-        sys.exit(f"{SOURCE}: no headline to cross-check the tables against")
+        raise ValueError("no headline to cross-check the tables against")
     stated = tuple(int(g) for g in head.groups())
     if stated != (passing, total, blocked):
-        sys.exit(
-            f"{SOURCE}: headline says {stated[0]} of {stated[1]} pass, "
+        raise ValueError(
+            f"headline says {stated[0]} of {stated[1]} pass, "
             f"{stated[2]} blocked; tables sum to {passing} of {total}, {blocked}"
         )
+    return passing, total, missing
+
+
+def main():
+    try:
+        passing, total, missing = counts((ROOT / SOURCE).read_text())
+    except (ValueError, KeyError) as e:
+        sys.exit(f"{SOURCE}: {e}")
+    blocked = sum(n for n, _ in missing)
 
     # sorted() is stable, so a tie keeps the roadmap's own order.
     top = sorted(missing, key=lambda row: -row[0])[:3]

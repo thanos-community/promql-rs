@@ -88,6 +88,8 @@ function unitPulse(section, tl) {
   tl.to(pass, { opacity: 0, duration: 0.4 }, 2)
 }
 
+const scoreParts = (section) => [section.querySelector('#score-draw rect'), section.querySelector('.last-label')]
+
 const hooks = {
   opener: {
     reset(section) {
@@ -178,6 +180,22 @@ const hooks = {
       if (n === 1) unitPulse(section, tl)
     },
   },
+  // ---- slide 8. Entering draws the passing line left to right by growing its
+  // clip rect, then brings in the last point's label. The finished chart is
+  // the markup's own state, and reset() clears back to it: a jump runs no
+  // enter, so #8 typed in, or Left from slide 9, shows the chart complete.
+  score: {
+    reset(section) {
+      const [rect, label] = scoreParts(section)
+      gsap.set(rect, { attr: { width: rect.ownerSVGElement.viewBox.baseVal.width } })
+      gsap.set(label, { clearProps: 'all' })
+    },
+    enter(section, tl) {
+      const [rect, label] = scoreParts(section)
+      tl.fromTo(rect, { attr: { width: 0 } }, { attr: { width: rect.ownerSVGElement.viewBox.baseVal.width }, duration: 1.6, ease: 'power1.inOut' }, 0.3)
+        .fromTo(label, { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.4, ease: 'power2.out' }, '>-0.15')
+    },
+  },
   plans: {
     reset: () => planReset(),
     step(section, i, forward, tl) {
@@ -191,7 +209,9 @@ export function enter(section) {
   // TALK.md: the opener's strike is the only animation on slides 0 and 1.
   if (section.hasAttribute('data-still')) return gsap.timeline()
   const kids = section.querySelectorAll(':scope > :not([data-step]):not(aside)')
-  return track(section, gsap.timeline().fromTo(kids, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: 0.45, stagger: 0.08 }))
+  const tl = track(section, gsap.timeline().fromTo(kids, { autoAlpha: 0, y: 24 }, { autoAlpha: 1, y: 0, duration: 0.45, stagger: 0.08 }))
+  hooks[section.dataset.anim]?.enter?.(section, tl)
+  return tl
 }
 
 export function step(section, i, forward) {

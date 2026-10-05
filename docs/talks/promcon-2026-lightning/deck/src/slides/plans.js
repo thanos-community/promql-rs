@@ -1,6 +1,7 @@
 // Slide 5, the plan explorer. Plan text is imported, never retyped: plans.json
 // is what promql-engine/tests/talk_plans.rs printed from the real planner.
 import plans from '../data/plans.json'
+import scan from '../data/vortex-scan.json'
 
 // The explorer has five states, one per step of the slide: 0 before click 1,
 // 1 to 3 the three presets on the logical plan, 4 the third preset on the
@@ -54,7 +55,6 @@ const KEEP = {
   // Sorted says the per-series aggregate streams; PartiallySorted([0, 1]) points
   // into a schema the abridged view no longer shows.
   ordering_mode: (v) => (v === 'Sorted' ? v : null),
-  partitions: (v) => v,
 }
 
 function abridgeLine(line) {
@@ -69,6 +69,19 @@ function abridgeLine(line) {
   return ind + body.slice(0, i) + (kept.length ? ': ' + kept.join(', ') : '')
 }
 const abridge = (plan) => plan.split('\n').map(abridgeLine).join('\n')
+
+// The in-memory test store reads no files, so its leaf says only partitions=4.
+// The physical view swaps in a Vortex-backed store's scan of a test file;
+// everything above the leaf stays the real planner output. The deck is frozen,
+// so the abridged scan is written by hand rather than taught to KEEP, whose
+// key=value split cannot read "predicate: ...".
+const SCAN_ABRIDGED = 'DataSourceExec: file_groups={1 group: [[dataset=default/…/test.vortex]]}, file_type=vortex, predicate: timestamp >= … AND timestamp < …'
+const withScan = (plan, line) => plan.replace(/^( *)DataSourceExec\b.*$/m, (_, ind) => ind + line)
+
+// explain.rs ends every logical Aggregate line with "per block" or "per series
+// per block". The slide drops it so the lines read at a glance; plans.json
+// keeps the planner's text, and the hover shows it.
+const unsuffix = (plan) => plan.replace(/ per (series per )?block$/gm, '')
 
 // ---- painting. The pane's textContent is the plan string exactly: the
 // indentation sits in a display:none span (CSS indents by padding instead, so
@@ -122,9 +135,12 @@ function render() {
   fullBtn.setAttribute('aria-pressed', String(full))
   pane.dataset.view = !q ? 'empty' : physical ? (full ? 'full' : 'abridged') : 'logical'
   if (!q) pane.replaceChildren()
-  else if (!physical) paint(q.logical)
-  else if (full) paint(q.physical, { physical })
-  else paint(abridge(q.physical), { physical, raw: q.physical })
+  else if (!physical) paint(unsuffix(q.logical), { raw: q.logical })
+  else {
+    const raw = withScan(q.physical, scan)
+    if (full) paint(raw, { physical })
+    else paint(withScan(abridge(q.physical), SCAN_ABRIDGED), { physical, raw })
+  }
 }
 
 // Called by animations.js for the controller's steps.

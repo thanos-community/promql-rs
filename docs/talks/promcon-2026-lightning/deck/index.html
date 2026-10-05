@@ -366,21 +366,24 @@ block_end    Timestamp(Millisecond)</pre>
 
 [click 2] Conformance is the gate that makes this work for agents: 2,098 evals from Prometheus itself. An agent checks its work against the real spec, not against its own opinion. [click 3] Gate three pins the DataFusion plans you saw, logical and physical. [click 4] Benchmarks, [click 5] then the profile. Those two are optional; the first three are not. [click 6] Then a human reviews and merges.</aside>
   </section>
-  <section data-title="Scoreboard" class="score-slide">
-    <!-- Every number here comes from src/data/scoreboard.json (scripts/scoreboard.py
-         reads UNSUPPORTED.md); slides/scoreboard.js fills the [data-score] slots. -->
-    <div class="headline">
-      <p class="big"><span data-score="passing"></span> <span class="of">of</span> <span data-score="total"></span></p>
-      <p class="pct" data-score="percent"></p>
+  <section data-title="Scoreboard" class="score-slide" data-anim="score">
+    <!-- slides/scoreboard.js draws the chart from src/data/conformance-history.json
+         (scripts/conformance-history.py) and fills the [data-score] slots and the
+         blockers from src/data/scoreboard.json (scripts/scoreboard.py). -->
+    <div class="score-grid">
+      <figure class="history">
+        <figcaption>promqltest evals passing, per commit</figcaption>
+        <svg class="chart" role="img"></svg>
+      </figure>
+      <div class="side">
+        <h3>Missing features that block the most evals</h3>
+        <ol class="blockers"></ol>
+        <h3>CI allowlist <code>SUPPORTED.toml</code></h3>
+        <p class="ci">A listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.</p>
+      </div>
     </div>
-    <p class="caption">promqltest evals pass</p>
-    <div class="bar" role="presentation"><div class="fill"></div></div>
-    <h3>Missing features that block the most evals</h3>
-    <ol class="blockers"></ol>
-    <h3>CI allowlist <code>SUPPORTED.toml</code></h3>
-    <p class="ci">A listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.</p>
-    <p class="source">source: <code data-score="source"></code></p>
-    <aside class="notes">Where does it stand? UNSUPPORTED.md, generated from a real run, says 559 of the 2,098 promqltest evals pass. The same file names what blocks the most: histogram_quantile with 86 evals, subqueries with 57, histogram_fraction with 56. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.</aside>
+    <p class="source">source: <code data-score="source"></code> at each commit that re-blessed it</p>
+    <aside class="notes">When CI started gating on promqltest, 267 of its 2,098 evals passed; today 559 do. UNSUPPORTED.md, generated from a real run, names what blocks the most: histogram_quantile with 86 evals, subqueries with 57, histogram_fraction with 56. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.</aside>
   </section>
 
   <section data-title="Close" class="close-slide">

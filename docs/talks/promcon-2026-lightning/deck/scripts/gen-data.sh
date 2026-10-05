@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Regenerates src/data/plans.json and src/data/scoreboard.json from the real
-# planner and the committed conformance roadmap. Run before building the deck.
+# Regenerates src/data/plans.json, scoreboard.json and conformance-history.json
+# from the real planner and the committed conformance roadmap and its history.
+# Run before building the deck.
 set -euo pipefail
 
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -22,5 +23,6 @@ test -s "$plans.tmp" || { echo "talk_plans wrote nothing to $plans.tmp" >&2; exi
 mv "$plans.tmp" "$plans"
 
 python3 "$root/docs/talks/promcon-2026-lightning/deck/scripts/scoreboard.py"
+python3 "$root/docs/talks/promcon-2026-lightning/deck/scripts/conformance-history.py"
 
-echo "wrote $plans and $data/scoreboard.json"
+echo "wrote $plans, $data/scoreboard.json and $data/conformance-history.json"

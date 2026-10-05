@@ -183,24 +183,35 @@ section.gates-slide{flex-direction:row;align-items:center;gap:40px;padding:100px
 .gate-col .g-green{color:var(--text-dim)}
 .gate-col .g-green b{color:var(--ok)}
 
-/* ---- 8, scoreboard */
-.score-slide{justify-content:center}
-.headline{display:flex;align-items:baseline;justify-content:space-between}
-.big,.pct{font-size:150px;line-height:1;font-weight:700}
-.big .of{font-size:72px;font-weight:400;color:var(--text-dim)}
-.pct{color:var(--accent)}
-.score-slide .caption{font-size:48px;color:var(--text-dim);margin:16px 0 28px}
-.bar{height:20px;border-radius:10px;overflow:hidden;background:var(--surface-2)}
-.bar .fill{height:100%;background:var(--ok)}
-.score-slide h3{margin:48px 0 14px}
+/* ---- 8, scoreboard. The chart's SVG is 1:1 with the stage, so its font
+   sizes are pixels in the room; the side column takes what the chart leaves. */
+.score-grid{flex:1;min-height:0;display:grid;grid-template-columns:auto 1fr;gap:72px;align-items:center}
+.history{margin:0}
+.history figcaption{font-size:36px;color:var(--text-dim);margin-bottom:8px}
+.chart{display:block;overflow:visible}
+.chart text{font-family:var(--font-sans)}
+.chart .tick{font-size:28px;fill:var(--text-faint)}
+.chart .grid{stroke:var(--surface-2);stroke-width:2}
+.chart .axis{stroke:var(--border-strong);stroke-width:2}
+.chart .total{fill:none;stroke:var(--text-faint);stroke-width:3;stroke-dasharray:14 10}
+.chart .total-label{font-size:30px;fill:var(--text-dim)}
+.chart .passing{fill:none;stroke:var(--accent);stroke-width:6;stroke-linejoin:round;stroke-linecap:round}
+.chart .pt{fill:var(--accent);stroke:var(--bg);stroke-width:3}
+/* The halo stops the gridlines at the glyphs instead of running through them. */
+.chart .last-label{paint-order:stroke;stroke:var(--bg);stroke-width:14px;stroke-linejoin:round}
+.chart .last-label .n{font-size:120px;font-weight:700;fill:var(--accent)}
+.chart .last-label .of{font-size:64px;fill:var(--text-dim)}
+.score-slide .side{font-size:34px}
+.score-slide h3{margin:56px 0 14px}
+.score-slide .side h3:first-child{margin-top:0}
 .score-slide h3 code{font-size:.85em}
 .blockers{margin:0;padding-left:1.4em}
 .blockers li{margin:0 0 .25em}
-.blockers .name{display:inline-block;width:460px}
+.blockers .name{display:inline-block;width:370px}
 .blockers code.name{font-size:.9em;background:none;border:0;padding:0}
 .blockers .count{color:var(--text-dim)}
-.score-slide .ci{font-size:36px;white-space:nowrap}
-.score-slide .source{font-size:28px;color:var(--text-faint);margin-top:40px}
+.score-slide .ci{margin:0}
+.score-slide .source{font-size:28px;color:var(--text-faint);margin:24px 0 0}
 .score-slide .source code{background:none;border:0;padding:0}
 
 /* ---- 9, close */

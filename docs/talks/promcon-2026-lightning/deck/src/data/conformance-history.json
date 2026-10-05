@@ -1,0 +1,82 @@
+[
+  {
+    "sha": "e578622",
+    "date": "2026-09-22",
+    "subject": "Run the promqltest corpus against the engine",
+    "pr": 15,
+    "passing": 267,
+    "total": 2098
+  },
+  {
+    "sha": "04a17b5",
+    "date": "2026-09-22",
+    "subject": "Check duplicate label sets on the result, not above the call",
+    "pr": 15,
+    "passing": 268,
+    "total": 2098
+  },
+  {
+    "sha": "36a389c",
+    "date": "2026-09-29",
+    "subject": "Lex keywords case-insensitively",
+    "pr": 38,
+    "passing": 289,
+    "total": 2098
+  },
+  {
+    "sha": "edaeac8",
+    "date": "2026-09-29",
+    "subject": "Apply functions to an instant vector",
+    "pr": 33,
+    "passing": 314,
+    "total": 2098
+  },
+  {
+    "sha": "a181824",
+    "date": "2026-10-03",
+    "subject": "Compute the arithmetic binary operators",
+    "pr": 35,
+    "passing": 401,
+    "total": 2098
+  },
+  {
+    "sha": "604381d",
+    "date": "2026-10-03",
+    "subject": "Compare vectors and scalars",
+    "pr": 35,
+    "passing": 463,
+    "total": 2098
+  },
+  {
+    "sha": "54cdaa5",
+    "date": "2026-10-04",
+    "subject": "Match vectors on the labels the query names",
+    "pr": 36,
+    "passing": 485,
+    "total": 2098
+  },
+  {
+    "sha": "99c8426",
+    "date": "2026-10-04",
+    "subject": "Answer the set operators from the same match group",
+    "pr": 36,
+    "passing": 499,
+    "total": 2098
+  },
+  {
+    "sha": "d146d51",
+    "date": "2026-10-04",
+    "subject": "Stand a fill value in for a side with no series",
+    "pr": 36,
+    "passing": 543,
+    "total": 2098
+  },
+  {
+    "sha": "0d176bb",
+    "date": "2026-10-04",
+    "subject": "Order the result with sort, sort_desc and sort_by_label",
+    "pr": 41,
+    "passing": 559,
+    "total": 2098
+  }
+]
