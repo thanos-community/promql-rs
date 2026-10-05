@@ -13,8 +13,7 @@
 //!
 //! Current scope: the subset invoked by the core expression and series
 //! description grammars (see `src/grammar.y` for the matching rule
-//! coverage). Helpers for histogram descriptors, fill modifiers, and
-//! duration-expression arithmetic are not yet implemented.
+//! coverage). Helpers for histogram descriptors are not yet implemented.
 
 // Every action returns `Result<T, ()>`: that is grmtools' convention for
 // the grammar's `%actiontype`, where `Err(())` signals "this production
@@ -27,7 +26,7 @@ use lrlex::{DefaultLexeme, DefaultLexerTypes};
 use lrpar::{Lexeme, NonStreamingLexer};
 
 use crate::ast::{
-    AggregateExpr, AtModifier, BinaryExpr, Call, Expr, FunctionRef, LabelMatcher, MatchOp,
+    AggregateExpr, AtModifier, BinaryExpr, Call, DurationExpr, Expr, FunctionRef, LabelMatcher, MatchOp,
     MatrixSelector, NumberLiteral, ParenExpr, SequenceValue, SeriesDescription, StringLiteral,
     SubqueryExpr, UnaryExpr, ValueType, VectorMatchCardinality, VectorMatching, VectorSelector,
 };
@@ -438,29 +437,27 @@ pub fn label_matcher_quoted_name<'l, 'i: 'l>(
 
 // -------- matrix / subquery / offset / @ --------
 
-/// Variant of [`matrix_selector`] for the upstream-shaped grammar,
-/// where the range arrives as a full Expr (produced by the
-/// `positive_duration_expr → duration_expr → number_duration_literal`
-/// chain) rather than a raw DURATION token. Currently only the literal
-/// form is supported; its f64 value is extracted directly.
+/// `matrix_selector : expr LEFT_BRACKET positive_duration_expr RIGHT_BRACKET`.
+/// The range is a literal (kept as seconds, upstream's `Range`) or a
+/// `DurationExpr` (kept unevaluated, upstream's `RangeExpr`): `step()` and
+/// `range()` are only known once the engine knows the query.
 pub fn matrix_selector_from_expr<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
     span: Span,
     selector: Result<Expr, ()>,
     range: Result<Expr, ()>,
 ) -> Result<Expr, ()> {
-    let range_secs = duration_from_expr(&range?)?;
+    let (range_secs, range_expr) = split_duration(range?)?;
     Ok(Expr::MatrixSelector(MatrixSelector {
         vector_selector: Box::new(selector?),
         range_secs,
-        range_expr: None,
+        range_expr,
         end_pos: span.end() as Pos,
     }))
 }
 
-/// Variant of [`subquery`] for the upstream-shaped grammar. Both the
-/// range and the optional step are Exprs built by the duration
-/// chain; each is currently expected to be a numeric literal.
+/// `subquery_expr`, both bracket forms. Range and step each split like
+/// [`matrix_selector_from_expr`]'s range.
 pub fn subquery_from_exprs<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
     span: Span,
@@ -468,66 +465,70 @@ pub fn subquery_from_exprs<'l, 'i: 'l>(
     range: Result<Expr, ()>,
     step: Option<Result<Expr, ()>>,
 ) -> Result<Expr, ()> {
-    let range_secs = duration_from_expr(&range?)?;
-    let step_secs = match step {
-        Some(r) => duration_from_expr(&r?)?,
-        None => 0.0,
+    let (range_secs, range_expr) = split_duration(range?)?;
+    let (step_secs, step_expr) = match step {
+        Some(r) => split_duration(r?)?,
+        None => (0.0, None),
     };
     Ok(Expr::Subquery(SubqueryExpr {
         expr: Box::new(inner?),
         range_secs,
-        range_expr: None,
+        range_expr,
         original_offset_secs: 0.0,
         original_offset_expr: None,
         offset_secs: 0.0,
         timestamp: None,
         start_or_end: None,
         step_secs,
-        step_expr: None,
+        step_expr,
         end_pos: span.end() as Pos,
     }))
 }
 
-/// Variant of [`offset`] for the upstream-shaped grammar, where the
-/// offset value flows through `offset_duration_expr → duration_expr`
-/// rather than a raw DURATION token. Currently only the literal form
-/// is supported; extracts the f64 and applies it to the subject.
+/// `offset_expr : expr OFFSET offset_duration_expr` — upstream's
+/// `addOffset` for a literal, `addOffsetExpr` for a `DurationExpr`.
 pub fn offset_from_expr<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
     inner: Result<Expr, ()>,
     offset: Result<Expr, ()>,
 ) -> Result<Expr, ()> {
-    let offset_secs = duration_from_expr(&offset?)?;
-    Ok(apply_offset(inner?, offset_secs))
+    let (offset_secs, offset_expr) = split_duration(offset?)?;
+    Ok(apply_offset(inner?, offset_secs, offset_expr))
 }
 
-/// Extract a seconds-valued f64 from an Expr whose shape is a
-/// `NumberLiteral` (either a `DURATION` token or a numeric literal).
-/// Other shapes — duration arithmetic, function calls — aren't
-/// yet supported and produce `Err(())`.
-fn duration_from_expr(e: &Expr) -> Result<f64, ()> {
+/// A duration operand as the selectors store it: a literal's seconds
+/// (upstream rounds them to a `time.Duration` at the use site), or the
+/// expression itself with the seconds left at zero.
+fn split_duration(e: Expr) -> Result<(f64, Option<Box<DurationExpr>>), ()> {
     match e {
-        Expr::NumberLiteral(nl) => Ok(nl.val),
-        Expr::Paren(p) => duration_from_expr(&p.expr),
+        Expr::NumberLiteral(nl) => Ok((nl.val, None)),
+        Expr::Duration(d) => Ok((0.0, Some(Box::new(d)))),
         _ => Err(()),
     }
 }
 
-fn apply_offset(mut e: Expr, offset_secs: f64) -> Expr {
+fn apply_offset(
+    mut e: Expr,
+    offset_secs: f64,
+    offset_expr: Option<Box<DurationExpr>>,
+) -> Expr {
     match &mut e {
         Expr::VectorSelector(vs) => {
             vs.original_offset_secs = offset_secs;
             vs.offset_secs = offset_secs;
+            vs.original_offset_expr = offset_expr;
         }
         Expr::MatrixSelector(ms) => {
             if let Expr::VectorSelector(vs) = ms.vector_selector.as_mut() {
                 vs.original_offset_secs = offset_secs;
                 vs.offset_secs = offset_secs;
+                vs.original_offset_expr = offset_expr;
             }
         }
         Expr::Subquery(sq) => {
             sq.original_offset_secs = offset_secs;
             sq.offset_secs = offset_secs;
+            sq.original_offset_expr = offset_expr;
         }
         _ => {}
     }
@@ -632,18 +633,215 @@ pub fn number_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<f64, ()>
     parse_number_literal(raw)
 }
 
-/// `unary_op number_duration_literal` — apply a +/- sign to a duration
-/// Expr. Used by `offset_duration_expr` and `signed_number` chains.
-pub fn signed_duration(op: Result<ItemType, ()>, inner: Result<Expr, ()>) -> Result<Expr, ()> {
-    let e = inner?;
-    let op = op?;
-    if let Expr::NumberLiteral(mut nl) = e {
-        if op == ItemType::Sub {
-            nl.val = -nl.val;
-        }
-        return Ok(Expr::NumberLiteral(nl));
+/// `number : DURATION` — the seconds a duration spells, so `metric @ 100s`
+/// and `@ 1m40s` take a timestamp the way a number does.
+pub fn duration_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<f64, ()> {
+    parse_duration_seconds(lexer.span_str(lx.span()))
+}
+
+// -------- duration expressions --------
+//
+// Upstream's parse-time errors here (`addParseErrf`) cannot carry a
+// message through grmtools' `Result<_, ()>` actions, so each is a bare
+// `Err(())` and the caller sees "parse produced an error node". The
+// errors that depend on the query (`step()`, `range()`) are raised by
+// the engine with upstream's messages.
+
+/// `1<<63/1e9` in the grammar's range checks: the longest duration, in
+/// seconds, a Go `time.Duration` holds.
+const MAX_DURATION_SECS: f64 = 9_223_372_036.854_775_807;
+
+fn duration_out_of_range(v: f64) -> bool {
+    !(-MAX_DURATION_SECS..=MAX_DURATION_SECS).contains(&v)
+}
+
+fn duration_node(
+    op: ItemType,
+    lhs: Option<Expr>,
+    rhs: Option<Expr>,
+    start_pos: Pos,
+    end_pos: Pos,
+) -> Expr {
+    Expr::Duration(DurationExpr {
+        op,
+        lhs: lhs.map(Box::new),
+        rhs: rhs.map(Box::new),
+        wrapped: false,
+        start_pos,
+        end_pos,
+    })
+}
+
+/// `duration_expr : number_duration_literal` and the two literal forms of
+/// `offset_duration_expr`: a literal past `time.Duration` is an error.
+pub fn duration_expr_literal(lit: Result<Expr, ()>) -> Result<Expr, ()> {
+    match lit? {
+        Expr::NumberLiteral(nl) if duration_out_of_range(nl.val) => Err(()),
+        e => Ok(e),
     }
-    Ok(e)
+}
+
+/// `positive_duration_expr : duration_expr` — a literal range or step must
+/// be above zero. A `DurationExpr` is checked once the engine has
+/// evaluated it.
+pub fn positive_duration_expr(e: Result<Expr, ()>) -> Result<Expr, ()> {
+    match e? {
+        Expr::NumberLiteral(nl) if nl.val <= 0.0 => Err(()),
+        e => Ok(e),
+    }
+}
+
+/// `unary_op duration_expr` and `unary_op number_duration_literal`. A
+/// literal folds the sign in; `-` before an expression wraps it, `+` is
+/// dropped. `span` runs from the operator, whose start the result takes.
+pub fn duration_unary(
+    op: Result<ItemType, ()>,
+    inner: Result<Expr, ()>,
+    span: Span,
+) -> Result<Expr, ()> {
+    let op = op?;
+    let start = span.start() as Pos;
+    match inner? {
+        Expr::NumberLiteral(mut nl) => {
+            if op == ItemType::Sub {
+                nl.val = -nl.val;
+            }
+            if duration_out_of_range(nl.val) {
+                return Err(());
+            }
+            nl.pos_range.start = start;
+            Ok(Expr::NumberLiteral(nl))
+        }
+        e @ Expr::Duration(_) if op == ItemType::Sub => {
+            Ok(duration_node(ItemType::Sub, None, Some(e), start, 0))
+        }
+        e @ Expr::Duration(_) => Ok(e),
+        _ => Err(()),
+    }
+}
+
+/// `unary_op LEFT_PAREN duration_expr RIGHT_PAREN`, so that
+/// `offset -(2 * 3)` negates the whole product, and `unary_op STEP ( )`,
+/// `unary_op RANGE ( )` and `unary_op min_max ( .. )`, which exist so the
+/// sign binds to the call, not to what follows it (`offset -step()*2` is
+/// `(offset -step()) * 2`).
+///
+/// Upstream's parenthesised form asserts the operand is a `DurationExpr`
+/// and panics on `-(5)`; a literal is negated like [`duration_unary`] does.
+pub fn duration_signed_group(
+    op: Result<ItemType, ()>,
+    inner: Result<Expr, ()>,
+    span: Span,
+) -> Result<Expr, ()> {
+    let op = op?;
+    let start = span.start() as Pos;
+    match inner? {
+        Expr::Duration(mut d) => {
+            d.wrapped = true;
+            let e = Expr::Duration(d);
+            if op == ItemType::Sub {
+                Ok(duration_node(ItemType::Sub, None, Some(e), start, 0))
+            } else {
+                Ok(e)
+            }
+        }
+        lit @ Expr::NumberLiteral(_) => duration_unary(Ok(op), Ok(lit), span),
+        _ => Err(()),
+    }
+}
+
+/// `duration_expr op duration_expr`. Division and modulo by a literal zero
+/// are parse errors upstream; a computed zero is the engine's to report.
+pub fn duration_binary(
+    op: ItemType,
+    lhs: Result<Expr, ()>,
+    rhs: Result<Expr, ()>,
+) -> Result<Expr, ()> {
+    let (lhs, rhs) = (lhs?, rhs?);
+    if matches!(op, ItemType::Div | ItemType::Mod)
+        && matches!(&rhs, Expr::NumberLiteral(nl) if nl.val == 0.0)
+    {
+        return Err(());
+    }
+    Ok(duration_node(op, Some(lhs), Some(rhs), 0, 0))
+}
+
+/// `STEP LEFT_PAREN RIGHT_PAREN` / `RANGE LEFT_PAREN RIGHT_PAREN`, in
+/// duration context only. `span` covers the whole call. The scalar
+/// functions of the same name are `function_call`'s, not this.
+pub fn duration_call(op: ItemType, span: Span) -> Result<Expr, ()> {
+    Ok(duration_node(
+        op,
+        None,
+        None,
+        span.start() as Pos,
+        span.end() as Pos,
+    ))
+}
+
+/// `unary_op STEP ( )` / `unary_op RANGE ( )`: the sign wraps the call,
+/// which keeps the span of `call_span`.
+pub fn duration_signed_call(
+    op: Result<ItemType, ()>,
+    inner: ItemType,
+    span: Span,
+    call_span: Span,
+) -> Result<Expr, ()> {
+    let call = duration_call(inner, call_span)?;
+    signed_node(op?, call, span)
+}
+
+fn signed_node(op: ItemType, e: Expr, span: Span) -> Result<Expr, ()> {
+    // Upstream keeps `+step()` as a unary node and so do we: `Op` is the
+    // sign either way, and the evaluator treats a missing LHS as unary.
+    Ok(duration_node(op, None, Some(e), span.start() as Pos, 0))
+}
+
+/// `min_max ( duration_expr , duration_expr )`.
+pub fn duration_min_max(
+    op: Result<ItemType, ()>,
+    lhs: Result<Expr, ()>,
+    rhs: Result<Expr, ()>,
+    span: Span,
+) -> Result<Expr, ()> {
+    Ok(duration_node(
+        op?,
+        Some(lhs?),
+        Some(rhs?),
+        span.start() as Pos,
+        span.end() as Pos,
+    ))
+}
+
+/// `unary_op min_max ( duration_expr , duration_expr )`. The inner call's
+/// own start is not visible to an action, so it shares the sign's.
+pub fn duration_signed_min_max(
+    sign: Result<ItemType, ()>,
+    op: Result<ItemType, ()>,
+    lhs: Result<Expr, ()>,
+    rhs: Result<Expr, ()>,
+    span: Span,
+) -> Result<Expr, ()> {
+    let call = duration_min_max(op, lhs, rhs, span)?;
+    Ok(duration_node(
+        sign?,
+        None,
+        Some(call),
+        span.start() as Pos,
+        span.end() as Pos,
+    ))
+}
+
+/// `paren_duration_expr : LEFT_PAREN duration_expr RIGHT_PAREN`. A literal
+/// stays a literal, so `[(5m)]` is still a plain range.
+pub fn duration_paren(inner: Result<Expr, ()>) -> Result<Expr, ()> {
+    match inner? {
+        Expr::Duration(mut d) => {
+            d.wrapped = true;
+            Ok(Expr::Duration(d))
+        }
+        e => Ok(e),
+    }
 }
 
 // -------- function calls & aggregates --------

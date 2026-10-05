@@ -453,10 +453,28 @@ pub struct DurationExpr {
 }
 
 impl DurationExpr {
+    /// Upstream `DurationExpr.PositionRange`. `step()`/`range()` carry their
+    /// own span, a unary form runs from its operator to the operand, and a
+    /// binary form spans its two operands. Upstream dereferences a nil `RHS`
+    /// in the `RHS == nil` branch; no parsed expression reaches it, and here
+    /// it falls back to the stored span rather than panicking.
     pub fn position_range(&self) -> PositionRange {
-        PositionRange {
+        let own = PositionRange {
             start: self.start_pos,
             end: self.end_pos,
+        };
+        if matches!(self.op, ItemType::Step | ItemType::Range) {
+            return own;
+        }
+        match (&self.lhs, &self.rhs) {
+            (None, Some(rhs)) => PositionRange {
+                start: self.start_pos,
+                end: rhs.position_range().end,
+            },
+            (Some(lhs), Some(rhs)) => {
+                PositionRange::merge(lhs.position_range(), rhs.position_range())
+            }
+            _ => own,
         }
     }
 }
