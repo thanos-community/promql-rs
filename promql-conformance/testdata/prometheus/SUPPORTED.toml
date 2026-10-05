@@ -220,6 +220,7 @@ fill-modifier = [
     "only_left + fill(0) only_right @ 0",
     "only_left + fill_left(0) only_right @ 0",
     "only_left + fill_right(0) only_right @ 0",
+    "other + fill @ 0",
     "other + fill(0) fill @ 0",
     "other + fill_left(0) fill_left @ 0",
     "other + fill_right(0) fill_right @ 0",
