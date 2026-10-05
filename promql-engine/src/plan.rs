@@ -533,7 +533,7 @@ impl Planner<'_> {
             end_ms: self.query.end_ms,
             step_ms: self.query.step_ms,
             window_ms: self.query.lookback_ms,
-            offset_ms: offset_ms(vs),
+            offset_ms: offset_ms(vs)?,
             at_ms: resolve_at(vs, self.query),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
@@ -920,8 +920,8 @@ impl Planner<'_> {
             start_ms: self.query.start_ms,
             end_ms: self.query.end_ms,
             step_ms: self.query.step_ms,
-            window_ms: (ms.range_secs * 1000.0).round() as i64,
-            offset_ms: offset_ms(vs),
+            window_ms: duration_ms("the range", ms.range_secs)?,
+            offset_ms: offset_ms(vs)?,
             at_ms: resolve_at(vs, self.query),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
@@ -1049,16 +1049,24 @@ fn canonical(labels: datafusion::logical_expr::Expr) -> Vec<datafusion::logical_
     vec![labels, col(SAMPLES), col(BLOCK_START), col(BLOCK_END)]
 }
 
-fn offset_ms(vs: &VectorSelector) -> i64 {
-    (vs.original_offset_secs * 1000.0).round() as i64
+fn offset_ms(vs: &VectorSelector) -> Result<i64, EngineError> {
+    duration_ms("the offset", vs.original_offset_secs)
+}
+
+/// A range or offset given as float seconds. Non-finite or `i64`-sized
+/// input is a query error rather than the clamped value `as i64` gives.
+fn duration_ms(what: &str, secs: f64) -> Result<i64, EngineError> {
+    promql_common::model::secs_to_millis(secs)
+        .ok_or_else(|| EngineError::Query(format!("{what} {secs}s is out of range")))
 }
 
 /// The widest `@` timestamp, offset or range this engine will plan.
 ///
 /// Three of these terms meet in one `i64` where `select_range` subtracts
 /// the window and the offset, so the bound is a quarter of the range.
-/// Prometheus catches an out-of-bounds `@` while parsing (`setTimestamp`
-/// in `parser.go`); ours saturates the float instead.
+/// Prometheus catches a non-finite or `int64`-sized `@` while parsing
+/// (`setTimestamp` in `parser.go`, ported in `promql-parser`); this bound
+/// is the narrower one this engine's arithmetic needs on top of that.
 const MAX_TIME_MS: i64 = i64::MAX / 4;
 
 /// One term of the scan-range arithmetic, named for the message.
@@ -1253,11 +1261,13 @@ mod tests {
     #[tokio::test]
     async fn an_at_modifier_out_of_range_is_a_query_error() {
         let range = RangeQuery::new(0, 60_000, 30_000);
-        let err = plan_of("up @ -1e30", range).await.unwrap_err();
+        // Past `MAX_TIME_MS` but inside `i64` milliseconds, so the parser
+        // accepts it; `1e30` never gets this far.
+        let err = plan_of("up @ -4e15", range).await.unwrap_err();
         assert!(matches!(err, EngineError::Query(_)), "{err}");
         assert!(err.to_string().contains("@ modifier"), "{err}");
 
-        let err = plan_of("rate(up[5m] @ 1e30)", range).await.unwrap_err();
+        let err = plan_of("rate(up[5m] @ 4e15)", range).await.unwrap_err();
         assert!(matches!(err, EngineError::Query(_)), "{err}");
         assert!(err.to_string().contains("@ modifier"), "{err}");
     }

@@ -68,7 +68,9 @@ pub struct BinModifiers {
 pub fn number_literal<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<Expr, ()> {
     let span = lx.span();
     let raw = lexer.span_str(span);
-    let val = parse_number_literal(raw).unwrap_or(0.0);
+    // Upstream's `number()` reports a literal `ParseFloat` rejects, `1e400`
+    // included, as a parse error; a zero here would pass it on silently.
+    let val = parse_number_literal(raw)?;
     Ok(Expr::NumberLiteral(NumberLiteral {
         val,
         duration: false,
@@ -532,8 +534,10 @@ fn apply_offset(mut e: Expr, offset_secs: f64) -> Expr {
     e
 }
 
-fn apply_at_timestamp(mut e: Expr, secs: f64) -> Expr {
-    let ts_ms = (secs * 1000.0) as i64;
+/// NaN, ±Inf and out-of-range seconds are a parse error, not a clamped
+/// timestamp (upstream's `setTimestamp` rejects them too).
+fn apply_at_timestamp(mut e: Expr, secs: f64) -> Result<Expr, ()> {
+    let ts_ms = promql_common::model::secs_to_millis(secs).ok_or(())?;
     match &mut e {
         Expr::VectorSelector(vs) => vs.timestamp = Some(ts_ms),
         Expr::MatrixSelector(ms) => {
@@ -544,7 +548,7 @@ fn apply_at_timestamp(mut e: Expr, secs: f64) -> Expr {
         Expr::Subquery(sq) => sq.timestamp = Some(ts_ms),
         _ => {}
     }
-    e
+    Ok(e)
 }
 
 pub fn at_modifier<'l, 'i: 'l>(
@@ -574,7 +578,7 @@ pub fn at_timestamp_val<'l, 'i: 'l>(
     inner: Result<Expr, ()>,
     secs: f64,
 ) -> Result<Expr, ()> {
-    Ok(apply_at_timestamp(inner?, secs))
+    apply_at_timestamp(inner?, secs)
 }
 
 /// Just the f64 value of a NUMBER token — used by upstream's `number`
@@ -898,7 +902,10 @@ fn parse_number_literal(raw: &str) -> Result<f64, ()> {
             .map(|n| n as f64)
             .map_err(|_| ());
     }
-    s.parse::<f64>().map_err(|_| ())
+    // Rust's parse saturates an overflowing literal to infinity where
+    // Go's `ParseFloat` returns `ErrRange`; the spelled-out infinities
+    // were handled above.
+    s.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(())
 }
 
 /// Parse a PromQL duration literal (`30s`, `1h30m`, `500ms`) into

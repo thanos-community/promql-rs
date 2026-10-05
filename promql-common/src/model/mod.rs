@@ -2,4 +2,4 @@
 
 pub mod time;
 
-pub use time::{Duration, ParseDurationError};
+pub use time::{secs_to_millis, Duration, ParseDurationError};
