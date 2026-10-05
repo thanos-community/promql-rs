@@ -1,0 +1,42 @@
+[
+  {
+    "name": "Ben Kochie",
+    "login": "SuperQ",
+    "avatar": "avatars/SuperQ.png"
+  },
+  {
+    "name": "Filip Petkovski",
+    "login": "fpetkovski",
+    "avatar": "avatars/fpetkovski.png"
+  },
+  {
+    "name": "Frederic Branczyk",
+    "login": "brancz",
+    "avatar": "avatars/brancz.png"
+  },
+  {
+    "name": "Matthias Loibl",
+    "login": "metalmatze",
+    "avatar": "avatars/metalmatze.png"
+  },
+  {
+    "name": "Michael Hoffmann",
+    "login": "MichaHoffmann",
+    "avatar": "avatars/MichaHoffmann.png"
+  },
+  {
+    "name": "Neven Miculinic",
+    "login": "nmiculinic",
+    "avatar": "avatars/nmiculinic.png"
+  },
+  {
+    "name": "Thor Hansen",
+    "login": "thorfour",
+    "avatar": "avatars/thorfour.png"
+  },
+  {
+    "name": "Wiard van Rij",
+    "login": "wiardvanrij",
+    "avatar": "avatars/wiardvanrij.png"
+  }
+]

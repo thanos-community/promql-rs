@@ -1,0 +1,102 @@
+/*
+ * Prometheus palette, fetched 2026-10-04. Light theme only: the projector is bright.
+ * prometheus.io is a Mantine app; its brand scale is a custom theme colour that Mantine
+ * writes into an inline <style> in the page HTML, not into a CSS file.
+ *
+ * Verified:
+ *   #e6522c  logo orange        https://prometheus.io/icon.svg  (path style fill:#e6522c)
+ *                               and banner <div style="background-color:#e6522c"> in https://prometheus.io/
+ *   #ffede6 #ffdad2 #f6b5a4 #f08e74 #ea6b4b #e75630 #e64a22 #cc3b16 #b73311 #a02709
+ *                               --mantine-color-prometheusColor-0..9 in https://prometheus.io/ (inline :root)
+ *   #e64a22  link colour        --mantine-color-anchor = prometheusColor-6 (light scheme, same inline :root)
+ *   #343a40  text, headings     --mantine-color-text = gray-8 (same inline :root); gray-8 value from
+ *                               https://prometheus.io/_next/static/css/12996fad8d583efc.css
+ *   #ffffff  page background    --mantine-color-body in 12996fad8d583efc.css
+ *   #868e96  dimmed text        --mantine-color-dimmed = gray-6 (12996fad8d583efc.css). Too light for a
+ *                               projector, so --text-dim uses gray-7 #495057 (same file) instead.
+ *   #f8f9fa #f1f3f5 #e9ecef #dee2e6 #ced4da  gray-0..4, same file; gray-4 is --mantine-color-default-border
+ *   #1971c2 #9c36b5 #099268 #2f9e44 #ebfbee  Mantine blue-8, grape-8, teal-8, green-8, green-0, same file
+ *   #e03131 #fff5f5  Mantine red-8, red-0, same file (fetched 2026-10-05); the pair mirrors --ok/--ok-bg
+ *   Lato: --font-lato in https://prometheus.io/_next/static/css/0566b04bc4104246.css
+ * NOT verified: no nav/heading colour other than gray-8 was found, so there is no separate navy;
+ *   the series colours --ca/--cb/--cc are Mantine hues chosen for contrast, not a Prometheus brand choice.
+ *
+ * Lato 400/700/400-italic, latin subset, from fonts.gstatic.com (Google Fonts, v25), SIL OFL 1.1: fonts/OFL.txt.
+ * The subset lacks arrows and maths symbols; those fall through to system-ui.
+ */
+@font-face {
+  font-family: "Lato";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("./fonts/lato-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Lato";
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url("./fonts/lato-700.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Lato";
+  font-style: italic;
+  font-weight: 400;
+  font-display: block;
+  src: url("./fonts/lato-400-italic.woff2") format("woff2");
+}
+
+:root {
+  color-scheme: light;
+  --pm-orange: #e6522c;
+  --pm-orange-0: #ffede6;
+  --pm-orange-1: #ffdad2;
+  --pm-orange-2: #f6b5a4;
+  --pm-orange-4: #ea6b4b;
+  --pm-orange-6: #e64a22;
+  --pm-orange-7: #cc3b16;
+  --pm-orange-8: #b73311;
+  --pm-orange-9: #a02709;
+  --pm-slate: #343a40;
+
+  --font-sans: "Lato", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f1f3f5;
+  --text: var(--pm-slate);
+  --text-dim: #495057;
+  --text-faint: #868e96;
+  --border: #dee2e6;
+  --border-strong: #ced4da;
+  --code-bg: #f8f9fa;
+  --link: var(--pm-orange-6);
+
+  /* Orange-on-white text needs the darker steps; --pm-orange itself is for fills and the logo. */
+  --accent: var(--pm-orange-8);
+  --accent-dim: var(--pm-orange-4);
+  --accent-bg: var(--pm-orange-0);
+  --accent-bg-strong: var(--pm-orange-1);
+
+  --ca: #1971c2;
+  --cb: #9c36b5;
+  --cc: #099268;
+  --ok: #2f9e44;
+  --ok-bg: #ebfbee;
+  --bad: #e03131;
+  --bad-bg: #fff5f5;
+  /* engine-blocks.html's amber "absent" pair has no Prometheus equivalent; reuse the orange tints. */
+  --absent: var(--pm-orange-9);
+  --absent-bg: var(--pm-orange-1);
+  --shadow: 0 1px 2px rgba(33, 37, 41, 0.08);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+a { color: var(--link); }
+h1, h2, h3 { color: var(--text); font-weight: 700; }
+code, pre, kbd, samp { font-family: var(--font-mono); }

@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>promql-rs: PromQL in Rust with Arrow &amp; DataFusion</title>
+</head>
+<body>
+<!-- One <section> per TALK.md slide, 0 to 9 in order. Each aside.notes holds
+     that slide's "Say" text verbatim for the speaker view; edit TALK.md first. -->
+<main id="stage">
+  <section data-title="Opener" class="title-slide" data-anim="opener" data-still>
+    <div class="title-block">
+      <p class="fake"><span class="strike">(Vibe) Rewriting Prometheus in Rust</span></p>
+      <h1 class="real" data-step>promql-rs: PromQL in Rust with Arrow &amp; DataFusion</h1>
+    </div>
+    <p class="byline">Matthias Loibl, Dash0</p>
+    <aside class="notes">Hi, I'm Matthias. The Prometheus community has joked about rewriting it in Rust for years. So here is my talk on vibe rewriting Prometheus in Rust.</aside>
+  </section>
+
+  <section data-title="Title" class="title-slide" data-still>
+    <div class="title-block">
+      <!-- Empty twin of slide 0's fake title, so this h1 sits where slide 0's step leaves it. -->
+      <p class="fake" aria-hidden="true"></p>
+      <h1>promql-rs: PromQL in Rust with Arrow &amp; DataFusion</h1>
+    </div>
+    <p class="byline">Matthias Loibl, Dash0</p>
+    <p class="repo">github.com/thanos-community/promql-rs</p>
+    <aside class="notes">I have five minutes and one sentence for you. A series is an Arrow row, and the engine is DataFusion aggregates over that row. This is promql-rs.</aside>
+  </section>
+
+  <section data-title="Origin and why" class="origin" data-anim="origin">
+    <div class="groups">
+      <div class="group">
+        <h2>Origin</h2>
+        <ul>
+          <li class="pt" data-step>Started at Polar Signals</li>
+          <li class="pt" data-step>Great Lakes, a columnar observability store</li>
+          <li class="pt" data-step>Dash0 acquired Polar Signals; we need a PromQL engine on Great Lakes at Dash0</li>
+          <li class="pt" data-step>Parser grammar generated from the Prometheus yacc grammar, not hand-rolled</li>
+          <li class="pt" data-step>Talked to the community and got in contact with people from Cloudflare, Reddit, Shopify and Roku for a first meeting</li>
+        </ul>
+        <!-- Filled by src/slides/origin.js: the first community meeting from
+             src/data/meeting.json, then contributors.json minus those people. -->
+        <div class="avatars">
+          <div class="met"></div>
+          <div class="since"><h3>contributing since</h3></div>
+        </div>
+      </div>
+      <div class="group">
+        <h2>Why</h2>
+        <!-- Two steps, the problem and then the answer, so the Why half takes two
+             clicks instead of five. -->
+        <ul>
+          <li class="pt many" data-step><ul>
+            <li>Great Lakes is a column store: Vortex in object storage</li>
+            <li>The Go engine decodes every sample into a point struct</li>
+          </ul></li>
+          <li class="pt many" data-step><ul>
+            <li>An engine that speaks Arrow reads the store's format directly</li>
+            <li>DataFusion brings the planner, parallelism and memory accounting</li>
+            <li>Goal: Rust and performance</li>
+          </ul></li>
+        </ul>
+      </div>
+    </div>
+    <aside class="notes">[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar observability store. [click 3] Dash0 acquired Polar Signals, and we need a PromQL engine on Great Lakes. [click 4] The parser isn't hand-rolled. Its grammar is generated from the Prometheus yacc grammar, so it parses what Prometheus parses, and a tool flags the rules it misses. [click 5] We talked to the community, and had first meetings with people from Cloudflare, Reddit, Shopify and Roku.
+
+[click 6] Great Lakes stores Vortex in object storage. The Go engine still decodes every sample into a point struct. [click 7] An engine that speaks Arrow reads the store's format directly. It borrows DataFusion's planner, parallelism and memory accounting. Rust and performance were the goal.</aside>
+  </section>
+
+  <section data-title="Two architectures" class="arch-slide" data-anim="seam">
+    <!-- Drawn at 1:1 with the stage (viewBox = rendered size), so font-size here is
+         stage px: nothing below 28. Rows line up across the columns so the two
+         parsers sit side by side; the left column skips row 4, which only the
+         physical plan needs. Calls go down on the left lane of each gap, data
+         comes up on the right lane and up the side lane to the result. -->
+    <svg class="arch" width="1760" height="944" viewBox="0 0 1760 944" role="img"
+         aria-label="Prometheus's Go engine beside promql-rs, from PromQL text down to storage, with calls pointing down and data pointing up">
+      <defs>
+        <marker id="ah-call" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+          <path class="ah-call" d="M0 0 L10 5 L0 10 z"/>
+        </marker>
+        <marker id="ah-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto-start-reverse">
+          <path class="ah-data" d="M0 0 L10 5 L0 10 z"/>
+        </marker>
+      </defs>
+
+      <!-- Prometheus (Go) -->
+      <g class="col go">
+        <text class="col-h" x="0" y="40">Prometheus (Go)</text>
+
+        <rect class="box" x="0" y="72" width="470" height="72" rx="10"/>
+        <text class="lbl" x="24" y="120">PromQL text</text>
+        <rect class="box result" x="500" y="72" width="140" height="72" rx="36"/>
+        <text class="lbl" x="570" y="120" text-anchor="middle">result</text>
+
+        <rect class="box" x="0" y="200" width="470" height="92" rx="10"/>
+        <text class="lbl" x="24" y="240">parser</text>
+        <text class="sub" x="24" y="276">yacc grammar</text>
+
+        <rect class="box" x="0" y="348" width="470" height="84" rx="10"/>
+        <text class="lbl mono" x="24" y="401">promql.Engine</text>
+
+        <rect class="box" x="0" y="488" width="470" height="110" rx="10"/>
+        <text class="lbl mono" x="24" y="534">rangeEval</text>
+        <text class="sub" x="24" y="574">loops over the steps</text>
+        <path class="loop" d="M412 528 A26 26 0 1 1 386 554" marker-end="url(#ah-call)"/>
+
+        <rect class="box" x="0" y="844" width="470" height="100" rx="10"/>
+        <text class="lbl mono" x="24" y="886">storage.Querier</text>
+        <text class="sub" x="24" y="924">hands out series iterators</text>
+        <text class="note" x="500" y="868">a series is a</text>
+        <text class="note mono" x="500" y="904">promql.Series,</text>
+        <text class="note" x="500" y="940">labels and a slice of points</text>
+
+        <line class="call" x1="150" y1="144" x2="150" y2="198" marker-end="url(#ah-call)"/>
+        <line class="call" x1="150" y1="292" x2="150" y2="346" marker-end="url(#ah-call)"/>
+        <line class="call" x1="150" y1="432" x2="150" y2="486" marker-end="url(#ah-call)"/>
+        <line class="call" x1="150" y1="598" x2="150" y2="842" marker-end="url(#ah-call)"/>
+        <line class="data" x1="300" y1="844" x2="300" y2="600" marker-end="url(#ah-data)"/>
+        <line class="data" x1="300" y1="488" x2="300" y2="434" marker-end="url(#ah-data)"/>
+        <path class="data" d="M470 390 H570 V146" marker-end="url(#ah-data)"/>
+      </g>
+
+      <!-- promql-rs -->
+      <svg class="col rs" x="900" y="0" width="860" height="944" overflow="visible">
+        <text class="col-h" x="0" y="40">promql-rs</text>
+
+        <rect class="box" x="0" y="72" width="470" height="72" rx="10"/>
+        <text class="lbl" x="24" y="120">PromQL text</text>
+        <rect class="box result" x="500" y="72" width="140" height="72" rx="36"/>
+        <text class="lbl" x="570" y="120" text-anchor="middle">result</text>
+
+        <rect class="box" x="0" y="200" width="470" height="92" rx="10"/>
+        <text class="lbl" x="24" y="240">parser</text>
+        <text class="sub" x="24" y="276">same grammar</text>
+
+        <rect class="box" x="0" y="348" width="470" height="84" rx="10"/>
+        <text class="lbl" x="24" y="401">planner</text>
+
+        <rect class="box" x="0" y="488" width="470" height="184" rx="10"/>
+        <text class="lbl" x="24" y="530">DataFusion logical plan</text>
+        <rect class="inner" x="24" y="550" width="422" height="50" rx="6"/>
+        <text class="code" x="44" y="585">Aggregate: sum</text>
+        <rect class="inner" x="24" y="610" width="422" height="50" rx="6"/>
+        <text class="code" x="44" y="645">Aggregate: rate</text>
+
+        <rect class="box" x="0" y="716" width="470" height="72" rx="10"/>
+        <text class="lbl" x="24" y="764">physical plan</text>
+
+        <!-- The seam: the one element step 1 leaves undimmed, with its ring. -->
+        <g class="seam-box">
+          <rect class="box" x="0" y="844" width="470" height="100" rx="10"/>
+          <text class="lbl mono" x="24" y="886">SeriesSource::select</text>
+          <text class="sub" x="24" y="924">returns a plan that streams Arrow</text>
+          <rect class="ring" x="-9" y="835" width="488" height="118" rx="16"/>
+        </g>
+        <text class="note" x="500" y="886">a series is</text>
+        <text class="note" x="500" y="926">one Arrow row</text>
+
+        <line class="call" x1="150" y1="144" x2="150" y2="198" marker-end="url(#ah-call)"/>
+        <line class="call" x1="150" y1="292" x2="150" y2="346" marker-end="url(#ah-call)"/>
+        <line class="call" x1="150" y1="432" x2="150" y2="486" marker-end="url(#ah-call)"/>
+        <line class="call" x1="150" y1="672" x2="150" y2="714" marker-end="url(#ah-call)"/>
+        <line class="call" x1="150" y1="788" x2="150" y2="842" marker-end="url(#ah-call)"/>
+        <line class="data" x1="300" y1="844" x2="300" y2="790" marker-end="url(#ah-data)"/>
+        <text class="rb" x="318" y="826">RecordBatch</text>
+        <path class="data" d="M470 752 H570 V146" marker-end="url(#ah-data)"/>
+        <text class="rb" x="588" y="470">RecordBatch</text>
+      </svg>
+    </svg>
+    <!-- Over the dimmed Go column: beside the box there is no free space, the
+         Go note on its left and the data lane and row note on its right. -->
+    <div class="seam" data-step>
+      <pre><code>trait SeriesSource {
+    async fn select(…)
+}</code></pre>
+      <p class="seam-line">one trait, your store</p>
+      <ul>
+        <li>in-memory store (the test suite)</li>
+        <li>Thanos Store API client: queries a real Thanos today</li>
+      </ul>
+    </div>
+    <aside class="notes">On the left is the Go engine you know. The parser hands an AST to promql.Engine. rangeEval walks the steps, and the selectors pull samples through storage.Querier iterators. A series is labels and a slice of points.
+
+On the right is promql-rs. Same grammar. A planner turns the AST into a DataFusion logical plan of stacked aggregates, and DataFusion makes the physical plan. At the bottom, a store implements one trait, SeriesSource, and returns a plan that streams Arrow RecordBatches. A series is one row, from the store to the result.
+
+[click 1] The seam is one trait, SeriesSource. Implement it, like a Go interface, and your store runs PromQL. I have a Thanos Store API client doing that against a real Thanos today.</aside>
+  </section>
+
+  <section data-title="A series is an Arrow row" class="row-slide">
+    <pre class="schema">labels       Struct&lt;__name__: Utf8View, ...&gt;
+samples      List&lt;Struct&lt;timestamp: Timestamp(Millisecond), value: Float64&gt;&gt;
+block_start  Timestamp(Millisecond)
+block_end    Timestamp(Millisecond)</pre>
+    <!-- The four rows of x in the block-edge fixture of docs/engine-blocks.html, in
+         seconds. The highlighted row is 2·a, the chunk slide 6 folds. -->
+    <table class="rows">
+      <thead><tr><th>labels</th><th>samples</th><th>block_start</th><th>block_end</th></tr></thead>
+      <tbody>
+        <tr><td class="sa">{pod="a"}</td><td>300 330 … 420 450 <span class="n">(6)</span></td><td>240</td><td>480</td></tr>
+        <tr><td class="sb">{pod="b"}</td><td>150 180 … 420 450 <span class="n">(11)</span></td><td>240</td><td>480</td></tr>
+        <tr class="hot"><td class="sa">{pod="a"}</td><td>300 330 … 570 600 <span class="n">(11)</span></td><td>480</td><td>720</td></tr>
+        <tr><td class="sb">{pod="b"}</td><td>180 210 … 570 600 <span class="n">(15)</span></td><td>480</td><td>720</td></tr>
+      </tbody>
+    </table>
+    <aside class="notes">This is the whole data model, four columns. Labels are a struct with one field per label name. Samples are a list of timestamp and value. block_start and block_end name the block, and so the steps this row answers. The highlighted row is one chunk of series a in block two. In two minutes you'll watch the engine fold it.</aside>
+  </section>
+
+  <section data-title="Plan explorer" class="plans-slide" data-anim="plans">
+    <!-- [click 1] to [click 4] of TALK.md. The controller counts these as steps;
+         animations.js maps step n to the explorer's state n. -->
+    <span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span>
+    <div class="explorer" data-demo>
+      <div class="query" aria-live="polite"><span class="prompt">&gt;</span><code class="q"></code></div>
+      <div class="controls">
+        <div class="presets" role="group" aria-label="Preset queries">
+          <button type="button" data-preset="1">selector</button>
+          <button type="button" data-preset="2">rate</button>
+          <button type="button" data-preset="3">sum by (job)</button>
+        </div>
+        <div class="views" role="group" aria-label="Plan">
+          <button type="button" data-view="logical">Logical</button>
+          <button type="button" data-view="physical">Physical</button>
+          <button type="button" class="full" data-full>full</button>
+        </div>
+      </div>
+      <div class="pane" role="region" aria-label="Plan text"></div>
+    </div>
+    <aside class="notes">[before click 1] These plans come from the real planner.
+
+[click 1] A bare selector. One scan, and above it one aggregate, vector_selector, grouped per series and block. Picking the last sample in the lookback is an aggregate over the samples list.
+
+[click 2] Now rate. The range selector has no node of its own. It's rate's input, and rate is the aggregate over the same scan.
+
+[click 3] Now sum by job. A second aggregate stacks on top, grouped by block and job. Every PromQL operator here is a DataFusion aggregate, and the query is those aggregates stacked.
+
+[click 4] And the physical plan. DataFusion's optimizer made this split, not my planner. A Partial in each store partition, a repartition on the block columns and job that keeps block order, and a FinalPartitioned.</aside>
+  </section>
+
+  <section data-title="Block-edge step-through" class="edge-slide">
+    <h2>Watch one query cross a block edge</h2>
+    <p class="edge-q"><code>sum(rate(x[5m]))</code></p>
+    <!-- Placeholder: the port of the step-through is deferred (TALK.md, slide 6 notes). -->
+    <p class="placeholder"><span>The step-through from <code>docs/engine-blocks.html</code> goes here.</span></p>
+    <aside class="notes">[before press 1] Now at runtime. sum of rate over two series. The fold is on top, the Arrow buffers below.
+
+[press 1] Series b reaches 450 seconds, block one's last step. sum holds two partials, one per step of this block.
+
+[press 2] Block edge. Series a arrives with block_start 480, so sum emits block one's two steps and the engine drops b's window buffer. Nothing per series crosses.
+
+[press 3] Series a starts from an empty buffer. The inspector follows the offsets to cells 17 to 23 of the timestamp and value arrays. They're copied into the window buffer, so a series can continue into the next batch.
+
+[press 4] The value drops from 16 to 3, a counter reset. rate keeps the 16 for reset_sum. The engine never held a whole series, only the window a step reaches. Memory is bounded by the block.</aside>
+  </section>
+
+  <section data-title="Five gates" class="gates-slide" data-anim="gates">
+    <!-- Step n adds gate n and the arrow into it; step 6 closes the loop and
+         turns the ring green (animations.js, hook "gates"). The panel lines are
+         quoted from AGENTS.md, "Five gates per engine feature"; keep them
+         verbatim. Gates 4 and 5 are optional by the author's choice for this
+         talk, not by AGENTS.md (TALK.md, slide 7 notes); dashes mark them. -->
+    <span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span>
+    <!-- Drawn 1:1 with the stage, ring centre (500, 470), radius 330. Gate 2 is
+         1.3 times the others: the corpus is what lets an agent check its work.
+         Arrow k leads into gate k + 2; the last one closes the loop into gate 1. -->
+    <svg class="cycle" width="1000" height="880" viewBox="0 0 1000 880" role="img"
+         aria-label="Five gates in a loop: unit, conformance, plan pins, then the optional benchmarks and profile, and back to unit">
+      <defs>
+        <marker id="ah-gate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+          <path class="ah" d="M0 0 L10 5 L0 10 z"/>
+        </marker>
+      </defs>
+      <path class="arc" d="M621 163 A330 330 0 0 1 734 238" marker-end="url(#ah-gate)"/>
+      <path class="arc" d="M826 520 A330 330 0 0 1 778 648" marker-end="url(#ah-gate)"/>
+      <path class="arc opt" d="M583 789 A330 330 0 0 1 417 789" marker-end="url(#ah-gate)"/>
+      <path class="arc opt" d="M222 648 A330 330 0 0 1 171 490" marker-end="url(#ah-gate)"/>
+      <path class="arc" d="M245 260 A330 330 0 0 1 379 163" marker-end="url(#ah-gate)"/>
+      <g class="gate">
+        <circle class="base" cx="500" cy="140" r="100"/>
+        <circle class="hot" cx="500" cy="140" r="100"/>
+        <!-- The 7.1 pulse (animations.js, unitPulse): opaque over .hot so the
+             orange shows only once the pulse fades out. -->
+        <circle class="fail" cx="500" cy="140" r="100"/>
+        <circle class="pass" cx="500" cy="140" r="100"/>
+        <circle class="ok" cx="500" cy="140" r="100"/>
+        <text class="num" x="500" y="114">1</text>
+        <text class="name" x="500" y="162">Unit</text>
+      </g>
+      <g class="gate conf">
+        <circle class="base" cx="814" cy="368" r="130"/>
+        <circle class="hot" cx="814" cy="368" r="130"/>
+        <circle class="ok" cx="814" cy="368" r="130"/>
+        <text class="num" x="814" y="342">2</text>
+        <text class="name" x="814" y="390">Conformance</text>
+      </g>
+      <g class="gate">
+        <circle class="base" cx="694" cy="737" r="100"/>
+        <circle class="hot" cx="694" cy="737" r="100"/>
+        <circle class="ok" cx="694" cy="737" r="100"/>
+        <text class="num" x="694" y="711">3</text>
+        <text class="name" x="694" y="759">Plan pins</text>
+      </g>
+      <g class="gate opt">
+        <circle class="base" cx="306" cy="737" r="100"/>
+        <circle class="hot" cx="306" cy="737" r="100"/>
+        <circle class="ok" cx="306" cy="737" r="100"/>
+        <text class="num" x="306" y="711">4</text>
+        <text class="name" x="306" y="759">Benchmarks</text>
+        <text class="tag" x="306" y="795">optional</text>
+      </g>
+      <g class="gate opt">
+        <circle class="base" cx="186" cy="368" r="100"/>
+        <circle class="hot" cx="186" cy="368" r="100"/>
+        <circle class="ok" cx="186" cy="368" r="100"/>
+        <text class="num" x="186" y="342">5</text>
+        <text class="name" x="186" y="390">Profile</text>
+        <text class="tag" x="186" y="426">optional</text>
+      </g>
+      <text class="cap" x="500" y="484">one feature, one loop</text>
+    </svg>
+    <div class="gate-col">
+      <h2>Five gates per engine feature</h2>
+      <div class="panels">
+        <p class="merge">a human at the merge</p>
+        <div class="panel">
+          <p class="g-name">1 Unit</p>
+          <!-- The lead is the talk's own line; the quote under it is AGENTS.md's.
+               green is cut to "all pass" because the full green sentence ends in
+               that same quote. -->
+          <p class="g-lead">Test first: the test fails, then the code makes it green.</p>
+          <p class="g-quote">“every new kernel or planner branch has a test that fails without it”</p>
+          <p class="g-what">The steps of <code>.github/workflows/ci.yml</code> before the promqltest allowlist check, run locally.</p>
+          <p class="g-green"><b>green:</b> all pass</p>
+        </div>
+        <div class="panel">
+          <p class="g-name">2 Conformance</p>
+          <!-- Filled from src/data/scoreboard.json (total) by slides/scoreboard.js. -->
+          <p class="g-count"><span data-score="total"></span> evals</p>
+          <p class="g-spec">Prometheus's own promqltest corpus, the spec the agents check their work against</p>
+          <p class="g-what">A lower count is a regression to fix.</p>
+          <p class="g-green"><b>green:</b> the gate passes without <code>BLESS</code>, and the pass count rose by the evals the feature targets.</p>
+        </div>
+        <div class="panel">
+          <p class="g-name">3 Plan pins</p>
+          <!-- The talk's own line. Every case pins the logical plan; only small
+               cases carry a physical block (promql-engine/tests/plan.rs). -->
+          <p class="g-spec">DataFusion logical plans, pinned as text in <code>tests/testdata/plans/*.yaml</code>; small cases pin the physical plan too.</p>
+          <p class="g-what">A changed pin is a design change: re-bless it in its own commit whose message says why the shape moved.</p>
+          <p class="g-green"><b>green:</b> every changed pin is explained in that commit.</p>
+        </div>
+        <div class="panel">
+          <p class="g-name">4 Benchmarks <span class="opt-tag">optional</span></p>
+          <p class="g-what"><code>promql-engine/benches</code> (<code>kernels</code>, <code>engine</code>, <code>memory</code>)</p>
+          <p class="g-green"><b>green:</b> no move beyond the five percent noise floor in the wrong direction, and the feature has a bench at realistic size.</p>
+        </div>
+        <div class="panel">
+          <p class="g-name">5 Profile <span class="opt-tag">optional</span></p>
+          <p class="g-what">Run the feature's bench with <code>--profile-time</code> (<code>promql-engine/benches/README.md</code>) and read the profile.</p>
+          <p class="g-green"><b>green:</b> the hot path is the one <code>docs/engine.md</code> predicts.</p>
+        </div>
+      </div>
+    </div>
+    <aside class="notes">The opener was half true: the agents write most of the code. [click 1] It holds because every feature walks these five gates in order, each green before the next. Unit is test-first: a failing test before the code. Each gate catches a different failure, so a skipped gate hides which layer broke.
+
+[click 2] Conformance is the gate that makes this work for agents: 2,098 evals from Prometheus itself. An agent checks its work against the real spec, not against its own opinion. [click 3] Gate three pins the DataFusion plans you saw, logical and physical. [click 4] Benchmarks, [click 5] then the profile. Those two are optional; the first three are not. [click 6] Then a human reviews and merges.</aside>
+  </section>
+  <section data-title="Scoreboard" class="score-slide">
+    <!-- Every number here comes from src/data/scoreboard.json (scripts/scoreboard.py
+         reads UNSUPPORTED.md); slides/scoreboard.js fills the [data-score] slots. -->
+    <div class="headline">
+      <p class="big"><span data-score="passing"></span> <span class="of">of</span> <span data-score="total"></span></p>
+      <p class="pct" data-score="percent"></p>
+    </div>
+    <p class="caption">promqltest evals pass</p>
+    <div class="bar" role="presentation"><div class="fill"></div></div>
+    <h3>Missing features that block the most evals</h3>
+    <ol class="blockers"></ol>
+    <h3>CI allowlist <code>SUPPORTED.toml</code></h3>
+    <p class="ci">A listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.</p>
+    <p class="source">source: <code data-score="source"></code></p>
+    <aside class="notes">Where does it stand? UNSUPPORTED.md, generated from a real run, says 559 of the 2,098 promqltest evals pass. The same file names what blocks the most: histogram_quantile with 86 evals, subqueries with 57, histogram_fraction with 56. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.</aside>
+  </section>
+
+  <section data-title="Close" class="close-slide">
+    <p class="repo">github.com/thanos-community/promql-rs</p>
+    <ul>
+      <li><code>docs/engine-blocks.html</code>: the walkthrough with the step-through, opens from disk</li>
+      <li><code>docs/talks/promcon-2026-lightning/</code>: these slides</li>
+      <li>Try it: clone, then <code>cargo test -p promql-conformance --test promqltest</code> prints the scoreboard</li>
+      <li>Runs at Dash0 as the PromQL layer on Great Lakes</li>
+    </ul>
+    <p class="thanks">Thanks</p>
+    <aside class="notes">The repo is on GitHub. The walkthrough you just saw and these slides live in docs, and they open from disk. To try it, clone it and run the promqltest suite, which prints the scoreboard. Dash0 runs this engine on top of Great Lakes. If you run PromQL over a columnar store, find me afterwards. Thanks.</aside>
+  </section>
+</main>
+<div id="speaker" hidden>
+  <div id="sp-now"><h3>Now</h3><div class="thumb"></div></div>
+  <div id="sp-next"><h3>Next</h3><div class="thumb"></div></div>
+  <div id="sp-notes"></div>
+  <div id="sp-clock"></div>
+</div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

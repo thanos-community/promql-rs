@@ -1,0 +1,32 @@
+[
+  {
+    "login": "metalmatze",
+    "name": "Matthias Loibl",
+    "company": "@dash0hq",
+    "avatar": "avatars/metalmatze.png"
+  },
+  {
+    "login": "brancz",
+    "name": "Frederic Branczyk",
+    "company": "@dash0hq",
+    "avatar": "avatars/brancz.png"
+  },
+  {
+    "login": "fpetkovski",
+    "name": "Filip Petkovski",
+    "company": "Shopify",
+    "avatar": "avatars/fpetkovski.png"
+  },
+  {
+    "login": "jesusvazquez",
+    "name": "Jesus Vazquez",
+    "company": "@grafana",
+    "avatar": "avatars/jesusvazquez.png"
+  },
+  {
+    "login": "saswatamcode",
+    "name": "Saswata Mukherjee",
+    "company": "Red Hat",
+    "avatar": "avatars/saswatamcode.png"
+  }
+]

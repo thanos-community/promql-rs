@@ -1,0 +1,219 @@
+/* Layout for the 1920x1080 stage. Colours and fonts come only from theme.css.
+   Sizes are stage px, which main.js scales to the window: body text stays at
+   36px or more and code at 28px or more, the floor for the back of a room.
+   Slide rules select on the section's class, not #stage, because the speaker
+   view clones sections into its thumbnails outside #stage. */
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg)}
+body{font-size:38px;line-height:1.35}
+[hidden]{display:none!important}
+#stage{position:absolute;left:50%;top:50%;width:1920px;height:1080px;transform-origin:center;background:var(--bg)}
+#stage > section{position:absolute;inset:0;visibility:hidden}
+#stage > section.active{visibility:visible}
+/* :where() keeps the base at zero specificity so a slide's own class rules win. */
+:where(#stage > section,#speaker .thumb > section){box-sizing:border-box;padding:96px 140px;display:flex;flex-direction:column;background:var(--bg)}
+#stage > section::before,#speaker .thumb > section::before{content:"";position:absolute;left:0;top:0;width:100%;height:10px;background:var(--pm-orange)}
+p{margin:0}
+h1{font-size:80px;line-height:1.15;margin:0}
+h2{font-size:64px;line-height:1.15;margin:0 0 40px}
+h3{font-size:40px;margin:0}
+code{font-size:.85em}
+p code,li code{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:0 .2em}
+ul{margin:0;padding-left:1.1em}
+li{margin:0 0 .5em}
+li::marker{color:var(--pm-orange)}
+.notes{display:none}
+
+/* ---- 0 and 1, title slides. Both share one grid so slide 1's h1 sits exactly
+   where slide 0's step lands the real title, and the byline does not move. */
+section.title-slide{display:grid;grid-template-rows:auto 104px 72px;align-content:start;padding-top:300px}
+.title-block{position:relative}
+/* The 50-character title needs 1875px at 80px and the slide is 1640px wide;
+   64px fits it on one line with room to spare. */
+.title-slide h1{font-size:64px;white-space:nowrap}
+.fake{font-size:40px;line-height:1.15;height:1.15em;font-weight:700;white-space:nowrap;transform-origin:0 0;opacity:.5;margin-bottom:12px}
+.strike{background:linear-gradient(var(--pm-orange),var(--pm-orange)) 0 58% / 100% 0.1em no-repeat}
+.title-slide .byline{grid-row:2;align-self:end;font-size:44px}
+.title-slide .repo{grid-row:3;align-self:end;font-family:var(--font-mono);font-size:36px;color:var(--accent)}
+
+/* ---- 2, origin and why. Top-aligned, so a new point lands below the list
+   and nothing above it moves. --big runs from 0 (compact list) to 1 (current
+   point); animations.js tweens it, and size, spacing and colour all follow, so
+   the shrink is one tween per point. The groups share one grid cell because
+   Why replaces Origin in place. */
+.origin .groups{display:grid}
+.origin .group{grid-area:1/1}
+.origin h2{color:var(--accent);margin-bottom:28px}
+.origin .pt{--big:1;font-size:calc(36px + var(--big) * 24px);line-height:1.25;margin:0 0 calc(10px + var(--big) * 10px);color:color-mix(in srgb,var(--text) calc(var(--big) * 100%),var(--text-dim))}
+/* A step with several points: the markers move to the inner items and hang
+   where the single points' markers do. */
+.origin .many{list-style:none}
+.origin .many > ul{padding-left:0;list-style-type:disc}
+.origin .many li{margin:0 0 calc(10px + var(--big) * 10px)}
+.origin .many li:last-child{margin-bottom:0}
+.origin .avatars{margin-top:32px}
+.origin .avatars > div{display:flex;gap:40px;align-items:flex-start}
+/* The second row: a heading on its own line, then smaller circles in the main
+   row's 160px columns and 40px gap, so they sit centred under its first two.
+   A grid rather than the flex row above, because the heading has to span the
+   row and the figures arrive from origin.js after it. The gap above it matches
+   the one above the main row, so the heading starts a sub-row instead of
+   reading as a caption of the row above; the 80px circles pay for that gap,
+   since under the two-line point at 2.5 the block has to end above the slide's
+   bottom padding. */
+.origin .avatars > .since{display:grid;grid-template-columns:repeat(auto-fill,160px);gap:10px 40px;margin-top:32px}
+.origin .since h3{grid-column:1/-1;font-size:22px;line-height:1.1;font-weight:400;color:var(--text-dim)}
+.origin .since figure{gap:8px}
+.origin .since figcaption{font-size:20px;line-height:1.2}
+.origin figure{margin:0;display:flex;flex-direction:column;align-items:center;gap:12px}
+.origin figure img{box-sizing:border-box;width:160px;height:160px;border-radius:50%;object-fit:cover;border:3px solid var(--border)}
+.origin figcaption{font-family:var(--font-mono);font-size:24px;color:var(--text-dim)}
+.origin .since figure img{width:80px;height:80px}
+
+/* ---- 3, two architectures. The SVG is 1:1 with the stage, so these font
+   sizes are stage px too. */
+section.arch-slide{padding:56px 80px 0}
+.arch{display:block;width:1760px;height:944px;overflow:visible}
+.arch text{font-family:var(--font-sans);fill:var(--text)}
+.arch .col-h{font-size:42px;font-weight:700}
+.arch .rs .col-h{fill:var(--accent)}
+.arch .box{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:2}
+.arch .rs .box{fill:var(--accent-bg);stroke:var(--pm-orange-2)}
+.arch .box.result,.arch .rs .box.result{fill:var(--surface);stroke:var(--ca);stroke-width:3}
+.arch .inner{fill:var(--surface);stroke:var(--pm-orange-2);stroke-width:2}
+.arch .lbl{font-size:34px;font-weight:700}
+.arch .mono,.arch .code,.arch .rb{font-family:var(--font-mono)}
+.arch .lbl.mono{font-size:32px}
+.arch .code{font-size:28px}
+.arch .sub{font-size:28px;fill:var(--text-dim)}
+.arch .note{font-size:30px;fill:var(--text-dim)}
+.arch .note .mono{fill:var(--text)}
+.arch .call,.arch .loop{stroke:var(--text-dim);stroke-width:3;fill:none}
+.arch .data{stroke:var(--ca);stroke-width:5;fill:none}
+.arch .ah-call{fill:var(--text-dim)}
+.arch .ah-data{fill:var(--ca)}
+.arch .rb{font-size:28px;font-weight:700;fill:var(--ca)}
+.arch .ring{fill:none;stroke:var(--pm-orange);stroke-width:6}
+/* Stage px: the SVG starts at the section padding (80, 56), so the select box
+   spans x 980-1450, y 900-1000. The callout ends 36px left of it, flush with
+   its bottom, and the pointer sits 50px up, at the box's middle. It starts at
+   the Go column's left edge so no dimmed box peeks out beside it. */
+.seam{position:absolute;left:80px;width:864px;bottom:80px;box-sizing:border-box;padding:28px 36px;background:var(--surface);border:2px solid var(--border-strong);border-radius:14px}
+.seam::after{content:"";position:absolute;right:-14px;bottom:38px;width:24px;height:24px;background:var(--surface);border-top:2px solid var(--border-strong);border-right:2px solid var(--border-strong);transform:rotate(45deg)}
+.seam pre{margin:0 0 18px;font-size:30px;line-height:1.35}
+.seam pre code{font-size:1em}
+.seam .seam-line{font-size:40px;font-weight:700;color:var(--accent);margin-bottom:14px}
+.seam li{font-size:36px;margin-bottom:.3em;text-wrap:balance}
+
+/* ---- 4, a series is an Arrow row */
+.row-slide{justify-content:center;gap:72px}
+.schema{margin:0;font-size:34px;line-height:1.45;padding:28px 40px;background:var(--code-bg);border:2px solid var(--border);border-radius:12px}
+.rows{border-collapse:collapse;font-family:var(--font-mono);font-size:34px}
+.rows th{font-size:28px;font-weight:700;text-align:left;color:var(--text-dim);padding:0 48px 14px 24px;border-bottom:2px solid var(--border-strong)}
+.rows td{padding:16px 48px 16px 24px;border-bottom:1px solid var(--border)}
+.rows .hot td{background:var(--accent-bg-strong);font-weight:700;border-top:3px solid var(--pm-orange);border-bottom:3px solid var(--pm-orange)}
+.rows .sa{color:var(--ca)}
+.rows .sb{color:var(--cb)}
+.rows .n{color:var(--text-faint);font-weight:400}
+
+/* ---- 5, plan explorer. The pane keeps white-space normal so the '\n' text
+   nodes between lines collapse; each line wraps itself with a hanging indent. */
+section.plans-slide{padding:72px 80px}
+.cue{display:none}
+.explorer{flex:1;min-height:0;display:flex;flex-direction:column;gap:28px}
+.query{display:flex;align-items:center;gap:24px;font-family:var(--font-mono);font-size:44px;min-height:1.5em;padding:16px 32px;border:2px solid var(--border-strong);border-radius:12px;background:var(--surface)}
+.query .prompt{color:var(--accent);font-weight:700}
+.query code{font-size:1em}
+.controls{display:flex;justify-content:space-between;align-items:center;gap:24px}
+.presets,.views{display:flex;gap:16px;align-items:center}
+.explorer button{font:inherit;font-size:34px;line-height:1.2;padding:10px 30px;border-radius:10px;border:2px solid var(--border-strong);background:var(--surface);color:var(--text);cursor:pointer}
+.explorer button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.explorer button.full{font-size:28px;padding:10px 22px;margin-left:16px}
+.explorer button.full[aria-pressed="true"]{background:var(--accent-bg-strong);border-color:var(--accent);color:var(--accent)}
+.pane{flex:1;min-height:0;overflow:auto;white-space:normal;font-family:var(--font-mono);font-size:30px;line-height:1.5;padding:24px 28px;background:var(--code-bg);border:2px solid var(--border);border-radius:12px}
+.pane[data-view="empty"]{border-style:dashed}
+.pane[data-view="full"]{font-size:28px}
+.pane .ln{display:block;white-space:pre-wrap;overflow-wrap:anywhere;padding-left:calc((var(--ind) + 4) * 1ch);text-indent:-4ch;border-radius:6px}
+.pane .ind{display:none}
+.pane .node{font-weight:700}
+.pane .agg{color:var(--accent)}
+.pane .ln.hot{background:var(--accent-bg-strong)}
+.pane mark{background:var(--pm-orange-2);color:inherit;border-radius:4px}
+
+/* ---- 6, block-edge placeholder */
+.edge-slide .edge-q{font-size:56px;margin-bottom:48px}
+.edge-slide .edge-q code{font-size:1em;color:var(--accent)}
+.edge-slide .placeholder{flex:1;display:flex;align-items:center;justify-content:center;border:3px dashed var(--border-strong);border-radius:16px;color:var(--text-dim)}
+
+/* ---- 7, five gates. The ring's SVG is 1:1 with the stage; the panels share
+   one grid cell so the column does not move as the gates come in. */
+section.gates-slide{flex-direction:row;align-items:center;gap:40px;padding:100px 100px 100px 80px}
+.cycle{flex:none;width:1000px;height:880px;overflow:visible}
+.cycle .arc{fill:none;stroke:var(--text-faint);stroke-width:4}
+.cycle .ah{fill:var(--text-faint)}
+.cycle .base{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:3}
+.cycle .hot{fill:var(--accent-bg-strong)}
+.cycle .ok{fill:var(--ok-bg);stroke:var(--ok);stroke-width:6}
+/* Hidden unless GSAP runs the pulse, so a speaker-view clone never shows one. */
+.cycle .fail{fill:var(--bad-bg);stroke:var(--bad);stroke-width:6;opacity:0}
+.cycle .pass{fill:var(--ok-bg);stroke:var(--ok);stroke-width:6;opacity:0}
+.cycle text{text-anchor:middle}
+.cycle .num{font-size:28px;fill:var(--text-dim)}
+.cycle .name{font-size:32px;font-weight:700;fill:var(--text)}
+.cycle .conf .num{font-size:34px}
+.cycle .conf .name{font-size:38px}
+/* Dashed marks the gates this talk calls optional, the arrows into them too. */
+.cycle .opt .base,.cycle .opt .ok{stroke-dasharray:16 10}
+.cycle .arc.opt{stroke-dasharray:12 10}
+.cycle .tag{font-size:22px;fill:var(--text-dim)}
+.cycle .cap{font-size:40px;fill:var(--text-dim)}
+.gate-col{flex:1;min-width:0;align-self:stretch;display:flex;flex-direction:column}
+.gate-col h2{font-size:56px;color:var(--accent);margin-bottom:24px}
+.gate-col .panels{flex:1;display:grid;align-items:center}
+.gate-col .panel{grid-area:1/1}
+/* In the panels' cell but pinned to its top, so it reads as a line under the
+   heading and the gate panels keep their place on every other step. */
+.gate-col .merge{grid-area:1/1;align-self:start;font-size:48px;font-weight:700}
+.gate-col .panel p{font-size:36px;margin-bottom:24px}
+.gate-col .panel .g-name{font-weight:700;font-size:48px}
+.gate-col .opt-tag{font-size:24px;font-weight:400;color:var(--text-dim);border:2px dashed var(--border-strong);border-radius:999px;padding:2px 14px;margin-left:12px;vertical-align:middle}
+.gate-col .panel .g-count{font-size:112px;font-weight:700;line-height:1;color:var(--accent);margin-bottom:12px}
+/* A flag or path split at its hyphen or slash reads as two words. */
+.gate-col code{white-space:nowrap}
+.gate-col .panel .g-lead{font-weight:700}
+.gate-col .g-green{color:var(--text-dim)}
+.gate-col .g-green b{color:var(--ok)}
+
+/* ---- 8, scoreboard */
+.score-slide{justify-content:center}
+.headline{display:flex;align-items:baseline;justify-content:space-between}
+.big,.pct{font-size:150px;line-height:1;font-weight:700}
+.big .of{font-size:72px;font-weight:400;color:var(--text-dim)}
+.pct{color:var(--accent)}
+.score-slide .caption{font-size:48px;color:var(--text-dim);margin:16px 0 28px}
+.bar{height:20px;border-radius:10px;overflow:hidden;background:var(--surface-2)}
+.bar .fill{height:100%;background:var(--ok)}
+.score-slide h3{margin:48px 0 14px}
+.score-slide h3 code{font-size:.85em}
+.blockers{margin:0;padding-left:1.4em}
+.blockers li{margin:0 0 .25em}
+.blockers .name{display:inline-block;width:460px}
+.blockers code.name{font-size:.9em;background:none;border:0;padding:0}
+.blockers .count{color:var(--text-dim)}
+.score-slide .ci{font-size:36px;white-space:nowrap}
+.score-slide .source{font-size:28px;color:var(--text-faint);margin-top:40px}
+.score-slide .source code{background:none;border:0;padding:0}
+
+/* ---- 9, close */
+.close-slide{justify-content:center}
+.close-slide .repo{font-family:var(--font-mono);font-size:56px;font-weight:700;color:var(--accent);margin-bottom:56px}
+.close-slide .thanks{font-size:96px;font-weight:700;margin-top:56px}
+
+/* ---- speaker view (?speaker): thumbnails of now and next, notes, clock */
+body.speaker{overflow:auto}
+body.speaker #stage{display:none}
+#speaker{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr auto;gap:16px;padding:16px;height:100vh;box-sizing:border-box;font-size:20px}
+#speaker h3{font-size:20px;color:var(--text-dim)}
+#speaker .thumb{position:relative;width:480px;height:270px;overflow:hidden;border:1px solid var(--border-strong)}
+#speaker .thumb section{position:absolute;transform:scale(.25);transform-origin:0 0;width:1920px;height:1080px}
+#sp-notes{grid-column:1/3;font-size:28px;white-space:pre-wrap}
+#sp-clock{grid-column:1/3;font-size:64px}
