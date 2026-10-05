@@ -431,16 +431,20 @@ impl Planner<'_> {
     /// 83962c35), the scalar's value with an empty label set.
     ///
     /// Nothing here reads a series, so the values are folded while
-    /// planning ([`crate::scalar`]) and the plan is the table holding
-    /// them: no store is asked, and no kernel runs. The table is
+    /// planning (`value` is [`crate::scalar::fold`] over an expression,
+    /// or a function of the step alone) and the plan is the table
+    /// holding them: no store is asked, and no kernel runs. The table is
     /// numbered because a query can hold more than one of them —
     /// `vector(1) + vector(2)`, once binary operators land — and two
     /// scans of the same name in one plan are one scan.
-    fn scalar_series(&mut self, expr: &Expr) -> Result<LogicalPlan, EngineError> {
+    fn scalar_series(
+        &mut self,
+        value: impl Fn(i64) -> Result<f64, EngineError>,
+    ) -> Result<LogicalPlan, EngineError> {
         let mut timestamps = Vec::new();
         let mut values = Vec::new();
         for ts in grid_of(self.query).steps() {
-            values.push(scalar::fold(expr, ts)?);
+            values.push(value(ts)?);
             timestamps.push(ts);
         }
 
@@ -465,7 +469,7 @@ impl Planner<'_> {
     fn expr<'f>(&'f mut self, expr: &'f Expr, above: Above<'f>) -> Planning<'f> {
         Box::pin(async move {
             match expr {
-                Expr::VectorSelector(vs) => self.selector(vs, above).await,
+                Expr::VectorSelector(vs) => self.selector(vs, above, selector::Pick::Value).await,
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c).await,
@@ -524,10 +528,14 @@ impl Planner<'_> {
         Ok((builder, label_names))
     }
 
+    /// `pick` is the value, except under `timestamp(x)`, where the
+    /// selector itself answers with each sample's time: see
+    /// [`Planner::timestamp`].
     async fn selector(
         &mut self,
         vs: &VectorSelector,
         above: Above<'_>,
+        pick: selector::Pick,
     ) -> Result<Planned, EngineError> {
         let params = Params {
             start_ms: self.query.start_ms,
@@ -542,17 +550,61 @@ impl Planner<'_> {
         let (builder, label_names) = self.scan(vs, hints).await?;
         // Grouped by the block and the whole label set, so every chunk of
         // a label set in a block folds into one group.
-        let plan = builder
-            .aggregate(
-                series_keys(),
-                vec![
-                    selector::call(col(SAMPLES), col(BLOCK_START), col(BLOCK_END), &params)
-                        .alias(SAMPLES),
-                ],
-            )?
-            .project(canonical(col(LABELS)))?
-            .build()?;
+        let builder = builder.aggregate(
+            series_keys(),
+            vec![selector::call(
+                col(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+                &params,
+                pick,
+            )
+            .alias(SAMPLES)],
+        )?;
+        let (labels_expr, label_names) = match pick {
+            selector::Pick::Value => (col(LABELS), label_names),
+            // `funcTimestamp` emits with `DropName`. Above the grouping,
+            // as the range functions drop it: below, two series differing
+            // only in their name would fold into one group.
+            selector::Pick::Timestamp => {
+                let (expr, names) = labels::keep(&label_names, |n| n != METRIC_NAME);
+                (expr.alias(LABELS), names)
+            }
+        };
+        let plan = builder.project(canonical(labels_expr))?.build()?;
         Ok(Planned { plan, label_names })
+    }
+
+    /// `timestamp(v)`, which upstream evaluates two ways (the `Call` arm
+    /// of `eval`, `promql/engine.go` at 83962c35). Over a bare vector
+    /// selector, parentheses and all,
+    /// `rangeEvalTimestampFunctionOverVectorSelector` reads each picked
+    /// sample's own time. Over anything else the vector's samples carry
+    /// the step they were evaluated at, and `funcTimestamp` reads that;
+    /// `timestamp(abs(x))` is the step, where `timestamp(x)` is not.
+    async fn timestamp(&mut self, call: &Call) -> Result<Planned, EngineError> {
+        let mut arg = &call.args[0];
+        loop {
+            arg = match arg {
+                Expr::Paren(p) => &p.expr,
+                Expr::StepInvariant(e) => e,
+                _ => break,
+            };
+        }
+        match arg {
+            Expr::VectorSelector(vs) => {
+                self.selector(
+                    vs,
+                    Above {
+                        func: Some("timestamp"),
+                        grouping: None,
+                    },
+                    selector::Pick::Timestamp,
+                )
+                .await
+            }
+            _ => self.elementwise(call, elementwise::Func::Timestamp).await,
+        }
     }
 
     /// One function call, sent to the operator its shape calls for.
@@ -566,7 +618,7 @@ impl Planner<'_> {
         let name = call.func.name.as_str();
         if name == "vector" {
             return Ok(Planned {
-                plan: self.scalar_series(&call.args[0])?,
+                plan: self.scalar_series(|ts| scalar::fold(&call.args[0], ts))?,
                 label_names: Vec::new(),
             });
         }
@@ -581,6 +633,21 @@ impl Planner<'_> {
         if name == "absent_over_time" {
             let input = self.range_over(call, Func::PresentOverTime, name).await?;
             return self.absent(&call.args[0], input);
+        }
+        // `time()` and `pi()` are a value per step and nothing else, the
+        // table `scalar_series` builds, which the result then reads as a
+        // scalar. `scalar(v)` is typed the same and is not that: it reads
+        // a vector, and the fold names it as the gap it is.
+        let returns_scalar =
+            crate::function::signature(name).is_some_and(|s| s.return_type == ValueType::Scalar);
+        if returns_scalar {
+            return Ok(Planned {
+                plan: self.scalar_series(|ts| scalar::call(call, ts))?,
+                label_names: Vec::new(),
+            });
+        }
+        if name == "timestamp" {
+            return self.timestamp(call).await;
         }
         if let Some(func) = elementwise::Func::parse(name) {
             return self.elementwise(call, func).await;
@@ -631,20 +698,34 @@ impl Planner<'_> {
         func: elementwise::Func,
     ) -> Result<Planned, EngineError> {
         let mut args = Vec::new();
-        for arg in &call.args[1..] {
+        for arg in call.args.iter().skip(1) {
             args.push(self.constant(arg, &format!("the {} function", func.as_str()))?);
         }
-        // Upstream's `extractFuncFromPath` tells the store the innermost
-        // call it sits under, which for `abs(x)` is this one.
-        let input = self
-            .expr(
-                &call.args[0],
-                Above {
-                    func: Some(func.as_str()),
-                    grouping: None,
-                },
-            )
-            .await?;
+        let input = match call.args.first() {
+            // Upstream's `extractFuncFromPath` tells the store the
+            // innermost call it sits under, which for `abs(x)` is this
+            // one.
+            Some(vector) => {
+                self.expr(
+                    vector,
+                    Above {
+                        func: Some(func.as_str()),
+                        grouping: None,
+                    },
+                )
+                .await?
+            }
+            // `dateWrapper` with no vector reads the evaluation time as
+            // one unlabelled sample, which is what `vector(time())` is;
+            // `time.Unix(enh.Ts/1000, 0)` and `int64(float64(Ts)/1000)`
+            // both truncate toward zero, so the one kernel serves both
+            // forms. Only that family reaches here without a vector:
+            // `check_call` has held every other call to its arity.
+            None => Planned {
+                plan: self.scalar_series(|ts| Ok(scalar::time(ts)))?,
+                label_names: Vec::new(),
+            },
+        };
         let (labels_expr, label_names) = labels::keep(&input.label_names, |n| {
             !func.drops_metric_name() || n != METRIC_NAME
         });
@@ -692,7 +773,7 @@ impl Planner<'_> {
             // Two scalars are a value per step and nothing else, which
             // is the table [`Planner::scalar_series`] already builds.
             _ => Ok(Planned {
-                plan: self.scalar_series(expr)?,
+                plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
                 label_names: Vec::new(),
             }),
         }
@@ -1354,6 +1435,46 @@ mod tests {
             .to_string();
         assert!(message.contains("@ modifier timestamp"), "{message}");
         assert!(message.contains(&MAX_TIME_MS.to_string()), "{message}");
+    }
+
+    /// `year()` has no series to read, so no store is asked: the
+    /// evaluation time comes from the grid the planner already holds.
+    /// `time()` at the top of a query is the scalar table and nothing
+    /// else; `scalar(up)` is typed the same and is still the gap it was.
+    #[tokio::test]
+    async fn a_scalar_returning_call_is_the_scalar_table() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        assert!(hints_of("time()", range).await.is_empty());
+        assert!(hints_of("pi()", range).await.is_empty());
+        let err = plan_of("scalar(up)", range).await.unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
+            "{err}"
+        );
+    }
+
+    /// The store hears `timestamp` only when the selector is what it
+    /// reads; through another function it hears that function, since
+    /// the time then comes from the step and not from the store.
+    #[tokio::test]
+    async fn timestamp_reaches_the_store_only_over_a_bare_selector() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        for query in ["timestamp(x)", "timestamp(((x)))"] {
+            let hints = hints_of(query, range).await;
+            assert_eq!(hints.len(), 1, "{query}");
+            assert_eq!(hints[0].func.as_deref(), Some("timestamp"), "{query}");
+        }
+        let hints = hints_of("timestamp(abs(x))", range).await;
+        assert_eq!(hints[0].func.as_deref(), Some("abs"));
+    }
+
+    #[tokio::test]
+    async fn a_date_function_without_a_vector_asks_no_store() {
+        let range = RangeQuery::new(0, 60_000, 30_000);
+        assert!(hints_of("year()", range).await.is_empty());
+        let hints = hints_of("year(up)", range).await;
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].func.as_deref(), Some("year"));
     }
 
     #[tokio::test]

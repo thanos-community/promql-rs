@@ -3,9 +3,9 @@
 //!
 //! These are the functions that look at one sample at a time and change
 //! nothing else: same series, same timestamps, a new value. Upstream
-//! writes them through `simpleFloatFunc`, `clamp` and `funcRound`
-//! (`promql/functions.go` at 83962c35), each mapping one `Sample` to one
-//! `Sample` with `DropName: true`.
+//! writes them through `simpleFloatFunc`, `clamp`, `funcRound`,
+//! `dateWrapper` and `funcTimestamp` (`promql/functions.go` at 83962c35),
+//! each mapping one `Sample` to one `Sample` with `DropName: true`.
 //!
 //! So the kernel here rebuilds only the value array and hands back the
 //! timestamps, offsets and validity it was given: the shape of the input
@@ -19,13 +19,16 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float64Array, ListArray, StructArray,
     TimestampMillisecondArray,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, OffsetBuffer};
 use datafusion::arrow::compute::FilterBuilder;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Float64Type};
+use datafusion::arrow::datatypes::{
+    DataType, Field, FieldRef, Float64Type, TimestampMillisecondType,
+};
 use datafusion::common::{plan_err, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -82,6 +85,20 @@ pub enum Func {
     Atanh,
     Deg,
     Rad,
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    DaysInMonth,
+    Hour,
+    Minute,
+    Month,
+    Year,
+    /// `funcTimestamp` over a vector that is not a bare selector: the
+    /// samples carry the step they were evaluated at, and that is the
+    /// answer. Over a bare selector the sample's own time is wanted
+    /// instead, which only the selector kernel still knows
+    /// ([`crate::selector::Pick`]); the planner sends that shape there.
+    Timestamp,
 }
 
 impl Func {
@@ -114,6 +131,15 @@ impl Func {
             "atanh" => Func::Atanh,
             "deg" => Func::Deg,
             "rad" => Func::Rad,
+            "day_of_month" => Func::DayOfMonth,
+            "day_of_week" => Func::DayOfWeek,
+            "day_of_year" => Func::DayOfYear,
+            "days_in_month" => Func::DaysInMonth,
+            "hour" => Func::Hour,
+            "minute" => Func::Minute,
+            "month" => Func::Month,
+            "year" => Func::Year,
+            "timestamp" => Func::Timestamp,
             // Last, and reachable only from a plan's own literal: an
             // operator's spelling is never a function name, so no call
             // can land here.
@@ -154,6 +180,15 @@ impl Func {
             Func::Atanh => "atanh",
             Func::Deg => "deg",
             Func::Rad => "rad",
+            Func::DayOfMonth => "day_of_month",
+            Func::DayOfWeek => "day_of_week",
+            Func::DayOfYear => "day_of_year",
+            Func::DaysInMonth => "days_in_month",
+            Func::Hour => "hour",
+            Func::Minute => "minute",
+            Func::Month => "month",
+            Func::Year => "year",
+            Func::Timestamp => "timestamp",
         }
     }
 
@@ -207,6 +242,7 @@ impl Func {
             Func::Clamp => Bound::clamp(a.unwrap_or(f64::NAN), b.unwrap_or(f64::NAN))?,
             Func::ClampMin => Bound::clamp(a.unwrap_or(f64::NAN), f64::INFINITY)?,
             Func::ClampMax => Bound::clamp(f64::NEG_INFINITY, a.unwrap_or(f64::NAN))?,
+            Func::Timestamp => Bound::Timestamp,
             other => Bound::Map(other.map_fn()),
         })
     }
@@ -237,11 +273,109 @@ impl Func {
             Func::Atanh => f64::atanh,
             Func::Deg => |v| v * 180.0 / std::f64::consts::PI,
             Func::Rad => |v| v * std::f64::consts::PI / 180.0,
-            Func::Binary { .. } | Func::Round | Func::Clamp | Func::ClampMin | Func::ClampMax => {
+            Func::DayOfMonth => |v| civil(v, |t| t.day()),
+            // Sunday is 0, as `time.Weekday` counts.
+            Func::DayOfWeek => |v| civil(v, |t| t.weekday().num_days_from_sunday()),
+            Func::DayOfYear => |v| civil(v, |t| t.ordinal()),
+            // `funcDaysInMonth`'s `32 - time.Date(y, m, 32, …).Day()`: the
+            // month's length, which chrono answers without the overflow trick.
+            Func::DaysInMonth => |v| civil(v, |t| t.num_days_in_month()),
+            Func::Hour => |v| civil(v, |t| t.hour()),
+            Func::Minute => |v| civil(v, |t| t.minute()),
+            Func::Month => |v| civil(v, |t| t.month()),
+            Func::Year => year,
+            Func::Binary { .. }
+            | Func::Round
+            | Func::Clamp
+            | Func::ClampMin
+            | Func::ClampMax
+            | Func::Timestamp => {
                 unreachable!("{} takes its arguments through bind", self.as_str())
             }
         }
     }
+}
+
+/// `dateWrapper`'s `time.Unix(int64(v), 0).UTC()` with one of its eight
+/// callers' field reads applied: proleptic Gregorian in UTC, as Go's
+/// `time` is and as chrono's `DateTime<Utc>` is. The year is the one
+/// field that does not go through here, see [`year`].
+///
+/// Go's `int64(v)` truncates toward zero, as `as i64` does, and leaves a
+/// NaN, an infinity or a value past `int64` to the CPU. `as` saturates
+/// those to the nearer end, which is Go's own answer on arm64, and on
+/// amd64 for everything but NaN: there the CPU answers `math.MinInt64`
+/// for all of them, which reads as the same date as `MaxInt64` because
+/// Go's wrap puts the first second of `int64` one second after its last
+/// (see [`beyond_chrono`]), where `as` makes a NaN zero and so the
+/// epoch. No query in the corpus observes the difference, and a check
+/// for it on every sample is not worth one CPU's answer to a NaN date.
+///
+/// The match is written out here and in [`year`] rather than behind one
+/// shared function so that the hot arm stays the two calls it was: with
+/// the fallback's arithmetic in the same body the compiler stopped
+/// fusing chrono's field read with `from_timestamp`, and every extractor
+/// paid a tenth more per sample for a branch it never takes.
+fn civil<T: Into<f64>>(v: f64, read: impl FnOnce(DateTime<Utc>) -> T) -> f64 {
+    let secs = v as i64;
+    match DateTime::from_timestamp(secs, 0) {
+        Some(t) => read(t).into(),
+        None => read(beyond_chrono(secs).0).into(),
+    }
+}
+
+/// `funcYear`: the one field the 400-year shift in [`beyond_chrono`]
+/// moves, so it alone restores the shift.
+fn year(v: f64) -> f64 {
+    let secs = v as i64;
+    match DateTime::from_timestamp(secs, 0) {
+        Some(t) => f64::from(t.year()),
+        None => {
+            let (t, cycles) = beyond_chrono(secs);
+            (i64::from(t.year()) + 400 * cycles) as f64
+        }
+    }
+}
+
+/// Seconds in Gregorian 400-year cycle: 146,097 days, which is also a
+/// whole number of weeks, so a date shifted by whole cycles keeps its
+/// month, day, weekday, day of the year, leap-year status and time of
+/// day, and moves only in its year.
+const CYCLE_SECS: i128 = 146_097 * 86_400;
+
+/// 2000-01-01 UTC, the first second of a cycle that chrono's calendar
+/// holds whole.
+const CYCLE_ANCHOR_SECS: i128 = 946_684_800;
+
+/// Go's `unixToAbsolute` (`time/time.go`, Go 1.25 as Prometheus pins):
+/// the seconds from its absolute zero, March 1 of the year
+/// -292277022400, to the Unix epoch.
+const UNIX_TO_ABSOLUTE: i128 = 9_223_372_028_741_760_000;
+
+/// `time.Unix(secs, 0).UTC()` for a second chrono's calendar does not
+/// hold, as a chrono time in the years 2000 to 2399 plus the number of
+/// 400-year cycles it was moved by to get there.
+///
+/// chrono's calendar ends at the years ±262143, some 8.2 trillion
+/// seconds from the epoch, where Go's keeps counting to the ends of
+/// `int64`. Moved by whole cycles a date keeps every field but its year,
+/// so the fields are read where chrono can read them and only [`year`]
+/// has anything to restore.
+///
+/// Go's `time` counts seconds from its absolute zero in a `uint64`, and
+/// its `int64` addition on the way wraps rather than fails, so the last
+/// 257 years of `int64` before the zero come out as the years after its
+/// end instead (`Time.absSec`); the modulus here is that wrap, and it
+/// is what makes an infinity, saturated to either end, read as one date.
+#[cold]
+#[inline(never)]
+fn beyond_chrono(secs: i64) -> (DateTime<Utc>, i64) {
+    let unix = (i128::from(secs) + UNIX_TO_ABSOLUTE).rem_euclid(1 << 64) - UNIX_TO_ABSOLUTE;
+    let cycles = (unix - CYCLE_ANCHOR_SECS).div_euclid(CYCLE_SECS);
+    let shifted = (unix - cycles * CYCLE_SECS) as i64;
+    let t = DateTime::from_timestamp(shifted, 0)
+        .expect("a second in the years 2000 to 2399 is a chrono date");
+    (t, cycles as i64)
 }
 
 /// `funcSgn`: zero and NaN come back as themselves, so the sign of `-0`
@@ -277,6 +411,9 @@ pub enum Bound {
         min: f64,
         max: f64,
     },
+    /// Reads the timestamp column instead of the value column; see
+    /// [`Func::Timestamp`].
+    Timestamp,
 }
 
 impl Bound {
@@ -304,6 +441,7 @@ impl Bound {
             }
             Bound::Clamp { min, max } => go_max(*min, go_min(*max, v)),
             Bound::Binary { .. } => unreachable!("a binary operator runs over whole lanes"),
+            Bound::Timestamp => unreachable!("timestamp reads the timestamp column, not a value"),
         }
     }
 }
@@ -482,6 +620,13 @@ pub fn apply(samples: &ListArray, bound: Option<Bound>) -> Result<ListArray> {
                 Computed::Holds(holds) => return filtered(samples, timestamps, values, &holds),
             }
         }
+        // `float64(el.T) / 1000`: the sample's own time in seconds.
+        Bound::Timestamp => timestamps
+            .as_primitive::<TimestampMillisecondType>()
+            .values()
+            .iter()
+            .map(|t| *t as f64 / 1000.0)
+            .collect(),
         _ => values.values().iter().map(|v| bound.value(*v)).collect(),
     };
     let entries = StructArray::new(
@@ -630,6 +775,149 @@ mod tests {
         // A to_nearest of zero is an infinite inverse: upstream answers
         // NaN rather than refusing the call.
         assert!(round(1.0, Some(0.0)).is_nan());
+    }
+
+    /// The corpus's `functions.test` dates, each a Go `time` edge: the
+    /// leap second's two sides, a February 29th and the March 1st after
+    /// it, the 366th day, and a Monday against `time.Weekday`'s Sunday.
+    #[test]
+    fn the_date_functions_read_gos_utc_calendar() {
+        let at = |name: &str, secs: f64| value(name, secs);
+        // 2006-01-02 22:04:05 UTC, a Monday.
+        assert_eq!(at("year", 1_136_239_445.0), 2006.0);
+        assert_eq!(at("month", 1_136_239_445.0), 1.0);
+        assert_eq!(at("day_of_month", 1_136_239_445.0), 2.0);
+        assert_eq!(at("day_of_year", 1_136_239_445.0), 2.0);
+        assert_eq!(at("day_of_week", 1_136_239_445.0), 1.0);
+        assert_eq!(at("hour", 1_136_239_445.0), 22.0);
+        assert_eq!(at("minute", 1_136_239_445.0), 4.0);
+        // The epoch, a Thursday.
+        assert_eq!(at("year", 0.0), 1970.0);
+        assert_eq!(at("day_of_week", 0.0), 4.0);
+        assert_eq!(at("day_of_year", 0.0), 1.0);
+        // 2008-12-31 23:59:59 and 2009-01-01 00:00:00.
+        assert_eq!(at("year", 1_230_767_999.0), 2008.0);
+        assert_eq!(at("year", 1_230_768_000.0), 2009.0);
+        // 2016-02-29 23:59:59 and 2016-03-01 00:00:00.
+        assert_eq!(at("month", 1_456_790_399.0), 2.0);
+        assert_eq!(at("day_of_month", 1_456_790_399.0), 29.0);
+        assert_eq!(at("month", 1_456_790_400.0), 3.0);
+        assert_eq!(at("day_of_month", 1_456_790_400.0), 1.0);
+        // The last day of a leap year and of a common one.
+        assert_eq!(at("day_of_year", 1_483_191_420.0), 366.0);
+        assert_eq!(at("day_of_year", 1_672_493_820.0), 365.0);
+        // February 2016 and February 2017.
+        assert_eq!(at("days_in_month", 1_454_284_800.0), 29.0);
+        assert_eq!(at("days_in_month", 1_485_907_200.0), 28.0);
+        // A 30-day month, and a century year that is not a leap year.
+        assert_eq!(at("days_in_month", 1_491_004_800.0), 30.0);
+        assert_eq!(at("days_in_month", 4_105_123_200.0), 28.0);
+    }
+
+    /// Every field of one date, in the order the extractors are named.
+    fn fields(secs: f64) -> [f64; 8] {
+        [
+            "day_of_month",
+            "day_of_week",
+            "day_of_year",
+            "days_in_month",
+            "hour",
+            "minute",
+            "month",
+            "year",
+        ]
+        .map(|name| value(name, secs))
+    }
+
+    /// chrono's calendar stops at the years ±262143 and Go's does not.
+    /// The expectations here and below are Go 1.25's `time` run by hand
+    /// (`absSeconds.days().split()`, `time/time.go`), the calendar
+    /// Prometheus at 83962c35 answers with.
+    #[test]
+    fn the_calendar_continues_past_chronos_edges() {
+        // The last second chrono holds on each side, and the first it
+        // does not: 262142-12-31 23:59:59, then 262143-01-01, and
+        // -262143-01-01 00:00:00, then the leap day's year before it.
+        assert_eq!(
+            fields(8_210_266_876_799.0),
+            [31.0, 1.0, 365.0, 31.0, 23.0, 59.0, 12.0, 262_142.0]
+        );
+        assert_eq!(
+            fields(8_210_266_876_800.0),
+            [1.0, 2.0, 1.0, 31.0, 0.0, 0.0, 1.0, 262_143.0]
+        );
+        assert_eq!(
+            fields(-8_334_601_228_800.0),
+            [1.0, 4.0, 1.0, 31.0, 0.0, 0.0, 1.0, -262_143.0]
+        );
+        assert_eq!(
+            fields(-8_334_601_228_801.0),
+            [31.0, 3.0, 366.0, 31.0, 23.0, 59.0, 12.0, -262_144.0]
+        );
+    }
+
+    /// Ten trillion seconds either side of the epoch: 318857-05-20
+    /// 17:46:40, a Sunday, and -314918-08-13 06:13:20, also a Sunday.
+    #[test]
+    fn a_far_date_keeps_every_field_but_the_year_from_its_cycle() {
+        assert_eq!(
+            fields(10_000_000_000_000.0),
+            [20.0, 0.0, 140.0, 31.0, 17.0, 46.0, 5.0, 318_857.0]
+        );
+        assert_eq!(
+            fields(-10_000_000_000_000.0),
+            [13.0, 0.0, 225.0, 31.0, 6.0, 13.0, 8.0, -314_918.0]
+        );
+    }
+
+    /// `int64`'s last second is 292277026596-12-04 15:30:07, Go's
+    /// documented end of time. Its first second is one second later by
+    /// Go's wrap, so an infinity or a float past `int64` lands on the
+    /// same date whichever end the conversion saturates it to. A NaN is
+    /// the one input where Go's answer is the CPU's: zero on arm64 and
+    /// here, the epoch; `MinInt64` on amd64, which is this same end.
+    #[test]
+    fn the_ends_of_int64_meet_where_go_wraps() {
+        let end = [4.0, 0.0, 339.0, 31.0, 15.0, 30.0, 12.0, 292_277_026_596.0];
+        assert_eq!(fields(9_223_372_036_854_775_807.0), end);
+        assert_eq!(fields(-9_223_372_036_854_775_808.0), end);
+        for v in [f64::INFINITY, f64::NEG_INFINITY, 1e19, -1e19] {
+            assert_eq!(fields(v), end, "{v}");
+        }
+        assert_eq!(fields(f64::NAN), fields(0.0));
+        // One second before the wrap is Go's absolute zero, March 1 of
+        // the year -292277022400, a Wednesday.
+        assert_eq!(
+            fields(-9_223_372_028_741_760_000.0),
+            [1.0, 3.0, 61.0, 31.0, 0.0, 0.0, 3.0, -292_277_022_400.0]
+        );
+    }
+
+    /// `int64(v)` truncates toward zero: `-9.75` is `-9`, nine seconds
+    /// before the epoch, which is the last day of 1969 and not, as a
+    /// floor would make it, ten seconds before.
+    #[test]
+    fn a_fractional_timestamp_is_truncated_toward_zero() {
+        assert_eq!(value("year", -9.75), 1969.0);
+        assert_eq!(value("month", -9.75), 12.0);
+        assert_eq!(value("day_of_month", -9.75), 31.0);
+        assert_eq!(value("day_of_year", -9.75), 365.0);
+        assert_eq!(value("day_of_week", -9.75), 3.0);
+        assert_eq!(value("hour", -9.75), 23.0);
+        assert_eq!(value("minute", -9.75), 59.0);
+        assert_eq!(value("minute", 119.9), 1.0);
+        // Half a second before the epoch is still the epoch's second.
+        assert_eq!(value("year", -0.5), 1970.0);
+        assert_eq!(value("year", -1.0), 1969.0);
+    }
+
+    /// `funcTimestamp` answers with the sample's time, in seconds, and
+    /// never looks at its value.
+    #[test]
+    fn timestamp_reads_the_timestamp_column() {
+        let out = apply(&samples(), Func::Timestamp.bind(None, None)).unwrap();
+        assert_eq!(out.offsets(), samples().offsets());
+        assert_eq!(values_of(&out), vec![0.0, 0.001, 0.007]);
     }
 
     #[test]

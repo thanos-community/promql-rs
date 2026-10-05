@@ -16,7 +16,7 @@
 //! [`crate::plan`]'s tree check before any of this runs, so a
 //! comparison that reaches here always had the modifier.
 
-use promql_parser::ast::Expr;
+use promql_parser::ast::{Call, Expr};
 use promql_parser::token::ItemType;
 
 use crate::error::EngineError;
@@ -44,22 +44,30 @@ pub fn fold(expr: &Expr, ts_ms: i64) -> Result<f64, EngineError> {
             let (lhs, rhs) = (fold(&b.lhs, ts_ms)?, fold(&b.rhs, ts_ms)?);
             binop(b.op, lhs, rhs)
         }
-        Expr::Call(c) => {
-            // Before the name is matched, not after: `time(1)` takes no
-            // arguments upstream and must say so rather than quietly
-            // answering the time.
-            crate::function::check_call(c)?;
-            match c.func.name.as_str() {
-                // Upstream's `funcTime`: the step in seconds, as a float.
-                "time" => Ok(ts_ms as f64 / 1000.0),
-                "pi" => Ok(std::f64::consts::PI),
-                name => Err(EngineError::Unsupported(format!("the {name} function"))),
-            }
-        }
+        Expr::Call(c) => call(c, ts_ms),
         // A duration expression is scalar-typed but its value comes from
         // the query's own step and range, which this fold does not see.
         other => Err(EngineError::Unsupported(describe(other))),
     }
+}
+
+/// A scalar-returning call at one step. Its own entry point because the
+/// planner meets such a call as a `Call`, not as the `Expr` around it.
+pub(crate) fn call(c: &Call, ts_ms: i64) -> Result<f64, EngineError> {
+    // Before the name is matched, not after: `time(1)` takes no
+    // arguments upstream and must say so rather than quietly answering
+    // the time.
+    crate::function::check_call(c)?;
+    match c.func.name.as_str() {
+        "time" => Ok(time(ts_ms)),
+        "pi" => Ok(std::f64::consts::PI),
+        name => Err(EngineError::Unsupported(format!("the {name} function"))),
+    }
+}
+
+/// Upstream's `funcTime`: the step in seconds, as a float.
+pub(crate) fn time(ts_ms: i64) -> f64 {
+    ts_ms as f64 / 1000.0
 }
 
 /// Upstream's `scalarBinop`, which is [`crate::binary::Op`] with the

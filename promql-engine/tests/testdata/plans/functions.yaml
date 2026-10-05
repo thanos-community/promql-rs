@@ -52,6 +52,82 @@ tests:
     plan: |
       TableScan: scalar_0
 
+  - name: time at the top of the query
+    description: >
+      A scalar-returning call is a value per step and nothing else, so
+      it is the scalar table itself, with no function node over it; the
+      caller reads the one unlabelled series as a scalar by the
+      expression's type.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      time()
+    plan: |
+      TableScan: scalar_0
+
+  - name: a date function over a selector
+    description: >
+      dateWrapper is simpleFloatFunc's shape with a calendar for the
+      map, so it takes the elementwise projection abs takes, __name__
+      dropped above the selector.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      day_of_week(temperature)
+    plan: |
+      Projection: labels{city}, promql_elementwise(day_of_week_0.samples, Utf8("day_of_week"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: day_of_week_0
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: temperature
+
+  - name: a date function without a vector
+    description: >
+      With no vector, dateWrapper reads the evaluation time, which the
+      planner hands the same kernel as the vector(time()) table: no
+      store is asked, and the plan says which function ran rather than
+      folding the calendar into the table.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      year()
+    plan: |
+      Projection: labels{}, promql_elementwise(year_1.samples, Utf8("year"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: year_1
+          TableScan: scalar_0
+
+  - name: timestamp over a selector
+    description: >
+      The selector itself picks each sample's time, so there is no
+      function node: the pick is the selector's trailing argument, and
+      __name__ is dropped above the grouping as a range function drops it.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      timestamp(temperature)
+    plan: |
+      Projection: labels{city}
+        Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m, timestamp) per series per block
+          TableScan: temperature
+
+  - name: timestamp over another function
+    description: >
+      Under abs the samples already carry the step, so timestamp is the
+      elementwise projection reading the timestamp column, and the
+      selector below it picks values as usual.
+    load:
+      - temperature{city="oslo"} 0
+    query: |
+      timestamp(abs(temperature))
+    plan: |
+      Projection: labels{city}, promql_elementwise(timestamp_1.samples, Utf8("timestamp"), Float64(NULL), Float64(NULL))
+        SubqueryAlias: timestamp_1
+          Projection: labels{city}, promql_elementwise(abs_0.samples, Utf8("abs"), Float64(NULL), Float64(NULL))
+            SubqueryAlias: abs_0
+              Projection: labels, samples, block_start, block_end
+                Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                  TableScan: temperature
+
   - name: count over time
     description: >
       A counting function takes the same aggregate as rate; only the

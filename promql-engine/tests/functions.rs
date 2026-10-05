@@ -132,6 +132,95 @@ fn each_function_answers_for_each_series() {
     }
 }
 
+/// `dateWrapper` reads each value as Unix seconds, truncated toward
+/// zero: lima's -9.75 is nine seconds before the epoch, the last minute
+/// of 1969, and oslo's 9.25 is the epoch's first.
+#[test]
+fn the_date_functions_read_the_value_as_unix_seconds() {
+    for (query, lima, oslo) in [
+        ("year(temperature)", 1969.0, 1970.0),
+        ("month(temperature)", 12.0, 1.0),
+        ("day_of_month(temperature)", 31.0, 1.0),
+        ("day_of_year(temperature)", 365.0, 1.0),
+        // A Wednesday and a Thursday, Sunday being 0.
+        ("day_of_week(temperature)", 3.0, 4.0),
+        ("days_in_month(temperature)", 31.0, 31.0),
+        ("hour(temperature)", 23.0, 0.0),
+        ("minute(temperature)", 59.0, 0.0),
+    ] {
+        let got = vector(query);
+        assert_eq!(got.len(), 2, "{query}");
+        assert_eq!(got[0].0, vec![("city".to_string(), "lima".to_string())]);
+        assert_eq!(got[0].1, lima, "{query} for lima");
+        assert_eq!(got[1].1, oslo, "{query} for oslo");
+    }
+}
+
+/// A value past chrono's calendar is still a date upstream, and here:
+/// ten trillion seconds is the year 318857, and as many before the
+/// epoch the year -314918.
+#[test]
+fn a_date_past_chronos_calendar_is_still_answered() {
+    for (query, want) in [
+        ("year(vector(10000000000000))", 318_857.0),
+        ("month(vector(10000000000000))", 5.0),
+        ("hour(vector(10000000000000))", 17.0),
+        ("year(vector(-10000000000000))", -314_918.0),
+    ] {
+        let got = vector(query);
+        assert_eq!(got.len(), 1, "{query}");
+        assert_eq!(got[0].1, want, "{query}");
+    }
+}
+
+/// Without a vector the date functions read the evaluation time, here
+/// 150s into the epoch, as one unlabelled sample: `minute()` is
+/// `minute(vector(time()))`, and must agree with it on every step.
+#[test]
+fn a_date_function_without_a_vector_reads_the_evaluation_time() {
+    for (name, want) in [
+        ("year", 1970.0),
+        ("month", 1.0),
+        ("day_of_month", 1.0),
+        ("day_of_year", 1.0),
+        ("day_of_week", 4.0),
+        ("days_in_month", 31.0),
+        ("hour", 0.0),
+        ("minute", 2.0),
+    ] {
+        let got = vector(&format!("{name}()"));
+        assert_eq!(got.len(), 1, "{name}()");
+        assert!(got[0].0.is_empty(), "{name}(): {:?}", got[0].0);
+        assert_eq!(got[0].1, want, "{name}()");
+        assert_eq!(vector(&format!("{name}(vector(time()))")), got, "{name}");
+    }
+}
+
+/// Over a bare selector `timestamp` is the picked sample's own time: at
+/// 150s with a 10s offset the sample at 120s is picked, and 120 is the
+/// answer. Through another function the sample is the step's, so the
+/// same selector under `abs` answers 150, as upstream does.
+#[test]
+fn timestamp_is_the_samples_time_over_a_selector_and_the_steps_elsewhere() {
+    for (query, want) in [
+        ("timestamp(temperature)", 150.0),
+        ("timestamp(temperature offset 10s)", 120.0),
+        ("timestamp((temperature offset 10s))", 120.0),
+        ("timestamp(abs(temperature offset 10s))", 150.0),
+        ("timestamp(timestamp(temperature offset 10s))", 150.0),
+    ] {
+        let got = vector(query);
+        assert_eq!(got.len(), 2, "{query}");
+        assert_eq!(got[0].0, vec![("city".to_string(), "lima".to_string())]);
+        assert_eq!(got[0].1, want, "{query}");
+        assert_eq!(got[1].1, want, "{query}");
+    }
+    let got = vector("timestamp(vector(1))");
+    assert_eq!(got.len(), 1);
+    assert!(got[0].0.is_empty());
+    assert_eq!(got[0].1, 150.0);
+}
+
 /// A value a function has nothing to say about is still a sample: the
 /// series stays in the result carrying a NaN, as upstream's
 /// `simpleFloatFunc` leaves it.
@@ -193,6 +282,19 @@ fn vector_of_a_scalar_is_one_unlabelled_series() {
     assert_eq!(vector("abs(vector(-3))")[0].1, 3.0);
 }
 
+/// A scalar at the top of the query comes back as the one unlabelled
+/// series `vector()` would make of it, which is how upstream's
+/// evaluator carries one too; the expression's type, not the result,
+/// says it is a scalar.
+#[test]
+fn a_scalar_returning_call_is_one_unlabelled_series() {
+    let got = vector("time()");
+    assert_eq!(got.len(), 1);
+    assert!(got[0].0.is_empty());
+    assert_eq!(got[0].1, 150.0);
+    assert_eq!(vector("pi()")[0].1, std::f64::consts::PI);
+}
+
 /// Upstream evaluates a scalar argument per step; this engine folds it
 /// while planning, so one that moves is named rather than guessed at.
 /// A one-step query has nothing that can move — this is the range path.
@@ -250,17 +352,11 @@ fn a_call_prometheus_would_not_parse_is_a_query_error() {
 /// feature it is, not as a bad query.
 #[test]
 fn the_functions_that_are_not_elementwise_are_still_unsupported() {
-    for (query, what) in [
-        ("scalar(temperature)", "the scalar function"),
-        ("timestamp(temperature)", "the timestamp function"),
-        ("year(temperature)", "the year function"),
-    ] {
-        let err = error(query);
-        assert!(
-            matches!(&err, EngineError::Unsupported(f) if f == what),
-            "{query}: {err}"
-        );
-    }
+    let err = error("scalar(temperature)");
+    assert!(
+        matches!(&err, EngineError::Unsupported(f) if f == "the scalar function"),
+        "{err}"
+    );
 }
 
 /// `absent` answers nothing while the series is there, whatever shape

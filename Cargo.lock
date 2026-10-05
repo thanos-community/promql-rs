@@ -3112,6 +3112,7 @@ name = "promql-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "criterion",
  "datafusion",
  "futures",
