@@ -153,15 +153,10 @@ fn aggregations_compose_over_range_functions() {
 fn what_is_still_unsupported_is_named() {
     let engine = Engine::blocking().unwrap();
     for (q, what) in [
-        (
-            "absent_over_time(http_requests_total[5m])",
-            "the absent_over_time function",
-        ),
         ("rate(http_requests_total[5m:1m])", "a subquery"),
-        // Instant-vector functions that are not elementwise: `absent`
-        // invents a series and `timestamp` reads the sample's own time,
-        // neither of which the elementwise operator can express.
-        ("absent(http_requests_total)", "the absent function"),
+        // An instant-vector function that is not elementwise: `timestamp`
+        // reads the sample's own time, which the elementwise operator
+        // cannot express.
         ("timestamp(http_requests_total)", "the timestamp function"),
         (
             "quantile_over_time(0.5, http_requests_total[5m])",
