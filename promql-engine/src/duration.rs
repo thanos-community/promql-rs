@@ -26,16 +26,24 @@ pub(crate) struct DurationCtx {
 }
 
 impl DurationCtx {
-    /// `step()` is the query's step, even when `start == end`: this engine
-    /// treats equal bounds as a one-step range query (see the store-hints
-    /// test in `plan`), and callers that mean an instant query pass a
-    /// nominal step because `Grid` rejects zero. Upstream's instant
-    /// queries evaluate durations with a zero step, so `[step()]` there is
-    /// "duration must be greater than 0"; here it is the nominal step.
-    /// `range()` is `end - start` either way.
+    /// `step()` is the query's step, and zero when `start == end`.
+    ///
+    /// Upstream's `NewInstantQuery` builds its `durationVisitor` with no
+    /// step, while `NewRangeQuery` passes the interval, so in an instant
+    /// query `[step()]` is "duration must be greater than 0" and
+    /// `offset step()` is no offset. The engine has no instant entry
+    /// point: callers pass equal bounds and a nominal step (`Grid`
+    /// rejects zero), so equal bounds stand for an instant query here and
+    /// the nominal step is never read. `range()` is `end - start` either
+    /// way.
     pub(crate) fn new(query: &RangeQuery) -> Self {
+        let step_ms = if query.start_ms == query.end_ms {
+            0
+        } else {
+            query.step_ms
+        };
         Self {
-            step_secs: query.step_ms as f64 / 1000.0,
+            step_secs: step_ms as f64 / 1000.0,
             range_secs: (query.end_ms - query.start_ms) as f64 / 1000.0,
         }
     }
@@ -212,9 +220,16 @@ mod tests {
     }
 
     #[test]
-    fn an_instant_query_has_no_range() {
-        let instant = RangeQuery::new(50_000, 50_000, 1);
+    fn an_instant_query_has_no_step_and_no_range() {
+        // The nominal step an instant query carries must not leak into
+        // `step()`.
+        let instant = RangeQuery::new(50_000, 50_000, 1_000);
+        assert_eq!(offset_ms("step()", &instant), Ok(0));
         assert_eq!(offset_ms("range()", &instant), Ok(0));
+        assert_eq!(
+            range_ms("step()", &instant),
+            Err("2:8: duration must be greater than 0".into())
+        );
         assert_eq!(
             range_ms("range()", &instant),
             Err("2:9: duration must be greater than 0".into())
