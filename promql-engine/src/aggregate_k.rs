@@ -210,23 +210,37 @@ impl<'a> Incoming<'a> {
 /// Upstream's `HashRatioSampler.SampleOffset`: the label set's `Hash()` as
 /// a fraction of `MaxUint64`.
 ///
-/// `Labels.Hash` is xxhash64 over each label as `name 0xFF value 0xFF`, in
-/// name order, which is how a `labels.Labels` built without the
-/// `stringlabels` tag hashes; that build's hash covers its own encoding
-/// instead and gives another offset. A label whose value is empty is not
-/// in the set, as everywhere else in the engine.
+/// `Labels.Hash` is the `stringlabels` one (`model/labels/
+/// labels_stringlabels.go` at 83962c35): xxhash64, seed 0, of the label
+/// set's own encoding, `ls.data`. That file is built under
+/// `!slicelabels && !dedupelabels`, so an untagged build, which is what
+/// Prometheus ships and the corpus is run against, uses it, and the
+/// `name 0xFF value 0xFF` hash of `labels_slicelabels.go` (tag
+/// `slicelabels`) would sample other series. Per label, in name order,
+/// the encoding is the name's length, the name, the value's length and
+/// the value, a length being one byte below 255 and otherwise `0xFF` and
+/// the length as three bytes, little-endian (`encodeSize`). A label whose
+/// value is empty is not in the set, as everywhere else in the engine.
 fn sample_offset(labels: &StructArray, row: usize) -> Result<f64> {
-    const SEP: u8 = 0xFF;
+    fn size(n: usize, out: &mut Vec<u8>) {
+        if n < 255 {
+            out.push(n as u8);
+        } else {
+            // `sizeWhenEncoded` panics past 1<<24; a label that long is
+            // not one a store holds.
+            out.extend_from_slice(&[0xFF, n as u8, (n >> 8) as u8, (n >> 16) as u8]);
+        }
+    }
     let mut bytes = Vec::new();
     for (field, column) in labels.fields().iter().zip(labels.columns()) {
         let value = read_string(column, row)?;
         if value.is_empty() {
             continue;
         }
+        size(field.name().len(), &mut bytes);
         bytes.extend_from_slice(field.name().as_bytes());
-        bytes.push(SEP);
+        size(value.len(), &mut bytes);
         bytes.extend_from_slice(value.as_bytes());
-        bytes.push(SEP);
     }
     let hash = twox_hash::XxHash64::oneshot(0, &bytes);
     Ok(hash as f64 / u64::MAX as f64)
@@ -911,7 +925,7 @@ mod tests {
     }
 
     /// `Labels.Hash` of no labels is `xxhash.Sum64(nil)`, XXH64 of the
-    /// empty string at seed 0.
+    /// empty string at seed 0, in either build.
     #[test]
     fn the_sampling_offset_is_the_xxhash64_of_the_label_set() {
         let empty = StructArray::new_empty_fields(1, None);
@@ -929,6 +943,61 @@ mod tests {
             sample_offset(&blank, 0).unwrap(),
             sample_offset(&empty, 0).unwrap()
         );
+    }
+
+    /// The label set as `stringlabels` stores it, and its XXH64, worked
+    /// outside this crate from `encodeSize` and `marshalLabelToSizedBuffer`
+    /// with an independent XXH64 (checked against the reference vectors
+    /// for "", "a" and "abc").
+    #[test]
+    fn the_sampling_offset_hashes_the_stringlabels_encoding() {
+        let two = StructArray::new(
+            Fields::from(vec![
+                Field::new("job", series::label_type(), false),
+                Field::new("pod", series::label_type(), false),
+            ]),
+            vec![
+                Arc::new(StringViewArray::from_iter_values(["api"])),
+                Arc::new(StringViewArray::from_iter_values(["a"])),
+            ],
+            None,
+        );
+        // 03 'job' 03 'api' 03 'pod' 01 'a'
+        let bytes = b"\x03job\x03api\x03pod\x01a";
+        assert_eq!(
+            twox_hash::XxHash64::oneshot(0, bytes),
+            0x37C9_2B91_FDAC_ADAE
+        );
+        assert_eq!(
+            sample_offset(&two, 0).unwrap(),
+            0x37C9_2B91_FDAC_ADAE_u64 as f64 / u64::MAX as f64
+        );
+    }
+
+    /// A length of 255 or more is `0xFF` and three little-endian bytes,
+    /// so 254 is the last one-byte length.
+    #[test]
+    fn a_long_label_value_is_sized_with_four_bytes() {
+        let offset = |len: usize, hash: u64| {
+            let big = StructArray::new(
+                Fields::from(vec![Field::new("big", series::label_type(), false)]),
+                vec![Arc::new(StringViewArray::from_iter_values([
+                    "x".repeat(len)
+                ]))],
+                None,
+            );
+            assert_eq!(
+                sample_offset(&big, 0).unwrap(),
+                hash as f64 / u64::MAX as f64,
+                "{len}"
+            );
+        };
+        // 03 'big' FE 'x'*254
+        offset(254, 0xA1AC_FBEF_D2F8_71F3);
+        // 03 'big' FF FF 00 00 'x'*255
+        offset(255, 0xA600_F638_ABCD_B0F5);
+        // 03 'big' FF 2C 01 00 'x'*300
+        offset(300, 0xEE47_A4DE_FE81_1E01);
     }
 
     #[test]
