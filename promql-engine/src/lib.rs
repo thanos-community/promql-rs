@@ -33,6 +33,7 @@ pub mod absent;
 pub mod aggregate; // benches/kernels.rs
 pub mod binary; // benches/kernels.rs
 mod buffer;
+pub(crate) mod duration;
 pub mod elementwise; // benches/kernels.rs
 pub(crate) mod engine;
 pub(crate) mod error;

@@ -32,8 +32,7 @@ start_symbol = "start"
 emit_roots = ["start", "step_invariant_expr"]
 
 # Upstream rules to skip entirely, plus anything they pull in. We don't
-# port histogram descriptors, duration expressions (experimental) or
-# fill modifiers. Series descriptions ARE ported (float sequences
+# port histogram descriptors. Series descriptions ARE ported (float sequences
 # only); the histogram alts of `series_item` drop out automatically
 # because they reference skipped rules.
 skip_rules = [
@@ -772,6 +771,11 @@ alt = "NUMBER"
 action = "actions::number_value($lexer, $1.map_err(|_| ())?)"
 
 [[actions]]
+rule = "number"
+alt = "DURATION"
+action = "actions::duration_value($lexer, $1.map_err(|_| ())?)"
+
+[[actions]]
 rule = "signed_number"
 alt = "ADD number"
 action = "$2"
@@ -858,21 +862,125 @@ alt = "LEFT_PAREN number_duration_literal RIGHT_PAREN"
 action = "Ok(())"
 
 # --- duration-expression family ---
-# Currently only the DURATION literal form inside matrix brackets is
-# supported. The full duration-arithmetic tree (Prometheus 3.x
-# experimental feature) parses but each non-literal alt returns Err(())
-# at runtime. Filling these in is a follow-up once we decide whether
-# to support `[5m+1m]`-style expressions.
+# Ported from upstream's duration_expr rules. Literals fold at parse
+# time; anything holding step(), range(), min()/max() or an operator
+# between operands becomes an `Expr::Duration` the engine evaluates once
+# it knows the query's step and range (upstream's `durationVisitor`).
 
 [[actions]]
 rule = "positive_duration_expr"
 alt = "duration_expr"
-action = "$1"
+action = "actions::positive_duration_expr($1)"
 
 [[actions]]
 rule = "duration_expr"
 alt = "number_duration_literal"
+action = "actions::duration_expr_literal($1)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "unary_op duration_expr"
+action = "actions::duration_unary($1, $2, $span)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "duration_expr ADD duration_expr"
+action = "actions::duration_binary(ItemType::Add, $1, $3)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "duration_expr SUB duration_expr"
+action = "actions::duration_binary(ItemType::Sub, $1, $3)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "duration_expr MUL duration_expr"
+action = "actions::duration_binary(ItemType::Mul, $1, $3)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "duration_expr DIV duration_expr"
+action = "actions::duration_binary(ItemType::Div, $1, $3)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "duration_expr MOD duration_expr"
+action = "actions::duration_binary(ItemType::Mod, $1, $3)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "duration_expr POW duration_expr"
+action = "actions::duration_binary(ItemType::Pow, $1, $3)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "STEP LEFT_PAREN RIGHT_PAREN"
+action = "actions::duration_call(ItemType::Step, $span)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "RANGE LEFT_PAREN RIGHT_PAREN"
+action = "actions::duration_call(ItemType::Range, $span)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "min_max LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN"
+action = "actions::duration_min_max($1, $3, $5, $span)"
+
+[[actions]]
+rule = "duration_expr"
+alt = "paren_duration_expr"
 action = "$1"
+
+[[actions]]
+rule = "paren_duration_expr"
+alt = "LEFT_PAREN duration_expr RIGHT_PAREN"
+action = "actions::duration_paren($2)"
+
+[[actions]]
+rule = "min_max"
+alt = "MIN"
+action = "Ok(ItemType::Min)"
+
+[[actions]]
+rule = "min_max"
+alt = "MAX"
+action = "Ok(ItemType::Max)"
+
+[[actions]]
+rule = "offset_duration_expr"
+alt = "STEP LEFT_PAREN RIGHT_PAREN"
+action = "actions::duration_call(ItemType::Step, $span)"
+
+[[actions]]
+rule = "offset_duration_expr"
+alt = "RANGE LEFT_PAREN RIGHT_PAREN"
+action = "actions::duration_call(ItemType::Range, $span)"
+
+[[actions]]
+rule = "offset_duration_expr"
+alt = "unary_op STEP LEFT_PAREN RIGHT_PAREN"
+action = "actions::duration_signed_call($1, ItemType::Step, $span, cfgrammar::Span::new($2.map_err(|_| ())?.span().start(), $span.end()))"
+
+[[actions]]
+rule = "offset_duration_expr"
+alt = "unary_op RANGE LEFT_PAREN RIGHT_PAREN"
+action = "actions::duration_signed_call($1, ItemType::Range, $span, cfgrammar::Span::new($2.map_err(|_| ())?.span().start(), $span.end()))"
+
+[[actions]]
+rule = "offset_duration_expr"
+alt = "min_max LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN"
+action = "actions::duration_min_max($1, $3, $5, $span)"
+
+[[actions]]
+rule = "offset_duration_expr"
+alt = "unary_op min_max LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN"
+action = "actions::duration_signed_min_max($1, $2, $4, $6, $span)"
+
+[[actions]]
+rule = "offset_duration_expr"
+alt = "unary_op LEFT_PAREN duration_expr RIGHT_PAREN"
+action = "actions::duration_signed_group($1, $3, $span)"
 
 # Matrix selector now uses positive_duration_expr from upstream.
 [[actions]]
@@ -905,12 +1013,12 @@ action = "$1"
 [[actions]]
 rule = "offset_duration_expr"
 alt = "number_duration_literal"
-action = "$1"
+action = "actions::duration_expr_literal($1)"
 
 [[actions]]
 rule = "offset_duration_expr"
 alt = "unary_op number_duration_literal"
-action = "actions::signed_duration($1, $2)"
+action = "actions::duration_unary($1, $2, $span)"
 
 # Two-argument subquery form: rate(foo[5m])[30m:1m].
 [[actions]]
