@@ -12,8 +12,21 @@
 
 use std::sync::Arc;
 
-use promql_engine::{Engine, EngineError, MemorySeriesSource, RangeQuery};
-use promql_parser::SeriesDescription;
+use promql_engine::{Engine, EngineError, EngineOptions, MemorySeriesSource, RangeQuery};
+use promql_parser::{ParserOptions, SeriesDescription};
+
+/// `fill`, `fill_left` and `fill_right` are experimental syntax: a stock
+/// engine refuses them while parsing, so the tests that evaluate one switch
+/// on the gate that admits it.
+fn engine() -> Engine {
+    Engine::blocking_with_options(EngineOptions {
+        parser: ParserOptions {
+            enable_binop_fill_modifiers: true,
+            ..Default::default()
+        },
+    })
+    .unwrap()
+}
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
     lines
@@ -53,8 +66,7 @@ fn vector_of(
     query: &str,
     range: &RangeQuery,
 ) -> Vec<Row> {
-    let batches = Engine::blocking()
-        .unwrap()
+    let batches = engine()
         .range_query(source, query, range)
         .unwrap_or_else(|e| panic!("{query}: {e}"));
     let mut rows: Vec<Row> = promql_engine::series::decode(&batches)
@@ -165,7 +177,7 @@ fn a_match_group_with_two_series_on_a_side_fails() {
         ]),
         30.0,
     );
-    let engine = Engine::blocking().unwrap();
+    let engine = engine();
     let range = RangeQuery::new(0, 0, 30_000);
 
     let err = engine
@@ -333,7 +345,7 @@ fn a_kept_name_splits_a_match_group_into_a_series_each() {
         ]),
         350.0,
     );
-    let engine = Engine::blocking().unwrap();
+    let engine = engine();
     let range = promql_engine::RangeQuery::new(0, 700_000, 700_000);
 
     let batches = engine
@@ -499,7 +511,7 @@ fn a_fan_out_comparison_keeps_the_metric_name() {
 /// Every way a match can fail, in upstream's words.
 #[test]
 fn the_matching_errors_are_upstreams() {
-    let engine = Engine::blocking().unwrap();
+    let engine = engine();
     let source = zoned();
     // Every one of these is a rejection Prometheus also makes, so it has
     // to reach the caller as `Query` and not as the DataFusion error the
@@ -631,7 +643,7 @@ fn or_fills_in_the_signatures_the_left_side_missed() {
 /// say so itself, in the same words.
 #[test]
 fn a_set_operator_takes_neither_a_group_modifier_nor_a_scalar() {
-    let engine = Engine::blocking().unwrap();
+    let engine = engine();
     let at_0 = RangeQuery::new(0, 0, 30_000);
     let fails = |query: &str| match engine.range_query(&zoned(), query, &at_0).expect_err(query) {
         EngineError::Query(message) => message,
@@ -709,7 +721,7 @@ fn a_fill_value_answers_for_a_side_with_no_series() {
 /// side and it becomes one.
 #[test]
 fn a_group_with_no_left_side_is_empty_until_a_fill_answers_for_it() {
-    let engine = Engine::blocking().unwrap();
+    let engine = engine();
     // Two `limit` series in one `on(pod)` group and no `requests` at
     // all, which is a duplicate on the right waiting to be noticed.
     let source = MemorySeriesSource::from_descriptions(
@@ -737,7 +749,7 @@ fn a_group_with_no_left_side_is_empty_until_a_fill_answers_for_it() {
 /// so while parsing; this engine has to say it itself.
 #[test]
 fn a_fill_needs_two_vectors_and_a_value_operator() {
-    let engine = Engine::blocking().unwrap();
+    let engine = engine();
     let at_0 = RangeQuery::new(0, 0, 30_000);
     let fails = |query: &str| match engine.range_query(&zoned(), query, &at_0).expect_err(query) {
         EngineError::Query(message) => message,
@@ -758,8 +770,7 @@ fn a_fill_needs_two_vectors_and_a_value_operator() {
 /// copied across it; ours has to say so itself.
 #[test]
 fn a_label_cannot_be_matched_on_and_copied_at_once() {
-    let err = Engine::blocking()
-        .unwrap()
+    let err = engine()
         .range_query(
             &zoned(),
             "requests / on(pod) group_left(pod) limit",
@@ -778,8 +789,7 @@ fn a_label_cannot_be_matched_on_and_copied_at_once() {
 #[test]
 fn a_step_varying_scalar_operand_is_unsupported() {
     let range = RangeQuery::new(0, 300_000, 30_000);
-    let err = Engine::blocking()
-        .unwrap()
+    let err = engine()
         .range_query(source().as_ref(), "requests * time()", &range)
         .unwrap_err();
     assert!(
@@ -800,8 +810,7 @@ fn matching_is_per_step_not_per_series() {
     // A 30s step over the three scrapes, with the default lookback
     // carrying each sample forward; only the last step has both.
     let range = RangeQuery::new(0, 60_000, 30_000);
-    let batches = Engine::blocking()
-        .unwrap()
+    let batches = engine()
         .range_query(&source, "requests / errors", &range)
         .expect("the query runs");
     let series = promql_engine::series::decode(&batches).expect("the canonical shape decodes");

@@ -4,7 +4,8 @@
 //! of what these functions do, so each case reads the result back as a
 //! list of series in the order the engine handed them over.
 
-use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series};
+use promql_engine::{Engine, EngineOptions, MemorySeriesSource, RangeQuery, Series};
+use promql_parser::ParserOptions;
 use promql_parser::SeriesDescription;
 
 const INSTANT: RangeQuery = RangeQuery {
@@ -13,6 +14,17 @@ const INSTANT: RangeQuery = RangeQuery {
     step_ms: 30_000,
     lookback_ms: 300_000,
 };
+
+/// `sort_by_label` and `sort_by_label_desc` are experimental functions.
+fn engine() -> Engine {
+    Engine::blocking_with_options(EngineOptions {
+        parser: ParserOptions {
+            enable_experimental_functions: true,
+            ..Default::default()
+        },
+    })
+    .unwrap()
+}
 
 fn load(lines: &[&str]) -> Vec<SeriesDescription> {
     lines
@@ -25,10 +37,7 @@ fn load(lines: &[&str]) -> Vec<SeriesDescription> {
 /// the case cares about plus its one value.
 fn order(lines: &[&str], query: &str, show: &[&str], range: RangeQuery) -> Vec<String> {
     let source = MemorySeriesSource::from_descriptions(&load(lines), 30.0);
-    let batches = Engine::blocking()
-        .unwrap()
-        .range_query(&source, query, &range)
-        .unwrap();
+    let batches = engine().range_query(&source, query, &range).unwrap();
     promql_engine::series::decode(&batches)
         .expect("the result is canonical")
         .iter()
@@ -162,7 +171,7 @@ fn desc_reverses_the_tiebreak_too() {
 #[test]
 fn the_argument_list_is_checked() {
     let source = MemorySeriesSource::from_descriptions(&load(&VALUES), 30.0);
-    let engine = Engine::blocking().unwrap();
+    let engine = engine();
     for query in ["sort(x, x)", r#"sort_by_label(x, 1)"#] {
         let err = engine
             .range_query(&source, query, &INSTANT)

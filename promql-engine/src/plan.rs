@@ -1416,7 +1416,14 @@ mod tests {
     async fn plan_of(query: &str, range: RangeQuery) -> Result<LogicalPlan, EngineError> {
         let ctx = SessionContext::new();
         let source = MemorySeriesSource::default();
-        let expr: Expr = promql_parser::parse_expr(query).expect("query parses");
+        // `limitk` and `limit_ratio` are experimental aggregators, and the
+        // guards below are about planning them, not about whether they parse.
+        let expr: Expr = promql_parser::Parser::new(promql_parser::ParserOptions {
+            enable_experimental_functions: true,
+            ..Default::default()
+        })
+        .parse_expr(query)
+        .expect("query parses");
         plan(&ctx.state(), &source, &expr, &range).await
     }
 

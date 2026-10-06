@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use promql_engine::{Engine, MemorySeriesSource, RangeQuery, Series, SeriesSource};
+use promql_engine::{Engine, EngineOptions, MemorySeriesSource, RangeQuery, Series, SeriesSource};
+use promql_parser::ParserOptions;
 
 #[path = "support/pprof.rs"]
 mod profiler;
@@ -124,7 +125,14 @@ const QUERIES: [(&str, &str); 7] = [
 /// Every query at every shape, over the last hour of data at 30s and as
 /// an instant query at the last sample.
 fn query(c: &mut Criterion) {
-    let engine = Engine::blocking().unwrap();
+    // `sort_by_label` is an experimental function.
+    let engine = Engine::blocking_with_options(EngineOptions {
+        parser: ParserOptions {
+            enable_experimental_functions: true,
+            ..Default::default()
+        },
+    })
+    .unwrap();
     let mut g = c.benchmark_group("engine/query");
     for shape in &SHAPES {
         let source = synthetic(shape);
@@ -192,7 +200,14 @@ fn elementwise(c: &mut Criterion) {
 /// signature, which over this source is one group per series. Ids are
 /// `engine/binary/<shape>/<series>x<samples>`.
 fn binary(c: &mut Criterion) {
-    let engine = Engine::blocking().unwrap();
+    // `fill` is experimental syntax.
+    let engine = Engine::blocking_with_options(EngineOptions {
+        parser: ParserOptions {
+            enable_binop_fill_modifiers: true,
+            ..Default::default()
+        },
+    })
+    .unwrap();
     let shape = &SHAPES[2];
     let source = synthetic(shape);
     let end = shape.end_ms();

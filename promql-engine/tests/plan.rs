@@ -101,8 +101,8 @@ use datafusion::physical_plan::{displayable, ExecutionPlan, InputOrderMode, Part
 use promql_engine::check_selector_plans;
 use promql_engine::series::{encode, label_names_of, Block};
 use promql_engine::{
-    range, selector, Engine, EngineError, MemorySeriesSource, RangeQuery, SelectHints, Series,
-    SeriesSource,
+    range, selector, Engine, EngineError, EngineOptions, MemorySeriesSource, RangeQuery,
+    SelectHints, Series, SeriesSource,
 };
 use promql_parser::ast::LabelMatcher;
 use serde::Deserialize;
@@ -195,7 +195,14 @@ fn plan_of(case: &Case, defaults: Bounds) -> (String, Option<String>) {
 
     // `Engine::new`, not `blocking`: an engine that owns a runtime cannot
     // be dropped from inside one, and the runtime here is this function's.
-    let engine = Engine::new();
+    //
+    // Every gate is open: a pin is about the plan a query gets, and the
+    // corpus spans the experimental surface (fill in `operators`, and
+    // whatever the next topic adds). Whether stock options refuse that
+    // syntax is `tests/feature_flags.rs`'s question.
+    let engine = Engine::with_options(EngineOptions {
+        parser: promql_parser::ParserOptions::all(),
+    });
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
