@@ -124,6 +124,25 @@ mod tests {
         );
     }
 
+    /// `docs/feature-flags.md` is the reviewer's table; a flag renamed
+    /// here and not there fails this.
+    #[test]
+    fn the_doc_lists_every_flag_under_its_names() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/feature-flags.md"
+        ))
+        .expect("docs/feature-flags.md");
+        for f in FEATURE_FLAGS {
+            for name in [f.flag, f.upstream_option, f.option] {
+                assert!(
+                    doc.contains(&format!("`{name}`")),
+                    "{name} is not in the doc"
+                );
+            }
+        }
+    }
+
     #[test]
     fn features_name_the_flag_that_gates_them() {
         assert_eq!(
