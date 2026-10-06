@@ -13,6 +13,7 @@
 //     grmtools token rename table)
 
 %start start
+%parse-param p: &crate::context::ParserCtx
 %left 'LOR'
 %left 'LAND' 'LUNLESS'
 %left 'EQLC' 'GTE' 'GTR' 'LSS' 'LTE' 'NEQ' 'TRIM_UPPER' 'TRIM_LOWER'
@@ -49,9 +50,9 @@ expr -> Result<Expr, ()>:
   ;
 
 aggregate_expr -> Result<Expr, ()>:
-    aggregate_op aggregate_modifier function_call_body { actions::aggregate($lexer, $span, $1?, Some($2?), $3?) }
-  | aggregate_op function_call_body aggregate_modifier { actions::aggregate($lexer, $span, $1?, Some($3?), $2?) }
-  | aggregate_op function_call_body { actions::aggregate($lexer, $span, $1?, None, $2?) }
+    aggregate_op aggregate_modifier function_call_body { actions::aggregate($lexer, p, $span, $1?, Some($2?), $3?) }
+  | aggregate_op function_call_body aggregate_modifier { actions::aggregate($lexer, p, $span, $1?, Some($3?), $2?) }
+  | aggregate_op function_call_body { actions::aggregate($lexer, p, $span, $1?, None, $2?) }
   ;
 
 aggregate_modifier -> Result<(bool, Vec<String>), ()>:
@@ -60,24 +61,24 @@ aggregate_modifier -> Result<(bool, Vec<String>), ()>:
   ;
 
 binary_expr -> Result<Expr, ()>:
-    expr 'ADD' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'ATAN2' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'DIV' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'EQLC' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'GTE' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'GTR' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'TRIM_UPPER' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'TRIM_LOWER' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'LAND' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'LOR' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'LSS' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'LTE' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'LUNLESS' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'MOD' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'MUL' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'NEQ' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'POW' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
-  | expr 'SUB' bin_modifier expr { actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4) }
+    expr 'ADD' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'ATAN2' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'DIV' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'EQLC' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'GTE' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'GTR' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'TRIM_UPPER' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'TRIM_LOWER' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LAND' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LOR' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LSS' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LTE' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'LUNLESS' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'MOD' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'MUL' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'NEQ' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'POW' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
+  | expr 'SUB' bin_modifier expr { actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4) }
   ;
 
 bin_modifier -> Result<Option<actions::BinModifiers>, ()>:
@@ -132,10 +133,10 @@ fill_value -> Result<f64, ()>:
   ;
 
 function_call -> Result<Expr, ()>:
-    'IDENT' function_call_body { actions::function_call($lexer, $span, $1.map_err(|_| ())?, $2?) }
-  | at_modifier_preprocessors function_call_body { Err(()) }
-  | 'STEP' function_call_body { Err(()) }
-  | 'RANGE' function_call_body { Err(()) }
+    'IDENT' function_call_body { actions::function_call($lexer, p, $span, $1.map_err(|_| ())?, $2?) }
+  | at_modifier_preprocessors function_call_body { actions::function_call_at_modifier(p, $span, $1) }
+  | 'STEP' function_call_body { actions::function_call_keyword($lexer, p, $1.map_err(|_| ())?) }
+  | 'RANGE' function_call_body { actions::function_call_keyword($lexer, p, $1.map_err(|_| ())?) }
   ;
 
 function_call_body -> Result<Vec<Expr>, ()>:
@@ -162,11 +163,11 @@ offset_expr -> Result<Expr, ()>:
   ;
 
 anchored_expr -> Result<Expr, ()>:
-    expr 'ANCHORED' { actions::set_anchored($1) }
+    expr 'ANCHORED' { actions::set_anchored(p, $1) }
   ;
 
 smoothed_expr -> Result<Expr, ()>:
-    expr 'SMOOTHED' { actions::set_smoothed($1) }
+    expr 'SMOOTHED' { actions::set_smoothed(p, $1) }
   ;
 
 step_invariant_expr -> Result<Expr, ()>:

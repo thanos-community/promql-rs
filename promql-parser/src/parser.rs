@@ -48,7 +48,9 @@ use lrpar::{LexError, Lexeme, NonStreamingLexer};
 
 use crate::actions::ParseResult;
 use crate::ast::{Expr, LabelMatcher, SeriesDescription};
+use crate::context::ParserCtx;
 use crate::error::{ParseError, ParseErrors};
+use crate::options::ParserOptions;
 use crate::posrange::{Pos, PositionRange};
 
 mod start_tokens {
@@ -183,7 +185,11 @@ fn error_range(e: &lrpar::LexParseError<u32, LexerTypes>) -> PositionRange {
 
 /// Run the grammar over `input` in the given parse mode. Upstream's
 /// `parseGenerated`.
-fn parse_generated(input: &str, mode: ParseMode) -> Result<ParseResult, ParseErrors> {
+fn parse_generated(
+    input: &str,
+    mode: ParseMode,
+    options: ParserOptions,
+) -> Result<ParseResult, ParseErrors> {
     // Declared out here, initialised inside the branches: the boxed
     // lexer borrows from its `LexerDef`, so the def has to outlive it.
     // This is a lifetime constraint, not a lazy initialisation.
@@ -202,13 +208,17 @@ fn parse_generated(input: &str, mode: ParseMode) -> Result<ParseResult, ParseErr
         inject: mode.start_token(),
     };
 
-    let (ast, errs) = crate::grammar::parse(&injecting);
-    if !errs.is_empty() {
-        let mut out = Vec::with_capacity(errs.len());
-        for e in errs {
-            out.push(ParseError::new(format!("{e}"), error_range(&e)));
-        }
-        return Err(ParseErrors::new(out));
+    let ctx = ParserCtx::new(options);
+    let (ast, errs) = crate::grammar::parse(&injecting, &ctx);
+    let syntax_errors: Vec<ParseError> = errs
+        .iter()
+        .map(|e| ParseError::new(format!("{e}"), error_range(e)))
+        .collect();
+    // A gate reports and parsing carries on, so the tree can be whole and
+    // still be rejected. Upstream's `parseGenerated` likewise returns the
+    // accumulated errors in preference to the result.
+    if ctx.has_errors() || !syntax_errors.is_empty() {
+        return Err(ctx.into_errors(syntax_errors));
     }
     // Neither of these carries a span of its own, so they cover the
     // whole input rather than claiming a misleading `0..0`.
@@ -233,60 +243,105 @@ fn unexpected_mode(what: &str, input: &str) -> ParseErrors {
     )])
 }
 
-/// Parse a PromQL expression. Upstream: `parser.ParseExpr`.
-pub fn parse_expr(input: &str) -> Result<Expr, ParseErrors> {
-    match parse_generated(input, ParseMode::Expression)? {
-        ParseResult::Expr(e) => Ok(e),
-        _ => Err(unexpected_mode("an expression", input)),
-    }
+/// A parser configured with [`ParserOptions`]. Upstream `parser.NewParser`
+/// and its `Parser` interface: the options are fixed at construction and
+/// every method parses under them.
+///
+/// The package-level functions below ([`parse_expr`] and the rest) are
+/// upstream's `ParseExpr` and friends, which parse with the zero
+/// `Options`: every experimental gate off, as stock Prometheus has it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Parser {
+    options: ParserOptions,
 }
 
-/// Parse a metric selector, returning its label matchers.
-/// Upstream: `parser.ParseMetricSelector`.
-pub fn parse_metric_selector(input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
-    let expr = match parse_generated(input, ParseMode::MetricSelector)? {
-        ParseResult::Expr(e) => e,
-        _ => return Err(unexpected_mode("a metric selector", input)),
-    };
-    match expr {
-        Expr::VectorSelector(mut vs) => {
-            if !vs.name.is_empty() {
-                vs.label_matchers.push(LabelMatcher {
-                    name: "__name__".to_string(),
-                    op: crate::ast::MatchOp::Equal,
-                    value: std::mem::take(&mut vs.name),
-                    pos_range: vs.pos_range,
-                });
-            }
-            Ok(vs.label_matchers)
+impl Parser {
+    /// Upstream `NewParser`.
+    pub fn new(options: ParserOptions) -> Self {
+        Self { options }
+    }
+
+    pub fn options(&self) -> &ParserOptions {
+        &self.options
+    }
+
+    /// Parse a PromQL expression. Upstream: `Parser.ParseExpr`.
+    pub fn parse_expr(&self, input: &str) -> Result<Expr, ParseErrors> {
+        match parse_generated(input, ParseMode::Expression, self.options)? {
+            ParseResult::Expr(e) => Ok(e),
+            _ => Err(unexpected_mode("an expression", input)),
         }
-        _ => Err(unexpected_mode("a metric selector", input)),
+    }
+
+    /// Parse a metric selector, returning its label matchers.
+    /// Upstream: `Parser.ParseMetricSelector`.
+    pub fn parse_metric_selector(&self, input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
+        let expr = match parse_generated(input, ParseMode::MetricSelector, self.options)? {
+            ParseResult::Expr(e) => e,
+            _ => return Err(unexpected_mode("a metric selector", input)),
+        };
+        match expr {
+            Expr::VectorSelector(mut vs) => {
+                if !vs.name.is_empty() {
+                    vs.label_matchers.push(LabelMatcher {
+                        name: "__name__".to_string(),
+                        op: crate::ast::MatchOp::Equal,
+                        value: std::mem::take(&mut vs.name),
+                        pos_range: vs.pos_range,
+                    });
+                }
+                Ok(vs.label_matchers)
+            }
+            _ => Err(unexpected_mode("a metric selector", input)),
+        }
+    }
+
+    /// Parse a series description — one `metric{...} <values>` line of a
+    /// promqltest load block. Upstream: `Parser.ParseSeriesDesc`.
+    ///
+    /// Value sequences are expanded at parse time, as upstream does: a
+    /// `<value>+<step>x<count>` run yields `count + 1` points, the extra
+    /// one being "time 0, which we ignore in tests".
+    ///
+    /// Native-histogram descriptors (`{{schema:1 …}}`) are not supported
+    /// yet; those alternatives of `series_item` reference rules that are
+    /// still on the sidecar's skip list, so they are rejected as parse
+    /// errors.
+    pub fn parse_series_desc(&self, input: &str) -> Result<SeriesDescription, ParseErrors> {
+        match parse_generated(input, ParseMode::SeriesDescription, self.options)? {
+            ParseResult::SeriesDescription(sd) => Ok(sd),
+            _ => Err(unexpected_mode("a series description", input)),
+        }
+    }
+
+    /// Parse a bare label set (`{foo="bar"}`). Upstream's `START_METRIC`
+    /// mode, used by promtool's unit-test loader. Upstream:
+    /// `Parser.ParseMetric`.
+    pub fn parse_metric(&self, input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
+        match parse_generated(input, ParseMode::Metric, self.options)? {
+            ParseResult::Metric(m) => Ok(m),
+            _ => Err(unexpected_mode("a metric", input)),
+        }
     }
 }
 
-/// Parse a series description — one `metric{...} <values>` line of a
-/// promqltest load block. Upstream: `parser.ParseSeriesDesc`.
-///
-/// Value sequences are expanded at parse time, as upstream does: a
-/// `<value>+<step>x<count>` run yields `count + 1` points, the extra
-/// one being "time 0, which we ignore in tests".
-///
-/// Native-histogram descriptors (`{{schema:1 …}}`) are not supported
-/// yet; those alternatives of `series_item` reference rules that are
-/// still on the sidecar's skip list, so they are rejected as parse
-/// errors.
+/// Parse a PromQL expression with every experimental gate off. Upstream:
+/// `parser.ParseExpr`.
+pub fn parse_expr(input: &str) -> Result<Expr, ParseErrors> {
+    Parser::default().parse_expr(input)
+}
+
+/// Upstream: `parser.ParseMetricSelector`. See [`Parser::parse_metric_selector`].
+pub fn parse_metric_selector(input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
+    Parser::default().parse_metric_selector(input)
+}
+
+/// Upstream: `parser.ParseSeriesDesc`. See [`Parser::parse_series_desc`].
 pub fn parse_series_desc(input: &str) -> Result<SeriesDescription, ParseErrors> {
-    match parse_generated(input, ParseMode::SeriesDescription)? {
-        ParseResult::SeriesDescription(sd) => Ok(sd),
-        _ => Err(unexpected_mode("a series description", input)),
-    }
+    Parser::default().parse_series_desc(input)
 }
 
-/// Parse a bare label set (`{foo="bar"}`). Upstream's `START_METRIC`
-/// mode, used by promtool's unit-test loader.
+/// Upstream's `START_METRIC` mode. See [`Parser::parse_metric`].
 pub fn parse_metric(input: &str) -> Result<Vec<LabelMatcher>, ParseErrors> {
-    match parse_generated(input, ParseMode::Metric)? {
-        ParseResult::Metric(m) => Ok(m),
-        _ => Err(unexpected_mode("a metric", input)),
-    }
+    Parser::default().parse_metric(input)
 }

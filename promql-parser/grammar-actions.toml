@@ -26,6 +26,11 @@ use crate::actions;
 # so `build.rs` sets `allow_missing_terms_in_lexer`.
 start_symbol = "start"
 
+# `%parse-param`: the per-parse state every action receives as `p`.
+# Upstream's actions reach the same state as `yylex.(*parser)`: the
+# `options` the gates read and `addParseErrf`.
+parse_param = "p: &crate::context::ParserCtx"
+
 # Rules the generator traces reachability from. Only rules reachable
 # from any of these are emitted — everything else is dead for us.
 # `start` reaches expr, vector_selector, metric and series_description.
@@ -228,92 +233,92 @@ action = "$1"
 [[actions]]
 rule = "binary_expr"
 alt = "expr ADD bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr SUB bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr MUL bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr DIV bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr MOD bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr POW bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr ATAN2 bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LAND bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LOR bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LUNLESS bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr EQLC bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr NEQ bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LSS bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr LTE bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr GTR bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr GTE bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr TRIM_UPPER bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 [[actions]]
 rule = "binary_expr"
 alt = "expr TRIM_LOWER bin_modifier expr"
-action = "actions::binary($lexer, $2.map_err(|_| ())?, $3, $1, $4)"
+action = "actions::binary($lexer, p, $2.map_err(|_| ())?, $3, $1, $4)"
 
 # --- unary_expr ---
 
@@ -337,17 +342,17 @@ action = "Ok(ItemType::Sub)"
 [[actions]]
 rule = "aggregate_expr"
 alt = "aggregate_op aggregate_modifier function_call_body"
-action = "actions::aggregate($lexer, $span, $1?, Some($2?), $3?)"
+action = "actions::aggregate($lexer, p, $span, $1?, Some($2?), $3?)"
 
 [[actions]]
 rule = "aggregate_expr"
 alt = "aggregate_op function_call_body aggregate_modifier"
-action = "actions::aggregate($lexer, $span, $1?, Some($3?), $2?)"
+action = "actions::aggregate($lexer, p, $span, $1?, Some($3?), $2?)"
 
 [[actions]]
 rule = "aggregate_expr"
 alt = "aggregate_op function_call_body"
-action = "actions::aggregate($lexer, $span, $1?, None, $2?)"
+action = "actions::aggregate($lexer, p, $span, $1?, None, $2?)"
 
 [[actions]]
 rule = "aggregate_modifier"
@@ -560,7 +565,27 @@ action = "Ok(Vec::new())"
 [[actions]]
 rule = "function_call"
 alt = "IDENTIFIER function_call_body"
-action = "actions::function_call($lexer, $span, $1.map_err(|_| ())?, $2?)"
+action = "actions::function_call($lexer, p, $span, $1.map_err(|_| ())?, $2?)"
+
+# The other three arms are not ported (`start()`, `end()`, `step()` and
+# `range()` are experimental duration functions, and the rest of their
+# handling arrives with the duration-expression productions), but the
+# gate is part of each arm upstream, so it runs here and the arm still
+# fails as it did before.
+[[actions]]
+rule = "function_call"
+alt = "at_modifier_preprocessors function_call_body"
+action = "actions::function_call_at_modifier(p, $span, $1)"
+
+[[actions]]
+rule = "function_call"
+alt = "STEP function_call_body"
+action = "actions::function_call_keyword($lexer, p, $1.map_err(|_| ())?)"
+
+[[actions]]
+rule = "function_call"
+alt = "RANGE function_call_body"
+action = "actions::function_call_keyword($lexer, p, $1.map_err(|_| ())?)"
 
 [[actions]]
 rule = "function_call_body"
@@ -713,12 +738,12 @@ action = "actions::subquery($lexer, $span, $1, $3.map_err(|_| ())?, None)"
 [[actions]]
 rule = "anchored_expr"
 alt = "expr ANCHORED"
-action = "actions::set_anchored($1)"
+action = "actions::set_anchored(p, $1)"
 
 [[actions]]
 rule = "smoothed_expr"
 alt = "expr SMOOTHED"
-action = "actions::set_smoothed($1)"
+action = "actions::set_smoothed(p, $1)"
 
 [[actions]]
 rule = "offset_expr"

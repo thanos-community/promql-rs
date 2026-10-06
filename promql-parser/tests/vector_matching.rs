@@ -1,7 +1,17 @@
 //! Tests for vector matching modifiers in binary expressions.
 
 use promql_parser::ast::{BinaryExpr, VectorMatchCardinality};
-use promql_parser::{parse_expr, Expr};
+use promql_parser::{parse_expr, Expr, Parser, ParserOptions};
+
+/// `fill`, `fill_left` and `fill_right` are experimental syntax, off in
+/// [`parse_expr`] as in stock Prometheus.
+fn parse_expr_with_fill(input: &str) -> Result<Expr, promql_parser::ParseErrors> {
+    Parser::new(ParserOptions {
+        enable_binop_fill_modifiers: true,
+        ..Default::default()
+    })
+    .parse_expr(input)
+}
 
 #[test]
 fn bool_modifier() {
@@ -189,7 +199,7 @@ fn no_modifiers_means_no_vector_matching() {
 #[test]
 fn fill_modifier() {
     let input = "a + on(instance) fill(0) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         vector_matching, ..
@@ -208,7 +218,7 @@ fn fill_modifier() {
 #[test]
 fn fill_left_modifier() {
     let input = "a + ignoring(cpu) fill_left(1.5) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         vector_matching, ..
@@ -226,7 +236,7 @@ fn fill_left_modifier() {
 #[test]
 fn fill_right_modifier() {
     let input = "a * on(job) fill_right(100) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         vector_matching, ..
@@ -244,7 +254,7 @@ fn fill_right_modifier() {
 #[test]
 fn fill_left_right_modifier() {
     let input = "a / on(instance) fill_left(0) fill_right(1) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         vector_matching, ..
@@ -262,7 +272,7 @@ fn fill_left_right_modifier() {
 #[test]
 fn fill_right_left_modifier() {
     let input = "a - ignoring(pod) fill_right(5.5) fill_left(2.5) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         vector_matching, ..
@@ -280,7 +290,7 @@ fn fill_right_left_modifier() {
 #[test]
 fn fill_with_negative_value() {
     let input = "a + on(instance) fill(-1) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         vector_matching, ..
@@ -297,7 +307,7 @@ fn fill_with_negative_value() {
 #[test]
 fn fill_with_group_left() {
     let input = "a + on(instance) group_left(pod) fill(0) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         vector_matching, ..
@@ -317,7 +327,7 @@ fn fill_with_group_left() {
 #[test]
 fn complex_fill_chain() {
     let input = "a == bool on(instance, job) group_left(pod) fill_left(-1.5) fill_right(2.5) b";
-    let expr = parse_expr(input).expect("parse failed");
+    let expr = parse_expr_with_fill(input).expect("parse failed");
 
     if let Expr::Binary(BinaryExpr {
         return_bool,

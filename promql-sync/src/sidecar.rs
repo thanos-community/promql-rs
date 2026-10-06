@@ -22,6 +22,9 @@ use serde::Deserialize;
 pub struct Sidecar {
     pub epilogue: String,
     pub start_symbol: String,
+    /// grmtools `%parse-param` (`name: Type`), passed to every action
+    /// under that name. Upstream's `yylex.(*parser)`.
+    pub parse_param: Option<String>,
     pub emit_roots: Vec<String>,
     pub return_types: BTreeMap<String, String>,
     pub actions: Vec<ActionEntry>,
@@ -76,6 +79,7 @@ impl Sidecar {
         Ok(Self {
             epilogue: actions.epilogue.unwrap_or_default(),
             start_symbol: actions.start_symbol.unwrap_or_else(|| "Expr".to_string()),
+            parse_param: actions.parse_param,
             emit_roots: actions.emit_roots.unwrap_or_default(),
             return_types,
             actions: actions_list,
@@ -123,6 +127,7 @@ struct TokensFile {
 struct ActionsFile {
     epilogue: Option<String>,
     start_symbol: Option<String>,
+    parse_param: Option<String>,
     emit_roots: Option<Vec<String>>,
     return_types: Option<BTreeMap<String, String>>,
     #[serde(rename = "actions")]

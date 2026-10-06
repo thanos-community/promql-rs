@@ -93,13 +93,20 @@ fn run() -> Stats {
     let corpus = load_corpus();
     let mut stats = Stats::default();
     let mut seen_inputs: HashSet<String> = HashSet::new();
+    // Upstream's `TestParseExpressions` parses `testExpr` with exactly these
+    // two gates on and the other two off; the corpus is that table.
+    let parser = promql_parser::Parser::new(promql_parser::ParserOptions {
+        enable_experimental_functions: true,
+        experimental_duration_expr: true,
+        ..Default::default()
+    });
     for case in corpus.cases {
         if !seen_inputs.insert(case.input.clone()) {
             // Dedup exact-duplicate cases (upstream has a few).
             continue;
         }
         stats.total += 1;
-        let got = promql_parser::parse_expr(&case.input);
+        let got = parser.parse_expr(&case.input);
         let ours_ok = got.is_ok();
         let expect_ok = !case.fail;
         if ours_ok == expect_ok {
