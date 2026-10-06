@@ -46,15 +46,18 @@ use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, VectorMatchCardinality, VectorSelector,
 };
+use promql_parser::token::ItemType;
 
 use crate::absent;
 use crate::aggregate::{self, Op};
+use crate::aggregate_k;
 use crate::binary;
 use crate::elementwise;
 use crate::error::EngineError;
 use crate::labels;
 use crate::matcher::{effective_matchers, METRIC_NAME};
 use crate::params::{step_count, Params};
+use crate::quantile;
 use crate::range::{self, Func};
 use crate::selector;
 use crate::series::{Block, Series, BLOCK_END, BLOCK_START, LABELS, SAMPLES};
@@ -327,6 +330,15 @@ const BINARY_STAGE: &str = "binary";
 /// `labels::group_exprs` prefixes every key it makes, so nothing it
 /// produces can be spelled this way.
 const PAIRS: &str = "__pairs__";
+
+/// The column a group's chosen series arrive in for `aggregate_k`, named
+/// so that nothing `labels::group_exprs` makes can be spelled the same.
+pub(crate) const CHOSEN: &str = "__chosen__";
+
+/// What `Unnest` calls one field of the opened [`CHOSEN`] struct.
+fn chosen_column(field: &str) -> Column {
+    Column::new_unqualified(format!("{CHOSEN}.{field}"))
+}
 
 /// What `Unnest` calls one field of an opened struct.
 fn pair_column(field: &str) -> Column {
@@ -1108,6 +1120,12 @@ impl Planner<'_> {
     }
 
     async fn aggregate(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
+        if let Some(op) = aggregate_k::Op::from_token(agg.op) {
+            return self.aggregate_k(agg, op).await;
+        }
+        if agg.op == ItemType::Quantile {
+            return self.quantile(agg).await;
+        }
         let op = Op::from_token(agg.op)
             .ok_or_else(|| EngineError::Unsupported(format!("the {} aggregation", agg.op)))?;
         if agg.param.is_some() {
@@ -1116,40 +1134,61 @@ impl Planner<'_> {
                 agg.op
             )));
         }
-        // `without` names what to drop, so it says nothing about which
-        // labels a store may stop reading; only `by` does, and upstream's
-        // `extractGroupsFromPath` hints on that alone.
-        let grouping = (!agg.without).then(|| Grouping {
+        let input = self.aggregate_input(agg, op.as_str(), true).await?;
+        let call = aggregate::call(
+            col(SAMPLES),
+            op,
+            self.query.start_ms,
+            self.query.end_ms,
+            self.query.step_ms,
+        );
+        Self::fold_groups(input, agg, call)
+    }
+
+    /// The vector an aggregation reads, told to the store as under `name`.
+    ///
+    /// `with_grouping` is whether the store may read only the labels
+    /// `by` names. `without` names what to drop, so it says nothing about
+    /// which labels a store may stop reading; only `by` does, and upstream's
+    /// `extractGroupsFromPath` hints on that alone. The aggregations that
+    /// keep the input's labels, `topk` and its family, pass false: their
+    /// output is whole series, and a store that read only the grouping
+    /// would return them without the rest.
+    async fn aggregate_input(
+        &mut self,
+        agg: &AggregateExpr,
+        name: &str,
+        with_grouping: bool,
+    ) -> Result<Planned, EngineError> {
+        let grouping = (with_grouping && !agg.without).then(|| Grouping {
             labels: agg.grouping.clone(),
             by: true,
         });
-        let input = self
-            .expr(
-                &agg.expr,
-                Above {
-                    func: Some(op.as_str()),
-                    grouping: grouping.as_ref(),
-                },
-            )
-            .await?;
+        self.expr(
+            &agg.expr,
+            Above {
+                func: Some(name),
+                grouping: grouping.as_ref(),
+            },
+        )
+        .await
+    }
 
+    /// An aggregation that folds each group of `input` into one series:
+    /// `call` over the samples, grouped by the block and the
+    /// aggregation's labels.
+    fn fold_groups(
+        input: Planned,
+        agg: &AggregateExpr,
+        call: datafusion::logical_expr::Expr,
+    ) -> Result<Planned, EngineError> {
         let keys = labels::group_keys(&input.label_names, &agg.grouping, agg.without);
         // The block leads the key, so each group is one block's partials
         // and leaves when the block does.
         let mut group = vec![col(BLOCK_START), col(BLOCK_END)];
         group.extend(labels::group_exprs(&keys));
         let plan = LogicalPlanBuilder::from(input.plan)
-            .aggregate(
-                group,
-                vec![aggregate::call(
-                    col(SAMPLES),
-                    op,
-                    self.query.start_ms,
-                    self.query.end_ms,
-                    self.query.step_ms,
-                )
-                .alias(SAMPLES)],
-            )?
+            .aggregate(group, vec![call.alias(SAMPLES)])?
             .project(canonical(labels::regroup(&keys).alias(LABELS)))?
             .build()?;
         Ok(Planned {
@@ -1157,6 +1196,166 @@ impl Planner<'_> {
             label_names: keys,
         })
     }
+
+    /// An aggregation's parameter at every step of the grid.
+    ///
+    /// Upstream evaluates it as a scalar expression and reads the value
+    /// at the step, `fParams.Next`, so `topk(time() / 60, x)` takes a
+    /// different `k` as the query walks forward. A parameter that needs a
+    /// vector, `topk(scalar(foo), x)`, is named as the gap it is.
+    fn step_params(&self, param: &Expr) -> Result<Vec<f64>, EngineError> {
+        grid_of(self.query)
+            .steps()
+            .map(|ts| scalar::fold(param, ts))
+            .collect()
+    }
+
+    /// `quantile(q, v)`: upstream's `QUANTILE` arm of `aggregation`.
+    ///
+    /// The parameter is checked for nothing here. An out-of-range or NaN
+    /// `q` is an annotation upstream and the answer is `quantile`'s: `+Inf`,
+    /// `-Inf` or NaN. The engine has no annotation channel yet.
+    async fn quantile(&mut self, agg: &AggregateExpr) -> Result<Planned, EngineError> {
+        let param = agg
+            .param
+            .as_deref()
+            .ok_or_else(|| EngineError::Query("quantile aggregation without a parameter".into()))?;
+        let q = self.step_params(param)?;
+        let input = self.aggregate_input(agg, "quantile", true).await?;
+        let call = quantile::call(
+            col(SAMPLES),
+            &q,
+            self.query.start_ms,
+            self.query.end_ms,
+            self.query.step_ms,
+        );
+        Self::fold_groups(input, agg, call)
+    }
+
+    /// `topk`, `bottomk`, `limitk` and `limit_ratio`: upstream's
+    /// `rangeEvalAgg` for these four and the `aggregationK` it runs.
+    ///
+    /// The result keeps the input's labels, so the aggregate answers with
+    /// the chosen series of each group as a list and the plan unnests it
+    /// back to the canonical rows. An instant `topk` or `bottomk` is then
+    /// sorted as upstream returns it, see [`sort::grouped_by_value`].
+    async fn aggregate_k(
+        &mut self,
+        agg: &AggregateExpr,
+        op: aggregate_k::Op,
+    ) -> Result<Planned, EngineError> {
+        let param = agg.param.as_deref().ok_or_else(|| {
+            EngineError::Query(format!("{} aggregation without a parameter", agg.op))
+        })?;
+        let k = self.step_params(param)?;
+        check_k_params(op, &k)?;
+        let input = self.aggregate_input(agg, op.as_str(), false).await?;
+
+        let keys = labels::group_keys(&input.label_names, &agg.grouping, agg.without);
+        let mut group = vec![col(BLOCK_START), col(BLOCK_END)];
+        group.extend(labels::group_exprs(&keys));
+        let chosen = CHOSEN;
+        let call = aggregate_k::call(
+            col(LABELS),
+            col(SAMPLES),
+            op,
+            &k,
+            self.query.start_ms,
+            self.query.end_ms,
+            self.query.step_ms,
+        );
+        let builder = LogicalPlanBuilder::from(input.plan)
+            .aggregate(group, vec![call.alias(chosen)])?
+            // Twice, as `vector_vector` does and for its reason: the
+            // first makes a row of each chosen series, the second opens
+            // its struct into columns, where a `get_field` could be
+            // pushed under the first unnest.
+            .unnest_column(Column::new_unqualified(chosen))?
+            .unnest_column(Column::new_unqualified(chosen))?
+            .project(vec![
+                datafusion::logical_expr::Expr::Column(chosen_column(LABELS)).alias(LABELS),
+                datafusion::logical_expr::Expr::Column(chosen_column(SAMPLES)).alias(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+            ])?;
+        let mut plan = builder.build()?;
+        if self.query.start_ms == self.query.end_ms
+            && matches!(op, aggregate_k::Op::Topk | aggregate_k::Op::Bottomk)
+        {
+            let (group_labels, _) =
+                labels::keep(&input.label_names, |n| keys.iter().any(|k| k == n));
+            plan = LogicalPlanBuilder::from(plan)
+                .sort(sort::grouped_by_value(
+                    group_labels,
+                    op == aggregate_k::Op::Topk,
+                ))?
+                .build()?;
+        }
+        Ok(Planned {
+            plan,
+            label_names: input.label_names,
+        })
+    }
+}
+
+/// Upstream's checks on the parameter of `topk`, `bottomk`, `limitk` and
+/// `limit_ratio` before the loop of `rangeEvalAgg`, in its order: an
+/// `fParams.Max()` below the minimum that selects anything ends the
+/// evaluation with no result at all and before any error, and only then
+/// are a NaN and, for `k`, a value `int64` cannot hold refused. The first
+/// is not a check here, since a `k` of zero selects nothing at any step.
+fn check_k_params(op: aggregate_k::Op, params: &[f64]) -> Result<(), EngineError> {
+    // `math.Max` and `math.Min` over the steps, which a NaN poisons.
+    let has_nan = params.iter().any(|p| p.is_nan());
+    let max = params.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = params.iter().copied().fold(f64::INFINITY, f64::min);
+    match op {
+        aggregate_k::Op::Topk | aggregate_k::Op::Bottomk | aggregate_k::Op::Limitk => {
+            if !has_nan && max < 1.0 {
+                return Ok(());
+            }
+            if has_nan {
+                return Err(EngineError::Query("Parameter value is NaN".into()));
+            }
+            // `float64(math.MinInt64)` and `float64(math.MaxInt64)`, both
+            // a power of two.
+            const BOUND: f64 = 9_223_372_036_854_775_808.0;
+            if min <= -BOUND {
+                return Err(EngineError::Query(format!(
+                    "Scalar value {} underflows int64",
+                    go_float(min)
+                )));
+            }
+            if max >= BOUND {
+                return Err(EngineError::Query(format!(
+                    "Scalar value {} overflows int64",
+                    go_float(max)
+                )));
+            }
+        }
+        aggregate_k::Op::LimitRatio => {
+            if has_nan {
+                return Err(EngineError::Query("Ratio value is NaN".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A float as Go's `%v` prints it, for the values a message above quotes:
+/// at least `2^63` in magnitude, so always in its exponent form.
+fn go_float(v: f64) -> String {
+    if v.is_infinite() {
+        return if v > 0.0 { "+Inf" } else { "-Inf" }.into();
+    }
+    let rust = format!("{v:e}");
+    let (mantissa, exp) = rust.split_once('e').expect("`{:e}` always has an exponent");
+    let exp: i32 = exp.parse().expect("an integer exponent");
+    format!(
+        "{mantissa}e{}{:02}",
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    )
 }
 
 /// The group key of a selector or range aggregate: one group per label
@@ -1403,11 +1602,60 @@ mod tests {
         assert_eq!(hints[0].func.as_deref(), Some("count"));
         assert_eq!(hints[0].grouping, None);
 
+        // `topk` keeps whole series, so a store told to read only the
+        // grouping labels would hand them back without the rest.
+        let hints = hints_of("topk by (pod)(1, x)", range).await;
+        assert_eq!(hints[0].func.as_deref(), Some("topk"));
+        assert_eq!(hints[0].grouping, None);
+        // `quantile` folds like `sum`, and hears its grouping like it.
+        let hints = hints_of("quantile by (pod)(0.5, x)", range).await;
+        assert_eq!(hints[0].func.as_deref(), Some("quantile"));
+        assert!(hints[0].grouping.is_some());
+
         // Equal bounds are a one-step range query, not an instant one:
         // the step is still the grid the caller asked for.
         let one_step = RangeQuery::new(600_000, 600_000, 30_000);
         let hints = hints_of("x", one_step).await;
         assert_eq!(hints[0].step_ms, Some(30_000));
+    }
+
+    /// What upstream's `rangeEvalAgg` refuses before it evaluates, in its
+    /// order, and what it spells `%v`.
+    #[test]
+    fn the_k_parameter_checks_are_upstreams_in_upstreams_order() {
+        use aggregate_k::Op;
+        let msg = |op, p: &[f64]| check_k_params(op, p).unwrap_err().to_string();
+        assert_eq!(msg(Op::Topk, &[f64::NAN]), "Parameter value is NaN");
+        // A NaN anywhere in the range poisons `Max()`.
+        assert_eq!(msg(Op::Limitk, &[1.0, f64::NAN]), "Parameter value is NaN");
+        assert_eq!(msg(Op::LimitRatio, &[0.5, f64::NAN]), "Ratio value is NaN");
+        assert_eq!(
+            msg(Op::Bottomk, &[1.0, 1e19]),
+            "Scalar value 1e+19 overflows int64"
+        );
+        assert_eq!(
+            msg(Op::Topk, &[-1.5e19, 1.0]),
+            "Scalar value -1.5e+19 underflows int64"
+        );
+        assert_eq!(
+            msg(Op::Topk, &[f64::INFINITY]),
+            "Scalar value +Inf overflows int64"
+        );
+        // Nothing reaches one, so the bounds are never read: upstream
+        // returns before it looks.
+        assert!(check_k_params(Op::Topk, &[-1e30, 0.5]).is_ok());
+        assert!(check_k_params(Op::Topk, &[f64::NEG_INFINITY]).is_ok());
+        // A ratio has no range to refuse, only the NaN.
+        assert!(check_k_params(Op::LimitRatio, &[-5.0, 7.0]).is_ok());
+        assert!(check_k_params(Op::Topk, &[1.0, 9e18]).is_ok());
+    }
+
+    #[test]
+    fn go_prints_a_float_in_exponent_form_with_a_signed_two_digit_exponent() {
+        assert_eq!(go_float(1e19), "1e+19");
+        assert_eq!(go_float(-9.3e18), "-9.3e+18");
+        assert_eq!(go_float(1.5e100), "1.5e+100");
+        assert_eq!(go_float(f64::NEG_INFINITY), "-Inf");
     }
 
     /// Plan `query` against an empty store: every guard here runs before
@@ -1528,19 +1776,13 @@ mod tests {
             let query = format!("{op} by (pod) (up)");
             assert!(plan_of(&query, range).await.is_ok(), "{query}");
         }
-        for op in [
-            "topk",
-            "bottomk",
-            "quantile",
-            "count_values",
-            "limitk",
-            "limit_ratio",
-        ] {
+        for op in ["topk", "bottomk", "quantile", "limitk", "limit_ratio"] {
             let query = format!("{op}(1, up)");
-            let err = plan_of(&query, range).await.unwrap_err();
-            assert!(matches!(err, EngineError::Unsupported(_)), "{query}: {err}");
-            assert!(err.to_string().contains(op), "{query}: {err}");
+            assert!(plan_of(&query, range).await.is_ok(), "{query}");
         }
+        let err = plan_of("count_values(\"v\", up)", range).await.unwrap_err();
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("count_values"), "{err}");
     }
 
     /// Upstream's parser refuses `1 > 1` because it cannot mean the

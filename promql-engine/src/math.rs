@@ -305,6 +305,48 @@ pub fn max_of(values: &[f64]) -> Option<f64> {
         .map(|(first, _)| values.iter().copied().fold(*first, max_nan_loses))
 }
 
+/// Upstream's `vectorByValueHeap.Less` as a total order: a NaN sorts
+/// before every number. Go's own `Less` also answers true for two NaNs,
+/// which only decides how equal NaNs fall in an unstable sort and is not
+/// an order a Rust sort may be handed.
+pub fn nan_first(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.partial_cmp(&b).expect("neither is NaN"),
+    }
+}
+
+/// The `q` quantile of `values`, upstream's `quantile` (`promql/quantile.go`
+/// at 83962c35), shared by the `quantile` aggregation and, once it lands,
+/// `quantile_over_time`.
+///
+/// `values` is sorted in place, NaNs first as upstream's heap orders them,
+/// so a NaN sample is the low end of the rank rather than poisoning every
+/// answer. Empty input and a NaN `q` are NaN; `q` below 0 is `-Inf` and
+/// above 1 is `+Inf`. Between two ranks the answer is their weighted
+/// average, written as `lower*(1-w) + upper*w`: the algebraically equal
+/// `lower + (upper-lower)*w` differs in the last bit.
+pub fn quantile(q: f64, values: &mut [f64]) -> f64 {
+    if values.is_empty() || q.is_nan() {
+        return f64::NAN;
+    }
+    if q < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if q > 1.0 {
+        return f64::INFINITY;
+    }
+    values.sort_unstable_by(|a, b| nan_first(*a, *b));
+    let n = values.len() as f64;
+    let rank = q * (n - 1.0);
+    let lower = rank.floor().max(0.0);
+    let upper = (lower + 1.0).min(n - 1.0);
+    let weight = rank - rank.floor();
+    values[lower as usize] * (1.0 - weight) + values[upper as usize] * weight
+}
+
 // ── Elementwise: a slice of values into a slice of accumulators ──────
 //
 // Each takes the accumulator's lanes as parallel slices rather than a
@@ -535,6 +577,26 @@ mod tests {
                 assert_eq!(max_of(values), None);
             }
         }
+    }
+
+    /// The corpus's `data` series for `quantile(0.8, …)` and the edges
+    /// upstream's doc comment promises.
+    #[test]
+    fn quantile_interpolates_ranks_and_clamps_q() {
+        let q = |q: f64, values: &[f64]| quantile(q, &mut values.to_vec());
+        assert_eq!(q(0.8, &[0.0, 1.0]), 0.8);
+        assert_eq!(q(0.8, &[0.0, 1.0, 2.0]), 1.6);
+        assert_eq!(q(0.5, &[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(q(0.0, &[3.0, 1.0, 2.0]), 1.0);
+        assert_eq!(q(1.0, &[3.0, 1.0, 2.0]), 3.0);
+        assert_eq!(q(-0.1, &[1.0]), f64::NEG_INFINITY);
+        assert_eq!(q(1.1, &[1.0]), f64::INFINITY);
+        assert!(q(f64::NAN, &[1.0]).is_nan());
+        assert!(q(0.5, &[]).is_nan());
+        // A NaN is the bottom rank, not a poison: the median of
+        // {NaN, 1, 2} is 1, and q = 0 is the NaN itself.
+        assert_eq!(q(0.5, &[2.0, f64::NAN, 1.0]), 1.0);
+        assert!(q(0.0, &[2.0, f64::NAN, 1.0]).is_nan());
     }
 
     #[test]

@@ -117,7 +117,10 @@ fn matchers_reach_the_source() {
 fn anything_but_a_selector_is_unsupported_by_name() {
     let engine = Engine::blocking().unwrap();
     for (query, what) in [
-        ("topk(2, http_requests_total)", "the topk aggregation"),
+        (
+            "count_values(\"v\", http_requests_total)",
+            "the count_values aggregation",
+        ),
         ("http_requests_total[5m]", "a range selector"),
     ] {
         let err = engine

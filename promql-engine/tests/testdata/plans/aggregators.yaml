@@ -187,3 +187,63 @@ tests:
           Projection: labels{job, pod}
             Aggregate: rate(samples[5m], 600000..1200000 step 30s) per series per block
               TableScan: http_requests_total
+
+  - name: topk selects series, so its labels survive
+    description: >
+      topk keeps the input's series rather than folding them, so the
+      aggregate answers with the chosen series of each group as a list
+      and the plan unnests it back to rows. The k parameter is folded to a
+      value per step while planning.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      topk by (job) (3, http_requests_total)
+    plan: |
+      Projection: __chosen__.labels, __chosen__.samples
+        Unnest: lists[] structs[__chosen__]
+          Unnest: lists[__chosen__|depth=1] structs[]
+            Aggregate: topk by (job) (samples, k=3, 600000..1200000 step 30s) per block
+              Projection: labels, samples, block_start, block_end
+                Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+                  TableScan: http_requests_total
+
+  - name: quantile folds like sum with a parameter
+    description: >
+      quantile is one value per group and step, so it plans as sum does,
+      with q folded to a value per step.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      quantile by (job) (0.9, http_requests_total)
+    plan: |
+      Projection: labels{job: __group__job}
+        Aggregate: quantile by (job) (samples, q=0.9, 600000..1200000 step 30s) per block
+          Projection: labels, samples, block_start, block_end
+            Aggregate: vector_selector(samples, 600000..1200000 step 30s, lookback 5m) per series per block
+              TableScan: http_requests_total
+
+  - name: an instant topk is sorted the way upstream returns it
+    description: >
+      Equal bounds make the query instant, whose topk answer is the heap
+      sorted: by group, then by value with NaN last. A range query has no
+      such order, and the sort is absent from the topk case above.
+    range:
+      start_ms: 1200000
+      end_ms: 1200000
+      step_ms: 30000
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      topk by (job) (3, http_requests_total)
+    plan: |
+      Sort: promql_labels_key(promql_labels(Utf8("job"), get_field(labels, Utf8("job")))) ASC NULLS LAST, isnan(get_field(array_element(samples, Int64(-1)), Utf8("value"))) ASC NULLS LAST, array_element(samples, Int64(-1)).value DESC NULLS LAST
+        Projection: __chosen__.labels, __chosen__.samples
+          Unnest: lists[] structs[__chosen__]
+            Unnest: lists[__chosen__|depth=1] structs[]
+              Aggregate: topk by (job) (samples, k=3, 1200000..1200000 step 30s) per block
+                Projection: labels, samples, block_start, block_end
+                  Aggregate: vector_selector(samples, 1200000..1200000 step 30s, lookback 5m) per series per block
+                    TableScan: http_requests_total

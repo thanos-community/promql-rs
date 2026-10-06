@@ -21,6 +21,7 @@ promql-parser = { path = "../promql-parser" }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+twox-hash = { workspace = true }
 # Only for the memory bench's heap profiles; the library never uses them.
 jemalloc_pprof = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }

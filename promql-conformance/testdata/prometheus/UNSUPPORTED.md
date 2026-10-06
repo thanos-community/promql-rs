@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **707 of 2098 evals pass** (33.7%), and **492** are blocked on the features below.
+Against the vendored corpus: **735 of 2098 evals pass** (35.0%), and **464** are blocked on the features below.
 
 ## Missing features
 
@@ -21,14 +21,12 @@ Against the vendored corpus: **707 of 2098 evals pass** (33.7%), and **492** are
 | 41 | the info function |
 | 21 | the label_replace function |
 | 20 | a unary operator |
-| 19 | the topk aggregation |
 | 16 | the histogram_quantiles function |
 | 13 | a scalar literal |
 | 9 | the predict_linear function |
 | 9 | the quantile_over_time function |
-| 7 | the bottomk aggregation |
 | 7 | the label_join function |
-| 6 | the quantile aggregation |
+| 6 | the scalar function |
 | 5 | a string literal |
 | 4 | the deriv function |
 | 4 | the stddev_over_time function |
@@ -45,8 +43,6 @@ Against the vendored corpus: **707 of 2098 evals pass** (33.7%), and **492** are
 | 1 | the histogram_avg function |
 | 1 | the histogram_stddev function |
 | 1 | the histogram_stdvar function |
-| 1 | the limit_ratio aggregation |
-| 1 | the limitk aggregation |
 | 1 | the rate function over a parenthesized expression |
 | 1 | the ts_of_max_over_time function |
 | 1 | the ts_of_min_over_time function |
@@ -60,11 +56,11 @@ Against the vendored corpus: **707 of 2098 evals pass** (33.7%), and **492** are
 | trig_functions | 19 | 19 (100%) | fully green |
 | staleness | 17 | 17 (100%) | fully green |
 | collision | 2 | 2 (100%) | fully green |
+| aggregators | 160 | 119 (74%) |  |
 | range_queries | 18 | 13 (72%) |  |
 | type_and_unit | 58 | 39 (67%) |  |
 | operators | 213 | 131 (62%) |  |
-| aggregators | 160 | 93 (58%) |  |
-| name_label_dropping | 30 | 16 (53%) |  |
+| name_label_dropping | 30 | 18 (60%) |  |
 | functions | 413 | 204 (49%) |  |
 | at_modifier | 71 | 33 (46%) |  |
 | extended_vectors | 118 | 38 (32%) |  |

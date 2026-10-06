@@ -31,6 +31,7 @@
 
 pub mod absent;
 pub mod aggregate; // benches/kernels.rs
+pub mod aggregate_k; // benches/kernels.rs
 pub mod binary; // benches/kernels.rs
 mod buffer;
 pub mod elementwise; // benches/kernels.rs
@@ -45,6 +46,7 @@ pub mod math; // benches/kernels.rs
 pub(crate) mod memory;
 pub(crate) mod params;
 pub(crate) mod plan;
+pub mod quantile; // benches/kernels.rs
 pub mod range; // benches/kernels.rs
 pub(crate) mod scalar;
 pub mod selector; // benches/kernels.rs

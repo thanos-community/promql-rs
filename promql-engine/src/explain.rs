@@ -53,7 +53,7 @@ use promql_parser::ast::LabelMatcher;
 
 use crate::matcher::METRIC_NAME;
 use crate::source::{SelectHints, SelectorTable};
-use crate::{absent, aggregate, labels, range, selector, series};
+use crate::{absent, aggregate, aggregate_k, labels, quantile, range, selector, series};
 
 /// Renders `plan` the way `tests/testdata/plans/` pins it. See the module doc
 /// comment for what "readable" means and why it is safe to pin.
@@ -402,6 +402,8 @@ fn render_aggregate_call<A: Arg>(name: &str, args: &[A], single_scan: bool) -> O
         selector::NAME => render_vector_selector(args, single_scan),
         range::NAME => render_range_function(args, single_scan),
         aggregate::NAME => render_aggregate_op(args, single_scan),
+        quantile::NAME => render_quantile_op(args, single_scan),
+        aggregate_k::NAME => render_aggregate_k_op(args, single_scan),
         absent::NAME => render_absent_call(args, single_scan),
         _ => None,
     }
@@ -731,6 +733,44 @@ fn render_aggregate_op<A: Arg>(args: &[A], single_scan: bool) -> Option<String> 
     ))
 }
 
+/// `promql_quantile(samples, q, start, end, step)` as
+/// `quantile(samples, q=Q, START..END step STEP)`.
+fn render_quantile_op<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
+    if args.len() != 5 {
+        return None;
+    }
+    let samples = args[0].render(single_scan);
+    let q = render_params(&args[1])?;
+    let start = require_i64(&args[2])?;
+    let end = require_i64(&args[3])?;
+    let step = require_i64(&args[4])?;
+    Some(format!(
+        "quantile({samples}, q={q}, {start}..{end} step {})",
+        Duration::from_millis(step).ok()?
+    ))
+}
+
+/// `promql_aggregate_k(labels, samples, '<op>', k, start, end, step)` as
+/// `<op>(labels, samples, k=K, START..END step STEP)`, `ratio=` for
+/// `limit_ratio`.
+fn render_aggregate_k_op<A: Arg>(args: &[A], single_scan: bool) -> Option<String> {
+    if args.len() != 7 {
+        return None;
+    }
+    let labels = args[0].render(single_scan);
+    let samples = args[1].render(single_scan);
+    let op = utf8_literal(&args[2])?;
+    let name = if op == "limit_ratio" { "ratio" } else { "k" };
+    let k = render_params(&args[3])?;
+    let start = require_i64(&args[4])?;
+    let end = require_i64(&args[5])?;
+    let step = require_i64(&args[6])?;
+    Some(format!(
+        "{op}({labels}, {samples}, {name}={k}, {start}..{end} step {})",
+        Duration::from_millis(step).ok()?
+    ))
+}
+
 /// An `Aggregate` node whose shape is exactly what `plan.rs` builds for a
 /// selector, a range function or a PromQL aggregation over a block-and-
 /// label-set grouping: one aggregate expression aliased `samples`, group
@@ -763,12 +803,19 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
     let Expr::Alias(alias) = &agg.aggr_expr[0] else {
         return None;
     };
-    if alias.name != series::SAMPLES {
-        return None;
-    }
     let Expr::AggregateFunction(f) = alias.expr.as_ref() else {
         return None;
     };
+    // `topk` and its family answer in the column `plan.rs` unnests, every
+    // other aggregate in `samples`.
+    let alias_is = if f.func.name() == aggregate_k::NAME {
+        crate::plan::CHOSEN
+    } else {
+        series::SAMPLES
+    };
+    if alias.name != alias_is {
+        return None;
+    }
     let p = &f.params;
     if p.distinct || p.filter.is_some() || !p.order_by.is_empty() || p.null_treatment.is_some() {
         return None;
@@ -805,16 +852,45 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
             };
             Some(format!("Aggregate: {call} per series per block"))
         }
-        aggregate::NAME => {
+        aggregate::NAME | quantile::NAME | aggregate_k::NAME => {
             let args = &p.args;
-            if args.len() != 5 {
-                return None;
-            }
-            let samples = render_expr(&args[0], single_scan);
-            let op = utf8_literal(&args[1])?;
-            let start = require_i64(&args[2])?;
-            let end = require_i64(&args[3])?;
-            let step = require_i64(&args[4])?;
+            // What each call carries before the step grid, and where the
+            // grid starts.
+            let (op, shown, grid) = match f.func.name() {
+                aggregate::NAME if args.len() == 5 => (
+                    utf8_literal(&args[1])?.to_string(),
+                    render_expr(&args[0], single_scan),
+                    2,
+                ),
+                quantile::NAME if args.len() == 5 => (
+                    "quantile".to_string(),
+                    format!(
+                        "{}, q={}",
+                        render_expr(&args[0], single_scan),
+                        render_params(&args[1])?
+                    ),
+                    2,
+                ),
+                aggregate_k::NAME if args.len() == 7 => {
+                    labels_column_text(&args[0], single_scan)?;
+                    let op = utf8_literal(&args[2])?;
+                    let name = if op == "limit_ratio" { "ratio" } else { "k" };
+                    (
+                        op.to_string(),
+                        format!(
+                            "{}, {name}={}",
+                            render_expr(&args[1], single_scan),
+                            render_params(&args[3])?
+                        ),
+                        4,
+                    )
+                }
+                _ => return None,
+            };
+            let start = require_i64(&args[grid])?;
+            let end = require_i64(&args[grid + 1])?;
+            let step = require_i64(&args[grid + 2])?;
+            let samples = shown;
 
             let mut keys = Vec::with_capacity(rest.len());
             for e in rest {
@@ -845,6 +921,27 @@ fn render_aggregate_node(agg: &Aggregate, single_scan: bool) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// A per-step parameter literal ([`crate::aggregate::params_literal`]): the
+/// one number when every step has it, the list when they differ.
+fn render_params<A: Arg>(e: &A) -> Option<String> {
+    let ScalarValue::List(list) = e.literal()? else {
+        return None;
+    };
+    let values = list.value(0);
+    use datafusion::arrow::array::AsArray;
+    let values = values.as_primitive_opt::<datafusion::arrow::datatypes::Float64Type>()?;
+    let first = *values.values().first()?;
+    if values
+        .values()
+        .iter()
+        .all(|v| v.to_bits() == first.to_bits())
+    {
+        return Some(format!("{first}"));
+    }
+    let each: Vec<String> = values.values().iter().map(|v| format!("{v}")).collect();
+    Some(format!("[{}]", each.join(", ")))
 }
 
 /// A literal, non-`NULL` `Int64` — every timestamp/duration argument in

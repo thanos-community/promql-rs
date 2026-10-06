@@ -47,8 +47,10 @@ use crate::series;
 pub const NAME: &str = "promql_aggregate";
 
 /// The aggregation operators this function implements. PromQL's others
-/// (`topk`, `quantile`, `count_values`, …) produce per-series or
-/// per-value output and get their own treatment later.
+/// produce per-series or per-value output, or need every value of a step
+/// at once, and have their own functions: `topk` and its family in
+/// [`crate::aggregate_k`], `quantile` in [`crate::quantile`].
+/// `count_values` has none yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Sum,
@@ -169,7 +171,7 @@ impl Grid {
         self.start_ms + index as i64 * self.step_ms
     }
 
-    fn index(&self, ts: i64) -> Result<usize> {
+    pub(crate) fn index(&self, ts: i64) -> Result<usize> {
         // Reachable from SQL with any timestamp, so a sample far enough
         // below the grid start to wrap `i64` is off the grid, not a panic.
         let off_grid = || {
@@ -1147,6 +1149,80 @@ pub fn call(samples: Expr, op: Op, start_ms: i64, end_ms: i64, step_ms: i64) -> 
         lit(end_ms),
         lit(step_ms),
     ])
+}
+
+/// The type of an aggregation parameter that moves with the step: one
+/// `f64` per grid position, as a list literal argument.
+///
+/// `topk(time() / 60, x)` is a different `k` at every step, and a
+/// `promql_*` call takes only literals, so the planner folds the
+/// parameter per step ([`crate::scalar::fold`]) and passes the column of
+/// values whole. A constant parameter is the same value repeated, which
+/// keeps one shape for both.
+pub(crate) fn params_type() -> DataType {
+    DataType::List(Arc::new(Field::new_list_field(DataType::Float64, true)))
+}
+
+/// [`params_type`] as a literal.
+pub(crate) fn params_literal(values: &[f64]) -> Expr {
+    let scalars: Vec<ScalarValue> = values
+        .iter()
+        .map(|v| ScalarValue::Float64(Some(*v)))
+        .collect();
+    lit(ScalarValue::List(ScalarValue::new_list_nullable(
+        &scalars,
+        &DataType::Float64,
+    )))
+}
+
+/// The literal argument at `i` of a planned call, if it is one.
+pub(crate) fn literal_arg<'a>(args: &'a AccumulatorArgs, i: usize) -> Option<&'a ScalarValue> {
+    args.exprs
+        .get(i)
+        .and_then(|e| (e.as_ref() as &dyn Any).downcast_ref::<Literal>())
+        .map(Literal::value)
+}
+
+/// The `Int64` literal argument at `i`, named `what` in the complaint.
+pub(crate) fn int_arg(args: &AccumulatorArgs, i: usize, what: &str, name: &str) -> Result<i64> {
+    match literal_arg(args, i) {
+        Some(ScalarValue::Int64(Some(n))) => Ok(*n),
+        _ => Err(DataFusionError::Plan(format!(
+            "{name}: {what} must be an Int64 literal"
+        ))),
+    }
+}
+
+/// The per-step parameter at argument `i`, one value for each of the
+/// grid's positions.
+pub(crate) fn params_arg(
+    args: &AccumulatorArgs,
+    i: usize,
+    grid: &Grid,
+    name: &str,
+) -> Result<Vec<f64>> {
+    let values = match literal_arg(args, i) {
+        Some(ScalarValue::List(list)) if list.len() == 1 => list.value(0),
+        _ => {
+            return Err(DataFusionError::Plan(format!(
+                "{name}: the parameter must be a list literal of Float64"
+            )))
+        }
+    };
+    let values = values
+        .as_primitive_opt::<Float64Type>()
+        .filter(|v| v.null_count() == 0)
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("{name}: the parameter must hold Float64 values"))
+        })?;
+    if values.len() != grid.len() {
+        return Err(DataFusionError::Plan(format!(
+            "{name}: the parameter has {} values for a grid of {} steps",
+            values.len(),
+            grid.len()
+        )));
+    }
+    Ok(values.values().to_vec())
 }
 
 /// The operator and the step grid, read back off the planned call.
