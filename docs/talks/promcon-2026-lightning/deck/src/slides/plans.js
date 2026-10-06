@@ -50,7 +50,8 @@ const KEEP = {
   mode: (v) => v,
   gby: (v) => `[${aliases(v).join(', ')}]`,
   // Hash([a@0, b@1], 10) -> Hash([a, b]): the key is the point, the fan-out is the machine's.
-  partitioning: (v) => v.replace(/@\d+/g, '').replace(/^(\w+)\((\[[^\]]*\]), \d+\)$/, '$1($2)'),
+  // SeriesSetExec prints the store's Hash([labels]) too; the transcript's key is the shuffle's.
+  partitioning: (v, node) => (node === 'RepartitionExec' ? v.replace(/@\d+/g, '').replace(/^(\w+)\((\[[^\]]*\]), \d+\)$/, '$1($2)') : null),
   preserve_order: (v) => v,
   // Sorted says the per-series aggregate streams; PartiallySorted([0, 1]) points
   // into a schema the abridged view no longer shows.
@@ -62,11 +63,12 @@ function abridgeLine(line) {
   const body = line.slice(ind.length)
   const i = body.indexOf(': ')
   if (i < 0) return line
+  const node = body.slice(0, i)
   const kept = pairs(body.slice(i + 2)).flatMap(([k, v]) => {
-    const r = KEEP[k]?.(v)
+    const r = KEEP[k]?.(v, node)
     return r == null ? [] : [`${k}=${r}`]
   })
-  return ind + body.slice(0, i) + (kept.length ? ': ' + kept.join(', ') : '')
+  return ind + node + (kept.length ? ': ' + kept.join(', ') : '')
 }
 const abridge = (plan) => plan.split('\n').map(abridgeLine).join('\n')
 
@@ -99,7 +101,7 @@ function decorate(body, physical) {
   if (!m) return [body]
   const [, node, rest] = m
   const out = [el('b', /^Aggregate/.test(node) ? 'node agg' : 'node', node)]
-  const key = physical && rest.match(/Hash\((\[[^\]]*\])/)
+  const key = physical && node === 'RepartitionExec' && rest.match(/Hash\((\[[^\]]*\])/)
   if (key) {
     const at = rest.indexOf(key[1], key.index)
     out.push(rest.slice(0, at), el('mark', null, key[1]), rest.slice(at + key[1].length))

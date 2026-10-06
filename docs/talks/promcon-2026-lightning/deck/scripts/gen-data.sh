@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Regenerates src/data/plans.json, scoreboard.json and conformance-history.json
-# from the real planner and the committed conformance roadmap and its history.
+# Regenerates src/data/plans.json, stepthrough.json, scoreboard.json and
+# conformance-history.json from the real planner and engine and the committed
+# conformance roadmap and its history.
 # Run before building the deck.
 set -euo pipefail
 
@@ -22,7 +23,13 @@ PROMQL_TALK_PLANS_OUT="$plans.tmp" cargo test -p promql-engine --test talk_plans
 test -s "$plans.tmp" || { echo "talk_plans wrote nothing to $plans.tmp" >&2; exit 1; }
 mv "$plans.tmp" "$plans"
 
+steps="$data/stepthrough.json"
+rm -f "$steps.tmp"
+PROMQL_TALK_STEPTHROUGH_OUT="$steps.tmp" cargo test -p promql-engine --test talk_stepthrough
+test -s "$steps.tmp" || { echo "talk_stepthrough wrote nothing to $steps.tmp" >&2; exit 1; }
+mv "$steps.tmp" "$steps"
+
 python3 "$root/docs/talks/promcon-2026-lightning/deck/scripts/scoreboard.py"
 python3 "$root/docs/talks/promcon-2026-lightning/deck/scripts/conformance-history.py"
 
-echo "wrote $plans, $data/scoreboard.json and $data/conformance-history.json"
+echo "wrote $plans, $steps, $data/scoreboard.json and $data/conformance-history.json"

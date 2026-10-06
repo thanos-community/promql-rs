@@ -38,8 +38,12 @@ def tables(text):
 
 def short_name(feature):
     """The roadmap's row text as a slide label: `the histogram_quantile
-    function` is `histogram_quantile`, `a subquery` is `subqueries`."""
+    function` is `histogram_quantile`, `a subquery` is `subqueries`, `the
+    anchored and smoothed modifiers` loses its article."""
     m = re.fullmatch(r"the (\S+) (?:function|aggregation)", feature)
+    if m:
+        return m.group(1)
+    m = re.fullmatch(r"the (.+)", feature)
     if m:
         return m.group(1)
     m = re.fullmatch(r"an? (.+)", feature)

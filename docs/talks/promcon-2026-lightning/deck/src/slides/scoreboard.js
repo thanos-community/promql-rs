@@ -31,10 +31,11 @@ section.querySelector('.blockers').replaceChildren(...score.top_blockers.map((b)
 // in the room. The x axis is ordinal: commits came in bursts, and a time axis
 // would stack a day's blessings onto one spot.
 const W = 968, H = 720
-const plot = { left: 110, right: W - 40, top: 30, bottom: H - 64 }
+const plot = { left: 110, right: W - 40, top: 30, bottom: H - 110 }
 const inset = 34 // keeps the first and last point off the axis ends
 const maxTotal = Math.max(...history.map((p) => p.total))
-const x = (i) => plot.left + inset + (i * (plot.right - plot.left - 2 * inset)) / Math.max(history.length - 1, 1)
+const slot = (plot.right - plot.left - 2 * inset) / Math.max(history.length - 1, 1)
+const x = (i) => plot.left + inset + i * slot
 const y = (v) => plot.bottom - (v / maxTotal) * (plot.bottom - plot.top)
 
 const NS = 'http://www.w3.org/2000/svg'
@@ -49,10 +50,17 @@ function svg(tag, attrs = {}, ...kids) {
 const yTicks = []
 for (let v = 0; v <= maxTotal * 0.9; v += 500) yTicks.push(v)
 
-// UTC both ways: the dates are calendar days, and a local zone west of UTC
-// would print the day before.
-const day = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
-const dateTicks = history.flatMap((p, i) => (i && history[i - 1].date === p.date ? [] : [i]))
+// One slot per commit, labelled with the PR it merged, else its sha; no dates,
+// since a day of many merges would bunch them. A label wider than its slot
+// alternates between two rows, and wider than two slots only every nth slot
+// and the last carry one. Widths are estimated at 0.55em a character, because
+// the fonts may not have loaded when this runs.
+const tag = (p) => (p.pr ? `#${p.pr}` : p.sha)
+const labelW = Math.max(...history.map((p) => tag(p).length)) * 0.55 * 24 + 12
+const rows = labelW > slot ? 2 : 1
+const every = Math.ceil(labelW / (slot * rows))
+const lastI = history.length - 1
+const labelled = history.map((_, i) => i).filter((i) => i === lastI || (i % every === 0 && lastI - i >= every))
 
 // Stepped at the midpoint between two commits whose totals differ, so an
 // upstream corpus bump shows where it landed; a constant total is one flat line.
@@ -77,9 +85,9 @@ chart.replaceChildren(
     svg('text', { class: 'tick', x: plot.left - 18, y: y(v), 'text-anchor': 'end', 'dominant-baseline': 'middle' }, num.format(v)))),
   svg('path', { class: 'total', d: totalPath }),
   svg('text', { class: 'total-label', x: plot.left + 8, y: y(maxTotal) + 40 }, `${num.format(maxTotal)} evals in the corpus`),
-  ...dateTicks.map((i) => svg('g', {},
-    svg('line', { class: 'axis', x1: x(i), x2: x(i), y1: plot.bottom, y2: plot.bottom + 12 }),
-    svg('text', { class: 'tick', x: x(i), y: plot.bottom + 48, 'text-anchor': 'middle' }, day.format(new Date(history[i].date))))),
+  ...history.map((_, i) => svg('line', { class: 'axis', x1: x(i), x2: x(i), y1: plot.bottom, y2: plot.bottom + 10 })),
+  ...labelled.map((i, k) => svg('text', { class: 'tick commit', x: x(i), y: plot.bottom + 36 + (k % rows) * 26, 'text-anchor': 'middle' }, tag(history[i]))),
+  svg('text', { class: 'axis-title', x: (plot.left + plot.right) / 2, y: plot.bottom + 48 + 26 * rows, 'text-anchor': 'middle' }, 'commits'),
   svg('g', { class: 'drawn', 'clip-path': 'url(#score-draw)' },
     svg('polyline', { class: 'passing', points: history.map((p, i) => `${x(i)},${y(p.passing)}`).join(' ') }),
     ...history.map((p, i) => svg('circle', { class: 'pt', cx: x(i), cy: y(p.passing), r: p === last ? 13 : 9 },

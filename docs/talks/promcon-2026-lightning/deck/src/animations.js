@@ -1,5 +1,6 @@
 import gsap from 'gsap'
 import { planReset, planStep } from './slides/plans.js'
+import { stepthroughReset, stepthroughStep } from './slides/stepthrough.js'
 
 // Steps are TALK.md's [click n] cues: the controller counts a slide's
 // [data-step] elements and calls step() once per click. A slide with
@@ -195,6 +196,12 @@ const hooks = {
       tl.fromTo(rect, { attr: { width: 0 } }, { attr: { width: rect.ownerSVGElement.viewBox.baseVal.width }, duration: 1.6, ease: 'power1.inOut' }, 0.3)
         .fromTo(label, { autoAlpha: 0, y: 16 }, { autoAlpha: 1, y: 0, duration: 0.4, ease: 'power2.out' }, '>-0.15')
     },
+  },
+  // ---- slide 6. stepthrough.js holds every state and the choreography of
+  // each click; a click back tweens straight to the state before it.
+  stepthrough: {
+    reset: () => stepthroughReset(),
+    step: (section, i, forward, tl) => stepthroughStep(i, forward, tl),
   },
   plans: {
     reset: () => planReset(),

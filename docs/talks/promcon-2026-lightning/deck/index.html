@@ -35,7 +35,7 @@
         <h2>Origin</h2>
         <ul>
           <li class="pt" data-step>Started at Polar Signals</li>
-          <li class="pt" data-step>Great Lakes, a columnar observability store</li>
+          <li class="pt" data-step>Great Lakes, a columnar observability store written in Rust</li>
           <li class="pt" data-step>Dash0 acquired Polar Signals; we need a PromQL engine on Great Lakes at Dash0</li>
           <li class="pt" data-step>Parser grammar generated from the Prometheus yacc grammar, not hand-rolled</li>
           <li class="pt" data-step>Talked to the community and got in contact with people from Cloudflare, Reddit, Shopify and Roku for a first meeting</li>
@@ -49,24 +49,17 @@
       </div>
       <div class="group">
         <h2>Why</h2>
-        <!-- Two steps, the problem and then the answer, so the Why half takes two
-             clicks instead of five. -->
         <ul>
-          <li class="pt many" data-step><ul>
-            <li>Great Lakes is a column store: Vortex in object storage</li>
-            <li>The Go engine decodes every sample into a point struct</li>
-          </ul></li>
-          <li class="pt many" data-step><ul>
-            <li>An engine that speaks Arrow reads the store's format directly</li>
-            <li>DataFusion brings the planner, parallelism and memory accounting</li>
-            <li>Goal: Rust and performance</li>
-          </ul></li>
+          <li class="pt" data-step>Great Lakes is a column store: Vortex in object storage, Arrow in memory</li>
+          <li class="pt" data-step>The Go engine decodes every sample into a point struct</li>
+          <li class="pt" data-step>An engine that speaks Arrow reads the store's format directly</li>
+          <li class="pt" data-step>DataFusion brings the planner, parallelism and memory accounting</li>
         </ul>
       </div>
     </div>
-    <aside class="notes">[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar observability store. [click 3] Dash0 acquired Polar Signals, and we need a PromQL engine on Great Lakes. [click 4] The parser isn't hand-rolled. Its grammar is generated from the Prometheus yacc grammar, so it parses what Prometheus parses, and a tool flags the rules it misses. [click 5] We talked to the community, and had first meetings with people from Cloudflare, Reddit, Shopify and Roku.
+    <aside class="notes">[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar observability store in Rust. [click 3] Dash0 acquired Polar Signals, and we need a PromQL engine on Great Lakes. [click 4] The parser isn't hand-rolled. Its grammar is generated from the Prometheus yacc grammar, so it parses what Prometheus parses, and a tool flags the rules it misses. [click 5] We talked to the community, and had first meetings with people from Cloudflare, Reddit, Shopify and Roku.
 
-[click 6] Great Lakes stores Vortex in object storage. The Go engine still decodes every sample into a point struct. [click 7] An engine that speaks Arrow reads the store's format directly. It borrows DataFusion's planner, parallelism and memory accounting. Rust and performance were the goal.</aside>
+[click 6] Great Lakes stores Vortex in object storage, Arrow in memory. [click 7] The Go engine still decodes every sample into a point struct. [click 8] An engine that speaks Arrow reads the store's format directly. [click 9] It borrows DataFusion's planner, parallelism and memory accounting.</aside>
   </section>
 
   <section data-title="Two architectures" class="arch-slide" data-anim="seam">
@@ -189,7 +182,8 @@ On the right is promql-rs. Same grammar. A planner turns the AST into a DataFusi
 [click 1] The seam is one trait, SeriesSource. Implement it, like a Go interface, and your store runs PromQL. I have a Thanos Store API client doing that against a real Thanos today.</aside>
   </section>
 
-  <section data-title="A series is an Arrow row" class="row-slide">
+  <section data-title="Blocks in Arrow" class="row-slide">
+    <h2>Blocks in Arrow</h2>
     <pre class="schema">labels       Struct&lt;__name__: Utf8View, ...&gt;
 samples      List&lt;Struct&lt;timestamp: Timestamp(Millisecond), value: Float64&gt;&gt;
 block_start  Timestamp(Millisecond)
@@ -212,6 +206,7 @@ block_end    Timestamp(Millisecond)</pre>
     <!-- [click 1] to [click 4] of TALK.md. The controller counts these as steps;
          animations.js maps step n to the explorer's state n. -->
     <span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span>
+    <h2>PromQL as DataFusion plans</h2>
     <div class="explorer" data-demo>
       <div class="query" aria-live="polite"><span class="prompt">&gt;</span><code class="q"></code></div>
       <div class="controls">
@@ -239,20 +234,25 @@ block_end    Timestamp(Millisecond)</pre>
 [click 4] And the physical plan. DataFusion's optimizer made this split, not my planner. A Partial in each store partition, a repartition on the block columns and job that keeps block order, and a FinalPartitioned.</aside>
   </section>
 
-  <section data-title="Block-edge step-through" class="edge-slide">
-    <h2>Watch one query cross a block edge</h2>
-    <p class="edge-q"><code>sum(rate(x[5m]))</code></p>
-    <!-- Placeholder: the port of the step-through is deferred (TALK.md, slide 6 notes). -->
-    <p class="placeholder"><span>The step-through from <code>docs/engine-blocks.html</code> goes here.</span></p>
-    <aside class="notes">[before press 1] Now at runtime. sum of rate over two series. The fold is on top, the Arrow buffers below.
+  <section data-title="Row by row, block by block" class="st-slide" data-anim="stepthrough">
+    <!-- [click 1] to [click 5] of TALK.md. slides/stepthrough.js draws the SVG
+         from docs/engine-blocks.html's fixture and the engine's numbers, and
+         owns every state of the slide. -->
+    <span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span><span class="cue" data-step></span>
+    <h2>Row by row, block by block</h2>
+    <p class="st-q"><code>sum(rate(x[5m]))</code><span>step 30 s · one store partition</span></p>
+    <svg class="st-svg" role="img" aria-label="sum(rate(x[5m])) over two RecordBatches of Arrow rows in two blocks: rate folds one row at a time through one window buffer, and sum's Partial holds one slot per step of the open block and emits a block through the repartition and the Final"></svg>
+    <aside class="notes">[before click 1] Now that plan runs over the four rows you saw. rate holds one window buffer, sum one partial per step of the open block.
 
-[press 1] Series b reaches 450 seconds, block one's last step. sum holds two partials, one per step of this block.
+[click 1] rate copies row one's samples into the buffer and answers 420 and 450, block one's only steps.
 
-[press 2] Block edge. Series a arrives with block_start 480, so sum emits block one's two steps and the engine drops b's window buffer. Nothing per series crosses.
+[click 2] Row two has other labels, so a is done. Its answer leaves as one Arrow row, up into sum, and its buffer goes.
 
-[press 3] Series a starts from an empty buffer. The inspector follows the offsets to cells 17 to 23 of the timestamp and value arrays. They're copied into the window buffer, so a series can continue into the next batch.
+[click 3] Row three is a again, in block two. It starts from an empty buffer; the grey samples only feed windows. The value drops from 16 to 3, a reset.
 
-[press 4] The value drops from 16 to 3, a counter reset. rate keeps the 16 for reset_sum. The engine never held a whole series, only the window a step reaches. Memory is bounded by the block.</aside>
+[click 4] Batch D brings its own offsets, from zero. When a's block-two row reaches sum, block one is over: the Partial emits it, through the repartition, to the Final.
+
+[click 5] The engine never held a whole series, only the window a step reaches. Memory is bounded by the block.</aside>
   </section>
 
   <section data-title="Five gates" class="gates-slide" data-anim="gates">
@@ -372,7 +372,7 @@ block_end    Timestamp(Millisecond)</pre>
          blockers from src/data/scoreboard.json (scripts/scoreboard.py). -->
     <div class="score-grid">
       <figure class="history">
-        <figcaption>promqltest evals passing, per commit</figcaption>
+        <figcaption>promqltest evals passing, per merged pull request</figcaption>
         <svg class="chart" role="img"></svg>
       </figure>
       <div class="side">
@@ -382,8 +382,8 @@ block_end    Timestamp(Millisecond)</pre>
         <p class="ci">A listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.</p>
       </div>
     </div>
-    <p class="source">source: <code data-score="source"></code> at each commit that re-blessed it</p>
-    <aside class="notes">When CI started gating on promqltest, 267 of its 2,098 evals passed; today 559 do. UNSUPPORTED.md, generated from a real run, names what blocks the most: histogram_quantile with 86 evals, subqueries with 57, histogram_fraction with 56. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.</aside>
+    <p class="source">source: <code data-score="source"></code> at each merge on main that changed it</p>
+    <aside class="notes">When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 do. UNSUPPORTED.md, generated from a real run, names what blocks the most: histogram_quantile with 86 evals, the anchored and smoothed modifiers with 80, subqueries with 60. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.</aside>
   </section>
 
   <section data-title="Close" class="close-slide">

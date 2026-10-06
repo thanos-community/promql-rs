@@ -42,14 +42,10 @@ section.title-slide{display:grid;grid-template-rows:auto 104px 72px;align-conten
    Why replaces Origin in place. */
 .origin .groups{display:grid}
 .origin .group{grid-area:1/1}
-.origin h2{color:var(--accent);margin-bottom:28px}
+/* Slides 4, 5 and 6 take this headline too, on the same spot: the base
+   padding puts it there, so none of them may pad its section differently. */
+.origin h2,.row-slide > h2,.plans-slide > h2,.st-slide > h2{color:var(--accent);margin-bottom:28px}
 .origin .pt{--big:1;font-size:calc(36px + var(--big) * 24px);line-height:1.25;margin:0 0 calc(10px + var(--big) * 10px);color:color-mix(in srgb,var(--text) calc(var(--big) * 100%),var(--text-dim))}
-/* A step with several points: the markers move to the inner items and hang
-   where the single points' markers do. */
-.origin .many{list-style:none}
-.origin .many > ul{padding-left:0;list-style-type:disc}
-.origin .many li{margin:0 0 calc(10px + var(--big) * 10px)}
-.origin .many li:last-child{margin-bottom:0}
 .origin .avatars{margin-top:32px}
 .origin .avatars > div{display:flex;gap:40px;align-items:flex-start}
 /* The second row: a heading on its own line, then smaller circles in the main
@@ -104,10 +100,12 @@ section.arch-slide{padding:56px 80px 0}
 .seam .seam-line{font-size:40px;font-weight:700;color:var(--accent);margin-bottom:14px}
 .seam li{font-size:36px;margin-bottom:.3em;text-wrap:balance}
 
-/* ---- 4, a series is an Arrow row */
-.row-slide{justify-content:center;gap:72px}
+/* ---- 4, blocks in Arrow. The auto margins centre the schema and the rows in
+   the height under the headline. */
+.row-slide{gap:72px}
+.row-slide > h2{margin-bottom:auto}
 .schema{margin:0;font-size:34px;line-height:1.45;padding:28px 40px;background:var(--code-bg);border:2px solid var(--border);border-radius:12px}
-.rows{border-collapse:collapse;font-family:var(--font-mono);font-size:34px}
+.rows{margin-bottom:auto;border-collapse:collapse;font-family:var(--font-mono);font-size:34px}
 .rows th{font-size:28px;font-weight:700;text-align:left;color:var(--text-dim);padding:0 48px 14px 24px;border-bottom:2px solid var(--border-strong)}
 .rows td{padding:16px 48px 16px 24px;border-bottom:1px solid var(--border)}
 .rows .hot td{background:var(--accent-bg-strong);font-weight:700;border-top:3px solid var(--pm-orange);border-bottom:3px solid var(--pm-orange)}
@@ -117,7 +115,6 @@ section.arch-slide{padding:56px 80px 0}
 
 /* ---- 5, plan explorer. The pane keeps white-space normal so the '\n' text
    nodes between lines collapse; each line wraps itself with a hanging indent. */
-section.plans-slide{padding:72px 80px}
 .cue{display:none}
 .explorer{flex:1;min-height:0;display:flex;flex-direction:column;gap:28px}
 .query{display:flex;align-items:center;gap:24px;font-family:var(--font-mono);font-size:44px;min-height:1.5em;padding:16px 32px;border:2px solid var(--border-strong);border-radius:12px;background:var(--surface)}
@@ -139,10 +136,7 @@ section.plans-slide{padding:72px 80px}
 .pane .ln.hot{background:var(--accent-bg-strong)}
 .pane mark{background:var(--pm-orange-2);color:inherit;border-radius:4px}
 
-/* ---- 6, block-edge placeholder */
-.edge-slide .edge-q{font-size:56px;margin-bottom:48px}
-.edge-slide .edge-q code{font-size:1em;color:var(--accent)}
-.edge-slide .placeholder{flex:1;display:flex;align-items:center;justify-content:center;border:3px dashed var(--border-strong);border-radius:16px;color:var(--text-dim)}
+/* ---- 6, row by row: src/slides/stepthrough.css */
 
 /* ---- 7, five gates. The ring's SVG is 1:1 with the stage; the panels share
    one grid cell so the column does not move as the gates come in. */
@@ -191,6 +185,8 @@ section.gates-slide{flex-direction:row;align-items:center;gap:40px;padding:100px
 .chart{display:block;overflow:visible}
 .chart text{font-family:var(--font-sans)}
 .chart .tick{font-size:28px;fill:var(--text-faint)}
+.chart .commit{font-size:24px}
+.chart .axis-title{font-size:28px;fill:var(--text-dim)}
 .chart .grid{stroke:var(--surface-2);stroke-width:2}
 .chart .axis{stroke:var(--border-strong);stroke-width:2}
 .chart .total{fill:none;stroke:var(--text-faint);stroke-width:3;stroke-dasharray:14 10}
@@ -207,7 +203,8 @@ section.gates-slide{flex-direction:row;align-items:center;gap:40px;padding:100px
 .score-slide h3 code{font-size:.85em}
 .blockers{margin:0;padding-left:1.4em}
 .blockers li{margin:0 0 .25em}
-.blockers .name{display:inline-block;width:370px}
+/* First-line baseline, so a name that wraps keeps its list number and count on its first line. */
+.blockers .name{display:inline-block;width:370px;baseline-source:first}
 .blockers code.name{font-size:.9em;background:none;border:0;padding:0}
 .blockers .count{color:var(--text-dim)}
 .score-slide .ci{margin:0}

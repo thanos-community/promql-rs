@@ -1,0 +1,50 @@
+/* ---- 6, row by row. The drawing is 1:1 with the stage, so a font-size here
+   is stage px. It reaches past the base padding on both sides and into the
+   bottom one: batch C's 28 timestamp cells need a 58px pitch to hold three
+   digits at 28px, and the headline keeps the base padding on top, as slides 4
+   and 5 do. */
+.st-q{position:absolute;top:112px;right:140px;display:flex;align-items:baseline;gap:24px}
+.st-q code{font-size:40px;color:var(--accent);background:none;border:0;padding:0}
+.st-q span{font-size:28px;color:var(--text-dim)}
+.st-svg{flex:none;width:1820px;height:850px;margin:0 -90px;overflow:visible}
+.st-svg text{font-size:28px;fill:var(--text);font-variant-numeric:tabular-nums}
+.st-svg .mono{font-family:var(--font-mono)}
+/* Three digits at 28px leave a 54px cell almost no margin. */
+.st-svg .num{letter-spacing:-1px}
+.st-svg .dim{fill:var(--text-dim)}
+.st-svg .b{font-weight:700}
+.st-svg .h{font-size:30px;font-weight:700}
+.st-svg .ta{fill:var(--ca)}
+.st-svg .tb{fill:var(--cb)}
+.st-svg .k1{fill:var(--accent)}
+.st-svg .k2{fill:var(--cc)}
+.st-svg .val{font-weight:700;fill:var(--accent)}
+.st-svg .rel{font-weight:700;fill:var(--accent)}
+.st-svg .tbad{fill:var(--bad)}
+.st-svg .cap .l1{font-size:32px;font-weight:700}
+.st-svg .cap text{font-size:32px}
+
+.st-svg rect{stroke-width:2}
+.st-svg .ca{fill:color-mix(in srgb,var(--ca) 10%,var(--bg));stroke:var(--ca)}
+.st-svg .cb{fill:color-mix(in srgb,var(--cb) 10%,var(--bg));stroke:var(--cb)}
+.st-svg .rb{fill:var(--surface-2);stroke:var(--text-faint);stroke-dasharray:6 4}
+.st-svg .off,.st-svg .chip{fill:var(--surface);stroke:var(--border-strong)}
+.st-svg .tick{stroke:var(--text-faint);stroke-width:2}
+.st-svg .op{fill:var(--code-bg);stroke:var(--border-strong)}
+.st-svg .fa{fill:color-mix(in srgb,var(--ca) 25%,var(--bg));stroke:var(--ca);stroke-width:3}
+.st-svg .fb{fill:color-mix(in srgb,var(--cb) 25%,var(--bg));stroke:var(--cb);stroke-width:3}
+.st-svg .hi rect,.st-svg .win{fill:none;stroke:var(--pm-orange);stroke-width:4}
+.st-svg .bad{fill:none;stroke:var(--bad);stroke-width:4}
+.st-svg .flash{fill:var(--accent-bg-strong);stroke:var(--pm-orange);stroke-width:3}
+.st-svg .ghost rect{fill:none;stroke:var(--border-strong);stroke-width:3;stroke-dasharray:12 8}
+.st-svg .rbline{fill:none;stroke:var(--text-faint);stroke-width:3}
+.st-svg .flow path{fill:none;stroke:var(--text-faint);stroke-width:3}
+.st-svg .flow .head{fill:var(--text-faint);stroke:none}
+.st-svg .brk path{fill:none;stroke:var(--border-strong);stroke-width:2}
+.st-svg .brk text{fill:var(--text-dim)}
+.st-svg .brk.hot path{stroke-width:4}
+.st-svg .brk.hot text{font-weight:700}
+.st-svg .brk.hot.k1 path{stroke:var(--accent)}
+.st-svg .brk.hot.k1 text{fill:var(--accent)}
+.st-svg .brk.hot.k2 path{stroke:var(--cc)}
+.st-svg .brk.hot.k2 text{fill:var(--cc)}

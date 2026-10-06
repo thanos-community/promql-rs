@@ -46,34 +46,30 @@ I have five minutes and one sentence for you. A series is an Arrow row, and the 
 
 ### On screen
 
-Seven steps. The current step is large; the steps before it in the same group shrink into a compact list above it. Steps 1 to 5 bring one point each under the heading "Origin"; at step 6 the heading "Why" replaces the Origin list. Steps 6 and 7 bring several points at once.
+Nine steps, one point each. The current point is large; the points before it in the same group shrink into a compact list above it. Steps 1 to 5 bring the points under the heading "Origin"; at step 6 the heading "Why" replaces the Origin list, and steps 6 to 9 bring the Why points the same way.
 
 - 2.1 Started at Polar Signals
-- 2.2 Great Lakes, a columnar observability store
+- 2.2 Great Lakes, a columnar observability store written in Rust
 - 2.3 Dash0 acquired Polar Signals; we need a PromQL engine on Great Lakes at Dash0
 - 2.4 Parser grammar generated from the Prometheus yacc grammar, not hand-rolled
 - 2.5 Talked to the community and got in contact with people from Cloudflare, Reddit, Shopify and Roku for a first meeting. Two rows of circular avatars appear, each with the GitHub login beneath and no company labels anywhere. The main row is the first community meeting (`deck/src/data/meeting.json`): Ben Kochie, Filip Petkovski, Frederic Branczyk, Matthias Loibl, Mengnan, Michael Hoffmann, Neven Miculinic, Thor Hansen and Wiard van Rij. Mengnan has no verified GitHub login and is left off the row. Beneath it, a smaller row titled "contributing since" shows the repo contributors who were not in the meeting (`deck/src/data/contributors.json`).
-- 2.6 Two points:
-  - Great Lakes is a column store: Vortex in object storage
-  - The Go engine decodes every sample into a point struct
-- 2.7 Three points:
-  - An engine that speaks Arrow reads the store's format directly
-  - DataFusion brings the planner, parallelism and memory accounting
-  - Goal: Rust and performance
+- 2.6 Great Lakes is a column store: Vortex in object storage, Arrow in memory
+- 2.7 The Go engine decodes every sample into a point struct
+- 2.8 An engine that speaks Arrow reads the store's format directly
+- 2.9 DataFusion brings the planner, parallelism and memory accounting
 
-### Say (114 words)
+### Say (113 words)
 
-[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar observability store. [click 3] Dash0 acquired Polar Signals, and we need a PromQL engine on Great Lakes. [click 4] The parser isn't hand-rolled. Its grammar is generated from the Prometheus yacc grammar, so it parses what Prometheus parses, and a tool flags the rules it misses. [click 5] We talked to the community, and had first meetings with people from Cloudflare, Reddit, Shopify and Roku.
+[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar observability store in Rust. [click 3] Dash0 acquired Polar Signals, and we need a PromQL engine on Great Lakes. [click 4] The parser isn't hand-rolled. Its grammar is generated from the Prometheus yacc grammar, so it parses what Prometheus parses, and a tool flags the rules it misses. [click 5] We talked to the community, and had first meetings with people from Cloudflare, Reddit, Shopify and Roku.
 
-[click 6] Great Lakes stores Vortex in object storage. The Go engine still decodes every sample into a point struct. [click 7] An engine that speaks Arrow reads the store's format directly. It borrows DataFusion's planner, parallelism and memory accounting. Rust and performance were the goal.
+[click 6] Great Lakes stores Vortex in object storage, Arrow in memory. [click 7] The Go engine still decodes every sample into a point struct. [click 8] An engine that speaks Arrow reads the store's format directly. [click 9] It borrows DataFusion's planner, parallelism and memory accounting.
 
 ### Notes
 
 - The parser claim stays honest because of the second half of the sentence. README.md says the parser still misses native-histogram descriptors, duration arithmetic, and the anchored and smoothed selectors, and `promql-sync generate-grammar` prints every upstream alternative without a Rust action.
 - The sources do not say what the conversations with Cloudflare, Reddit, Shopify and Roku were about, so the transcript states only that they happened. The speaker may add one clause.
 - No Thanos lineage and no other engine by name, on this slide or any other.
-- Performance appears only as a goal.
-- The Why points come in two steps, the problem and then the answer, so the Why half takes two clicks instead of five.
+- Each Why point is its own press, as each Origin point is; two or three landing at once looked broken next to the Origin half.
 
 ## 3. Two architectures · 1:20, 55 s
 
@@ -98,10 +94,11 @@ On the right is promql-rs. Same grammar. A planner turns the AST into a DataFusi
 - Check the Go names against the pinned Prometheus commit in `promql-conformance/testdata/prometheus/UPSTREAM.md`, not a local checkout's HEAD.
 - The right column's middle boxes reuse the plan shapes of slide 5, so the two slides read as one picture.
 
-## 4. A series is an Arrow row · 2:15, 30 s
+## 4. Blocks in Arrow · 2:15, 30 s
 
 ### On screen
 
+- Headline "Blocks in Arrow", top left, styled and placed as slide 2's "Origin".
 - The schema, copied from `docs/engine-blocks.md` section 1:
 
   ```
@@ -133,7 +130,8 @@ This is the whole data model, four columns. Labels are a struct with one field p
 
 ### On screen
 
-- A query field with three preset buttons, a plan pane below it, and a Logical / Physical toggle that appears with the third query only. Plan text comes from the real planner at build time; the shapes below are the current pins.
+- Headline "PromQL as DataFusion plans", top left, styled and placed as slide 2's "Origin".
+- Below it, a query field with three preset buttons, a plan pane below it, and a Logical / Physical toggle that appears with the third query only. Plan text comes from the real planner at build time; the shapes below are the current pins. The pane takes the height left under the headline, and the longest plan, the abridged physical plan of click 4 with its wrapped scan line, fits without scrolling.
 - Click 1, `http_requests_total`. Shape from `promql-engine/tests/testdata/plans/selectors.yaml`:
 
   ```
@@ -197,33 +195,41 @@ This is the whole data model, four columns. Labels are a struct with one field p
 
 ### On screen
 
-- The step-through from `docs/engine-blocks.html`, section "Watch one query cross a block edge": the fold animation (`#fold-svg`) on top, the Arrow buffer inspector (`#arrow-svg`) below, the frame counter and both captions visible.
-- `sum(rate(x[5m]))` at step 30 s. Blocks every 240 s: block 1 answers 420 s and 450 s, block 2 answers 480 s to 600 s.
-- Play is hidden. Step → is the only control used. ← Step and Restart stay for recovery.
-- Opens on frame 5 / 19, "push 1·b to 420 s".
-- Press 1, frame 6 / 19, "push 1·b to 450 s": block 1's last step is final.
-- Press 2, frame 7 / 19, "block edge": `sum` emits 420 s and 450 s, drops their partials, opens five for block 2.
-- Press 3, frame 8 / 19, "push 2·a to 480 s": the inspector reads cells 17 to 23 of batch C, offsets `[0, 6, 17, 28]`, and copies them into the window buffer. Samples before 480 s are reach-back.
-- Press 4, frame 9 / 19, "push 2·a to 510 s": the value falls from 16 to 3.
+- Headline "Row by row, block by block", top left, styled and placed as slide 2's "Origin". Top right, `sum(rate(x[5m]))` and "step 30 s · one store partition".
+- Below it, one drawing at stage scale. It runs wider than the other slides' text column, so the 28 timestamp cells of batch C fit at 28 px.
+  - Top: RecordBatch C and RecordBatch D as Arrow arrays. `labels.pod`, `block_start` and `block_end` hold one cell per row. `offsets` sit on the boundaries they define, `[0, 6, 17, 28]` in C and `[0, 15]` in D, over the flat `timestamp` and `value` child buffers, 28 cells in C and 15 in D. The rows 1·a, 1·b and 2·a in C and 2·b in D are slide 4's four rows. Until click 4, D is a dashed outline, "not arrived yet". A caption box right of D names what the current click shows.
+  - Bottom left, `rate`, "AggregateExec · SinglePartitioned · Sorted": the seven steps 420 s to 600 s under two brackets, block 1 240–480 and block 2 480–720. Below them, the open series' window buffer as timestamp and value cells, with the reach-back cells before `block_start` grey and dashed, and the output row `rate` builds: labels, the block's step values, `block_start` and `block_end`.
+  - Bottom right, slide 5's operators top to bottom: `sum` Partial with one slot per step of the open block, the repartition on `Hash(block_start, block_end)`, `sum` FinalPartitioned, and seven output cells.
+- 6.0 Nothing read yet. The buffer is empty, the Partial says "no block open", and the output cells are empty.
+- 6.1 Row 1·a. Its slice of C, cells 0 to 5, is outlined, and the cells fly down into the window buffer. An orange window sweeps 420 s and 450 s, each step lights up for `a`, and a's output row fills with 0.015 and 0.018.
+- 6.2 Row 1·b. Its other labels close `a`: a's output row moves into the Partial, which opens block 1's two slots, 0.015 and 0.018. a's buffer goes. Cells 6 to 16 copy in, 150 s to 210 s grey, 420 s and 450 s sweep, and b's output row fills.
+- 6.3 Row 2·a, slide 4's highlighted row. Its `block_start` 480 closes `b`, whose row moves up: the slots read 0.048 and 0.052. Cells 17 to 27 copy into an empty buffer, 300 s to 450 s grey. The sweep runs 480 s to 600 s; at 510 s the value cell 3 turns red and "reset_sum = 16" appears.
+- 6.4 RecordBatch D replaces its outline, offsets `[0, 15]`; C dims and is tagged "released". 2·b closes `a`: a's block-2 row moves into the Partial, which emits block 1. The repartition and the Final light in turn, and the output cells for 420 s and 450 s fill with 0.048 and 0.052. Block 2's five slots open with a's rates, and the buffer is empty.
+- 6.5 Cells 0 to 14 of D copy in, 180 s to 450 s grey, and 480 s to 600 s sweep. At the end of the stream, b's row moves up, the Partial emits block 2 through the repartition and the Final, and the output completes: 0.055, 0.065, 0.069, 0.074, 0.074. The buffer and the slots end empty.
 
-### Say (136 words)
+### Say (140 words)
 
-[before press 1] Now at runtime. sum of rate over two series. The fold is on top, the Arrow buffers below.
+[before click 1] Now that plan runs over the four rows you saw. rate holds one window buffer, sum one partial per step of the open block.
 
-[press 1] Series b reaches 450 seconds, block one's last step. sum holds two partials, one per step of this block.
+[click 1] rate copies row one's samples into the buffer and answers 420 and 450, block one's only steps.
 
-[press 2] Block edge. Series a arrives with block_start 480, so sum emits block one's two steps and the engine drops b's window buffer. Nothing per series crosses.
+[click 2] Row two has other labels, so a is done. Its answer leaves as one Arrow row, up into sum, and its buffer goes.
 
-[press 3] Series a starts from an empty buffer. The inspector follows the offsets to cells 17 to 23 of the timestamp and value arrays. They're copied into the window buffer, so a series can continue into the next batch.
+[click 3] Row three is a again, in block two. It starts from an empty buffer; the grey samples only feed windows. The value drops from 16 to 3, a reset.
 
-[press 4] The value drops from 16 to 3, a counter reset. rate keeps the 16 for reset_sum. The engine never held a whole series, only the window a step reaches. Memory is bounded by the block.
+[click 4] Batch D brings its own offsets, from zero. When a's block-two row reaches sum, block one is over: the Partial emits it, through the repartition, to the Final.
+
+[click 5] The engine never held a whole series, only the window a step reaches. Memory is bounded by the block.
 
 ### Notes
 
-- Status: the step-through port is deferred; the first deck build ships this slide as a static placeholder that names the demo. The batch-crossing question stays open until the author overhauls this slide.
-- Frame numbers are replayed from the page's own event list: 19 frames, the block edge at 7, batch D's arrival at 13.
-- The page cuts the batch edge before `2·b` on purpose, so at frame 13 no series continues across it, and four presses from frame 5 do not reach it. Press 3 therefore states the copy point from the inspector caption instead of showing a window buffer crossing a batch. If a visible crossing is wanted, the deck's copy of the fixture would split `2·a` across batches C and D. That makes the deck diverge from the page and is an open question.
-- The rates the page shows come from its own port of `extrapolatedRate`, not from the engine (`docs/engine-blocks.md`, *Notes on the numbers*). The transcript quotes no rate.
+- Ported from `docs/engine-blocks.html`, section "Watch one query cross a block edge": its fixture, its two batches and the order of its events. `deck/src/slides/stepthrough.js` draws them again at stage scale, because the page's text would render at 13 to 18 stage px. The page's one frame per step becomes the sweep inside a click. Its controls, per-step table, lane bars and long captions are not ported.
+- The numbers come from the engine. `promql-engine/tests/talk_stepthrough.rs` runs `rate(x[5m])` and `sum(rate(x[5m]))` over the fixture and writes `deck/src/data/stepthrough.json`, run by `deck/scripts/gen-data.sh`. It asserts all 14 rates and 7 sums against `docs/engine-blocks.md` sections 4 and 5 to 1e-10, and that both queries emit one row per block. The slide rounds to three decimals; the transcript quotes no rate.
+- The deck differs from the page in when `sum` emits block 1. The page emits it when the store's 2·a arrives. The deck follows slide 5's plan: the Partial sees only rate's output rows, and `rate` emits a's block-2 row only when 2·b closes it, so block 1 leaves `sum` at click 4.
+- Block 1 starts at 240 s here and on slide 4, as in a store with fixed 240 s ranges. `MemorySeriesSource`, which the export runs on, starts its first block at the first window end, 420 s. Both blocks answer 420 s and 450 s from the same samples, so the numbers agree, and the export does not compare the block start.
+- No series continues across a batch, because the fixture cuts D before 2·b. Click 4 shows D's offsets starting again at 0 instead, and the transcript makes no claim about a crossing.
+- The slide shows one store partition's stream. With several, each runs its own `rate` and Partial, and the Final adds their partials per block, as slide 5's physical plan shows.
+- The headline wording is a proposal.
 
 ## 7. Five gates · 4:40, 50 s
 
@@ -258,28 +264,28 @@ The opener was half true: the agents write most of the code. [click 1] It holds 
 
 ### On screen
 
-- A chart of conformance progress, captioned "promqltest evals passing, per commit" (source: `deck/src/data/conformance-history.json`, from the committed history of `promql-conformance/testdata/prometheus/UNSUPPORTED.md`). The 2,098 evals come from 20 vendored `.test` files (source: `promql-conformance/tests/promqltest.rs`).
-  - X axis: the commits that re-blessed the allowlist, oldest on the left, evenly spaced, with a date tick at each day's first commit, not one per commit.
+- A chart of conformance progress, captioned "promqltest evals passing, per merged pull request" (source: `deck/src/data/conformance-history.json`, from the committed history of `promql-conformance/testdata/prometheus/UNSUPPORTED.md`). The 2,098 evals come from 20 vendored `.test` files (source: `promql-conformance/tests/promqltest.rs`).
+  - X axis, titled "commits": one evenly spaced slot per merge commit on main that changed the allowlist, oldest on the left, each labelled in small type with the number of the PR it merged (`#15` to `#56`), or its short sha when it names none. Labels too wide for their slot alternate between two rows, and past that only every nth slot and the last are labelled. No dates on the axis: a day of many merges would bunch them.
   - Y axis: 0 to the corpus total, with a dashed line at the total, 2,098. The line steps if the total changes between commits; so far it never has.
-  - The passing count in orange, one point per commit, from 267 at the first gated run to 559 at the last. The last point carries "559 of 2,098" in large type.
+  - The passing count in orange, one point per merge, from 268 at the first gated merge to 707 at the last. The last point carries "707 of 2,098" in large type.
   - On entering the slide the line draws left to right; jumping straight to #8 shows the finished chart.
 - Beside the chart, missing features that block the most evals (source: `UNSUPPORTED.md`, *Missing features*):
   - `histogram_quantile`, 86 evals
-  - subqueries, 57 evals
-  - `histogram_fraction`, 56 evals
+  - anchored and smoothed modifiers, 80 evals
+  - subqueries, 60 evals
 - Below that, the CI rule from the allowlist `promql-conformance/testdata/prometheus/SUPPORTED.toml` (source: `README.md`, *Status*): a listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.
 
-### Say (64 words)
+### Say (68 words)
 
-When CI started gating on promqltest, 267 of its 2,098 evals passed; today 559 do. UNSUPPORTED.md, generated from a real run, names what blocks the most: histogram_quantile with 86 evals, subqueries with 57, histogram_fraction with 56. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.
+When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 do. UNSUPPORTED.md, generated from a real run, names what blocks the most: histogram_quantile with 86 evals, the anchored and smoothed modifiers with 80, subqueries with 60. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.
 
 ### Notes
 
-- Every number on this slide is generated at build time from `UNSUPPORTED.md` and its git history. The figures above are the current values: 559 of 2,098 passing, and 465 evals blocked on missing features (source: `UNSUPPORTED.md`).
-- The chart's points come from `deck/scripts/conformance-history.py`. It walks every commit from HEAD that touched `SUPPORTED.toml` or `UNSUPPORTED.md`, and reads the count that commit's `UNSUPPORTED.md` states, cross-checked against its tables. It walks every commit, not `--first-parent`: the blessing commits form one ancestry chain across the stacked PRs #15, #38, #33, #35, #36 and #41, while a merge-only walk would fold several blessings into one point. That gives ten points from 2026-09-22 to 2026-10-04, dated by commit date, with none left out.
-- The first point, 267, is the commit that added the promqltest allowlist check to CI, which is what the Say means by "when CI started gating".
+- Every number on this slide is generated at build time from `UNSUPPORTED.md` and its git history. The figures above are the current values: 707 of 2,098 passing, and 492 evals blocked on missing features (source: `UNSUPPORTED.md`).
+- The chart's points come from `deck/scripts/conformance-history.py`. It walks `--first-parent` from HEAD over the commits that changed `SUPPORTED.toml` or `UNSUPPORTED.md`, and reads the count that commit's `UNSUPPORTED.md` states, cross-checked against its tables. Every such commit on main is a pull request's merge, which carries the state it merged, so each point is a state main actually held. A PR's own blessing commits are not points: parallel PRs re-bless after rebasing onto each other, so a branch commit's count can describe a tree main never had. That gives twelve points, PRs #15 to #56, from 2026-09-22 to 2026-10-05, dated by commit date, with none left out. #53 re-blessed without changing the count, so it shows as a flat step.
+- The first point, 268, is the merge of #15, which added the promqltest allowlist check to CI; that is what the Say means by "when CI started gating".
 - The scoreboard numbers are produced by `deck/scripts/scoreboard.py` into `deck/src/data/scoreboard.json`. Slide 7's eval count reads the same `total`.
-- `native_histograms` alone is 521 evals with 0 passing (source: `UNSUPPORTED.md`, *By file*), and native histograms are a stated non-goal (`docs/engine.md`). It explains a quarter of the gap if a question comes up. It stays off the slide to keep the time.
+- `native_histograms` alone is 521 evals with 0 passing (source: `UNSUPPORTED.md`, *By file*), and native histograms are a stated non-goal (`docs/engine.md`). It is over a third of the 1,391 evals still failing, if a question comes up. It stays off the slide to keep the time.
 
 ## 9. Close · 6:00, 25 s
 
@@ -307,7 +313,7 @@ The repo is on GitHub. The walkthrough you just saw and these slides live in doc
 - A local server (`deck/serve.sh`) is used on stage for the speaker window only; the slides themselves need no server.
 - No CDN or network fetch at runtime; fonts and libraries are vendored and inlined.
 - Branding follows prometheus.io: Lato (SIL OFL, vendored) and the Prometheus palette, defined once in `deck/src/theme.css`.
-- Demo code is copied from `docs/engine-blocks.html`, not shared with it; the step-through port is deferred.
+- Demo code is copied from `docs/engine-blocks.html`, not shared with it. Slide 6 copies the page's fixture and event order and redraws them at stage scale in `deck/src/slides/stepthrough.js`, one click per Arrow row.
 - Polar Signals, Dash0 and Great Lakes appear only on slides 2 and 9, plus the speaker affiliation on the title slide.
-- No performance numbers anywhere; Rust and performance appear only as a goal.
-- Plan text and scoreboard numbers are generated at build time by `deck/scripts/gen-data.sh` from the real planner and `UNSUPPORTED.md`, except the physical scan line on slide 5, which is the Vortex line kept in `deck/src/data/vortex-scan.json`.
+- No performance numbers anywhere.
+- Plan text, slide 6's rates and the scoreboard numbers are generated at build time by `deck/scripts/gen-data.sh` from the real planner and engine and `UNSUPPORTED.md`, except the physical scan line on slide 5, which is the Vortex line kept in `deck/src/data/vortex-scan.json`.

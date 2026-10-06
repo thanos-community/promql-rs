@@ -1,22 +1,14 @@
 [
   {
-    "sha": "e578622",
+    "sha": "21ccff7",
     "date": "2026-09-22",
-    "subject": "Run the promqltest corpus against the engine",
-    "pr": 15,
-    "passing": 267,
-    "total": 2098
-  },
-  {
-    "sha": "04a17b5",
-    "date": "2026-09-22",
-    "subject": "Check duplicate label sets on the result, not above the call",
+    "subject": "Run Prometheus's promqltest corpus against the engine",
     "pr": 15,
     "passing": 268,
     "total": 2098
   },
   {
-    "sha": "36a389c",
+    "sha": "94c4f1f",
     "date": "2026-09-29",
     "subject": "Lex keywords case-insensitively",
     "pr": 38,
@@ -24,7 +16,7 @@
     "total": 2098
   },
   {
-    "sha": "edaeac8",
+    "sha": "3844a71",
     "date": "2026-09-29",
     "subject": "Apply functions to an instant vector",
     "pr": 33,
@@ -32,51 +24,75 @@
     "total": 2098
   },
   {
-    "sha": "a181824",
-    "date": "2026-10-03",
-    "subject": "Compute the arithmetic binary operators",
-    "pr": 35,
-    "passing": 401,
-    "total": 2098
-  },
-  {
-    "sha": "604381d",
-    "date": "2026-10-03",
-    "subject": "Compare vectors and scalars",
+    "sha": "1f66516",
+    "date": "2026-10-04",
+    "subject": "Compute the arithmetic and comparison binary operators",
     "pr": 35,
     "passing": 463,
     "total": 2098
   },
   {
-    "sha": "54cdaa5",
+    "sha": "ceb0aab",
     "date": "2026-10-04",
-    "subject": "Match vectors on the labels the query names",
-    "pr": 36,
-    "passing": 485,
-    "total": 2098
-  },
-  {
-    "sha": "99c8426",
-    "date": "2026-10-04",
-    "subject": "Answer the set operators from the same match group",
-    "pr": 36,
-    "passing": 499,
-    "total": 2098
-  },
-  {
-    "sha": "d146d51",
-    "date": "2026-10-04",
-    "subject": "Stand a fill value in for a side with no series",
+    "subject": "Match, combine and fill vectors on the labels the query names",
     "pr": 36,
     "passing": 543,
     "total": 2098
   },
   {
-    "sha": "0d176bb",
+    "sha": "08fe353",
     "date": "2026-10-04",
-    "subject": "Order the result with sort, sort_desc and sort_by_label",
+    "subject": "Sort an instant query's result",
     "pr": 41,
     "passing": 559,
+    "total": 2098
+  },
+  {
+    "sha": "66b8ccd",
+    "date": "2026-10-05",
+    "subject": "Answer absent() and absent_over_time()",
+    "pr": 51,
+    "passing": 586,
+    "total": 2098
+  },
+  {
+    "sha": "beb5134",
+    "date": "2026-10-05",
+    "subject": "Answer the date and time functions",
+    "pr": 52,
+    "passing": 625,
+    "total": 2098
+  },
+  {
+    "sha": "8add3c0",
+    "date": "2026-10-05",
+    "subject": "Parse the anchored and smoothed range modifiers",
+    "pr": 53,
+    "passing": 625,
+    "total": 2098
+  },
+  {
+    "sha": "be7f611",
+    "date": "2026-10-05",
+    "subject": "Give a unary sign the precedence of MUL",
+    "pr": 55,
+    "passing": 628,
+    "total": 2098
+  },
+  {
+    "sha": "cf48b2d",
+    "date": "2026-10-05",
+    "subject": "Lex `fill` as a keyword only when it opens a call",
+    "pr": 54,
+    "passing": 629,
+    "total": 2098
+  },
+  {
+    "sha": "68424b0",
+    "date": "2026-10-05",
+    "subject": "Let keywords be label names inside braces",
+    "pr": 56,
+    "passing": 707,
     "total": 2098
   }
 ]

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Write the deck's conformance history: the pass count at every commit that
-re-blessed the promqltest allowlist.
+"""Write the deck's conformance history: the pass count at every state of the
+promqltest allowlist that the mainline held.
 
 SUPPORTED.toml and UNSUPPORTED.md are blessed together with the code, so each
-commit touching them is a point, and each point's numbers are the ones that
-commit's UNSUPPORTED.md states, read with scoreboard.py's parser.
+commit that changed them is a candidate point, and a point's numbers are the
+ones that commit's UNSUPPORTED.md states, read with scoreboard.py's parser.
 
-Every commit is walked, not --first-parent: the blessing commits form one
-ancestry chain, so each count includes the one before it, and a merge-only walk
-would fold several blessings into one point. The script refuses history where
-that stops holding, because a side branch's count is relative to its own base
-and would zigzag on an axis that reads as progress.
+The walk is --first-parent from HEAD, so a pull request is one point: its
+merge commit, which carries the state it merged. The blessing commits on a PR
+branch are not points. Each was blessed against that branch's own base, and
+parallel PRs re-bless after rebasing onto each other, so a branch commit's
+count can describe a tree main never held.
 
 A commit whose UNSUPPORTED.md is absent or unreadable is left out, never
 interpolated, and named on stderr. SUPPORTED.toml cannot stand in: a file marked
@@ -36,32 +36,20 @@ def git(*args):
     ).stdout
 
 
-def merged_by():
-    """Commit -> number of the pull request whose merge brought it onto HEAD's
-    first-parent line; a commit's own subject carries no PR number."""
-    prs = {}
-    for line in git("log", "--first-parent", "--merges", "--format=%H %s", "HEAD").splitlines():
-        sha, subject = line.split(" ", 1)
-        m = re.match(r"Merge pull request #(\d+)", subject)
-        if m:
-            for c in git("rev-list", f"{sha}^1..{sha}^2").split():
-                prs[c] = int(m.group(1))
-    return prs
-
-
 def main():
+    # %b's first line is the PR title GitHub writes into a merge commit.
     log = git(
-        "log", "--topo-order", "--reverse", "--format=%H%x00%h%x00%cs%x00%s",
+        "log", "--first-parent", "--reverse", "--format=%H%x00%h%x00%cs%x00%s%x00%b%x01",
         "HEAD", "--", ALLOWLIST, scoreboard.SOURCE,
     )
-    commits = [line.split("\0") for line in log.splitlines()]
-    for (a, *_), (b, *_) in zip(commits, commits[1:]):
-        if subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=scoreboard.ROOT).returncode:
-            sys.exit(f"{a[:7]} is not an ancestor of {b[:7]}: the blessings no longer form one line")
-
-    prs = merged_by()
     points = []
-    for sha, short, date, subject in commits:
+    for record in filter(str.strip, log.split("\x01")):
+        sha, short, date, subject, body = record.strip("\n").split("\0")
+        merged = re.match(r"Merge pull request #(\d+)", subject)
+        squashed = re.search(r"\(#(\d+)\)$", subject)
+        pr = merged or squashed
+        title = body.strip().split("\n")[0] if merged and body.strip() else subject
+
         shown = subprocess.run(
             ["git", "show", f"{sha}:{scoreboard.SOURCE}"],
             cwd=scoreboard.ROOT, capture_output=True, text=True,
@@ -74,7 +62,8 @@ def main():
             print(f"left out {short} {subject!r}: {e}", file=sys.stderr)
             continue
         points.append({
-            "sha": short, "date": date, "subject": subject, "pr": prs.get(sha),
+            "sha": short, "date": date, "subject": title,
+            "pr": int(pr.group(1)) if pr else None,
             "passing": passing, "total": total,
         })
 

@@ -1,8 +1,8 @@
 {
-  "passing": 559,
+  "passing": 707,
   "total": 2098,
-  "percent": 26.6,
-  "blocked_total": 465,
+  "percent": 33.7,
+  "blocked_total": 492,
   "top_blockers": [
     {
       "name": "histogram_quantile",
@@ -10,14 +10,14 @@
       "count": 86
     },
     {
-      "name": "subqueries",
-      "feature": "a subquery",
-      "count": 57
+      "name": "anchored and smoothed modifiers",
+      "feature": "the anchored and smoothed modifiers",
+      "count": 80
     },
     {
-      "name": "histogram_fraction",
-      "feature": "the histogram_fraction function",
-      "count": 56
+      "name": "subqueries",
+      "feature": "a subquery",
+      "count": 60
     }
   ],
   "source": "promql-conformance/testdata/prometheus/UNSUPPORTED.md"

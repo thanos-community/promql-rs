@@ -16,7 +16,6 @@
 
 use std::num::NonZeroUsize;
 
-use datafusion::physical_plan::displayable;
 use promql_engine::{Engine, MemorySeriesSource, RangeQuery};
 use serde_json::json;
 
@@ -70,7 +69,7 @@ fn export_talk_plans() {
             let exec = rt
                 .block_on(engine.physical_plan_async(&source, query, &range))
                 .unwrap_or_else(|e| panic!("{query} lowers: {e}"));
-            let physical = displayable(exec.as_ref()).indent(true).to_string();
+            let physical = promql_engine::explain_physical_plan(exec.as_ref());
             json!({
                 "query": query,
                 "logical": promql_engine::explain_plan(&plan).trim_end(),
