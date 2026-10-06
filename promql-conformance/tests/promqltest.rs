@@ -50,7 +50,7 @@ use std::sync::OnceLock;
 use libtest_mimic::{Arguments, Failed, Trial};
 use promql_conformance::prometheus::supported::{self, Supported};
 use promql_conformance::prometheus::{
-    feature_label, inventory_markdown, load_corpus, run_script, scoreboard, Outcome, Verdict,
+    inventory_markdown, load_corpus, run_script, scoreboard, Outcome, Verdict,
 };
 use promql_conformance::DataFusionEngine;
 
@@ -168,7 +168,7 @@ fn gated(declared: &Supported, outcomes: &[Outcome]) -> Vec<Trial> {
 fn every_eval(outcomes: &[Outcome]) -> Vec<Trial> {
     outcomes
         .iter()
-        .filter(|o| !matches!(o.verdict, Verdict::Skipped(_)))
+        .filter(|o| !matches!(o.verdict, Verdict::Skipped(_) | Verdict::Gated(_)))
         .map(|o| {
             let name = format!("{}/{}", o.file, o.id);
             let at = format!("{}.test:{}", o.file, o.line);
@@ -180,10 +180,9 @@ fn every_eval(outcomes: &[Outcome]) -> Vec<Trial> {
                     "{detail}\n  query: {query}\n  at:    {at}"
                 ))),
                 Verdict::Unsupported(feature) => Err(Failed::from(format!(
-                    "{} is not supported yet\n  query: {query}\n  at:    {at}",
-                    feature_label(&feature),
+                    "{feature} is not supported yet\n  query: {query}\n  at:    {at}"
                 ))),
-                Verdict::Skipped(_) => Ok(()),
+                Verdict::Skipped(_) | Verdict::Gated(_) => Ok(()),
             })
         })
         .collect()

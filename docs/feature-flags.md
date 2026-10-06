@@ -35,8 +35,21 @@ node is still built, as with `addParseErrf`.
 The `start()`, `end()`, `step()` and `range()` arms are gated but still not
 ported past the gate: with the flag on they fail as before.
 
-`flag_for_feature` and `FEATURE_FLAGS` in `promql-parser/src/options.rs` are the
-code's copy of this table; `UNSUPPORTED.md` names the flag from them.
+`FEATURE_FLAGS` in `promql-parser/src/options.rs` is the code's copy of the
+first three columns.
+
+## Conformance
+
+Experimental syntax is not part of the core language yet, so the promqltest
+harness leaves it out of the count. An eval whose query stock Prometheus rejects
+but parses with every gate open is `Verdict::Gated`, naming the flags it needs
+(a flag is needed when closing just that gate stops the query parsing). It is in
+no total, no per-file ratio, no trial and not in `SUPPORTED.toml`;
+`UNSUPPORTED.md` lists how many there are per flag. The harness still evaluates
+the query with every gate open, upstream's `TestParserOpts`, so nothing else
+changes. A feature leaves the exclusion by being removed from the gated set,
+not by a flag flip: when upstream makes a feature stable it parses with defaults
+and its evals count again.
 
 ## Using them
 

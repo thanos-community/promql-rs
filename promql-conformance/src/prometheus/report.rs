@@ -17,16 +17,6 @@ use std::fmt::Write as _;
 use super::run::{Outcome, Verdict};
 use super::supported::Supported;
 
-/// A missing feature as a person reads it: its name, then the upstream
-/// flag that gates its syntax when it has one. Both reports use this, so
-/// they cannot disagree on which features are experimental.
-pub fn feature_label(feature: &str) -> String {
-    match promql_parser::flag_for_feature(feature) {
-        Some(flag) => format!("{feature} (upstream: --enable-feature={flag})"),
-        None => feature.to_string(),
-    }
-}
-
 /// One `.test` file's standing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStats {
@@ -38,6 +28,9 @@ pub struct FileStats {
     /// cannot read histograms is not the same finding as one at 0/213
     /// because the engine gets everything wrong.
     pub skipped: usize,
+    /// Evals of experimental syntax, left out of `evals` and everything
+    /// derived from it. See [`Verdict::Gated`].
+    pub gated: usize,
 }
 
 impl FileStats {
@@ -62,7 +55,12 @@ pub fn per_file(outcomes: &[Outcome]) -> Vec<FileStats> {
             evals: 0,
             passed: 0,
             skipped: 0,
+            gated: 0,
         });
+        if matches!(o.verdict, Verdict::Gated(_)) {
+            stats.gated += 1;
+            continue;
+        }
         stats.evals += 1;
         match o.verdict {
             Verdict::Pass => stats.passed += 1,
@@ -91,6 +89,17 @@ pub fn missing_features(outcomes: &[Outcome]) -> BTreeMap<&str, usize> {
     features
 }
 
+/// How many gated evals each `--enable-feature` combination holds out.
+pub fn gated_by_flags(outcomes: &[Outcome]) -> BTreeMap<&str, usize> {
+    let mut gated: BTreeMap<&str, usize> = BTreeMap::new();
+    for o in outcomes {
+        if let Verdict::Gated(flags) = &o.verdict {
+            *gated.entry(flags.as_str()).or_default() += 1;
+        }
+    }
+    gated
+}
+
 /// The per-file table printed on every run.
 ///
 /// Nudges toward `"all"` where a file is fully green, but never acts on
@@ -112,6 +121,13 @@ pub fn scoreboard(outcomes: &[Outcome], supported: &Supported) -> String {
             100.0 * passed as f64 / total as f64
         },
     );
+    let gated: usize = stats.iter().map(|s| s.gated).sum();
+    if gated > 0 {
+        let _ = writeln!(
+            out,
+            "  not counted: {gated} more evals use experimental syntax behind a parser flag\n"
+        );
+    }
 
     let width = stats.iter().map(|s| s.file.len()).max().unwrap_or(0);
     for s in &stats {
@@ -124,10 +140,13 @@ pub fn scoreboard(outcomes: &[Outcome], supported: &Supported) -> String {
         );
         if s.is_fully_green() && !supported.batch(&s.file).is_some_and(|b| b.is_all()) {
             let _ = write!(out, "   ← fully green; consider {} = \"all\"", s.file);
-        } else if s.skipped == s.evals {
+        } else if s.skipped == s.evals && s.evals > 0 {
             let _ = write!(out, "   (all skipped)");
         } else if s.skipped > 0 {
             let _ = write!(out, "   ({} skipped)", s.skipped);
+        }
+        if s.gated > 0 {
+            let _ = write!(out, "   (+{} gated)", s.gated);
         }
         out.push('\n');
     }
@@ -171,25 +190,38 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
         },
     );
 
-    out.push_str(
-        "## Missing features\n\n\
-         A flag in the last column is the Prometheus `--enable-feature` value that gates \
-         the feature's syntax upstream. The harness turns every one on, as upstream's \
-         promqltest does, so those evals run here; a stock engine would refuse them.\n\n\
-         | evals blocked | feature | upstream flag |\n|---:|---|---|\n",
-    );
+    out.push_str("## Missing features\n\n| evals blocked | feature |\n|---:|---|\n");
     let mut rows: Vec<(&str, usize)> = features.into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     for (feature, count) in rows {
-        let flag = promql_parser::flag_for_feature(feature)
-            .map(|f| format!("`{f}`"))
-            .unwrap_or_default();
-        let _ = writeln!(out, "| {count} | {feature} | {flag} |");
+        let _ = writeln!(out, "| {count} | {feature} |");
+    }
+
+    let gated = gated_by_flags(outcomes);
+    if !gated.is_empty() {
+        let total: usize = gated.values().sum();
+        let _ = write!(
+            out,
+            "\n## Left out: experimental syntax\n\n\
+             **{total}** more evals use syntax that stock Prometheus refuses unless an \
+             `--enable-feature` value is on. They are not part of the core language yet, \
+             so they are in no total above, in no row of the tables, and not in \
+             `SUPPORTED.toml`. The harness still evaluates them with every gate open; \
+             `docs/feature-flags.md` lists the flags.\n\n\
+             | evals | needs |\n|---:|---|\n"
+        );
+        let mut rows: Vec<(&str, usize)> = gated.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        for (flags, count) in rows {
+            let _ = writeln!(out, "| {count} | `{flags}` |");
+        }
     }
 
     out.push_str("\n## By file\n\n| file | evals | passing | |\n|---|---:|---:|---|\n");
     for s in &stats {
-        let note = if s.is_fully_green() {
+        let note = if s.evals == 0 && s.gated > 0 {
+            "all gated — experimental syntax"
+        } else if s.is_fully_green() {
             "fully green"
         } else if s.skipped == s.evals {
             "all skipped — native histograms"
@@ -281,42 +313,33 @@ mod tests {
     }
 
     #[test]
-    fn the_inventory_names_the_flag_an_experimental_feature_needs() {
-        let outcomes = vec![
-            outcome(
-                "a.test",
-                "1",
-                Verdict::Unsupported("the anchored and smoothed modifiers".into()),
-            ),
-            outcome(
-                "a.test",
-                "2",
-                Verdict::Unsupported("the mad_over_time function".into()),
-            ),
-            outcome(
-                "a.test",
-                "3",
-                Verdict::Unsupported("the rate function".into()),
-            ),
-        ];
+    fn gated_evals_are_in_no_total_and_are_listed_by_flag() {
+        let mut outcomes = sample();
+        outcomes.push(outcome(
+            "fill",
+            "1",
+            Verdict::Gated("promql-binop-fill-modifiers".into()),
+        ));
+        outcomes.push(outcome(
+            "half",
+            "9",
+            Verdict::Gated("promql-extended-range-selectors".into()),
+        ));
+        let stats = per_file(&outcomes);
+        let fill = stats.iter().find(|s| s.file == "fill").unwrap();
+        assert_eq!((fill.evals, fill.passed, fill.gated), (0, 0, 1));
+        let half = stats.iter().find(|s| s.file == "half").unwrap();
+        assert_eq!((half.evals, half.gated), (2, 1));
+
+        let out = scoreboard(&outcomes, &Supported::default());
+        assert!(out.contains("8 evals — 3 pass (37.5%)"), "{out}");
+        assert!(out.contains("2 more evals"), "{out}");
+
         let md = inventory_markdown(&outcomes);
-        assert!(
-            md.contains(
-                "| 1 | the anchored and smoothed modifiers | `promql-extended-range-selectors` |"
-            ),
-            "{md}"
-        );
-        assert!(
-            md.contains("| 1 | the mad_over_time function | `promql-experimental-functions` |"),
-            "{md}"
-        );
-        // A stable feature has an empty flag cell.
-        assert!(md.contains("| 1 | the rate function |  |"), "{md}");
-        assert_eq!(
-            feature_label("the mad_over_time function"),
-            "the mad_over_time function (upstream: --enable-feature=promql-experimental-functions)"
-        );
-        assert_eq!(feature_label("a subquery"), "a subquery");
+        assert!(md.contains("**3 of 8 evals pass**"), "{md}");
+        assert!(md.contains("| 1 | `promql-binop-fill-modifiers` |"), "{md}");
+        assert!(md.contains("all gated"), "{md}");
+        assert!(!inventory_markdown(&sample()).contains("Left out"));
     }
 
     #[test]

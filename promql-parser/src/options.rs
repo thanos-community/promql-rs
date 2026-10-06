@@ -42,6 +42,24 @@ impl ParserOptions {
     }
 }
 
+impl ParserOptions {
+    /// These options with the gate behind `flag` (an `--enable-feature`
+    /// value from [`FEATURE_FLAGS`]) set to `on`, or `None` for a name that
+    /// is not one.
+    pub fn with_flag(mut self, flag: &str, on: bool) -> Option<Self> {
+        let [functions, duration, selectors, fill] = FEATURE_FLAGS.map(|f| f.flag);
+        let field = match flag {
+            f if f == functions => &mut self.enable_experimental_functions,
+            f if f == duration => &mut self.experimental_duration_expr,
+            f if f == selectors => &mut self.enable_extended_range_selectors,
+            f if f == fill => &mut self.enable_binop_fill_modifiers,
+            _ => return None,
+        };
+        *field = on;
+        Some(self)
+    }
+}
+
 /// One `--enable-feature` value and the option it sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureFlag {
@@ -53,9 +71,9 @@ pub struct FeatureFlag {
     pub option: &'static str,
 }
 
-/// The four gates, in `parser.Options` order. The conformance reports
-/// name a missing feature's flag from this table, so a flag added here
-/// shows up there.
+/// The four gates, in `parser.Options` order. The conformance harness
+/// finds which of them a query needs from this table, so a flag added
+/// here is picked up there.
 pub const FEATURE_FLAGS: [FeatureFlag; 4] = [
     FeatureFlag {
         flag: "promql-experimental-functions",
@@ -78,27 +96,6 @@ pub const FEATURE_FLAGS: [FeatureFlag; 4] = [
         option: "enable_binop_fill_modifiers",
     },
 ];
-
-/// The flag that gates the language feature the engine calls `feature`
-/// in `EngineError::Unsupported` (`the mad_over_time function`,
-/// `the limitk aggregation`, `the anchored and smoothed modifiers`), or
-/// `None` for one stock Prometheus parses.
-pub fn flag_for_feature(feature: &str) -> Option<&'static str> {
-    let [functions, _duration, selectors, _fill] = FEATURE_FLAGS.map(|f| f.flag);
-    if feature == "the anchored and smoothed modifiers" {
-        return Some(selectors);
-    }
-    if let Some(name) = feature
-        .strip_prefix("the ")
-        .and_then(|f| f.strip_suffix(" function"))
-    {
-        return crate::functions::is_experimental(name).then_some(functions);
-    }
-    let name = feature
-        .strip_prefix("the ")
-        .and_then(|f| f.strip_suffix(" aggregation"))?;
-    matches!(name, "limitk" | "limit_ratio").then_some(functions)
-}
 
 #[cfg(test)]
 mod tests {
@@ -144,21 +141,26 @@ mod tests {
     }
 
     #[test]
-    fn features_name_the_flag_that_gates_them() {
-        assert_eq!(
-            flag_for_feature("the anchored and smoothed modifiers"),
-            Some("promql-extended-range-selectors")
-        );
-        assert_eq!(
-            flag_for_feature("the mad_over_time function"),
-            Some("promql-experimental-functions")
-        );
-        assert_eq!(
-            flag_for_feature("the limit_ratio aggregation"),
-            Some("promql-experimental-functions")
-        );
-        assert_eq!(flag_for_feature("the rate function"), None);
-        assert_eq!(flag_for_feature("the topk aggregation"), None);
-        assert_eq!(flag_for_feature("a subquery"), None);
+    fn with_flag_sets_exactly_the_named_gate() {
+        let count = |o: ParserOptions| {
+            [
+                o.enable_experimental_functions,
+                o.experimental_duration_expr,
+                o.enable_extended_range_selectors,
+                o.enable_binop_fill_modifiers,
+            ]
+            .iter()
+            .filter(|on| **on)
+            .count()
+        };
+        for f in FEATURE_FLAGS {
+            let one = ParserOptions::default().with_flag(f.flag, true).unwrap();
+            assert_eq!(count(one), 1, "{}", f.flag);
+            assert_eq!(one.with_flag(f.flag, false), Some(ParserOptions::default()));
+            let all_but = ParserOptions::all().with_flag(f.flag, false).unwrap();
+            assert_eq!(count(all_but), 3, "{}", f.flag);
+            assert_ne!(one, all_but);
+        }
+        assert_eq!(ParserOptions::default().with_flag("nope", true), None);
     }
 }

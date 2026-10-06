@@ -72,7 +72,7 @@ pub use crate::actions::parse_duration_seconds;
 pub use crate::ast::Expr;
 pub use crate::ast::{SequenceValue, SeriesDescription};
 pub use crate::error::{ParseError, ParseErrors};
-pub use crate::options::{flag_for_feature, FeatureFlag, ParserOptions, FEATURE_FLAGS};
+pub use crate::options::{FeatureFlag, ParserOptions, FEATURE_FLAGS};
 pub use crate::parser::{
     parse_expr, parse_metric, parse_metric_selector, parse_series_desc, Parser,
 };
