@@ -105,7 +105,7 @@ fn synthetic(shape: &Shape) -> Arc<dyn SeriesSource> {
 /// The two `sort` shapes only do work in the `instant` half of the
 /// matrix below: a range result is never reordered, so their `range_1h`
 /// numbers are the plain selector's plus the planner's.
-const QUERIES: [(&str, &str); 7] = [
+const QUERIES: [(&str, &str); 11] = [
     ("selector", "http_requests_total"),
     ("sum", "sum(http_requests_total)"),
     ("sum_by_route", "sum by (route) (http_requests_total)"),
@@ -115,6 +115,19 @@ const QUERIES: [(&str, &str); 7] = [
         "sum by (route) (increase(http_requests_total[5m]))",
     ),
     ("sort", "sort(http_requests_total)"),
+    // The selecting aggregations hold a heap of k per group and step, and
+    // `quantile` every value of the group: three different memory shapes
+    // over the same input.
+    ("topk_5", "topk(5, http_requests_total)"),
+    (
+        "topk_3_by_route",
+        "topk by (route) (3, http_requests_total)",
+    ),
+    (
+        "bottomk_5_rate",
+        "bottomk(5, rate(http_requests_total[5m]))",
+    ),
+    ("quantile_p99", "quantile(0.99, http_requests_total)"),
     (
         "sort_by_label_pod",
         r#"sort_by_label(http_requests_total, "pod")"#,
