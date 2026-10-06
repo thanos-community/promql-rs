@@ -475,3 +475,27 @@ fn a_label_name_may_not_contain_a_colon() {
     // identifier as alphanumerics alone.
     assert!(parse_expr(r#"up{a:b="c"}"#).is_err());
 }
+
+/// Upstream's `function_call` rule has an arm per keyword token for
+/// `start`, `end`, `step` and `range`; the keywords stay metric names
+/// when no `(` follows, and `@ start()` stays the modifier.
+#[test]
+fn query_context_keywords_are_calls_before_a_paren() {
+    for name in ["start", "end", "step", "range"] {
+        match must_parse(&format!("{name}()")) {
+            Expr::Call(c) => {
+                assert_eq!(c.func.name, name);
+                assert!(c.args.is_empty());
+            }
+            other => panic!("expected Call for {name}(), got {other:?}"),
+        }
+        match must_parse(name) {
+            Expr::VectorSelector(vs) => assert_eq!(vs.name, name),
+            other => panic!("expected VectorSelector for {name}, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        must_parse("up @ start()"),
+        Expr::VectorSelector(_)
+    ));
+}
