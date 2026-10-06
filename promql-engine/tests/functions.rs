@@ -428,3 +428,23 @@ fn absent_over_time_of_a_subquery_is_still_unsupported() {
         "{err}"
     );
 }
+
+/// Upstream's `UnaryExpr` arm: `-` negates each sample and drops the
+/// name, `+` is the operand as it was, name kept, and a scalar operand
+/// is still a scalar.
+#[test]
+fn unary_minus_negates_and_drops_the_name_and_plus_changes_nothing() {
+    let labelled = |city: &str| vec![("city".to_string(), city.to_string())];
+    assert_eq!(
+        vector("-temperature"),
+        vec![(labelled("lima"), 9.75), (labelled("oslo"), -9.25)]
+    );
+    assert_eq!(vector("- -temperature")[1], (labelled("oslo"), 9.25));
+    assert_eq!(vector("-(temperature)"), vector("-temperature"));
+    assert_eq!(vector("+temperature"), vector("temperature"));
+    assert_eq!(vector("-sum(temperature)")[0].1, 0.5);
+    // A sign over a scalar-typed expression folds; `vector` makes it
+    // visible as a series.
+    assert_eq!(vector("vector(-time())")[0].1, -150.0);
+    assert_eq!(vector("-vector(1)")[0].1, -1.0);
+}

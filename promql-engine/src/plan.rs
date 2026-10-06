@@ -44,8 +44,10 @@ use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, lit, LogicalPlan, LogicalPlanBuilder};
 use promql_parser::ast::{
-    AggregateExpr, AtModifier, BinaryExpr, Call, Expr, VectorMatchCardinality, VectorSelector,
+    AggregateExpr, AtModifier, BinaryExpr, Call, Expr, UnaryExpr, VectorMatchCardinality,
+    VectorSelector,
 };
+use promql_parser::token::ItemType;
 
 use crate::absent;
 use crate::aggregate::{self, Op};
@@ -478,6 +480,7 @@ impl Planner<'_> {
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c, above).await,
                 Expr::Binary(b) => self.binary(expr, b).await,
+                Expr::Unary(u) => self.unary(expr, u, above).await,
                 other => Err(EngineError::Unsupported(describe(other))),
             }
         })
@@ -761,6 +764,54 @@ impl Planner<'_> {
                     args.get(1).copied(),
                 )
                 .alias(SAMPLES),
+                col(BLOCK_START),
+                col(BLOCK_END),
+            ])?
+            .build()?;
+        Ok(Planned { plan, label_names })
+    }
+
+    /// `-x` and `+x`: upstream's `UnaryExpr` arm of `eval`
+    /// (`promql/engine.go`). Minus negates every sample and drops the
+    /// metric name; plus returns its operand untouched, name included,
+    /// because upstream's loop only runs for `SUB`. A scalar operand is a
+    /// value per step and folds like any other scalar. `above` passes
+    /// through: the sign changes no sample's selection, so the store is
+    /// told what sits over the operator.
+    async fn unary(
+        &mut self,
+        expr: &Expr,
+        u: &UnaryExpr,
+        above: Above<'_>,
+    ) -> Result<Planned, EngineError> {
+        if value_type(&u.expr) == ValueType::Scalar {
+            return Ok(Planned {
+                plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
+                label_names: Vec::new(),
+            });
+        }
+        match u.op {
+            ItemType::Add => self.expr(&u.expr, above).await,
+            ItemType::Sub => {
+                let input = self.expr(&u.expr, above).await?;
+                self.negate(input)
+            }
+            op => Err(EngineError::Unsupported(format!("the unary {op} operator"))),
+        }
+    }
+
+    /// `elementwise`'s projection with [`elementwise::Func::Neg`] and no
+    /// arguments, over an already planned vector.
+    fn negate(&mut self, input: Planned) -> Result<Planned, EngineError> {
+        let func = elementwise::Func::Neg;
+        let (labels_expr, label_names) = labels::keep(&input.label_names, |n| n != METRIC_NAME);
+        // Named for the reason `elementwise` names its stage.
+        let stage = self.stage(func.as_str());
+        let plan = LogicalPlanBuilder::from(input.plan)
+            .alias(stage)?
+            .project(vec![
+                labels_expr.alias(LABELS),
+                elementwise::call(col(SAMPLES), func, None, None).alias(SAMPLES),
                 col(BLOCK_START),
                 col(BLOCK_END),
             ])?

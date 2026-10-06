@@ -59,6 +59,11 @@ pub enum Func {
         return_bool: bool,
     },
     Abs,
+    /// Unary minus on a vector: `-x`. Upstream evaluates it inline in
+    /// `rangeEval`'s `UnaryExpr` arm (`promql/engine.go`) rather than as a
+    /// function, and drops the name there too. Never a function name, so
+    /// no call can reach it; the planner builds it from the `-` operator.
+    Neg,
     Ceil,
     Floor,
     Round,
@@ -105,6 +110,7 @@ impl Func {
     pub fn parse(s: &str) -> Option<Func> {
         Some(match s {
             "abs" => Func::Abs,
+            "neg" => Func::Neg,
             "ceil" => Func::Ceil,
             "floor" => Func::Floor,
             "round" => Func::Round,
@@ -154,6 +160,7 @@ impl Func {
         match self {
             Func::Binary { op, return_bool } => crate::binary::literal(*op, *return_bool),
             Func::Abs => "abs",
+            Func::Neg => "neg",
             Func::Ceil => "ceil",
             Func::Floor => "floor",
             Func::Round => "round",
@@ -251,6 +258,7 @@ impl Func {
     fn map_fn(self) -> fn(f64) -> f64 {
         match self {
             Func::Abs => f64::abs,
+            Func::Neg => |v| -v,
             Func::Ceil => f64::ceil,
             Func::Floor => f64::floor,
             Func::Exp => f64::exp,
@@ -982,6 +990,10 @@ mod tests {
             assert_eq!(Func::parse(func.as_str()), Some(func));
             assert!(crate::function::signature(func.as_str()).is_some());
         }
+        // The operator's own spelling: it round-trips, but names no
+        // PromQL function, so it has no signature.
+        assert_eq!(Func::parse(Func::Neg.as_str()), Some(Func::Neg));
+        assert!(crate::function::signature(Func::Neg.as_str()).is_none());
         assert_eq!(Func::parse("rate"), None);
     }
 
@@ -1011,6 +1023,15 @@ mod tests {
             .as_primitive::<Float64Type>()
             .values()
             .to_vec()
+    }
+
+    #[test]
+    fn neg_flips_every_sign_and_drops_the_name() {
+        let input = samples();
+        let out = apply(&input, Func::Neg.bind(None, None)).unwrap();
+        let expect: Vec<f64> = values_of(&input).iter().map(|v| -v).collect();
+        assert_eq!(values_of(&out), expect);
+        assert!(Func::Neg.drops_metric_name());
     }
 
     #[test]
