@@ -428,3 +428,57 @@ fn absent_over_time_of_a_subquery_is_still_unsupported() {
         "{err}"
     );
 }
+
+/// A number written out is a scalar, one unlabelled series like
+/// `time()`; the signs `-1` and `-Inf` carry are folded into it, and
+/// `NaN` stays NaN.
+#[test]
+fn a_bare_number_literal_is_one_unlabelled_series() {
+    for (query, want) in [
+        ("1", 1.0),
+        ("-0x1", -1.0),
+        ("1e3", 1000.0),
+        ("(2.)", 2.0),
+        ("+.5", 0.5),
+        ("-Inf", f64::NEG_INFINITY),
+    ] {
+        let got = vector(query);
+        assert_eq!(got.len(), 1, "{query}");
+        assert!(got[0].0.is_empty(), "{query}");
+        assert_eq!(got[0].1, want, "{query}");
+    }
+    assert!(vector("NaN")[0].1.is_nan());
+}
+
+/// A literal answers at every step of a range query, and a string,
+/// which upstream gives only to an instant query, is refused in one.
+#[test]
+fn a_literal_covers_the_range_and_a_string_is_refused_in_one() {
+    let engine = Engine::blocking().unwrap();
+    let range = RangeQuery::new(0, 120_000, 60_000);
+    let batches = engine.range_query(source().as_ref(), "7", &range).unwrap();
+    let decoded = promql_engine::series::decode(&batches).unwrap();
+    assert_eq!(decoded[0].values(), [7.0, 7.0, 7.0]);
+
+    let err = engine
+        .range_query(source().as_ref(), r#"("Foo")"#, &range)
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Query(m) if m.contains("for range query")),
+        "{err}"
+    );
+}
+
+/// The instant query's string answer, through any parentheses, and
+/// nothing for a query that is not a string.
+#[test]
+fn an_instant_string_is_the_literal_without_its_quotes() {
+    let engine = Engine::blocking().unwrap();
+    assert_eq!(
+        engine.instant_string(r#"(" Foo ")"#).unwrap().as_deref(),
+        Some(" Foo ")
+    );
+    assert_eq!(engine.instant_string(r#""""#).unwrap().as_deref(), Some(""));
+    assert_eq!(engine.instant_string("1").unwrap(), None);
+    assert_eq!(engine.instant_string("temperature").unwrap(), None);
+}

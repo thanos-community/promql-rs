@@ -141,6 +141,14 @@ pub trait Engine {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<QueryResult, EngineError>;
+
+    /// The string an instant query answers, if the query is a bare
+    /// string literal. Prometheus gives strings only to instant queries
+    /// and refuses them in a range query, so the one-step range the
+    /// runner uses for an instant eval cannot carry one.
+    fn instant_string(&self, _query: &str) -> Result<Option<String>, EngineError> {
+        Ok(None)
+    }
 }
 
 /// One `load <interval>` block's worth of data.

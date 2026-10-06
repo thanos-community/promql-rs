@@ -153,6 +153,16 @@ pub async fn plan(
         )));
     }
     check_expr(expr)?;
+    if string_literal(expr).is_some() {
+        // `NewRangeQuery` (`promql/engine.go`) refuses every expression
+        // type but these two; a string is answered only by an instant
+        // query, which [`crate::Engine::instant_string`] does without a
+        // plan.
+        return Err(EngineError::Query(
+            "invalid expression type \"string\" for range query, must be Scalar or instant Vector"
+                .into(),
+        ));
+    }
     let mut planner = Planner {
         state,
         source,
@@ -478,6 +488,19 @@ impl Planner<'_> {
                 Expr::Aggregate(a) => self.aggregate(a).await,
                 Expr::Call(c) => self.call(c, above).await,
                 Expr::Binary(b) => self.binary(expr, b).await,
+                // A number is a scalar, and a scalar is one unlabelled
+                // series over the grid, as `time()` is. `-1` and `-Inf`
+                // arrive as a unary over a literal, which upstream's
+                // parser folds into the number; only that is taken here,
+                // so a unary over a vector or a call stays its own gap.
+                Expr::NumberLiteral(_) => Ok(Planned {
+                    plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
+                    label_names: Vec::new(),
+                }),
+                Expr::Unary(_) if is_literal(expr) => Ok(Planned {
+                    plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
+                    label_names: Vec::new(),
+                }),
                 other => Err(EngineError::Unsupported(describe(other))),
             }
         })
@@ -1321,6 +1344,28 @@ fn reject_unsupported_modifiers(vs: &VectorSelector) -> Result<(), EngineError> 
         ));
     }
     Ok(())
+}
+
+/// The text of a query that is nothing but a string literal, however
+/// parenthesised. Upstream evaluates `("Foo")` to the string `Foo` as it
+/// does `"Foo"`: `ParenExpr` is transparent in `eval`.
+pub fn string_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::StringLiteral(s) => Some(&s.val),
+        Expr::Paren(p) => string_literal(&p.expr),
+        _ => None,
+    }
+}
+
+/// Whether an expression is a number written out, with its signs and
+/// parentheses and nothing else: `-1`, `+Inf`, `(2)`.
+fn is_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::NumberLiteral(_) => true,
+        Expr::Paren(p) => is_literal(&p.expr),
+        Expr::Unary(u) => is_literal(&u.expr),
+        _ => false,
+    }
 }
 
 /// A name for what an expression is, for the "not supported yet" message.

@@ -178,6 +178,15 @@ fn merge(load: &[LoadedSeries<'_>]) -> Vec<promql_engine::Series> {
 }
 
 impl Engine for DataFusionEngine {
+    fn instant_string(&self, query: &str) -> Result<Option<String>, EngineError> {
+        match self.inner.instant_string(query) {
+            Ok(s) => Ok(s),
+            // A parse error is the query's own answer, which `range_query`
+            // reports; leave it to that.
+            Err(_) => Ok(None),
+        }
+    }
+
     fn range_query(
         &self,
         load: &[LoadedSeries<'_>],
