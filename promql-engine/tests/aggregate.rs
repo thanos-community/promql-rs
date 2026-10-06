@@ -191,17 +191,10 @@ fn aggregations_nest() {
 #[test]
 fn parameterized_aggregations_are_named_as_unsupported() {
     let engine = Engine::blocking().unwrap();
-    for (q, what) in [
-        ("topk(2, http_requests_total)", "the topk aggregation"),
-        (
-            "quantile(0.5, http_requests_total)",
-            "the quantile aggregation",
-        ),
-        (
-            "count_values(\"v\", http_requests_total)",
-            "the count_values aggregation",
-        ),
-    ] {
+    for (q, what) in [(
+        "count_values(\"v\", http_requests_total)",
+        "the count_values aggregation",
+    )] {
         match engine.range_query(source().as_ref(), q, &RangeQuery::new(0, 0, 30_000)) {
             Err(EngineError::Unsupported(f)) => assert_eq!(f, what, "{q}"),
             other => panic!("{q}: {other:?}"),

@@ -52,6 +52,9 @@ serde_json = "1.0"
 # back when promql-testcases bound them; serde_yaml is unmaintained.
 serde_norway = "0.9"
 thiserror = "2.0"
+# `labels.Labels.Hash` for `limit_ratio`'s sampling offset: upstream hashes
+# the label set with xxhash64 (cespare/xxhash), seed 0.
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 toml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

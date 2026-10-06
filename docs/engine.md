@@ -168,6 +168,20 @@ hands up is one block's steps long.
 [`engine-blocks.md`](engine-blocks.md#4-an-aggregate-across-a-block-edge)
 walks one edge with numbers.
 
+Two aggregations break that bound's shape. `topk`, `bottomk`, `limitk`
+and `limit_ratio` (`aggregate_k.rs`, after `aggregationK`) select series,
+so their output keeps the input's labels: a group holds, per step, a heap
+of at most `k` entries, and each series behind an entry once, by `Arc`,
+so what a group keeps is what it can still return, groups × steps × `k`
+entries and the labels of those series. The aggregate answers with the
+chosen series of each group as a list that the plan unnests to rows, and
+its partial state is the same list, so two store partitions merge by
+offering one's chosen samples to the other's heaps. `quantile`
+(`quantile.rs`) cannot fold into a fixed state: it holds every value of
+its group in the block, 16 bytes a sample, as Prometheus does, and is the
+one aggregation whose memory follows the series under it. Both take their
+parameter as one value per step, folded while planning.
+
 The instant selector is the degenerate case. For each step it wants the last
 sample at or before the step within the lookback delta, and a stale marker
 that is that sample hides the series, so the selector keeps markers the

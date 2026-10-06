@@ -333,6 +333,12 @@ fn partitions_match_unpartitioned() {
                 "sum(x)",
                 "sum by (pod) (rate(x[5m]))",
                 "count_over_time(x[10m])",
+                "topk(1, x)",
+                "bottomk by (pod) (1, rate(x[5m]))",
+                "limitk(1, x)",
+                "limit_ratio(0.5, x)",
+                "quantile(0.5, x)",
+                "quantile by (pod) (0.3, rate(x[5m]))",
             ] {
                 assert_same_on(&source, q, multi_step());
             }

@@ -32,8 +32,8 @@ use datafusion::functions::core::expr_fn::get_field;
 use datafusion::functions::math::expr_fn::isnan;
 use datafusion::functions_nested::expr_fn::array_element;
 use datafusion::logical_expr::{
-    col, lit, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SortExpr,
-    Volatility,
+    col, lit, ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    SortExpr, Volatility,
 };
 
 use crate::series::{self, LABELS, SAMPLES, VALUE};
@@ -97,13 +97,7 @@ pub fn exprs(func: Func, labels: &[String], label_names: &[String]) -> Vec<SortE
         // An instant query narrows a row to at most one sample, so the
         // last is the step's. A row with none is null, which sorts after
         // every NaN, and `drop_empty` removes it before anyone sees it.
-        let value = get_field(array_element(col(SAMPLES), lit(-1_i64)), VALUE);
-        return vec![
-            // NaN last whichever way the values go: `funcSort` and
-            // `funcSortDesc` both reverse a heap that sorts NaN first.
-            SortExpr::new(isnan(value.clone()), true, false),
-            SortExpr::new(value, asc, false),
-        ];
+        return by_value(asc);
     }
     labels
         .iter()
@@ -123,6 +117,34 @@ pub fn exprs(func: Func, labels: &[String], label_names: &[String]) -> Vec<SortE
             false,
         )))
         .collect()
+}
+
+/// The sample value, then, of a row that an instant query narrowed to at
+/// most one sample.
+fn by_value(asc: bool) -> Vec<SortExpr> {
+    // The last sample is the step's. A row with none is null, which sorts
+    // after every NaN, and `drop_empty` removes it before anyone sees it.
+    let value = get_field(array_element(col(SAMPLES), lit(-1_i64)), VALUE);
+    vec![
+        // NaN last whichever way the values go: `funcSort` and
+        // `funcSortDesc` both reverse a heap that sorts NaN first.
+        SortExpr::new(isnan(value.clone()), true, false),
+        SortExpr::new(value, asc, false),
+    ]
+}
+
+/// The order an instant `topk` or `bottomk` answers in: group by group,
+/// each group's series by value with NaN last, descending for `topk`.
+///
+/// Upstream's `aggregationK` returns the groups in the order it first met
+/// them in the input and each group's heap sorted. The first is the
+/// input's accident, so the groups come out in label order instead, which
+/// is the order the rest of the result takes. `group` is the label set of
+/// the aggregation's grouping, which every series of one group shares.
+pub fn grouped_by_value(group: Expr, descending: bool) -> Vec<SortExpr> {
+    let mut keys = vec![SortExpr::new(Set::udf().call(vec![group]), true, false)];
+    keys.extend(by_value(!descending));
+    keys
 }
 
 /// `promql_natural_key(value)`: one label value as a byte string ordered
@@ -230,26 +252,34 @@ impl ScalarUDFImpl for Set {
         let mut key = Vec::new();
         for row in 0..labels.len() {
             key.clear();
-            // Fields are sorted by name and `""` means the series does
-            // not carry the label, which is exactly `labels.Labels`.
-            for (field, column) in labels.fields().iter().zip(labels.columns()) {
-                let value = read_string(column, row)?;
-                if value.is_empty() {
-                    continue;
-                }
-                escape(field.name(), &mut key);
-                key.extend_from_slice(&SEPARATOR);
-                escape(value, &mut key);
-                key.extend_from_slice(&SEPARATOR);
-            }
+            labels_key(labels, row, &mut key)?;
             out.append_value(&key);
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
 }
 
+/// Append row `row`'s label set to `out` as the byte string
+/// `promql_labels_key` orders by, for an operator that has to pick the
+/// first of several series in `labels.Compare` order without a `Sort`.
+pub(crate) fn labels_key(labels: &StructArray, row: usize, out: &mut Vec<u8>) -> Result<()> {
+    // Fields are sorted by name and `""` means the series does not carry
+    // the label, which is exactly `labels.Labels`.
+    for (field, column) in labels.fields().iter().zip(labels.columns()) {
+        let value = read_string(column, row)?;
+        if value.is_empty() {
+            continue;
+        }
+        escape(field.name(), out);
+        out.extend_from_slice(&SEPARATOR);
+        escape(value, out);
+        out.extend_from_slice(&SEPARATOR);
+    }
+    Ok(())
+}
+
 /// One string out of a `Utf8View` or `Utf8` column, NULL as `""`.
-fn read_string(values: &ArrayRef, row: usize) -> Result<&str> {
+pub(crate) fn read_string(values: &ArrayRef, row: usize) -> Result<&str> {
     match values.data_type() {
         DataType::Utf8View => {
             let views = values.as_string_view();
