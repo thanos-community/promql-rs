@@ -50,6 +50,7 @@ use promql_parser::ast::{
 use crate::absent;
 use crate::aggregate::{self, Op};
 use crate::binary;
+use crate::duration::DurationCtx;
 use crate::elementwise;
 use crate::error::EngineError;
 use crate::labels;
@@ -542,7 +543,7 @@ impl Planner<'_> {
             end_ms: self.query.end_ms,
             step_ms: self.query.step_ms,
             window_ms: self.query.lookback_ms,
-            offset_ms: offset_ms(vs)?,
+            offset_ms: offset_ms(vs, self.query)?,
             at_ms: resolve_at(vs, self.query),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
@@ -1052,18 +1053,17 @@ impl Planner<'_> {
                 )))
             }
         };
-        if ms.range_expr.is_some() {
-            return Err(EngineError::Unsupported(
-                "a range given as a duration expression".into(),
-            ));
-        }
+        let window_ms = match &ms.range_expr {
+            Some(d) => DurationCtx::new(self.query).millis(d, false)?,
+            None => duration_ms("the range", ms.range_secs)?,
+        };
 
         let params = Params {
             start_ms: self.query.start_ms,
             end_ms: self.query.end_ms,
             step_ms: self.query.step_ms,
-            window_ms: duration_ms("the range", ms.range_secs)?,
-            offset_ms: offset_ms(vs)?,
+            window_ms,
+            offset_ms: offset_ms(vs, self.query)?,
             at_ms: resolve_at(vs, self.query),
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
@@ -1191,8 +1191,14 @@ fn canonical(labels: datafusion::logical_expr::Expr) -> Vec<datafusion::logical_
     vec![labels, col(SAMPLES), col(BLOCK_START), col(BLOCK_END)]
 }
 
-fn offset_ms(vs: &VectorSelector) -> Result<i64, EngineError> {
-    duration_ms("the offset", vs.original_offset_secs)
+/// The selector's offset, from its literal or by folding its duration
+/// expression (upstream's `durationVisitor` on `OriginalOffsetExpr`).
+/// Unlike a range, an offset may be zero or negative.
+fn offset_ms(vs: &VectorSelector, query: &RangeQuery) -> Result<i64, EngineError> {
+    match &vs.original_offset_expr {
+        Some(d) => DurationCtx::new(query).millis(d, true),
+        None => duration_ms("the offset", vs.original_offset_secs),
+    }
 }
 
 /// A range or offset given as float seconds. Non-finite or `i64`-sized
@@ -1283,11 +1289,6 @@ fn check_range_modifiers(call: &Call) -> Result<(), EngineError> {
 }
 
 fn reject_unsupported_modifiers(vs: &VectorSelector) -> Result<(), EngineError> {
-    if vs.original_offset_expr.is_some() {
-        return Err(EngineError::Unsupported(
-            "an offset given as a duration expression".into(),
-        ));
-    }
     if vs.anchored || vs.smoothed {
         return Err(EngineError::Unsupported(
             "the anchored and smoothed modifiers".into(),
@@ -1408,6 +1409,53 @@ mod tests {
         let one_step = RangeQuery::new(600_000, 600_000, 30_000);
         let hints = hints_of("x", one_step).await;
         assert_eq!(hints[0].step_ms, Some(30_000));
+    }
+
+    /// A range given as a duration expression reaches the store as the
+    /// number it folds to under this query's step and range, not as the
+    /// literal's zero (upstream's `durationVisitor`).
+    #[tokio::test]
+    async fn a_range_expression_is_folded_with_the_querys_step() {
+        let range = RangeQuery::new(0, 600_000, 30_000);
+        for (query, window_ms) in [
+            ("rate(x[step()*4])", 120_000),
+            ("rate(x[range()/10+1m])", 120_000),
+            ("rate(x[2m])", 120_000),
+        ] {
+            let hints = hints_of(query, range).await;
+            assert_eq!(hints[0].range_ms, Some(window_ms), "{query}");
+        }
+        let err = plan_of("rate(x[step()-30])", range).await.unwrap_err();
+        assert!(
+            err.to_string().ends_with("duration must be greater than 0"),
+            "{err}"
+        );
+    }
+
+    /// An offset expression reads the store over the window its folded
+    /// value selects, and unlike a range may fold to zero or below.
+    #[tokio::test]
+    async fn an_offset_expression_reads_like_its_value() {
+        let range = RangeQuery::new(600_000, 900_000, 30_000);
+        let none = hints_of("x", range).await;
+        let back = hints_of("x offset 30s", range).await;
+        // The scan moves with the offset at all, or the loop below would
+        // pass for any value.
+        assert_ne!(none[0].start_ms, back[0].start_ms);
+        for (expr, literal) in [
+            ("step()", "30s"),
+            ("(range()/10)", "30s"),
+            ("-step()", "-30s"),
+            ("(step()-30)", "0s"),
+        ] {
+            let folded = hints_of(&format!("x offset {expr}"), range).await;
+            let plain = hints_of(&format!("x offset {literal}"), range).await;
+            assert_eq!(
+                (folded[0].start_ms, folded[0].end_ms),
+                (plain[0].start_ms, plain[0].end_ms),
+                "{expr}"
+            );
+        }
     }
 
     /// Plan `query` against an empty store: every guard here runs before

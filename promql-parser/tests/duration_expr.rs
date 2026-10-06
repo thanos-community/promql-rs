@@ -94,7 +94,11 @@ fn a_sign_before_a_call_wraps_the_call() {
 
 #[test]
 fn at_takes_a_duration_as_seconds() {
-    for (q, ms) in [("x @ 100s", 100_000), ("x @ 1m40s", 100_000), ("x @ -1m", -60_000)] {
+    for (q, ms) in [
+        ("x @ 100s", 100_000),
+        ("x @ 1m40s", 100_000),
+        ("x @ -1m", -60_000),
+    ] {
         match must_parse(q) {
             Expr::VectorSelector(vs) => assert_eq!(vs.timestamp, Some(ms), "{q}"),
             other => panic!("{q}: {other:?}"),

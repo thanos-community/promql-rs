@@ -26,9 +26,10 @@ use lrlex::{DefaultLexeme, DefaultLexerTypes};
 use lrpar::{Lexeme, NonStreamingLexer};
 
 use crate::ast::{
-    AggregateExpr, AtModifier, BinaryExpr, Call, DurationExpr, Expr, FunctionRef, LabelMatcher, MatchOp,
-    MatrixSelector, NumberLiteral, ParenExpr, SequenceValue, SeriesDescription, StringLiteral,
-    SubqueryExpr, UnaryExpr, ValueType, VectorMatchCardinality, VectorMatching, VectorSelector,
+    AggregateExpr, AtModifier, BinaryExpr, Call, DurationExpr, Expr, FunctionRef, LabelMatcher,
+    MatchOp, MatrixSelector, NumberLiteral, ParenExpr, SequenceValue, SeriesDescription,
+    StringLiteral, SubqueryExpr, UnaryExpr, ValueType, VectorMatchCardinality, VectorMatching,
+    VectorSelector,
 };
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
@@ -507,11 +508,7 @@ fn split_duration(e: Expr) -> Result<(f64, Option<Box<DurationExpr>>), ()> {
     }
 }
 
-fn apply_offset(
-    mut e: Expr,
-    offset_secs: f64,
-    offset_expr: Option<Box<DurationExpr>>,
-) -> Expr {
+fn apply_offset(mut e: Expr, offset_secs: f64, offset_expr: Option<Box<DurationExpr>>) -> Expr {
     match &mut e {
         Expr::VectorSelector(vs) => {
             vs.original_offset_secs = offset_secs;
@@ -649,10 +646,13 @@ pub fn duration_value<'l, 'i: 'l>(lexer: &'l L<'l, 'i>, lx: Lx) -> Result<f64, (
 
 /// `1<<63/1e9` in the grammar's range checks: the longest duration, in
 /// seconds, a Go `time.Duration` holds.
-const MAX_DURATION_SECS: f64 = 9_223_372_036.854_775_807;
+const MAX_DURATION_SECS: f64 = 9_223_372_036.854_776;
 
 fn duration_out_of_range(v: f64) -> bool {
-    !(-MAX_DURATION_SECS..=MAX_DURATION_SECS).contains(&v)
+    // As in Go, NaN is past neither bound, so it passes here and is the
+    // engine's to reject; `contains` would turn it into a parse error.
+    v.partial_cmp(&MAX_DURATION_SECS) == Some(std::cmp::Ordering::Greater)
+        || v.partial_cmp(&-MAX_DURATION_SECS) == Some(std::cmp::Ordering::Less)
 }
 
 fn duration_node(
