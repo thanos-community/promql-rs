@@ -17,6 +17,16 @@ use std::fmt::Write as _;
 use super::run::{Outcome, Verdict};
 use super::supported::Supported;
 
+/// A missing feature as a person reads it: its name, then the upstream
+/// flag that gates its syntax when it has one. Both reports use this, so
+/// they cannot disagree on which features are experimental.
+pub fn feature_label(feature: &str) -> String {
+    match promql_parser::flag_for_feature(feature) {
+        Some(flag) => format!("{feature} (upstream: --enable-feature={flag})"),
+        None => feature.to_string(),
+    }
+}
+
 /// One `.test` file's standing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStats {
@@ -161,11 +171,20 @@ pub fn inventory_markdown(outcomes: &[Outcome]) -> String {
         },
     );
 
-    out.push_str("## Missing features\n\n| evals blocked | feature |\n|---:|---|\n");
+    out.push_str(
+        "## Missing features\n\n\
+         A flag in the last column is the Prometheus `--enable-feature` value that gates \
+         the feature's syntax upstream. The harness turns every one on, as upstream's \
+         promqltest does, so those evals run here; a stock engine would refuse them.\n\n\
+         | evals blocked | feature | upstream flag |\n|---:|---|---|\n",
+    );
     let mut rows: Vec<(&str, usize)> = features.into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     for (feature, count) in rows {
-        let _ = writeln!(out, "| {count} | {feature} |");
+        let flag = promql_parser::flag_for_feature(feature)
+            .map(|f| format!("`{f}`"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "| {count} | {feature} | {flag} |");
     }
 
     out.push_str("\n## By file\n\n| file | evals | passing | |\n|---|---:|---:|---|\n");
@@ -259,6 +278,45 @@ mod tests {
         assert_eq!(features["the frob function"], 2);
         assert_eq!(features["the baz function"], 1);
         assert_eq!(features.len(), 2);
+    }
+
+    #[test]
+    fn the_inventory_names_the_flag_an_experimental_feature_needs() {
+        let outcomes = vec![
+            outcome(
+                "a.test",
+                "1",
+                Verdict::Unsupported("the anchored and smoothed modifiers".into()),
+            ),
+            outcome(
+                "a.test",
+                "2",
+                Verdict::Unsupported("the mad_over_time function".into()),
+            ),
+            outcome(
+                "a.test",
+                "3",
+                Verdict::Unsupported("the rate function".into()),
+            ),
+        ];
+        let md = inventory_markdown(&outcomes);
+        assert!(
+            md.contains(
+                "| 1 | the anchored and smoothed modifiers | `promql-extended-range-selectors` |"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("| 1 | the mad_over_time function | `promql-experimental-functions` |"),
+            "{md}"
+        );
+        // A stable feature has an empty flag cell.
+        assert!(md.contains("| 1 | the rate function |  |"), "{md}");
+        assert_eq!(
+            feature_label("the mad_over_time function"),
+            "the mad_over_time function (upstream: --enable-feature=promql-experimental-functions)"
+        );
+        assert_eq!(feature_label("a subquery"), "a subquery");
     }
 
     #[test]

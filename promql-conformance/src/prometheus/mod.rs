@@ -25,7 +25,7 @@ pub mod run;
 pub mod script;
 pub mod supported;
 
-pub use report::{inventory_markdown, scoreboard, FileStats};
+pub use report::{feature_label, inventory_markdown, scoreboard, FileStats};
 pub use run::{almost_equal, run_script, Outcome, Verdict};
 pub use script::{load_corpus, Command, Eval, Expect, Expected, Script, Timing};
 pub use supported::{Batch, Supported, Violation};

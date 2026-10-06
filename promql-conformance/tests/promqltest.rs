@@ -50,7 +50,7 @@ use std::sync::OnceLock;
 use libtest_mimic::{Arguments, Failed, Trial};
 use promql_conformance::prometheus::supported::{self, Supported};
 use promql_conformance::prometheus::{
-    inventory_markdown, load_corpus, run_script, scoreboard, Outcome, Verdict,
+    feature_label, inventory_markdown, load_corpus, run_script, scoreboard, Outcome, Verdict,
 };
 use promql_conformance::DataFusionEngine;
 
@@ -180,7 +180,8 @@ fn every_eval(outcomes: &[Outcome]) -> Vec<Trial> {
                     "{detail}\n  query: {query}\n  at:    {at}"
                 ))),
                 Verdict::Unsupported(feature) => Err(Failed::from(format!(
-                    "{feature} is not supported yet\n  query: {query}\n  at:    {at}"
+                    "{} is not supported yet\n  query: {query}\n  at:    {at}",
+                    feature_label(&feature),
                 ))),
                 Verdict::Skipped(_) => Ok(()),
             })

@@ -12,44 +12,46 @@ Against the vendored corpus: **707 of 2098 evals pass** (33.7%), and **492** are
 
 ## Missing features
 
-| evals blocked | feature |
-|---:|---|
-| 86 | the histogram_quantile function |
-| 80 | the anchored and smoothed modifiers |
-| 60 | a subquery |
-| 56 | the histogram_fraction function |
-| 41 | the info function |
-| 21 | the label_replace function |
-| 20 | a unary operator |
-| 19 | the topk aggregation |
-| 16 | the histogram_quantiles function |
-| 13 | a scalar literal |
-| 9 | the predict_linear function |
-| 9 | the quantile_over_time function |
-| 7 | the bottomk aggregation |
-| 7 | the label_join function |
-| 6 | the quantile aggregation |
-| 5 | a string literal |
-| 4 | the deriv function |
-| 4 | the stddev_over_time function |
-| 3 | the stdvar_over_time function |
-| 3 | the ts_of_first_over_time function |
-| 2 | a range selector |
-| 2 | the double_exponential_smoothing function |
-| 2 | the first_over_time function |
-| 2 | the histogram_count function |
-| 2 | the histogram_sum function |
-| 2 | the mad_over_time function |
-| 2 | the ts_of_last_over_time function |
-| 1 | the changes function over a parenthesized expression |
-| 1 | the histogram_avg function |
-| 1 | the histogram_stddev function |
-| 1 | the histogram_stdvar function |
-| 1 | the limit_ratio aggregation |
-| 1 | the limitk aggregation |
-| 1 | the rate function over a parenthesized expression |
-| 1 | the ts_of_max_over_time function |
-| 1 | the ts_of_min_over_time function |
+A flag in the last column is the Prometheus `--enable-feature` value that gates the feature's syntax upstream. The harness turns every one on, as upstream's promqltest does, so those evals run here; a stock engine would refuse them.
+
+| evals blocked | feature | upstream flag |
+|---:|---|---|
+| 86 | the histogram_quantile function |  |
+| 80 | the anchored and smoothed modifiers | `promql-extended-range-selectors` |
+| 60 | a subquery |  |
+| 56 | the histogram_fraction function |  |
+| 41 | the info function | `promql-experimental-functions` |
+| 21 | the label_replace function |  |
+| 20 | a unary operator |  |
+| 19 | the topk aggregation |  |
+| 16 | the histogram_quantiles function | `promql-experimental-functions` |
+| 13 | a scalar literal |  |
+| 9 | the predict_linear function |  |
+| 9 | the quantile_over_time function |  |
+| 7 | the bottomk aggregation |  |
+| 7 | the label_join function |  |
+| 6 | the quantile aggregation |  |
+| 5 | a string literal |  |
+| 4 | the deriv function |  |
+| 4 | the stddev_over_time function |  |
+| 3 | the stdvar_over_time function |  |
+| 3 | the ts_of_first_over_time function | `promql-experimental-functions` |
+| 2 | a range selector |  |
+| 2 | the double_exponential_smoothing function | `promql-experimental-functions` |
+| 2 | the first_over_time function | `promql-experimental-functions` |
+| 2 | the histogram_count function |  |
+| 2 | the histogram_sum function |  |
+| 2 | the mad_over_time function | `promql-experimental-functions` |
+| 2 | the ts_of_last_over_time function | `promql-experimental-functions` |
+| 1 | the changes function over a parenthesized expression |  |
+| 1 | the histogram_avg function |  |
+| 1 | the histogram_stddev function |  |
+| 1 | the histogram_stdvar function |  |
+| 1 | the limit_ratio aggregation | `promql-experimental-functions` |
+| 1 | the limitk aggregation | `promql-experimental-functions` |
+| 1 | the rate function over a parenthesized expression |  |
+| 1 | the ts_of_max_over_time function | `promql-experimental-functions` |
+| 1 | the ts_of_min_over_time function | `promql-experimental-functions` |
 
 ## By file
 
