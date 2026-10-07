@@ -9,15 +9,23 @@ const slides = [...stage.querySelectorAll(':scope > section')]
 const isSpeaker = new URLSearchParams(location.search).has('speaker')
 let cur = 0, st = 0 // slide index, steps shown on it
 const stepsOf = (i) => slides[i].querySelectorAll('[data-step]').length
+// A section with data-hidden is skipped, not removed: every other slide keeps
+// its number, so hashes, TALK.md headings and the speaker notes stay aligned,
+// and dropping the attribute brings the slide back.
+const inTalk = slides.flatMap((s, i) => (s.hasAttribute('data-hidden') ? [] : [i]))
+const after = (i) => inTalk.find((k) => k > i)
+const before = (i) => inTalk.findLast((k) => k < i)
 
 // #3 or #3.2 (slide, step). 0-based, so #n is the slide under TALK.md's
 // heading "n."; TALK.md numbers its slides from the opener, 0.
 const hashOf = (i, t) => `#${i}${t ? '.' + t : ''}`
 // Both parts are clamped: a step past the slide's last would hand animations.js
-// an undefined target.
+// an undefined target. A hidden slide's hash lands on the next slide's start,
+// so an old link never shows the room a slide the talk skips.
 function readHash() {
   const [s, t] = location.hash.slice(1).split('.').map((x) => Math.trunc(Number(x)))
   const i = Math.min(Math.max(s || 0, 0), slides.length - 1)
+  if (!inTalk.includes(i)) return [after(i) ?? before(i), 0]
   return [i, Math.min(Math.max(t || 0, 0), stepsOf(i))]
 }
 
@@ -37,18 +45,18 @@ function show(i, steps, { animate = true } = {}) {
 
 function next() {
   if (st < stepsOf(cur)) { step(slides[cur], st++, true); sync() }
-  else if (cur < slides.length - 1) show(cur + 1, 0)
+  else if (after(cur) !== undefined) show(after(cur), 0)
 }
 function prev() {
   if (st > 0) { step(slides[cur], --st, false); sync() }
-  else if (cur > 0) show(cur - 1, stepsOf(cur - 1), { animate: false })
+  else if (before(cur) !== undefined) show(before(cur), stepsOf(before(cur)), { animate: false })
 }
 const sync = () => { history.replaceState(null, '', hashOf(cur, st)); postState() }
 
 const actions = {
   next, prev,
-  first: () => show(0, 0),
-  last: () => show(slides.length - 1, 0),
+  first: () => show(inTalk[0], 0),
+  last: () => show(inTalk[inTalk.length - 1], 0),
 }
 // The speaker window sends navigation to the main deck instead of moving its
 // own copy, which would drift out of sync.
@@ -137,9 +145,10 @@ if (isSpeaker) {
   // room is without looking up.
   const label = (id, text) => { document.querySelector(`#${id} > h3`).textContent = text }
   const render = () => {
-    thumb('sp-now', cur); thumb('sp-next', cur + 1)
+    const n = after(cur)
+    thumb('sp-now', cur); thumb('sp-next', n)
     label('sp-now', `Now ${hashOf(cur, st)}`)
-    label('sp-next', slides[cur + 1] ? `Next ${hashOf(cur + 1, 0)}` : 'Next: end')
+    label('sp-next', n !== undefined ? `Next ${hashOf(n, 0)}` : 'Next: end')
     document.getElementById('sp-notes').textContent = slides[cur].querySelector('.notes')?.textContent ?? ''
   }
   const onState = (d) => {
@@ -162,6 +171,10 @@ if (isSpeaker) {
   else addEventListener('message', (e) => { if (e.source === speakerWin) onCommand(e.data) })
   const [i, t] = readHash()
   show(i, t, { animate: false })
+  // font-display:block lays text out in a fallback font until Lato is in, and
+  // a hook that measures text sizes itself to that: slide 7's heading wraps to
+  // two lines and lands off centre. Replaying the same state measures again.
+  document.fonts.ready.then(() => show(cur, st, { animate: false }))
   // replaceState in show() does not fire this, so only a typed or pasted hash lands here.
   addEventListener('hashchange', () => {
     const [i, t] = readHash()

@@ -161,7 +161,8 @@ section.gates-slide{flex-direction:row;align-items:center;gap:40px;padding:100px
 .cycle .tag{font-size:22px;fill:var(--text-dim)}
 .cycle .cap{font-size:40px;fill:var(--text-dim)}
 .gate-col{flex:1;min-width:0;align-self:stretch;display:flex;flex-direction:column}
-.gate-col h2{font-size:56px;color:var(--accent);margin-bottom:24px}
+/* Hugging its text, so the box animations.js scales up on 7.0 is the line itself. */
+.gate-col h2{align-self:flex-start;font-size:56px;color:var(--accent);margin-bottom:24px}
 .gate-col .panels{flex:1;display:grid;align-items:center}
 .gate-col .panel{grid-area:1/1}
 /* In the panels' cell but pinned to its top, so it reads as a line under the

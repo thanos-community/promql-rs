@@ -51,9 +51,10 @@ const beside = (section) => section.querySelectorAll('.arch .go, .arch .rs > :no
 // into it, the newest one filled; n = 6 adds the arrow closing the loop, turns
 // every gate green, and only then brings in the centre caption and the merge
 // line: the ring is not a loop until it closes. Panel n - 1 describes the gate
-// that just appeared. A gate scales about its own circle centre: a bbox-derived
-// origin reads zero while the slide is hidden, which is when reset() runs.
-function gateState(section, n, apply) {
+// that just appeared, after `lead` seconds. A gate scales about its own circle
+// centre: a bbox-derived origin reads zero while the slide is hidden, which is
+// when reset() runs.
+function gateState(section, n, apply, lead = 0.15) {
   const gates = [...section.querySelectorAll('.gate')]
   const arcs = [...section.querySelectorAll('.arc')]
   const done = n > gates.length
@@ -70,7 +71,7 @@ function gateState(section, n, apply) {
   apply(section.querySelector('.cap'), { autoAlpha: done ? 1 : 0, delay: done ? 0.35 : 0 })
   apply(section.querySelector('.merge'), { autoAlpha: done ? 1 : 0, y: done ? 0 : 16, delay: done ? 0.35 : 0 })
   section.querySelectorAll('.panel').forEach((p, k) =>
-    apply(p, { autoAlpha: k === n - 1 ? 1 : 0, y: k === n - 1 ? 0 : 16, delay: k === n - 1 ? 0.15 : 0 }))
+    apply(p, { autoAlpha: k === n - 1 ? 1 : 0, y: k === n - 1 ? 0 : 16, delay: k === n - 1 ? lead : 0 }))
 }
 
 // Gate 1 on 7.1: red, green, red, green, about 0.5 s each, a unit test failing
@@ -87,6 +88,26 @@ function unitPulse(section, tl) {
   tl.to(pass, { opacity: 1, duration: 0.12 }, 1.5)
   tl.set(fail, { opacity: 0 }, 2)
   tl.to(pass, { opacity: 0, duration: 0.4 }, 2)
+}
+
+// Slide 7's heading on 7.0: the column's own h2, scaled about its top-left
+// corner and moved to the stage centre, one line as wide as the slide's wider
+// side padding allows. The CSS layout is the small state, so the press to 7.1
+// tweens it to no transform at all. offset* read the layout whatever transform
+// GSAP left, but read zero in the speaker view, whose #stage is display:none;
+// its thumbnail shows the slide's last step, where the heading is small anyway.
+const gateHead = (section) => section.querySelector('.gate-col h2')
+function headBig(section) {
+  const h = gateHead(section)
+  if (!h.offsetWidth) return { x: 0, y: 0, scale: 1 }
+  let left = 0, top = 0
+  for (let e = h; e !== section; e = e.offsetParent) { left += e.offsetLeft; top += e.offsetTop }
+  const pad = getComputedStyle(section)
+  const side = Math.max(parseFloat(pad.paddingLeft), parseFloat(pad.paddingRight))
+  const W = section.offsetWidth, H = section.offsetHeight
+  const k = Math.min((W - 2 * side) / h.offsetWidth,
+    (H - parseFloat(pad.paddingTop) - parseFloat(pad.paddingBottom)) / h.offsetHeight)
+  return { x: (W - k * h.offsetWidth) / 2 - left, y: (H - k * h.offsetHeight) / 2 - top, scale: k }
 }
 
 const scoreParts = (section) => [section.querySelector('#score-draw rect'), section.querySelector('.last-label')]
@@ -174,11 +195,21 @@ const hooks = {
     reset(section) {
       gateState(section, 0, (t, { stagger, delay, ...v }) => gsap.set(t, v))
       gsap.set(section.querySelectorAll('.gate .fail, .gate .pass'), { opacity: 0 })
+      gsap.set(gateHead(section), { ...headBig(section), transformOrigin: '0 0' })
     },
     step(section, i, forward, tl) {
       const n = forward ? i + 1 : i
-      gateState(section, n, (t, v) => tl.to(t, { duration: 0.45, ease: 'power2.inOut', ...v }, 0))
+      // On the press to 7.1 the first panel waits for the heading to land above
+      // it; any sooner and the heading sweeps across the panel at twice its size.
+      const lead = i === 0 && forward ? 0.5 : 0.15
+      gateState(section, n, (t, v) => tl.to(t, { duration: 0.45, ease: 'power2.inOut', ...v }, 0), lead)
       if (n === 1) unitPulse(section, tl)
+      // Only the press between 7.0 and 7.1 moves the heading, so no later step
+      // starts a tween on it.
+      if (i === 0) {
+        const to = forward ? { x: 0, y: 0, scale: 1 } : headBig(section)
+        tl.to(gateHead(section), { ...to, duration: 0.7, ease: 'power3.inOut' }, 0)
+      }
     },
   },
   // ---- slide 8. Entering draws the passing line left to right by growing its

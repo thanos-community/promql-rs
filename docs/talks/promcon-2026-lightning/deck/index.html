@@ -26,7 +26,7 @@
     </div>
     <p class="byline">Matthias Loibl, Dash0</p>
     <p class="repo">github.com/thanos-community/promql-rs</p>
-    <aside class="notes">I have five minutes and one sentence for you. A series is an Arrow row, and the engine is DataFusion aggregates over that row. This is promql-rs.</aside>
+    <aside class="notes">I have five minutes for you. This is promql-rs: PromQL built on Arrow and DataFusion.</aside>
   </section>
 
   <section data-title="Origin and why" class="origin" data-anim="origin">
@@ -57,9 +57,9 @@
         </ul>
       </div>
     </div>
-    <aside class="notes">[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar observability store in Rust. [click 3] Dash0 acquired Polar Signals, and we need a PromQL engine on Great Lakes. [click 4] The parser isn't hand-rolled. Its grammar is generated from the Prometheus yacc grammar, so it parses what Prometheus parses, and a tool flags the rules it misses. [click 5] We talked to the community, and had first meetings with people from Cloudflare, Reddit, Shopify and Roku.
+    <aside class="notes">[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar store in Rust. [click 3] Dash0 acquired Polar Signals; we need PromQL on Great Lakes. [click 4] Our parser is generated from Prometheus's yacc grammar. [click 5] We met people from Cloudflare, Reddit, Shopify and Roku.
 
-[click 6] Great Lakes stores Vortex in object storage, Arrow in memory. [click 7] The Go engine still decodes every sample into a point struct. [click 8] An engine that speaks Arrow reads the store's format directly. [click 9] It borrows DataFusion's planner, parallelism and memory accounting.</aside>
+[click 6] Great Lakes stores Vortex in object storage, Arrow in memory. [click 7] Prometheus decodes every sample into a point struct. [click 8] An engine that speaks Arrow reads Great Lakes directly. [click 9] DataFusion brings the planner, parallelism and memory accounting.</aside>
   </section>
 
   <section data-title="Two architectures" class="arch-slide" data-anim="seam">
@@ -175,14 +175,14 @@
         <li>Thanos Store API client: queries a real Thanos today</li>
       </ul>
     </div>
-    <aside class="notes">On the left is the Go engine you know. The parser hands an AST to promql.Engine. rangeEval walks the steps, and the selectors pull samples through storage.Querier iterators. A series is labels and a slice of points.
+    <aside class="notes">On the left, the Go engine you know. A series is labels and a slice of points.
 
-On the right is promql-rs. Same grammar. A planner turns the AST into a DataFusion logical plan of stacked aggregates, and DataFusion makes the physical plan. At the bottom, a store implements one trait, SeriesSource, and returns a plan that streams Arrow RecordBatches. A series is one row, from the store to the result.
+On the right, promql-rs. Same grammar, then a DataFusion plan of stacked aggregates over a store that streams Arrow RecordBatches. A series is one row, from the store to the result.
 
-[click 1] The seam is one trait, SeriesSource. Implement it, like a Go interface, and your store runs PromQL. I have a Thanos Store API client doing that against a real Thanos today.</aside>
+[click 1] The seam is SeriesSource: one trait, your store. Implement it, like a Go interface, and your store runs PromQL. I have a Thanos Store API client doing that against a real Thanos today.</aside>
   </section>
 
-  <section data-title="Blocks in Arrow" class="row-slide">
+  <section data-title="Blocks in Arrow" class="row-slide" data-hidden>
     <h2>Blocks in Arrow</h2>
     <pre class="schema">labels       Struct&lt;__name__: Utf8View, ...&gt;
 samples      List&lt;Struct&lt;timestamp: Timestamp(Millisecond), value: Float64&gt;&gt;
@@ -225,13 +225,13 @@ block_end    Timestamp(Millisecond)</pre>
     </div>
     <aside class="notes">[before click 1] These plans come from the real planner.
 
-[click 1] A bare selector. One scan, and above it one aggregate, vector_selector, grouped per series and block. Picking the last sample in the lookback is an aggregate over the samples list.
+[click 1] A bare selector: one scan, and one aggregate, vector_selector, over each series' samples.
 
-[click 2] Now rate. The range selector has no node of its own. It's rate's input, and rate is the aggregate over the same scan.
+[click 2] Now rate. The range selector has no node of its own; rate is the aggregate over the same scan.
 
-[click 3] Now sum by job. A second aggregate stacks on top, grouped by block and job. Every PromQL operator here is a DataFusion aggregate, and the query is those aggregates stacked.
+[click 3] Now sum by job. A second aggregate stacks on top: every PromQL operator here is a DataFusion aggregate.
 
-[click 4] And the physical plan. DataFusion's optimizer made this split, not my planner. A Partial in each store partition, a repartition on the block columns and job that keeps block order, and a FinalPartitioned.</aside>
+[click 4] And the physical plan. DataFusion's optimizer made this split, not my planner: a Partial per store partition, a repartition on the highlighted key, and a FinalPartitioned.</aside>
   </section>
 
   <section data-title="Row by row, block by block" class="st-slide" data-anim="stepthrough">
@@ -242,15 +242,15 @@ block_end    Timestamp(Millisecond)</pre>
     <h2>Row by row, block by block</h2>
     <p class="st-q"><code>sum(rate(x[5m]))</code><span>step 30 s · one store partition</span></p>
     <svg class="st-svg" role="img" aria-label="sum(rate(x[5m])) over two RecordBatches of Arrow rows in two blocks: rate folds one row at a time through one window buffer, and sum's Partial holds one slot per step of the open block and emits a block through the repartition and the Final"></svg>
-    <aside class="notes">[before click 1] Now that plan runs over the four rows you saw. rate holds one window buffer, sum one partial per step of the open block.
+    <aside class="notes">[before click 1] Now that plan runs over four Arrow rows, each one series in one block, from block_start to block_end.
 
-[click 1] rate copies row one's samples into the buffer and answers 420 and 450, block one's only steps.
+[click 1] rate copies row one into its buffer and answers 420 and 450, block one's steps.
 
-[click 2] Row two has other labels, so a is done. Its answer leaves as one Arrow row, up into sum, and its buffer goes.
+[click 2] Row two has other labels, so a is done; its answer moves up into sum as one row.
 
-[click 3] Row three is a again, in block two. It starts from an empty buffer; the grey samples only feed windows. The value drops from 16 to 3, a reset.
+[click 3] Row three is a again, in block two. The drop from 16 to 3 is a reset.
 
-[click 4] Batch D brings its own offsets, from zero. When a's block-two row reaches sum, block one is over: the Partial emits it, through the repartition, to the Final.
+[click 4] Batch D brings its own offsets. When a's block-two row reaches sum, block one is done and goes to the Final.
 
 [click 5] The engine never held a whole series, only the window a step reaches. Memory is bounded by the block.</aside>
   </section>
@@ -321,7 +321,7 @@ block_end    Timestamp(Millisecond)</pre>
       <text class="cap" x="500" y="484">one feature, one loop</text>
     </svg>
     <div class="gate-col">
-      <h2>Five gates per engine feature</h2>
+      <h2>Vibe coding, with guardrails</h2>
       <div class="panels">
         <p class="merge">a human at the merge</p>
         <div class="panel">
@@ -362,9 +362,9 @@ block_end    Timestamp(Millisecond)</pre>
         </div>
       </div>
     </div>
-    <aside class="notes">The opener was half true: the agents write most of the code. [click 1] It holds because every feature walks these five gates in order, each green before the next. Unit is test-first: a failing test before the code. Each gate catches a different failure, so a skipped gate hides which layer broke.
+    <aside class="notes">The opener was half true: the agents write most of the code. [click 1] Every feature walks five gates in order, each green before the next. Unit is test-first: a failing test before the code.
 
-[click 2] Conformance is the gate that makes this work for agents: 2,098 evals from Prometheus itself. An agent checks its work against the real spec, not against its own opinion. [click 3] Gate three pins the DataFusion plans you saw, logical and physical. [click 4] Benchmarks, [click 5] then the profile. Those two are optional; the first three are not. [click 6] Then a human reviews and merges.</aside>
+[click 2] Conformance is what makes this work for agents: 2,098 evals from Prometheus itself. An agent checks its work against the real spec, not its own opinion. [click 3] Plan pins hold the DataFusion plans you saw. [click 4] Benchmarks [click 5] and the profile are optional. [click 6] And there's a human at the merge.</aside>
   </section>
   <section data-title="Scoreboard" class="score-slide" data-anim="score">
     <!-- slides/scoreboard.js draws the chart from src/data/conformance-history.json
@@ -383,7 +383,7 @@ block_end    Timestamp(Millisecond)</pre>
       </div>
     </div>
     <p class="source">source: <code data-score="source"></code> at each merge on main that changed it</p>
-    <aside class="notes">When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 do. UNSUPPORTED.md, generated from a real run, names what blocks the most: histogram_quantile with 86 evals, the anchored and smoothed modifiers with 80, subqueries with 60. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.</aside>
+    <aside class="notes">When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 do. The biggest blocker is histogram_quantile, with 86 evals. CI gates on an allowlist: a listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.</aside>
   </section>
 
   <section data-title="Close" class="close-slide">
@@ -392,10 +392,9 @@ block_end    Timestamp(Millisecond)</pre>
       <li><code>docs/engine-blocks.html</code>: the walkthrough with the step-through, opens from disk</li>
       <li><code>docs/talks/promcon-2026-lightning/</code>: these slides</li>
       <li>Try it: clone, then <code>cargo test -p promql-conformance --test promqltest</code> prints the scoreboard</li>
-      <li>Runs at Dash0 as the PromQL layer on Great Lakes</li>
     </ul>
     <p class="thanks">Thanks</p>
-    <aside class="notes">The repo is on GitHub. The walkthrough you just saw and these slides live in docs, and they open from disk. To try it, clone it and run the promqltest suite, which prints the scoreboard. Dash0 runs this engine on top of Great Lakes. If you run PromQL over a columnar store, find me afterwards. Thanks.</aside>
+    <aside class="notes">It's all on GitHub: the code, the walkthrough you just saw, and these slides. Clone it; the promqltest suite prints the scoreboard. If you run PromQL over a columnar store, find me afterwards. Thanks.</aside>
   </section>
 </main>
 <div id="speaker" hidden>

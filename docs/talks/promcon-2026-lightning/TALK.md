@@ -2,7 +2,7 @@
 
 - **Event.** PromCon 2026, lightning talk.
 - **Speaker.** Matthias Loibl.
-- **Length.** 6:25 at 140 wpm, to be trimmed after a test run; ten slides. Each slide's budget is its Say at 140 words per minute, rounded up to 5 s.
+- **Length.** 4:50; ten slides, slide 4 hidden. A timed run of the ten-slide draft took 6:50 for 845 spoken words, about 124 words per minute with clicks and pauses, so each slide's budget is its Say at 124 words per minute, rounded up to 5 s.
 - **Headline.** A series is an Arrow row, and the engine is DataFusion aggregates over that row.
 - **Second beat.** The engine never holds a whole series, only the window a step reaches, so memory is bounded by the block.
 
@@ -25,7 +25,7 @@ Hi, I'm Matthias. The Prometheus community has joked about rewriting it in Rust 
 - The fake title echoes the Bun post "Bun in Rust" (https://bun.com/blog/bun-in-rust), from the trend of rewriting Zig projects in Rust, and the years-old Prometheus community joke about rewriting Prometheus in Rust.
 - The affiliation here follows the same title-slide exception as slide 1.
 
-## 1. Title · 0:15, 15 s
+## 1. Title · 0:15, 10 s
 
 ### On screen
 
@@ -33,16 +33,17 @@ Hi, I'm Matthias. The Prometheus community has joked about rewriting it in Rust 
 - Matthias Loibl, Dash0
 - github.com/thanos-community/promql-rs
 
-### Say (27 words)
+### Say (15 words)
 
-I have five minutes and one sentence for you. A series is an Arrow row, and the engine is DataFusion aggregates over that row. This is promql-rs.
+I have five minutes for you. This is promql-rs: PromQL built on Arrow and DataFusion.
 
 ### Notes
 
 - The repo URL is confirmed as github.com/thanos-community/promql-rs.
-- The affiliation is the one place Dash0 appears outside slides 2 and 9. The brief asks for it on the title, and the Decisions rule below names the exception.
+- The affiliation is the one place Dash0 appears outside slide 2. The brief asks for it on the title, and the Decisions rule below names the exception.
+- The headline sentence at the top of this file is not said here: it is too deep for a cold audience. Slide 3's "a series is one row" and slide 5's "every PromQL operator here is a DataFusion aggregate" carry its two halves.
 
-## 2. Origin and why · 0:30, 50 s
+## 2. Origin and why · 0:25, 40 s
 
 ### On screen
 
@@ -58,20 +59,20 @@ Nine steps, one point each. The current point is large; the points before it in 
 - 2.8 An engine that speaks Arrow reads the store's format directly
 - 2.9 DataFusion brings the planner, parallelism and memory accounting
 
-### Say (113 words)
+### Say (78 words)
 
-[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar observability store in Rust. [click 3] Dash0 acquired Polar Signals, and we need a PromQL engine on Great Lakes. [click 4] The parser isn't hand-rolled. Its grammar is generated from the Prometheus yacc grammar, so it parses what Prometheus parses, and a tool flags the rules it misses. [click 5] We talked to the community, and had first meetings with people from Cloudflare, Reddit, Shopify and Roku.
+[click 1] Polar Signals started this engine. [click 2] We built it for Great Lakes, a columnar store in Rust. [click 3] Dash0 acquired Polar Signals; we need PromQL on Great Lakes. [click 4] Our parser is generated from Prometheus's yacc grammar. [click 5] We met people from Cloudflare, Reddit, Shopify and Roku.
 
-[click 6] Great Lakes stores Vortex in object storage, Arrow in memory. [click 7] The Go engine still decodes every sample into a point struct. [click 8] An engine that speaks Arrow reads the store's format directly. [click 9] It borrows DataFusion's planner, parallelism and memory accounting.
+[click 6] Great Lakes stores Vortex in object storage, Arrow in memory. [click 7] Prometheus decodes every sample into a point struct. [click 8] An engine that speaks Arrow reads Great Lakes directly. [click 9] DataFusion brings the planner, parallelism and memory accounting.
 
 ### Notes
 
-- The parser claim stays honest because of the second half of the sentence. README.md says the parser still misses native-histogram descriptors, duration arithmetic, and the anchored and smoothed selectors, and `promql-sync generate-grammar` prints every upstream alternative without a Rust action.
+- The Say claims only where the grammar comes from, not that the parser handles everything Prometheus parses. README.md says the parser still misses native-histogram descriptors, duration arithmetic, and the anchored and smoothed selectors, and `promql-sync generate-grammar` prints every upstream alternative without a Rust action.
 - The sources do not say what the conversations with Cloudflare, Reddit, Shopify and Roku were about, so the transcript states only that they happened. The speaker may add one clause.
 - No Thanos lineage and no other engine by name, on this slide or any other.
 - Each Why point is its own press, as each Origin point is; two or three landing at once looked broken next to the Origin half.
 
-## 3. Two architectures · 1:20, 55 s
+## 3. Two architectures · 1:05, 40 s
 
 ### On screen
 
@@ -81,20 +82,22 @@ Nine steps, one point each. The current point is large; the points before it in 
 - Arrows point down for calls and up for data. On the right every upward arrow is labelled `RecordBatch`.
 - One press: the `SeriesSource::select` box gets an orange ring and the rest of the diagram dims. A callout appears beside the box, over the dimmed Go column: `trait SeriesSource` and its method `select` in three lines of monospace, the line "one trait, your store", and two implementations, "in-memory store (the test suite)" and "Thanos Store API client: queries a real Thanos today".
 
-### Say (122 words)
+### Say (81 words)
 
-On the left is the Go engine you know. The parser hands an AST to promql.Engine. rangeEval walks the steps, and the selectors pull samples through storage.Querier iterators. A series is labels and a slice of points.
+On the left, the Go engine you know. A series is labels and a slice of points.
 
-On the right is promql-rs. Same grammar. A planner turns the AST into a DataFusion logical plan of stacked aggregates, and DataFusion makes the physical plan. At the bottom, a store implements one trait, SeriesSource, and returns a plan that streams Arrow RecordBatches. A series is one row, from the store to the result.
+On the right, promql-rs. Same grammar, then a DataFusion plan of stacked aggregates over a store that streams Arrow RecordBatches. A series is one row, from the store to the result.
 
-[click 1] The seam is one trait, SeriesSource. Implement it, like a Go interface, and your store runs PromQL. I have a Thanos Store API client doing that against a real Thanos today.
+[click 1] The seam is SeriesSource: one trait, your store. Implement it, like a Go interface, and your store runs PromQL. I have a Thanos Store API client doing that against a real Thanos today.
 
 ### Notes
 
 - Check the Go names against the pinned Prometheus commit in `promql-conformance/testdata/prometheus/UPSTREAM.md`, not a local checkout's HEAD.
 - The right column's middle boxes reuse the plan shapes of slide 5, so the two slides read as one picture.
 
-## 4. Blocks in Arrow · 2:15, 30 s
+## 4. Blocks in Arrow · 1:45, 0 s
+
+Hidden: skipped in the talk for now; the step-through carries the block columns. The slide stays in the file and the deck, at 0 s, and its words are left out of the total.
 
 ### On screen
 
@@ -126,7 +129,7 @@ This is the whole data model, four columns. Labels are a struct with one field p
 - `series_id`, the optional fifth column of keyed mode (`docs/series-source.md`, *The series batch*), stays off the slide. The talk shows sorted mode only.
 - The highlighted row is the row `2·a` that slide 6 folds, so the audience sees it twice.
 
-## 5. Plan explorer demo · 2:45, 55 s
+## 5. Plan explorer demo · 1:45, 45 s
 
 ### On screen
 
@@ -171,17 +174,17 @@ This is the whole data model, four columns. Labels are a struct with one field p
                 DataSourceExec: file_groups={1 group: [[dataset=default/…/test.vortex]]}, file_type=vortex, predicate: timestamp >= … AND timestamp < …
   ```
 
-### Say (123 words)
+### Say (83 words)
 
 [before click 1] These plans come from the real planner.
 
-[click 1] A bare selector. One scan, and above it one aggregate, vector_selector, grouped per series and block. Picking the last sample in the lookback is an aggregate over the samples list.
+[click 1] A bare selector: one scan, and one aggregate, vector_selector, over each series' samples.
 
-[click 2] Now rate. The range selector has no node of its own. It's rate's input, and rate is the aggregate over the same scan.
+[click 2] Now rate. The range selector has no node of its own; rate is the aggregate over the same scan.
 
-[click 3] Now sum by job. A second aggregate stacks on top, grouped by block and job. Every PromQL operator here is a DataFusion aggregate, and the query is those aggregates stacked.
+[click 3] Now sum by job. A second aggregate stacks on top: every PromQL operator here is a DataFusion aggregate.
 
-[click 4] And the physical plan. DataFusion's optimizer made this split, not my planner. A Partial in each store partition, a repartition on the block columns and job that keeps block order, and a FinalPartitioned.
+[click 4] And the physical plan. DataFusion's optimizer made this split, not my planner: a Partial per store partition, a repartition on the highlighted key, and a FinalPartitioned.
 
 ### Notes
 
@@ -189,9 +192,10 @@ This is the whole data model, four columns. Labels are a struct with one field p
 - No pin holds the physical plan of this exact query. The closest is "grouped aggregation over chunks in four partitions", `sum by (pod) (rate(x[5m]))`. The deck must plan against a source with several partitions, or the toggle shows no split.
 - The range `600000..1200000 step 30s` is the pin files' default. The deck's build picks its own and prints whatever the planner returns.
 - Plan text is generated by `promql-engine/tests/talk_plans.rs` into `deck/src/data/plans.json` against a four-partition source, so the physical toggle shows the split.
+- The Say never says "block": with slide 4 hidden, slide 6 introduces the block columns, and here the physical plan shows them in the highlighted key.
 - Everything above the scan line is generated by the planner. The scan line is taken from a Vortex-backed store's plan on a test file, kept verbatim in `deck/src/data/vortex-scan.json`, and substituted because the in-memory test store reads no files: its own leaf says only `DataSourceExec: partitions=4`.
 
-## 6. Block-edge step-through demo · 3:40, 60 s
+## 6. Block-edge step-through demo · 2:30, 55 s
 
 ### On screen
 
@@ -207,17 +211,17 @@ This is the whole data model, four columns. Labels are a struct with one field p
 - 6.4 RecordBatch D replaces its outline, offsets `[0, 15]`; C dims and is tagged "released". 2·b closes `a`: a's block-2 row moves into the Partial, which emits block 1. The repartition and the Final light in turn, and the output cells for 420 s and 450 s fill with 0.048 and 0.052. Block 2's five slots open with a's rates, and the buffer is empty.
 - 6.5 Cells 0 to 14 of D copy in, 180 s to 450 s grey, and 480 s to 600 s sweep. At the end of the stream, b's row moves up, the Partial emits block 2 through the repartition and the Final, and the output completes: 0.055, 0.065, 0.069, 0.074, 0.074. The buffer and the slots end empty.
 
-### Say (140 words)
+### Say (108 words)
 
-[before click 1] Now that plan runs over the four rows you saw. rate holds one window buffer, sum one partial per step of the open block.
+[before click 1] Now that plan runs over four Arrow rows, each one series in one block, from block_start to block_end.
 
-[click 1] rate copies row one's samples into the buffer and answers 420 and 450, block one's only steps.
+[click 1] rate copies row one into its buffer and answers 420 and 450, block one's steps.
 
-[click 2] Row two has other labels, so a is done. Its answer leaves as one Arrow row, up into sum, and its buffer goes.
+[click 2] Row two has other labels, so a is done; its answer moves up into sum as one row.
 
-[click 3] Row three is a again, in block two. It starts from an empty buffer; the grey samples only feed windows. The value drops from 16 to 3, a reset.
+[click 3] Row three is a again, in block two. The drop from 16 to 3 is a reset.
 
-[click 4] Batch D brings its own offsets, from zero. When a's block-two row reaches sum, block one is over: the Partial emits it, through the repartition, to the Final.
+[click 4] Batch D brings its own offsets. When a's block-two row reaches sum, block one is done and goes to the Final.
 
 [click 5] The engine never held a whole series, only the window a step reaches. Memory is bounded by the block.
 
@@ -229,38 +233,40 @@ This is the whole data model, four columns. Labels are a struct with one field p
 - Block 1 starts at 240 s here and on slide 4, as in a store with fixed 240 s ranges. `MemorySeriesSource`, which the export runs on, starts its first block at the first window end, 420 s. Both blocks answer 420 s and 450 s from the same samples, so the numbers agree, and the export does not compare the block start.
 - No series continues across a batch, because the fixture cuts D before 2·b. Click 4 shows D's offsets starting again at 0 instead, and the transcript makes no claim about a crossing.
 - The slide shows one store partition's stream. With several, each runs its own `rate` and Partial, and the Final adds their partials per block, as slide 5's physical plan shows.
+- With slide 4 hidden, no slide before this one shows the block columns, so the Say's first sentence names them: each row is one series in one block, from `block_start` to `block_end`.
 - The headline wording is a proposal.
 
-## 7. Five gates · 4:40, 50 s
+## 7. Five gates · 3:25, 40 s
 
 ### On screen
 
 - Left, a ring that builds up clockwise from the top, one gate per press. Each gate appears with the arrow leading into it; the newest gate is filled orange. Conformance is drawn about 1.3 times the size of the others. Gates 4 and 5 are optional: their circles and incoming arrows are dashed and carry a small "optional" tag.
-- Right, the heading "Five gates per engine feature" over a detail panel that always describes the gate that just appeared: what the gate checks and its "green:" condition, both quoted from AGENTS.md, *Five gates per engine feature*. Gates 1 and 3 open with a line of the talk's own.
-- 7.0 Empty: no gates, no caption, no panel. The centre of the ring stays empty while the ring builds.
-- 7.1 Gate 1, Unit. As the circle appears it pulses red, green, red, green, about half a second per colour, a failing unit test fixed twice over, then settles to the orange current-gate fill. Panel, leading in bold: "Test first: the test fails, then the code makes it green." Under it the AGENTS.md quote that backs it, "every new kernel or planner branch has a test that fails without it", then "The steps of `.github/workflows/ci.yml` before the promqltest allowlist check, run locally." green: "all pass". The green line stops there because the rest of AGENTS.md's green sentence is the quote above it.
+- Right, from 7.1 on, the heading "Vibe coding, with guardrails" over a detail panel that always describes the gate that just appeared: what the gate checks and its "green:" condition, both quoted from AGENTS.md, *Five gates per engine feature*. Gates 1 and 3 open with a line of the talk's own.
+- 7.0 The heading "Vibe coding, with guardrails" alone, super big and centred on the stage, horizontally and vertically: one line, as wide as the slide's padding allows, Lato bold in the accent colour. No gates, no caption, no panel. The centre of the ring stays empty while the ring builds.
+- 7.1 Gate 1, Unit. On the press the heading shrinks and moves from the centre to its place top right, over the panel, in one smooth move of about 0.7 s; the panel fades in as the heading lands. Meanwhile the circle appears and pulses red, green, red, green, about half a second per colour, a failing unit test fixed twice over, then settles to the orange current-gate fill. Panel, leading in bold: "Test first: the test fails, then the code makes it green." Under it the AGENTS.md quote that backs it, "every new kernel or planner branch has a test that fails without it", then "The steps of `.github/workflows/ci.yml` before the promqltest allowlist check, run locally." green: "all pass". The green line stops there because the rest of AGENTS.md's green sentence is the quote above it.
 - 7.2 Gate 2, Conformance, and the arrow from Unit. Panel: "2,098 evals" in large type, read from `total` in `deck/src/data/scoreboard.json`, and the line "Prometheus's own promqltest corpus, the spec the agents check their work against". Then "A lower count is a regression to fix." green: "the gate passes without `BLESS`, and the pass count rose by the evals the feature targets."
 - 7.3 Gate 3, Plan pins, and the arrow from Conformance. Panel: "DataFusion logical plans, pinned as text in `tests/testdata/plans/*.yaml`; small cases pin the physical plan too." Then "A changed pin is a design change: re-bless it in its own commit whose message says why the shape moved." green: "every changed pin is explained in that commit."
 - 7.4 Gate 4, Benchmarks, dashed and tagged optional, and its dashed arrow from Plan pins. Panel, also tagged optional: "`promql-engine/benches` (`kernels`, `engine`, `memory`)" green: "no move beyond the five percent noise floor in the wrong direction, and the feature has a bench at realistic size."
 - 7.5 Gate 5, Profile, dashed and tagged optional, and its dashed arrow from Benchmarks. Panel, also tagged optional: "Run the feature's bench with `--profile-time` (`promql-engine/benches/README.md`) and read the profile." green: "the hot path is the one `docs/engine.md` predicts."
 - 7.6 The closing arrow from Profile back to Unit, solid. All five gates turn green (`--ok` on `--ok-bg`; 4 and 5 stay dashed), and as the arrow lands the centre caption "one feature, one loop" fades in. The panel shows one short line under the heading: "a human at the merge". Stepping back to 7.5 hides both.
 
-### Say (110 words)
+### Say (80 words)
 
-The opener was half true: the agents write most of the code. [click 1] It holds because every feature walks these five gates in order, each green before the next. Unit is test-first: a failing test before the code. Each gate catches a different failure, so a skipped gate hides which layer broke.
+The opener was half true: the agents write most of the code. [click 1] Every feature walks five gates in order, each green before the next. Unit is test-first: a failing test before the code.
 
-[click 2] Conformance is the gate that makes this work for agents: 2,098 evals from Prometheus itself. An agent checks its work against the real spec, not against its own opinion. [click 3] Gate three pins the DataFusion plans you saw, logical and physical. [click 4] Benchmarks, [click 5] then the profile. Those two are optional; the first three are not. [click 6] Then a human reviews and merges.
+[click 2] Conformance is what makes this work for agents: 2,098 evals from Prometheus itself. An agent checks its work against the real spec, not its own opinion. [click 3] Plan pins hold the DataFusion plans you saw. [click 4] Benchmarks [click 5] and the profile are optional. [click 6] And there's a human at the merge.
 
 ### Notes
 
 - AGENTS.md, *Five gates per engine feature*, at the repository root, is the source of the gate order and of every quoted line; keep the quotes verbatim when AGENTS.md changes. It gives no separate "what it catches" line per gate, so each panel quotes the sentence of that gate's entry that says what it checks.
+- Stepping back from 7.1 to 7.0 grows the heading back to the centre; a jump shows it where the steps leave it, big on 7.0 and small from 7.1 on. Its big size is measured from the text, so a reworded heading still fits on one line.
 - The 7.1 pulse is the only colour animation before the closing frame. It settles back to the current-gate fill so that 7.2 onward look as they would without it and the ring's first green is the one at 7.6. It plays when a step lands on 7.1, forward or back; a jump to 7.1 shows the settled state.
 - Gates 4 and 5 being optional is the author's decision for this talk, not what AGENTS.md says: there every gate applies, and "A pull request that stops before gate 5 names the gate it reached and stays a draft." That line stays off the slide because it contradicts the optional marking.
 - The numbers come from `deck/src/data/scoreboard.json`: the 2,098 on screen is its `total`, the field slide 8 shows, so the two slides cannot disagree. The Say quotes the current value and needs the same edit when the corpus changes.
-- Every plan pin holds the logical plan; only small cases also hold the physical plan, because partition counts and repartitioning make larger physical plans too fragile to hold as text (`promql-engine/tests/plan.rs`). The 7.3 panel says so; the Say's "logical and physical" rests on those small cases.
+- Every plan pin holds the logical plan; only small cases also hold the physical plan, because partition counts and repartitioning make larger physical plans too fragile to hold as text (`promql-engine/tests/plan.rs`). The 7.3 panel says so.
 - "The opener" in the Say is slide 0's struck title, "(Vibe) Rewriting Prometheus in Rust". The plan pins of gate three are the pins whose shapes slide 5 shows.
 
-## 8. Scoreboard · 5:30, 30 s
+## 8. Scoreboard · 4:05, 25 s
 
 ### On screen
 
@@ -275,9 +281,9 @@ The opener was half true: the agents write most of the code. [click 1] It holds 
   - subqueries, 60 evals
 - Below that, the CI rule from the allowlist `promql-conformance/testdata/prometheus/SUPPORTED.toml` (source: `README.md`, *Status*): a listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.
 
-### Say (68 words)
+### Say (46 words)
 
-When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 do. UNSUPPORTED.md, generated from a real run, names what blocks the most: histogram_quantile with 86 evals, the anchored and smoothed modifiers with 80, subqueries with 60. CI gates on an allowlist, SUPPORTED.toml. A listed eval that stops passing turns CI red. So does an unlisted eval that starts passing, so new coverage gets declared.
+When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 do. The biggest blocker is histogram_quantile, with 86 evals. CI gates on an allowlist: a listed eval that stops passing turns CI red, and so does an unlisted eval that starts passing.
 
 ### Notes
 
@@ -287,7 +293,7 @@ When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 d
 - The scoreboard numbers are produced by `deck/scripts/scoreboard.py` into `deck/src/data/scoreboard.json`. Slide 7's eval count reads the same `total`.
 - `native_histograms` alone is 521 evals with 0 passing (source: `UNSUPPORTED.md`, *By file*), and native histograms are a stated non-goal (`docs/engine.md`). It is over a third of the 1,391 evals still failing, if a question comes up. It stays off the slide to keep the time.
 
-## 9. Close · 6:00, 25 s
+## 9. Close · 4:30, 20 s
 
 ### On screen
 
@@ -295,12 +301,11 @@ When CI started gating on promqltest, 268 of its 2,098 evals passed; today 707 d
 - `docs/engine-blocks.html`: the walkthrough with the step-through, opens from disk
 - `docs/talks/promcon-2026-lightning/`: these slides
 - Try it: clone, then `cargo test -p promql-conformance --test promqltest` prints the scoreboard
-- Runs at Dash0 as the PromQL layer on Great Lakes
 - Thanks
 
-### Say (56 words)
+### Say (34 words)
 
-The repo is on GitHub. The walkthrough you just saw and these slides live in docs, and they open from disk. To try it, clone it and run the promqltest suite, which prints the scoreboard. Dash0 runs this engine on top of Great Lakes. If you run PromQL over a columnar store, find me afterwards. Thanks.
+It's all on GitHub: the code, the walkthrough you just saw, and these slides. Clone it; the promqltest suite prints the scoreboard. If you run PromQL over a columnar store, find me afterwards. Thanks.
 
 ### Notes
 
@@ -314,6 +319,6 @@ The repo is on GitHub. The walkthrough you just saw and these slides live in doc
 - No CDN or network fetch at runtime; fonts and libraries are vendored and inlined.
 - Branding follows prometheus.io: Lato (SIL OFL, vendored) and the Prometheus palette, defined once in `deck/src/theme.css`.
 - Demo code is copied from `docs/engine-blocks.html`, not shared with it. Slide 6 copies the page's fixture and event order and redraws them at stage scale in `deck/src/slides/stepthrough.js`, one click per Arrow row.
-- Polar Signals, Dash0 and Great Lakes appear only on slides 2 and 9, plus the speaker affiliation on the title slide.
+- Polar Signals, Dash0 and Great Lakes appear only on slide 2, plus the speaker affiliation on the title slides 0 and 1. The close names neither on screen nor in its Say, because the engine does not run at Dash0 yet.
 - No performance numbers anywhere.
 - Plan text, slide 6's rates and the scoreboard numbers are generated at build time by `deck/scripts/gen-data.sh` from the real planner and engine and `UNSUPPORTED.md`, except the physical scan line on slide 5, which is the Vortex line kept in `deck/src/data/vortex-scan.json`.
