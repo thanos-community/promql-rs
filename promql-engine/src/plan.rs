@@ -412,12 +412,11 @@ type Planning<'f> = Pin<Box<dyn Future<Output = Result<Planned, EngineError>> + 
 struct Above<'a> {
     /// The enclosing function or aggregation's PromQL name.
     func: Option<&'a str>,
+    /// The nearest enclosing aggregation's labels, carried through the
+    /// calls that map each series to one series and keep its labels.
+    /// `func` stays the node nearest the selector, so under `rate` the
+    /// store hears `func=rate` with the `by` of the `sum` above it.
     grouping: Option<&'a Grouping>,
-    /// The `by` of the nearest aggregation, carried through the calls that
-    /// keep each series' labels. Where `grouping` is dropped because the
-    /// selector's parent is a function, this stays: it names labels to
-    /// read, and licenses no merging.
-    enclosing_by: Option<&'a [String]>,
 }
 
 impl Planner<'_> {
@@ -502,7 +501,6 @@ impl Planner<'_> {
             range_ms,
             func: above.func.map(str::to_string),
             grouping: above.grouping.cloned(),
-            enclosing_by: above.enclosing_by.map(<[String]>::to_vec),
             shard: None,
         }
     }
@@ -603,8 +601,7 @@ impl Planner<'_> {
                     vs,
                     Above {
                         func: Some("timestamp"),
-                        grouping: None,
-                        enclosing_by: above.enclosing_by,
+                        grouping: above.grouping,
                     },
                     selector::Pick::Timestamp,
                 )
@@ -634,11 +631,10 @@ impl Planner<'_> {
         }
         if name == "absent" {
             // `absent` reads which series exist, not their labels, so no
-            // `by` above it describes what the store should split by.
+            // `by` above it describes what the store should read.
             let above = Above {
                 func: Some(name),
                 grouping: None,
-                enclosing_by: None,
             };
             let input = self.expr(&call.args[0], above).await?;
             return self.absent(&call.args[0], input);
@@ -671,7 +667,7 @@ impl Planner<'_> {
             return self.sort(call, func).await;
         }
         // `label_replace` and `label_join` do not get here yet. When they
-        // do they must stop `enclosing_by`: they rewrite labels, so a `by`
+        // do they must stop `grouping`: they rewrite labels, so a `by`
         // can name a label the input lacks while its source goes unnamed.
         self.range_function(call, above).await
     }
@@ -729,8 +725,7 @@ impl Planner<'_> {
                     vector,
                     Above {
                         func: Some(func.as_str()),
-                        grouping: None,
-                        enclosing_by: above.enclosing_by,
+                        grouping: above.grouping,
                     },
                 )
                 .await?
@@ -1007,7 +1002,6 @@ impl Planner<'_> {
                 Above {
                     func: Some(name),
                     grouping: None,
-                    enclosing_by: None,
                 },
             )
             .await?;
@@ -1037,7 +1031,7 @@ impl Planner<'_> {
         let name = call.func.name.as_str();
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
-        self.range_over(call, func, name, above.enclosing_by).await
+        self.range_over(call, func, name, above.grouping).await
     }
 
     /// `func` over the one range selector `call` takes, told to the store
@@ -1050,7 +1044,7 @@ impl Planner<'_> {
         call: &Call,
         func: Func,
         name: &str,
-        enclosing_by: Option<&[String]>,
+        grouping: Option<&Grouping>,
     ) -> Result<Planned, EngineError> {
         let (ms, vs) = match call.args.as_slice() {
             [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
@@ -1094,19 +1088,18 @@ impl Planner<'_> {
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         check_time_bound("the range", params.window_ms)?;
-        // The store hears about this function, not the aggregation over
-        // it: `rate` is what decides which samples it may skip, and the
-        // grouping above it no longer describes the selector's parent, so
-        // it is dropped rather than threaded through. `enclosing_by` is
-        // threaded: `rate` keeps each series' labels, so the `by` still
-        // names the labels the aggregation reads off these series.
+        // `func` is this function, not the aggregation over it: `rate` is
+        // what decides which samples the store may skip. The aggregation's
+        // `by` still travels as `grouping`, because `rate` keeps each
+        // series' labels and so the labels it names are the ones read off
+        // these series. It does not license merging them: two counters
+        // merged below `rate` break reset detection.
         let hints = self.hints(
             &params,
             Some(params.window_ms),
             Above {
                 func: Some(name),
-                grouping: None,
-                enclosing_by,
+                grouping,
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
@@ -1158,9 +1151,6 @@ impl Planner<'_> {
                 Above {
                     func: Some(op.as_str()),
                     grouping: grouping.as_ref(),
-                    // A nested aggregation starts its own value; `without`
-                    // names what to drop and so nothing to split by.
-                    enclosing_by: (!agg.without).then_some(agg.grouping.as_slice()),
                 },
             )
             .await?;
@@ -1406,10 +1396,16 @@ mod tests {
         assert_eq!(hints[0].step_ms, Some(30_000));
         assert_eq!(hints[0].range_ms, Some(300_000));
         // `rate` stands between the aggregation and the selector, so it
-        // is the function the store is told about, and the grouping two
-        // levels up does not reach it.
+        // is the function the store is told about; the grouping two
+        // levels up still reaches it, as metadata.
         assert_eq!(hints[0].func.as_deref(), Some("rate"));
-        assert_eq!(hints[0].grouping, None);
+        assert_eq!(
+            hints[0].grouping,
+            Some(Grouping {
+                labels: vec!["pod".to_string()],
+                by: true,
+            })
+        );
 
         // A plain selector has no window and nothing above it.
         let hints = hints_of("x", range).await;
@@ -1442,46 +1438,51 @@ mod tests {
         assert_eq!(hints[0].step_ms, Some(30_000));
     }
 
-    /// `enclosing_by` reaches through calls that keep each series' labels
-    /// and stops where the `by` would name labels the selector does not
-    /// carry. `grouping` stays as it was: it licenses merging, which is
-    /// wrong below `rate`.
+    /// `grouping` reaches through calls that keep each series' labels and
+    /// stops where the `by` would name labels the selector does not carry.
+    /// `func` stays the node nearest the selector throughout.
     #[tokio::test]
     async fn the_store_hears_the_by_of_the_aggregation_over_label_keeping_calls() {
         let range = RangeQuery::new(0, 600_000, 30_000);
-        let by = |labels: &[&str]| Some(labels.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+        let by = |labels: &[&str]| {
+            Some(Grouping {
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                by: true,
+            })
+        };
 
-        let hints = hints_of("sum by (pod)(rate(x[5m]))", range).await;
-        assert_eq!(hints[0].grouping, None);
-        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
-
-        let hints = hints_of("sum by (pod)(abs(rate(x[5m])))", range).await;
-        assert_eq!(hints[0].grouping, None);
-        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+        for query in [
+            "sum by (pod)(rate(x[5m]))",
+            "sum by (pod)(abs(rate(x[5m])))",
+        ] {
+            let hints = hints_of(query, range).await;
+            assert_eq!(hints[0].func.as_deref(), Some("rate"), "{query}");
+            assert_eq!(hints[0].grouping, by(&["pod"]), "{query}");
+        }
 
         let hints = hints_of("sum by (pod)(timestamp(x))", range).await;
-        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+        assert_eq!(hints[0].func.as_deref(), Some("timestamp"));
+        assert_eq!(hints[0].grouping, by(&["pod"]));
         let hints = hints_of("sum by (pod)(timestamp(abs(x)))", range).await;
-        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+        assert_eq!(hints[0].func.as_deref(), Some("abs"));
+        assert_eq!(hints[0].grouping, by(&["pod"]));
 
-        // Directly under the aggregation both hints say the same labels.
-        let hints = hints_of("sum by (pod)(x)", range).await;
-        assert_eq!(hints[0].grouping.as_ref().map(|g| g.by), Some(true));
-        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+        // An ungrouped aggregation says so: it reads no label.
+        let hints = hints_of("sum(rate(x[5m]))", range).await;
+        assert_eq!(hints[0].grouping, by(&[]));
 
         // `without` names what to drop, not what to read.
         let hints = hints_of("count without (pod)(rate(x[5m]))", range).await;
-        assert_eq!(hints[0].enclosing_by, None);
-
-        // A nested aggregation starts its own value.
-        let hints = hints_of("sum by (a)(max by (a, b)(rate(x[5m])))", range).await;
         assert_eq!(hints[0].grouping, None);
-        assert_eq!(hints[0].enclosing_by, by(&["a", "b"]));
+
+        // A nested aggregation starts its own grouping.
+        let hints = hints_of("sum by (a)(max by (a, b)(rate(x[5m])))", range).await;
+        assert_eq!(hints[0].grouping, by(&["a", "b"]));
 
         // Vector matching reads labels the `by` does not name.
         let hints = hints_of("sum by (pod)(rate(x[5m]) * on() group_left y)", range).await;
         assert_eq!(hints.len(), 2);
-        assert!(hints.iter().all(|h| h.enclosing_by.is_none()));
+        assert!(hints.iter().all(|h| h.grouping.is_none()));
 
         for query in [
             "sum by (pod)(absent(x))",
@@ -1490,7 +1491,7 @@ mod tests {
             "rate(x[5m])",
         ] {
             let hints = hints_of(query, range).await;
-            assert_eq!(hints[0].enclosing_by, None, "{query}");
+            assert_eq!(hints[0].grouping, None, "{query}");
         }
     }
 

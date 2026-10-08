@@ -347,9 +347,6 @@ pub(crate) fn render_selection(
         let word = if grouping.by { "by" } else { "without" };
         out.push_str(&format!(" {word}=({})", grouping.labels.join(", ")));
     }
-    if let Some(labels) = &hints.enclosing_by {
-        out.push_str(&format!(" enclosing_by=({})", labels.join(", ")));
-    }
     if let Some(shard) = &hints.shard {
         out.push_str(&format!(" shard={}/{}", shard.index, shard.count));
     }

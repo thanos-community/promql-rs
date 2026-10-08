@@ -107,28 +107,25 @@ pub struct SelectHints {
     /// PromQL name (`rate`, `sum`); `None` when there is none.
     /// `count_over_time` needs no values; `rate` needs whole windows.
     pub func: Option<String>,
-    /// `by` of the aggregation directly above the selector. With
-    /// `sum by (route)` only `route` decides the output, so a store may
-    /// drop the other labels, and if it partitions its plan by the
-    /// grouping labels the engine aggregates without a shuffle. Absent as
-    /// soon as anything sits in between, as in `sum by (route)
-    /// (rate(x[5m]))`, where the selector's own parent is `rate`.
-    pub grouping: Option<Grouping>,
-    /// `by` labels of the nearest aggregation above the selector, reached
-    /// through calls that map each series to one series and keep its labels
-    /// (`rate`, `abs`, `timestamp`; `__name__` aside): `sum by (pod)
-    /// (rate(x[5m]))` says `[pod]` where `grouping` says nothing.
+    /// `by` labels of the nearest aggregation above the selector, seen
+    /// through the calls that map each series to one series and keep its
+    /// labels (`rate`, `abs`, `timestamp`): `sum by (pod) (rate(x[5m]))`
+    /// says `by (pod)` next to `func = rate`. `func` is the node nearest
+    /// the selector, so it alone does not describe what lies between the
+    /// selector and the aggregation.
     ///
-    /// Advisory, and weaker than `grouping`: it does not license merging
-    /// series that differ in other labels, because merging two counters
-    /// before `rate` breaks reset detection. It names the labels the
-    /// consuming aggregation reads. A store whose series are real, such as
-    /// a metrics store, ignores it. A store that picks its own series
-    /// identity may split its series by these labels, so that the
-    /// aggregation finds them. Absent under `without`, a rewrite of labels,
-    /// a binary operator, `absent` or a sort; a nested aggregation starts
-    /// its own.
-    pub enclosing_by: Option<Vec<String>>,
+    /// Advisory metadata about which labels the aggregation reads. It does
+    /// not authorize merging distinct series or discarding their identity:
+    /// even directly below `count by (pod)`, merging two input series
+    /// turns a count of two into one, and below `rate` it breaks reset
+    /// detection. A store whose series are real may use it to prune
+    /// labels it can prove unread; a store that picks its own series
+    /// identity may split its series by these labels. Absent under
+    /// `without`, label rewrites, `absent`, sorts and binary operators,
+    /// where the labels read are not the ones the `by` names; a nested
+    /// aggregation starts its own. An ungrouped aggregation says an empty
+    /// `by`.
+    pub grouping: Option<Grouping>,
     /// Return only shard `index` of `count` of the matching series, for
     /// scanning the series space in parallel; `None` for all of them.
     pub shard: Option<Shard>,
@@ -146,7 +143,6 @@ impl SelectHints {
             range_ms: None,
             func: None,
             grouping: None,
-            enclosing_by: None,
             shard: None,
         }
     }
@@ -173,11 +169,6 @@ impl SelectHints {
 
     pub fn with_grouping(mut self, grouping: Grouping) -> Self {
         self.grouping = Some(grouping);
-        self
-    }
-
-    pub fn with_enclosing_by(mut self, labels: Vec<String>) -> Self {
-        self.enclosing_by = Some(labels);
         self
     }
 
@@ -704,7 +695,6 @@ mod tests {
             .with_range_ms(5)
             .with_func("rate")
             .with_grouping(Grouping::new(vec!["route".into()], true))
-            .with_enclosing_by(vec!["route".into()])
             .with_shard(Shard::new(1, 4));
         assert_eq!(
             hints,
@@ -719,7 +709,6 @@ mod tests {
                     labels: vec!["route".into()],
                     by: true
                 }),
-                enclosing_by: Some(vec!["route".into()]),
                 shard: Some(Shard { index: 1, count: 4 }),
             }
         );
