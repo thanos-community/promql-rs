@@ -413,6 +413,11 @@ struct Above<'a> {
     /// The enclosing function or aggregation's PromQL name.
     func: Option<&'a str>,
     grouping: Option<&'a Grouping>,
+    /// The `by` of the nearest aggregation, carried through the calls that
+    /// keep each series' labels. Where `grouping` is dropped because the
+    /// selector's parent is a function, this stays: it names labels to
+    /// read, and licenses no merging.
+    enclosing_by: Option<&'a [String]>,
 }
 
 impl Planner<'_> {
@@ -472,7 +477,7 @@ impl Planner<'_> {
                 Expr::VectorSelector(vs) => self.selector(vs, above, selector::Pick::Value).await,
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
-                Expr::Call(c) => self.call(c).await,
+                Expr::Call(c) => self.call(c, above).await,
                 Expr::Binary(b) => self.binary(expr, b).await,
                 other => Err(EngineError::Unsupported(describe(other))),
             }
@@ -497,6 +502,7 @@ impl Planner<'_> {
             range_ms,
             func: above.func.map(str::to_string),
             grouping: above.grouping.cloned(),
+            enclosing_by: above.enclosing_by.map(<[String]>::to_vec),
             shard: None,
         }
     }
@@ -582,7 +588,7 @@ impl Planner<'_> {
     /// sample's own time. Over anything else the vector's samples carry
     /// the step they were evaluated at, and `funcTimestamp` reads that;
     /// `timestamp(abs(x))` is the step, where `timestamp(x)` is not.
-    async fn timestamp(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    async fn timestamp(&mut self, call: &Call, above: Above<'_>) -> Result<Planned, EngineError> {
         let mut arg = &call.args[0];
         loop {
             arg = match arg {
@@ -598,12 +604,16 @@ impl Planner<'_> {
                     Above {
                         func: Some("timestamp"),
                         grouping: None,
+                        enclosing_by: above.enclosing_by,
                     },
                     selector::Pick::Timestamp,
                 )
                 .await
             }
-            _ => self.elementwise(call, elementwise::Func::Timestamp).await,
+            _ => {
+                self.elementwise(call, elementwise::Func::Timestamp, above)
+                    .await
+            }
         }
     }
 
@@ -613,7 +623,7 @@ impl Planner<'_> {
     /// words: a call this engine cannot plan and a call Prometheus would
     /// not accept are different answers, and only the second is the
     /// user's mistake.
-    async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    async fn call(&mut self, call: &Call, above: Above<'_>) -> Result<Planned, EngineError> {
         crate::function::check_call(call)?;
         let name = call.func.name.as_str();
         if name == "vector" {
@@ -623,15 +633,20 @@ impl Planner<'_> {
             });
         }
         if name == "absent" {
+            // `absent` reads which series exist, not their labels, so no
+            // `by` above it describes what the store should split by.
             let above = Above {
                 func: Some(name),
                 grouping: None,
+                enclosing_by: None,
             };
             let input = self.expr(&call.args[0], above).await?;
             return self.absent(&call.args[0], input);
         }
         if name == "absent_over_time" {
-            let input = self.range_over(call, Func::PresentOverTime, name).await?;
+            let input = self
+                .range_over(call, Func::PresentOverTime, name, None)
+                .await?;
             return self.absent(&call.args[0], input);
         }
         // `time()` and `pi()` are a value per step and nothing else, the
@@ -647,15 +662,18 @@ impl Planner<'_> {
             });
         }
         if name == "timestamp" {
-            return self.timestamp(call).await;
+            return self.timestamp(call, above).await;
         }
         if let Some(func) = elementwise::Func::parse(name) {
-            return self.elementwise(call, func).await;
+            return self.elementwise(call, func, above).await;
         }
         if let Some(func) = sort::Func::parse(name) {
             return self.sort(call, func).await;
         }
-        self.range_function(call).await
+        // `label_replace` and `label_join` do not get here yet. When they
+        // do they must stop `enclosing_by`: they rewrite labels, so a `by`
+        // can name a label the input lacks while its source goes unnamed.
+        self.range_function(call, above).await
     }
 
     /// `absent(v)` and `absent_over_time(x[5m])`: the one series over the
@@ -696,6 +714,7 @@ impl Planner<'_> {
         &mut self,
         call: &Call,
         func: elementwise::Func,
+        above: Above<'_>,
     ) -> Result<Planned, EngineError> {
         let mut args = Vec::new();
         for arg in call.args.iter().skip(1) {
@@ -711,6 +730,7 @@ impl Planner<'_> {
                     Above {
                         func: Some(func.as_str()),
                         grouping: None,
+                        enclosing_by: above.enclosing_by,
                     },
                 )
                 .await?
@@ -987,6 +1007,7 @@ impl Planner<'_> {
                 Above {
                     func: Some(name),
                     grouping: None,
+                    enclosing_by: None,
                 },
             )
             .await?;
@@ -1003,16 +1024,20 @@ impl Planner<'_> {
 
     /// A function of one range selector: `rate(x[5m])` and its family.
     ///
-    /// Takes no `Above`: this call is itself what stands directly over the
-    /// selector, so nothing higher reaches the store.
-    async fn range_function(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    /// This call is what stands directly over the selector, so of `above`
+    /// only the enclosing `by` reaches the store.
+    async fn range_function(
+        &mut self,
+        call: &Call,
+        above: Above<'_>,
+    ) -> Result<Planned, EngineError> {
         // Before the function is resolved: `deriv(foo[3m] smoothed)` is
         // an invalid query whether or not this engine has `deriv`.
         check_range_modifiers(call)?;
         let name = call.func.name.as_str();
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
-        self.range_over(call, func, name).await
+        self.range_over(call, func, name, above.enclosing_by).await
     }
 
     /// `func` over the one range selector `call` takes, told to the store
@@ -1025,6 +1050,7 @@ impl Planner<'_> {
         call: &Call,
         func: Func,
         name: &str,
+        enclosing_by: Option<&[String]>,
     ) -> Result<Planned, EngineError> {
         let (ms, vs) = match call.args.as_slice() {
             [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
@@ -1071,13 +1097,16 @@ impl Planner<'_> {
         // The store hears about this function, not the aggregation over
         // it: `rate` is what decides which samples it may skip, and the
         // grouping above it no longer describes the selector's parent, so
-        // it is dropped rather than threaded through.
+        // it is dropped rather than threaded through. `enclosing_by` is
+        // threaded: `rate` keeps each series' labels, so the `by` still
+        // names the labels the aggregation reads off these series.
         let hints = self.hints(
             &params,
             Some(params.window_ms),
             Above {
                 func: Some(name),
                 grouping: None,
+                enclosing_by,
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
@@ -1129,6 +1158,9 @@ impl Planner<'_> {
                 Above {
                     func: Some(op.as_str()),
                     grouping: grouping.as_ref(),
+                    // A nested aggregation starts its own value; `without`
+                    // names what to drop and so nothing to split by.
+                    enclosing_by: (!agg.without).then_some(agg.grouping.as_slice()),
                 },
             )
             .await?;

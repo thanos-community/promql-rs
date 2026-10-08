@@ -48,6 +48,7 @@ pub struct SelectHints {
     pub range_ms: Option<i64>,      // window of a range selector, `[5m]`
     pub func: Option<String>,       // function or aggregation directly above
     pub grouping: Option<Grouping>, // `by`/`without` labels directly above
+    pub enclosing_by: Option<Vec<String>>, // `by` of the aggregation above, through label-keeping calls
     pub shard: Option<Shard>,       // return shard `index` of `count` only
 }
 
@@ -104,6 +105,15 @@ them.
   the output, so a store may drop the other labels, and if it partitions
   its plan by the grouping labels the engine aggregates without a
   shuffle.
+- `enclosing_by`: the `by` labels of the aggregation above, seen through
+  `rate`, `abs`, `timestamp` and the like, which map a series to a series
+  and keep its labels. Unlike `grouping` it does not license merging series
+  that differ in other labels: two counters merged before `rate` break
+  reset detection. A store whose series are real ignores it; a store that
+  picks its own series identity may split its series by these labels so the
+  aggregation finds them. Absent under `without`, `label_replace`,
+  `absent`, sorts and binary operators, where the labels read are not the
+  ones the `by` names; a nested aggregation starts its own.
 - `shard`: scan the series space in parallel, one shard per plan.
 
 Prometheus's `Limit` and `DisableTrimming` are left out: the first serves
