@@ -133,9 +133,10 @@ fill_value -> Result<f64, ()>:
 
 function_call -> Result<Expr, ()>:
     'IDENT' function_call_body { actions::function_call($lexer, $span, $1.map_err(|_| ())?, $2?) }
-  | at_modifier_preprocessors function_call_body { Err(()) }
-  | 'STEP' function_call_body { Err(()) }
-  | 'RANGE' function_call_body { Err(()) }
+  | 'START' function_call_body { actions::function_call($lexer, $span, $1.map_err(|_| ())?, $2?) }
+  | 'END' function_call_body { actions::function_call($lexer, $span, $1.map_err(|_| ())?, $2?) }
+  | 'STEP' function_call_body { actions::function_call($lexer, $span, $1.map_err(|_| ())?, $2?) }
+  | 'RANGE' function_call_body { actions::function_call($lexer, $span, $1.map_err(|_| ())?, $2?) }
   ;
 
 function_call_body -> Result<Vec<Expr>, ()>:

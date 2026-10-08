@@ -625,7 +625,7 @@ impl Planner<'_> {
         let name = call.func.name.as_str();
         if name == "vector" {
             return Ok(Planned {
-                plan: self.scalar_series(|ts| scalar::fold(&call.args[0], ts))?,
+                plan: self.scalar_series(|ts| scalar::fold(&call.args[0], ts, self.query))?,
                 label_names: Vec::new(),
             });
         }
@@ -653,7 +653,7 @@ impl Planner<'_> {
             crate::function::signature(name).is_some_and(|s| s.return_type == ValueType::Scalar);
         if returns_scalar {
             return Ok(Planned {
-                plan: self.scalar_series(|ts| scalar::call(call, ts))?,
+                plan: self.scalar_series(|ts| scalar::call(call, ts, self.query))?,
                 label_names: Vec::new(),
             });
         }
@@ -788,7 +788,7 @@ impl Planner<'_> {
             // Two scalars are a value per step and nothing else, which
             // is the table [`Planner::scalar_series`] already builds.
             _ => Ok(Planned {
-                plan: self.scalar_series(|ts| scalar::fold(expr, ts))?,
+                plan: self.scalar_series(|ts| scalar::fold(expr, ts, self.query))?,
                 label_names: Vec::new(),
             }),
         }
@@ -956,7 +956,7 @@ impl Planner<'_> {
     fn constant(&self, expr: &Expr, what: &str) -> Result<f64, EngineError> {
         let mut folded: Option<f64> = None;
         for ts in grid_of(self.query).steps() {
-            let v = scalar::fold(expr, ts)?;
+            let v = scalar::fold(expr, ts, self.query)?;
             match folded {
                 Some(first) if first.to_bits() != v.to_bits() => {
                     return Err(EngineError::Unsupported(format!(
