@@ -1442,6 +1442,58 @@ mod tests {
         assert_eq!(hints[0].step_ms, Some(30_000));
     }
 
+    /// `enclosing_by` reaches through calls that keep each series' labels
+    /// and stops where the `by` would name labels the selector does not
+    /// carry. `grouping` stays as it was: it licenses merging, which is
+    /// wrong below `rate`.
+    #[tokio::test]
+    async fn the_store_hears_the_by_of_the_aggregation_over_label_keeping_calls() {
+        let range = RangeQuery::new(0, 600_000, 30_000);
+        let by = |labels: &[&str]| Some(labels.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+
+        let hints = hints_of("sum by (pod)(rate(x[5m]))", range).await;
+        assert_eq!(hints[0].grouping, None);
+        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+
+        let hints = hints_of("sum by (pod)(abs(rate(x[5m])))", range).await;
+        assert_eq!(hints[0].grouping, None);
+        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+
+        let hints = hints_of("sum by (pod)(timestamp(x))", range).await;
+        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+        let hints = hints_of("sum by (pod)(timestamp(abs(x)))", range).await;
+        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+
+        // Directly under the aggregation both hints say the same labels.
+        let hints = hints_of("sum by (pod)(x)", range).await;
+        assert_eq!(hints[0].grouping.as_ref().map(|g| g.by), Some(true));
+        assert_eq!(hints[0].enclosing_by, by(&["pod"]));
+
+        // `without` names what to drop, not what to read.
+        let hints = hints_of("count without (pod)(rate(x[5m]))", range).await;
+        assert_eq!(hints[0].enclosing_by, None);
+
+        // A nested aggregation starts its own value.
+        let hints = hints_of("sum by (a)(max by (a, b)(rate(x[5m])))", range).await;
+        assert_eq!(hints[0].grouping, None);
+        assert_eq!(hints[0].enclosing_by, by(&["a", "b"]));
+
+        // Vector matching reads labels the `by` does not name.
+        let hints = hints_of("sum by (pod)(rate(x[5m]) * on() group_left y)", range).await;
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().all(|h| h.enclosing_by.is_none()));
+
+        for query in [
+            "sum by (pod)(absent(x))",
+            "sum by (pod)(absent_over_time(x[5m]))",
+            "sum by (pod)(sort(x))",
+            "rate(x[5m])",
+        ] {
+            let hints = hints_of(query, range).await;
+            assert_eq!(hints[0].enclosing_by, None, "{query}");
+        }
+    }
+
     /// Plan `query` against an empty store: every guard here runs before
     /// the store is asked for anything, and each node carries its own
     /// functions, so none need registering.
