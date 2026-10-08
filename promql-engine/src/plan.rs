@@ -412,6 +412,10 @@ type Planning<'f> = Pin<Box<dyn Future<Output = Result<Planned, EngineError>> + 
 struct Above<'a> {
     /// The enclosing function or aggregation's PromQL name.
     func: Option<&'a str>,
+    /// The nearest enclosing aggregation's labels, carried through the
+    /// calls that map each series to one series and keep its labels.
+    /// `func` stays the node nearest the selector, so under `rate` the
+    /// store hears `func=rate` with the `by` of the `sum` above it.
     grouping: Option<&'a Grouping>,
 }
 
@@ -472,7 +476,7 @@ impl Planner<'_> {
                 Expr::VectorSelector(vs) => self.selector(vs, above, selector::Pick::Value).await,
                 Expr::Paren(p) => self.expr(&p.expr, above).await,
                 Expr::Aggregate(a) => self.aggregate(a).await,
-                Expr::Call(c) => self.call(c).await,
+                Expr::Call(c) => self.call(c, above).await,
                 Expr::Binary(b) => self.binary(expr, b).await,
                 other => Err(EngineError::Unsupported(describe(other))),
             }
@@ -582,7 +586,7 @@ impl Planner<'_> {
     /// sample's own time. Over anything else the vector's samples carry
     /// the step they were evaluated at, and `funcTimestamp` reads that;
     /// `timestamp(abs(x))` is the step, where `timestamp(x)` is not.
-    async fn timestamp(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    async fn timestamp(&mut self, call: &Call, above: Above<'_>) -> Result<Planned, EngineError> {
         let mut arg = &call.args[0];
         loop {
             arg = match arg {
@@ -597,13 +601,16 @@ impl Planner<'_> {
                     vs,
                     Above {
                         func: Some("timestamp"),
-                        grouping: None,
+                        grouping: above.grouping,
                     },
                     selector::Pick::Timestamp,
                 )
                 .await
             }
-            _ => self.elementwise(call, elementwise::Func::Timestamp).await,
+            _ => {
+                self.elementwise(call, elementwise::Func::Timestamp, above)
+                    .await
+            }
         }
     }
 
@@ -613,7 +620,7 @@ impl Planner<'_> {
     /// words: a call this engine cannot plan and a call Prometheus would
     /// not accept are different answers, and only the second is the
     /// user's mistake.
-    async fn call(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    async fn call(&mut self, call: &Call, above: Above<'_>) -> Result<Planned, EngineError> {
         crate::function::check_call(call)?;
         let name = call.func.name.as_str();
         if name == "vector" {
@@ -623,6 +630,8 @@ impl Planner<'_> {
             });
         }
         if name == "absent" {
+            // `absent` reads which series exist, not their labels, so no
+            // `by` above it describes what the store should read.
             let above = Above {
                 func: Some(name),
                 grouping: None,
@@ -631,7 +640,9 @@ impl Planner<'_> {
             return self.absent(&call.args[0], input);
         }
         if name == "absent_over_time" {
-            let input = self.range_over(call, Func::PresentOverTime, name).await?;
+            let input = self
+                .range_over(call, Func::PresentOverTime, name, None)
+                .await?;
             return self.absent(&call.args[0], input);
         }
         // `time()` and `pi()` are a value per step and nothing else, the
@@ -647,15 +658,18 @@ impl Planner<'_> {
             });
         }
         if name == "timestamp" {
-            return self.timestamp(call).await;
+            return self.timestamp(call, above).await;
         }
         if let Some(func) = elementwise::Func::parse(name) {
-            return self.elementwise(call, func).await;
+            return self.elementwise(call, func, above).await;
         }
         if let Some(func) = sort::Func::parse(name) {
             return self.sort(call, func).await;
         }
-        self.range_function(call).await
+        // `label_replace` and `label_join` do not get here yet. When they
+        // do they must stop `grouping`: they rewrite labels, so a `by`
+        // can name a label the input lacks while its source goes unnamed.
+        self.range_function(call, above).await
     }
 
     /// `absent(v)` and `absent_over_time(x[5m])`: the one series over the
@@ -696,6 +710,7 @@ impl Planner<'_> {
         &mut self,
         call: &Call,
         func: elementwise::Func,
+        above: Above<'_>,
     ) -> Result<Planned, EngineError> {
         let mut args = Vec::new();
         for arg in call.args.iter().skip(1) {
@@ -710,7 +725,7 @@ impl Planner<'_> {
                     vector,
                     Above {
                         func: Some(func.as_str()),
-                        grouping: None,
+                        grouping: above.grouping,
                     },
                 )
                 .await?
@@ -1003,16 +1018,20 @@ impl Planner<'_> {
 
     /// A function of one range selector: `rate(x[5m])` and its family.
     ///
-    /// Takes no `Above`: this call is itself what stands directly over the
-    /// selector, so nothing higher reaches the store.
-    async fn range_function(&mut self, call: &Call) -> Result<Planned, EngineError> {
+    /// This call is what stands directly over the selector, so of `above`
+    /// only the enclosing `by` reaches the store.
+    async fn range_function(
+        &mut self,
+        call: &Call,
+        above: Above<'_>,
+    ) -> Result<Planned, EngineError> {
         // Before the function is resolved: `deriv(foo[3m] smoothed)` is
         // an invalid query whether or not this engine has `deriv`.
         check_range_modifiers(call)?;
         let name = call.func.name.as_str();
         let func = Func::parse(name)
             .ok_or_else(|| EngineError::Unsupported(format!("the {name} function")))?;
-        self.range_over(call, func, name).await
+        self.range_over(call, func, name, above.grouping).await
     }
 
     /// `func` over the one range selector `call` takes, told to the store
@@ -1025,6 +1044,7 @@ impl Planner<'_> {
         call: &Call,
         func: Func,
         name: &str,
+        grouping: Option<&Grouping>,
     ) -> Result<Planned, EngineError> {
         let (ms, vs) = match call.args.as_slice() {
             [Expr::MatrixSelector(ms)] => match ms.vector_selector.as_ref() {
@@ -1068,16 +1088,18 @@ impl Planner<'_> {
         };
         check_selector_bounds(params.at_ms, params.offset_ms)?;
         check_time_bound("the range", params.window_ms)?;
-        // The store hears about this function, not the aggregation over
-        // it: `rate` is what decides which samples it may skip, and the
-        // grouping above it no longer describes the selector's parent, so
-        // it is dropped rather than threaded through.
+        // `func` is this function, not the aggregation over it: `rate` is
+        // what decides which samples the store may skip. The aggregation's
+        // `by` still travels as `grouping`, because `rate` keeps each
+        // series' labels and so the labels it names are the ones read off
+        // these series. It does not license merging them: two counters
+        // merged below `rate` break reset detection.
         let hints = self.hints(
             &params,
             Some(params.window_ms),
             Above {
                 func: Some(name),
-                grouping: None,
+                grouping,
             },
         );
         let (builder, input_names) = self.scan(vs, hints).await?;
@@ -1374,10 +1396,16 @@ mod tests {
         assert_eq!(hints[0].step_ms, Some(30_000));
         assert_eq!(hints[0].range_ms, Some(300_000));
         // `rate` stands between the aggregation and the selector, so it
-        // is the function the store is told about, and the grouping two
-        // levels up does not reach it.
+        // is the function the store is told about; the grouping two
+        // levels up still reaches it, as metadata.
         assert_eq!(hints[0].func.as_deref(), Some("rate"));
-        assert_eq!(hints[0].grouping, None);
+        assert_eq!(
+            hints[0].grouping,
+            Some(Grouping {
+                labels: vec!["pod".to_string()],
+                by: true,
+            })
+        );
 
         // A plain selector has no window and nothing above it.
         let hints = hints_of("x", range).await;
@@ -1408,6 +1436,63 @@ mod tests {
         let one_step = RangeQuery::new(600_000, 600_000, 30_000);
         let hints = hints_of("x", one_step).await;
         assert_eq!(hints[0].step_ms, Some(30_000));
+    }
+
+    /// `grouping` reaches through calls that keep each series' labels and
+    /// stops where the `by` would name labels the selector does not carry.
+    /// `func` stays the node nearest the selector throughout.
+    #[tokio::test]
+    async fn the_store_hears_the_by_of_the_aggregation_over_label_keeping_calls() {
+        let range = RangeQuery::new(0, 600_000, 30_000);
+        let by = |labels: &[&str]| {
+            Some(Grouping {
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                by: true,
+            })
+        };
+
+        for query in [
+            "sum by (pod)(rate(x[5m]))",
+            "sum by (pod)(abs(rate(x[5m])))",
+        ] {
+            let hints = hints_of(query, range).await;
+            assert_eq!(hints[0].func.as_deref(), Some("rate"), "{query}");
+            assert_eq!(hints[0].grouping, by(&["pod"]), "{query}");
+        }
+
+        let hints = hints_of("sum by (pod)(timestamp(x))", range).await;
+        assert_eq!(hints[0].func.as_deref(), Some("timestamp"));
+        assert_eq!(hints[0].grouping, by(&["pod"]));
+        let hints = hints_of("sum by (pod)(timestamp(abs(x)))", range).await;
+        assert_eq!(hints[0].func.as_deref(), Some("abs"));
+        assert_eq!(hints[0].grouping, by(&["pod"]));
+
+        // An ungrouped aggregation says so: it reads no label.
+        let hints = hints_of("sum(rate(x[5m]))", range).await;
+        assert_eq!(hints[0].grouping, by(&[]));
+
+        // `without` names what to drop, not what to read.
+        let hints = hints_of("count without (pod)(rate(x[5m]))", range).await;
+        assert_eq!(hints[0].grouping, None);
+
+        // A nested aggregation starts its own grouping.
+        let hints = hints_of("sum by (a)(max by (a, b)(rate(x[5m])))", range).await;
+        assert_eq!(hints[0].grouping, by(&["a", "b"]));
+
+        // Vector matching reads labels the `by` does not name.
+        let hints = hints_of("sum by (pod)(rate(x[5m]) * on() group_left y)", range).await;
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().all(|h| h.grouping.is_none()));
+
+        for query in [
+            "sum by (pod)(absent(x))",
+            "sum by (pod)(absent_over_time(x[5m]))",
+            "sum by (pod)(sort(x))",
+            "rate(x[5m])",
+        ] {
+            let hints = hints_of(query, range).await;
+            assert_eq!(hints[0].grouping, None, "{query}");
+        }
     }
 
     /// Plan `query` against an empty store: every guard here runs before

@@ -47,7 +47,7 @@ pub struct SelectHints {
     pub step_ms: Option<i64>,       // step of the range query; None for instant
     pub range_ms: Option<i64>,      // window of a range selector, `[5m]`
     pub func: Option<String>,       // function or aggregation directly above
-    pub grouping: Option<Grouping>, // `by`/`without` labels directly above
+    pub grouping: Option<Grouping>, // `by` labels of the aggregation above, through label-keeping calls
     pub shard: Option<Shard>,       // return shard `index` of `count` only
 }
 
@@ -100,10 +100,18 @@ them.
   per window.
 - `func`: `count_over_time` and `present_over_time` need no values;
   `rate` needs whole windows.
-- `grouping`: with `sum by (route)` directly above, only `route` decides
-  the output, so a store may drop the other labels, and if it partitions
-  its plan by the grouping labels the engine aggregates without a
-  shuffle.
+- `grouping`: the `by` labels of the nearest aggregation above, seen
+  through `rate`, `abs`, `timestamp` and the like, which map a series to
+  a series and keep its labels; `func` stays the node nearest the
+  selector. It says which labels the aggregation reads, and licenses
+  nothing else: merging distinct series changes `count by (pod)` from two
+  to one and breaks `rate` at counter resets, so a safe pushdown needs
+  reasoning about the operations between, which `func` alone does not
+  describe. A store whose series are real may prune labels it can prove
+  unread; one that picks its own series identity may split its series by
+  these labels so the aggregation finds them. Absent under `without`,
+  `label_replace`, `absent`, sorts and binary operators; a nested
+  aggregation starts its own.
 - `shard`: scan the series space in parallel, one shard per plan.
 
 Prometheus's `Limit` and `DisableTrimming` are left out: the first serves
