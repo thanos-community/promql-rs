@@ -113,6 +113,8 @@ aggregators = [
     'sum(sum by (group) (http_requests{job="api-server"})) by (job) @ 3000000',
 ]
 at_modifier = [
+    "---metric @ 100 @ 10000",
+    "-metric @ 100 @ 10000",
     "abs(metric @ 11) @ 0..60000/10000",
     "metric @ 0 offset -50 @ 10000",
     "metric @ 0 offset -50 @ 10000 #2",
@@ -410,6 +412,8 @@ literals = [
     "1-1 @ 3000000",
 ]
 name_label_dropping = [
+    "-metric_a or -metric_b @ 0..1200000/600000",
+    "-metric_total @ 600000",
     "clamp(metric_total, 0, 100) @ 600000",
     'last_over_time(metric_total{env="1"}[10m]) @ 600000',
     'max_over_time(metric_total{env="1"}[10m]) @ 600000',
@@ -443,8 +447,17 @@ operators = [
     "(testhistogram_bucket) and on() (vector(-1) == 1) @ 600000",
     "(testhistogram_bucket) and on() (vector(1) == 1) @ 0..600000/300000",
     "(testhistogram_bucket) and on() (vector(1) == 1) @ 600000",
+    '+http_requests_total{job="api-server",instance="0",group="production"} @ 3000000',
+    "- - - SUM(http_requests_total) BY (job) @ 3000000",
     '-1 * http_requests_total{group="canary", instance="0", job="api-server"} / 0 @ 3000000',
+    "-10^3 * - SUM(http_requests_total) BY (job) ^ -1 @ 3000000",
     "-2^---1*3 @ 3000000",
+    '-http_requests_total{job="api-server",instance="0",group="production"} @ 3000000',
+    "-metric_a or -metric_b @ 0..1200000/600000",
+    "-{__name__=~'testmetric1|testmetric2'} @ 0",
+    '-{job="api"} @ 0',
+    '-{job="api"} @ 0 #2',
+    '-{job="api"} @ 1200000',
     '0 * http_requests_total{group="canary", instance="0", job="api-server"} % 0 @ 3000000',
     '0 * http_requests_total{group="canary", instance="0", job="api-server"} / 0 @ 3000000',
     "0 == bool 1 @ 3000000",
@@ -633,6 +646,10 @@ trig_functions = [
     "tanh(trig) @ 60000",
 ]
 type_and_unit = [
+    '+http_requests_total{job="api-server",instance="0",group="production"} @ 3000000',
+    '+http_requests_total{job="api-server",instance="0",group="production"} @ 3000000 #2',
+    "-10^3 * - SUM(http_requests_total) BY (job) ^ -1 @ 3000000",
+    "-10^3 * - SUM(http_requests_total) BY (job) ^ -1 @ 3000000 #2",
     "SUM(http_requests_total) BY (job) != bool SUM(http_requests_total) BY (job) @ 3000000",
     "SUM(http_requests_total) BY (job) != bool SUM(http_requests_total) BY (job) @ 3000000 #2",
     "SUM(http_requests_total) BY (job) - COUNT(http_requests_total) BY (job) @ 3000000",
