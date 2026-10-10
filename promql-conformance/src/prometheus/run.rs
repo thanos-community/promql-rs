@@ -313,6 +313,14 @@ fn run_eval(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
         Timing::Range(r) => (r.start_ms, r.end_ms, r.step_ms),
     };
 
+    if matches!(eval.timing, Timing::Instant { .. }) {
+        if let Ok(Some(v)) = engine.instant_string(&eval.query) {
+            return match verify(eval, QueryResult::Str { v, t: start_ms }) {
+                Ok(()) => Verdict::Pass,
+                Err(detail) => Verdict::Fail(detail),
+            };
+        }
+    }
     let actual = match engine.range_query(&load, &eval.query, start_ms, end_ms, step_ms) {
         Ok(r) => r,
         Err(EngineError::Unsupported(feature)) => return Verdict::Unsupported(feature),

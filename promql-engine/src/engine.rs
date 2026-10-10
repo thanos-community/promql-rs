@@ -168,6 +168,19 @@ impl Engine {
         crate::plan::plan(&self.ctx.state(), source, &expr, range).await
     }
 
+    /// The answer of an instant query that is a bare string literal, or
+    /// `None` for any other query.
+    ///
+    /// A string is not a series, so it has no place in the engine's
+    /// batches, and upstream answers it only to an instant query
+    /// (`evalStmt` returns `parser.String` for a `StringLiteral`) and
+    /// refuses it in a range query. Callers that run instant queries ask
+    /// here first; [`Self::range_query_async`] refuses the same query.
+    pub fn instant_string(&self, query: &str) -> Result<Option<String>, EngineError> {
+        let expr = promql_parser::parse_expr(query).map_err(EngineError::Parse)?;
+        Ok(crate::plan::string_literal(&expr).map(str::to_owned))
+    }
+
     /// The optimized `ExecutionPlan` a range query runs, for inspection or
     /// for a caller that streams it instead of paying for
     /// [`Self::range_query_async`]'s buffering, as the memory bench does.

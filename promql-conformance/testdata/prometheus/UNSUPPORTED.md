@@ -8,7 +8,7 @@ PROMQL_PROMQLTEST_BLESS=1 cargo test -p promql-conformance --test promqltest
 
 Nothing here gates CI. It is a roadmap: every row is a count of Prometheus's own promqltest evals that one missing feature blocks, so the top of the table is the cheapest coverage available.
 
-Against the vendored corpus: **642 of 1825 evals pass** (35.2%), and **340** are blocked on the features below.
+Against the vendored corpus: **660 of 1825 evals pass** (36.2%), and **322** are blocked on the features below.
 
 ## Missing features
 
@@ -20,13 +20,11 @@ Against the vendored corpus: **642 of 1825 evals pass** (35.2%), and **340** are
 | 21 | the label_replace function |
 | 20 | a unary operator |
 | 19 | the topk aggregation |
-| 13 | a scalar literal |
 | 9 | the predict_linear function |
 | 9 | the quantile_over_time function |
 | 7 | the bottomk aggregation |
 | 7 | the label_join function |
 | 6 | the quantile aggregation |
-| 5 | a string literal |
 | 4 | the deriv function |
 | 4 | the stddev_over_time function |
 | 3 | the stdvar_over_time function |
@@ -55,18 +53,18 @@ Against the vendored corpus: **642 of 1825 evals pass** (35.2%), and **340** are
 |---|---:|---:|---|
 | selectors | 31 | 31 (100%) | fully green |
 | extended_vectors | 30 | 30 (100%) | fully green |
+| literals | 25 | 25 (100%) | fully green |
 | trig_functions | 19 | 19 (100%) | fully green |
 | staleness | 17 | 17 (100%) | fully green |
 | collision | 2 | 2 (100%) | fully green |
 | fill-modifier | 1 | 1 (100%) | fully green |
 | range_queries | 16 | 11 (69%) |  |
 | type_and_unit | 58 | 39 (67%) |  |
-| operators | 213 | 131 (62%) |  |
+| operators | 213 | 132 (62%) |  |
 | aggregators | 158 | 93 (59%) |  |
 | name_label_dropping | 29 | 16 (55%) |  |
 | functions | 383 | 193 (50%) |  |
 | at_modifier | 69 | 33 (48%) |  |
-| literals | 25 | 8 (32%) |  |
 | duration_expression | 59 | 8 (14%) |  |
 | subquery | 34 | 2 (6%) |  |
 | histograms | 167 | 8 (5%) |  |
