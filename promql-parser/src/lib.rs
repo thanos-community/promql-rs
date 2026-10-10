@@ -19,7 +19,9 @@
 //! - `actions`: per-production Rust action helpers invoked from
 //!   `src/grammar.y`.
 //! - [`parser`]: public entry points ([`parse_expr`],
-//!   [`parse_metric_selector`], [`parse_series_desc`], [`parse_metric`]).
+//!   [`parse_metric_selector`], [`parse_series_desc`], [`parse_metric`]),
+//!   and [`Parser`] for parsing under non-default [`ParserOptions`].
+//! - [`options`]: the four experimental-syntax gates, off by default.
 //!
 //! The grmtools grammar lives in `src/grammar.y` and is compiled into
 //! `OUT_DIR/grammar_y.rs` by `build.rs`; likewise `src/lexer.l` →
@@ -37,7 +39,10 @@
 
 pub(crate) mod actions;
 pub mod ast;
+pub(crate) mod context;
 pub mod error;
+pub mod functions;
+pub mod options;
 // Tested port of lex.go that nothing calls until it replaces the lrlex lexers.
 #[allow(dead_code)]
 pub(crate) mod lexer;
@@ -67,4 +72,7 @@ pub use crate::actions::parse_duration_seconds;
 pub use crate::ast::Expr;
 pub use crate::ast::{SequenceValue, SeriesDescription};
 pub use crate::error::{ParseError, ParseErrors};
-pub use crate::parser::{parse_expr, parse_metric, parse_metric_selector, parse_series_desc};
+pub use crate::options::{FeatureFlag, ParserOptions, FEATURE_FLAGS};
+pub use crate::parser::{
+    parse_expr, parse_metric, parse_metric_selector, parse_series_desc, Parser,
+};

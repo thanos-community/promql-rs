@@ -108,8 +108,13 @@ impl QueryResult {
 /// - **Lookback delta 5m**, Prometheus's default.
 /// - **`@` modifier and negative offsets enabled.** 32 and 8 corpus
 ///   cases respectively need them.
-/// - **Experimental functions enabled**, matching what
-///   `testcases_test.go` sets before parsing corpus queries.
+/// - **All four parser feature flags enabled**, matching upstream's
+///   `TestParserOpts` (`promql/promqltest/test.go`):
+///   `promql-experimental-functions`, `promql-duration-expr`,
+///   `promql-extended-range-selectors` and `promql-binop-fill-modifiers`.
+///   The corpus needs them; a stock engine rejects those queries.
+///   Evals that need one are still run, but counted nowhere: see
+///   `Verdict::Gated`.
 /// - **`MaxSamples` effectively unlimited** (1e10), so no case should
 ///   fail on a sample limit.
 /// - **Default subquery step 1m**, but unobservable: the corpus contains

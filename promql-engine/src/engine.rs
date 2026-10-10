@@ -40,6 +40,8 @@ use datafusion::physical_plan::union::InterleaveExec;
 use datafusion::physical_plan::{self, ExecutionPlan, InputOrderMode, Partitioning};
 use datafusion::prelude::{SessionConfig, SessionContext};
 
+use promql_parser::{Parser, ParserOptions};
+
 use crate::error::EngineError;
 use crate::labelset;
 pub use crate::plan::RangeQuery;
@@ -47,9 +49,25 @@ use crate::series::{self, LABELS};
 use crate::source::{SeriesSetExec, SeriesSource};
 use crate::{absent, aggregate, binary, elementwise, labels, range, selector, sort};
 
+/// The knobs of Prometheus's `promql.EngineOpts` that this engine honours,
+/// one field each, under a name that follows upstream's.
+///
+/// `Default` is a stock Prometheus: every experimental option off. A new
+/// option goes here with its upstream default, so `Engine::new` keeps
+/// behaving as it did and a caller opts in by name:
+/// `EngineOptions { parser: ParserOptions::all(), ..Default::default() }`.
+#[derive(Debug, Clone, Default)]
+pub struct EngineOptions {
+    /// What the engine's parser accepts. Every query path parses with
+    /// these, so an experimental construct is refused with upstream's
+    /// message unless its gate is on here.
+    pub parser: ParserOptions,
+}
+
 pub struct Engine {
     ctx: SessionContext,
     rt: Option<tokio::runtime::Runtime>,
+    options: EngineOptions,
 }
 
 /// A failure out of DataFusion as the caller should read it.
@@ -72,8 +90,14 @@ fn lift(error: DataFusionError) -> EngineError {
 }
 
 impl Engine {
-    /// An engine for async callers. Use the `*_async` methods.
+    /// An engine for async callers, with stock Prometheus's options. Use the
+    /// `*_async` methods.
     pub fn new() -> Self {
+        Self::with_options(EngineOptions::default())
+    }
+
+    /// [`Self::new`] under `options`.
+    pub fn with_options(options: EngineOptions) -> Self {
         // A scan split by byte range cuts through a series. Round-robin is
         // off out of caution: with the selector SinglePartitioned over
         // Hash(labels) DataFusion only places it above the selector, over
@@ -99,19 +123,28 @@ impl Engine {
         ctx.register_udaf(binary::udaf());
         ctx.register_udf(sort::Natural::udf());
         ctx.register_udf(sort::Set::udf());
-        Self { ctx, rt: None }
+        Self {
+            ctx,
+            rt: None,
+            options,
+        }
     }
 
     /// An engine with its own runtime, for synchronous callers. The blocking
     /// methods refuse to run from inside a Tokio runtime; async callers use
     /// the `*_async` methods.
     pub fn blocking() -> Result<Self, EngineError> {
+        Self::blocking_with_options(EngineOptions::default())
+    }
+
+    /// [`Self::blocking`] under `options`.
+    pub fn blocking_with_options(options: EngineOptions) -> Result<Self, EngineError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(EngineError::RuntimeBuild)?;
         // Not `..Self::new()`: struct update cannot move out of a Drop type.
-        let mut engine = Self::new();
+        let mut engine = Self::with_options(options);
         engine.rt = Some(rt);
         Ok(engine)
     }
@@ -127,7 +160,11 @@ impl Engine {
         query: &str,
         range: &RangeQuery,
     ) -> Result<LogicalPlan, EngineError> {
-        let expr = promql_parser::parse_expr(query).map_err(EngineError::Parse)?;
+        // The one place a query string is parsed: `range_query`,
+        // `range_query_async` and `physical_plan_async` all plan through here.
+        let expr = Parser::new(self.options.parser)
+            .parse_expr(query)
+            .map_err(EngineError::Parse)?;
         crate::plan::plan(&self.ctx.state(), source, &expr, range).await
     }
 

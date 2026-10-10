@@ -84,6 +84,12 @@ pub enum Verdict {
     /// Nothing to hold the engine to — an unreadable load block or
     /// expected row, which today means native histograms.
     Skipped(String),
+    /// The query is experimental syntax: stock Prometheus refuses it unless
+    /// the named `--enable-feature` values are on. Not part of the core
+    /// language yet, so it is left out of the totals, the supported list and
+    /// the trials; the harness still runs it, with every gate open, so the
+    /// engine is not asked a different question than the script wrote.
+    Gated(String),
 }
 
 impl Verdict {
@@ -246,7 +252,38 @@ fn case_key(eval: &Eval) -> String {
     }
 }
 
+/// The `--enable-feature` values `query` needs, comma-separated, or `None`
+/// when stock Prometheus parses it (or nobody does, which is the engine's
+/// or the script's business, not a gate's).
+///
+/// A flag is needed when closing just that gate, with the rest open, makes
+/// the query stop parsing.
+fn gating_flags(query: &str) -> Option<String> {
+    use promql_parser::{ParserOptions, FEATURE_FLAGS};
+    if promql_parser::parse_expr(query).is_ok() {
+        return None;
+    }
+    let all = ParserOptions::all();
+    if promql_parser::Parser::new(all).parse_expr(query).is_err() {
+        return None;
+    }
+    let needed: Vec<&str> = FEATURE_FLAGS
+        .iter()
+        .filter(|f| {
+            let without = all.with_flag(f.flag, false).expect("a listed flag");
+            promql_parser::Parser::new(without)
+                .parse_expr(query)
+                .is_err()
+        })
+        .map(|f| f.flag)
+        .collect();
+    (!needed.is_empty()).then(|| needed.join(", "))
+}
+
 fn run_eval(engine: &dyn Engine, eval: &Eval, active: &[Block]) -> Verdict {
+    if let Some(flags) = gating_flags(&eval.query) {
+        return Verdict::Gated(flags);
+    }
     if !eval.is_supported() {
         return Verdict::Skipped(format!(
             "{} expected row(s) we cannot read: {}",
@@ -853,5 +890,32 @@ mod tests {
             verdicts("eval instant at 0 frob(x)\n  1\n", &engine),
             [Verdict::Unsupported("the frob function".into())]
         );
+    }
+
+    #[test]
+    fn a_query_is_gated_by_exactly_the_flags_it_needs() {
+        for (query, flags) in [
+            ("rate(x[5m])", None),
+            ("x +", None),
+            (
+                "mad_over_time(x[5m])",
+                Some("promql-experimental-functions"),
+            ),
+            ("limitk(1, x)", Some("promql-experimental-functions")),
+            ("x + fill(0) y", Some("promql-binop-fill-modifiers")),
+            (
+                "rate(x[5m] anchored)",
+                Some("promql-extended-range-selectors"),
+            ),
+            (
+                "mad_over_time(x[5m] smoothed) + fill(0) y",
+                Some(
+                    "promql-experimental-functions, promql-extended-range-selectors, \
+                     promql-binop-fill-modifiers",
+                ),
+            ),
+        ] {
+            assert_eq!(gating_flags(query).as_deref(), flags, "{query}");
+        }
     }
 }

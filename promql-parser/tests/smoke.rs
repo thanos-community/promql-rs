@@ -3,10 +3,26 @@
 //! parser + action helpers) and assert on the resulting AST.
 
 use promql_parser::ast::{Expr, MatchOp};
-use promql_parser::{parse_expr, parse_metric_selector};
+use promql_parser::{parse_expr, parse_metric_selector, Parser, ParserOptions};
 
 fn must_parse(q: &str) -> Expr {
     parse_expr(q).unwrap_or_else(|e| panic!("failed to parse {q:?}: {e}"))
+}
+
+/// The anchored and smoothed modifiers are experimental syntax, off in
+/// [`parse_expr`] as in stock Prometheus; the tests that exercise them
+/// switch on the one gate that guards them.
+fn extended_range_selectors() -> Parser {
+    Parser::new(ParserOptions {
+        enable_extended_range_selectors: true,
+        ..Default::default()
+    })
+}
+
+fn must_parse_extended(q: &str) -> Expr {
+    extended_range_selectors()
+        .parse_expr(q)
+        .unwrap_or_else(|e| panic!("failed to parse {q:?}: {e}"))
 }
 
 #[test]
@@ -277,7 +293,7 @@ fn anchored_and_smoothed_land_on_the_vector_selector() {
         ("rate(foo[5m] anchored)", true, false),
         ("rate(foo[5m] smoothed)", false, true),
     ] {
-        match must_parse(q) {
+        match must_parse_extended(q) {
             Expr::Call(c) => match &c.args[0] {
                 Expr::MatrixSelector(ms) => match &*ms.vector_selector {
                     Expr::VectorSelector(vs) => {
@@ -292,7 +308,7 @@ fn anchored_and_smoothed_land_on_the_vector_selector() {
         }
     }
     // A bare instant selector takes them too.
-    match must_parse("foo anchored") {
+    match must_parse_extended("foo anchored") {
         Expr::VectorSelector(vs) => assert!(vs.anchored && !vs.smoothed),
         other => panic!("expected VectorSelector, got {other:?}"),
     }
@@ -336,17 +352,27 @@ fn parse_errors_can_be_taken_by_value() {
 
 #[test]
 fn anchored_and_smoothed_are_mutually_exclusive() {
-    assert!(parse_expr("rate(foo[5m] anchored smoothed)").is_err());
-    assert!(parse_expr("rate(foo[5m] smoothed anchored)").is_err());
+    assert!(extended_range_selectors()
+        .parse_expr("rate(foo[5m] anchored smoothed)")
+        .is_err());
+    assert!(extended_range_selectors()
+        .parse_expr("rate(foo[5m] smoothed anchored)")
+        .is_err());
 }
 
 /// Upstream rejects the modifier on a subquery and on anything that is
 /// not a selector at all.
 #[test]
 fn a_misplaced_range_modifier_is_an_error() {
-    assert!(parse_expr("rate(foo[5m])[10m:1m] anchored").is_err());
-    assert!(parse_expr("(foo + bar) anchored").is_err());
-    assert!(parse_expr("sum(foo) smoothed").is_err());
+    assert!(extended_range_selectors()
+        .parse_expr("rate(foo[5m])[10m:1m] anchored")
+        .is_err());
+    assert!(extended_range_selectors()
+        .parse_expr("(foo + bar) anchored")
+        .is_err());
+    assert!(extended_range_selectors()
+        .parse_expr("sum(foo) smoothed")
+        .is_err());
 }
 
 /// `anchored_expr`, `offset_expr` and `at_expr` are all `expr` suffixes
@@ -359,7 +385,7 @@ fn a_range_modifier_composes_with_offset_and_at() {
         ("rate(foo[5m] offset 1m anchored)", 60.0, None),
         ("rate(foo[5m] @ 100 anchored)", 0.0, Some(100_000)),
     ] {
-        match must_parse(q) {
+        match must_parse_extended(q) {
             Expr::Call(c) => match &c.args[0] {
                 Expr::MatrixSelector(ms) => match &*ms.vector_selector {
                     Expr::VectorSelector(vs) => {

@@ -67,11 +67,11 @@ promql-parser/
 │   ├── actions.rs                       # every non-trivial grammar action body
 │   ├── lexer.rs                         # impl lrpar::Lexer, mirrors lex.go
 │   ├── tok.rs                           # Item / ItemType
-│   ├── functions.rs                     # built-in function registry
+│   ├── functions.rs                     # which functions are experimental (signatures: promql-engine)
 │   ├── posrange.rs
 │   ├── error.rs
 │   ├── options.rs                       # ParserOptions (experimental gates)
-│   └── context.rs                       # ParserCtx (error accumulator)
+│   └── context.rs                       # ParserCtx (options + error accumulator)
 ├── tests/
 │   ├── smoke.rs
 │   ├── conformance.rs                   # runs the generated corpus
@@ -137,6 +137,16 @@ checks `yylex.(*parser).options.EnableExperimentalFunctions` inside the
 action and calls `addParseErrf` when disabled. We mirror this exactly so
 our error messages and their positions match upstream — necessary for
 conformance.
+
+`ParserOptions` (`src/options.rs`) is `parser.Options` field for field, all
+off by default; `Parser::new(opts)` is `NewParser`, and the free `parse_*`
+functions use the zero options like upstream's package-level ones.
+grmtools gives an action only its own symbols and the lexer, so what upstream
+reaches as `yylex.(*parser)` travels as the grammar's `%parse-param`, named `p`:
+a `ParserCtx` holding the options and the `addParseErrf` accumulator. The
+sidecar's `parse_param` key makes `generate-grammar` emit the declaration, and
+actions that gate take `p` as their second argument. `docs/feature-flags.md`
+lists each gate against the upstream check it ports.
 
 ## Sync mechanism
 

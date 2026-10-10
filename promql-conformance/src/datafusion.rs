@@ -102,10 +102,20 @@ impl DataFusionEngine {
 
     pub fn with_source(source: SourceMode) -> Result<Self, EngineError> {
         Ok(Self {
-            inner: promql_engine::Engine::blocking()
+            inner: promql_engine::Engine::blocking_with_options(engine_options())
                 .map_err(|e| EngineError::Other(e.to_string()))?,
             source,
         })
+    }
+}
+
+/// What the harness parses with: every gate on, as upstream's promqltest
+/// does (`TestParserOpts` in `promql/promqltest/test.go`). The corpus
+/// uses `mad_over_time`, `fill`, `anchored` and the rest, which stock
+/// Prometheus refuses; which flag each needs is in `UNSUPPORTED.md`.
+fn engine_options() -> promql_engine::EngineOptions {
+    promql_engine::EngineOptions {
+        parser: promql_parser::ParserOptions::all(),
     }
 }
 
@@ -340,6 +350,23 @@ mod tests {
         ] {
             assert!(SourceMode::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// The corpus is written for upstream's `TestParserOpts`: with a gate
+    /// shut, its experimental evals fail at parse time and read as engine
+    /// gaps, so none may be.
+    #[test]
+    fn the_harness_opens_all_four_parser_gates() {
+        assert_eq!(engine_options().parser, promql_parser::ParserOptions::all());
+        let engine = DataFusionEngine::with_source(SourceMode::Plain).unwrap();
+        let load = [LoadedSeries {
+            series: &[desc("x 1 2 3"), desc(r#"y 4 5 6"#)],
+            interval_secs: 30.0,
+        }];
+        // Parses under fill; the result itself is not the question.
+        engine
+            .range_query(&load, "x + fill(0) y", 0, 60_000, 30_000)
+            .expect("fill parses");
     }
 
     /// Every mode answers a query over several series and blocks the way

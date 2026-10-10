@@ -31,6 +31,7 @@ use crate::ast::{
     MatrixSelector, NumberLiteral, ParenExpr, SequenceValue, SeriesDescription, StringLiteral,
     SubqueryExpr, UnaryExpr, ValueType, VectorMatchCardinality, VectorMatching, VectorSelector,
 };
+use crate::context::ParserCtx;
 use crate::posrange::{Pos, PositionRange};
 use crate::token::ItemType;
 
@@ -128,8 +129,13 @@ pub fn paren<'l, 'i: 'l>(
 /// Grammar-facing binary helper. The operator arrives as a captured
 /// token (`$2` in the emitted grammar) rather than a constant, so a
 /// single helper covers every operator alt.
+///
+/// Upstream `newBinaryExpression`, including its fill-modifier gate: the
+/// error is reported at the whole expression's range and the node is
+/// still built, as upstream returns `ret` after `addParseErrf`.
 pub fn binary<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
+    p: &ParserCtx,
     op_lx: Lx,
     modifiers: Result<Option<BinModifiers>, ()>,
     lhs: Result<Expr, ()>,
@@ -140,13 +146,28 @@ pub fn binary<'l, 'i: 'l>(
         Some(mods) => (Some(mods.vector_matching), mods.return_bool),
         None => (None, false),
     };
-    Ok(Expr::Binary(BinaryExpr {
+    let expr = Expr::Binary(BinaryExpr {
         op,
         lhs: Box::new(lhs?),
         rhs: Box::new(rhs?),
         vector_matching,
         return_bool,
-    }))
+    });
+    if !p.options().enable_binop_fill_modifiers {
+        if let Expr::Binary(BinaryExpr {
+            vector_matching: Some(vm),
+            ..
+        }) = &expr
+        {
+            if vm.fill_values.lhs.is_some() || vm.fill_values.rhs.is_some() {
+                p.add_parse_err(
+                    expr.position_range(),
+                    "binop fill modifiers are experimental and not enabled",
+                );
+            }
+        }
+    }
+    Ok(expr)
 }
 
 /// Grammar-facing unary helper. Same shape as [`binary`] — op comes in
@@ -575,21 +596,39 @@ pub fn at_modifier<'l, 'i: 'l>(
 /// `anchored_expr : expr ANCHORED` and `smoothed_expr : expr SMOOTHED`.
 /// Both modifiers live on the `VectorSelector`, reached through the
 /// matrix selector when there is one; upstream's `setAnchored` and
-/// `setSmoothed` differ only in which field they set.
+/// `setSmoothed` differ only in which field they set, and in the words
+/// of their messages.
 ///
-/// Upstream rejects a subquery with `<name> modifier is not supported
-/// for subqueries` and anything else with `<name> modifier not
-/// implemented`. Neither message survives: grmtools fixes actions at
-/// `Result<T, ()>`, so both rejections arrive as a bare `Err(())`.
-fn set_range_modifier(inner: Result<Expr, ()>, anchored: bool) -> Result<Expr, ()> {
+/// The gate comes first and leaves the expression untouched, as
+/// upstream's early `return` does.
+fn set_range_modifier(p: &ParserCtx, inner: Result<Expr, ()>, anchored: bool) -> Result<Expr, ()> {
     let mut e = inner?;
+    let name = if anchored { "anchored" } else { "smoothed" };
+    let range = e.position_range();
+    if !p.options().enable_extended_range_selectors {
+        p.add_parse_err(
+            range,
+            format!("{name} modifier is experimental and not enabled"),
+        );
+        return Ok(e);
+    }
     let vs = match &mut e {
         Expr::VectorSelector(vs) => vs,
         Expr::MatrixSelector(ms) => match ms.vector_selector.as_mut() {
             Expr::VectorSelector(vs) => vs,
             _ => return Err(()),
         },
-        _ => return Err(()),
+        Expr::Subquery(_) => {
+            p.add_parse_err(
+                range,
+                format!("{name} modifier is not supported for subqueries"),
+            );
+            return Err(());
+        }
+        _ => {
+            p.add_parse_err(range, format!("{name} modifier not implemented"));
+            return Err(());
+        }
     };
     if anchored {
         vs.anchored = true;
@@ -600,17 +639,21 @@ fn set_range_modifier(inner: Result<Expr, ()>, anchored: bool) -> Result<Expr, (
     // together". It sets the flag first and then complains, so the
     // check is on both being set, not on the one arriving second.
     if vs.anchored && vs.smoothed {
+        p.add_parse_err(
+            range,
+            "anchored and smoothed modifiers cannot be used together",
+        );
         return Err(());
     }
     Ok(e)
 }
 
-pub fn set_anchored(inner: Result<Expr, ()>) -> Result<Expr, ()> {
-    set_range_modifier(inner, true)
+pub fn set_anchored(p: &ParserCtx, inner: Result<Expr, ()>) -> Result<Expr, ()> {
+    set_range_modifier(p, inner, true)
 }
 
-pub fn set_smoothed(inner: Result<Expr, ()>) -> Result<Expr, ()> {
-    set_range_modifier(inner, false)
+pub fn set_smoothed(p: &ParserCtx, inner: Result<Expr, ()>) -> Result<Expr, ()> {
+    set_range_modifier(p, inner, false)
 }
 
 /// Variant of [`at_timestamp`] for the upstream-shaped grammar, where
@@ -648,33 +691,98 @@ pub fn signed_duration(op: Result<ItemType, ()>, inner: Result<Expr, ()>) -> Res
 
 // -------- function calls & aggregates --------
 
+/// Upstream's `function_call` action, identifier arm.
 pub fn function_call<'l, 'i: 'l>(
     lexer: &'l L<'l, 'i>,
+    p: &ParserCtx,
     span: Span,
     name_lx: Lx,
     args: Vec<Expr>,
 ) -> Result<Expr, ()> {
     let name = lexer.span_str(name_lx.span()).to_string();
+    let experimental = check_function_enabled(p, &name, to_pos_range(name_lx.span()));
     Ok(Expr::Call(Call {
         func: FunctionRef {
             name,
             arg_types: Vec::new(),
             return_type: ValueType::Vector,
             variadic: 0,
-            experimental: false,
+            experimental,
         },
         args,
         pos_range: to_pos_range(span),
     }))
 }
 
+/// The `fn.Experimental && !EnableExperimentalFunctions` check every
+/// `function_call` arm repeats upstream. `range` is the function-name
+/// token's, where upstream reports it. Returns whether `name` is
+/// experimental.
+fn check_function_enabled(p: &ParserCtx, name: &str, range: PositionRange) -> bool {
+    let experimental = crate::functions::is_experimental(name);
+    if experimental && !p.options().enable_experimental_functions {
+        p.add_parse_err(range, format!("function {name:?} is not enabled"));
+    }
+    experimental
+}
+
+/// `function_call : at_modifier_preprocessors function_call_body`, i.e.
+/// `start()` and `end()`. Gated; then rejected as before, since the arm
+/// is not ported.
+pub fn function_call_at_modifier(
+    p: &ParserCtx,
+    span: Span,
+    modifier: Result<AtModifier, ()>,
+) -> Result<Expr, ()> {
+    let name = match modifier? {
+        AtModifier::Start => "start",
+        AtModifier::End => "end",
+    };
+    let start = span.start() as Pos;
+    check_function_enabled(
+        p,
+        name,
+        PositionRange::new(start, start + name.len() as Pos),
+    );
+    Err(())
+}
+
+/// `function_call : STEP function_call_body` and the `RANGE` twin. Gated;
+/// then rejected as before, since the arms are not ported.
+pub fn function_call_keyword<'l, 'i: 'l>(
+    lexer: &'l L<'l, 'i>,
+    p: &ParserCtx,
+    lx: Lx,
+) -> Result<Expr, ()> {
+    // Upstream's `$1.Val`: the token as written.
+    check_function_enabled(p, lexer.span_str(lx.span()), to_pos_range(lx.span()));
+    Err(())
+}
+
+/// Upstream `newAggregateExpr`, including the experimental-aggregator
+/// gate: `limitk` and `limit_ratio` follow `EnableExperimentalFunctions`.
+/// Upstream reports it and returns the half-built node; this returns an
+/// error, since nothing downstream can use that node.
 pub fn aggregate<'l, 'i: 'l>(
     _lexer: &'l L<'l, 'i>,
+    p: &ParserCtx,
     span: Span,
     op: ItemType,
     modifier: Option<(bool, Vec<String>)>,
     mut args: Vec<Expr>,
 ) -> Result<Expr, ()> {
+    if !p.options().enable_experimental_functions
+        && matches!(op, ItemType::Limitk | ItemType::LimitRatio)
+    {
+        p.add_parse_err(
+            to_pos_range(span),
+            format!(
+                "{op}() is experimental and must be enabled with \
+                 --enable-feature=promql-experimental-functions"
+            ),
+        );
+        return Err(());
+    }
     let (without, grouping) = modifier.unwrap_or((false, Vec::new()));
     let (param, expr) = if aggregator_takes_param(op) && args.len() >= 2 {
         let p = args.remove(0);

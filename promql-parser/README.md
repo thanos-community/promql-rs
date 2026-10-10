@@ -55,6 +55,8 @@ sync-meta.toml        Machine-readable state for the sync tool
   best-effort AST with diagnostics.
 - Experimental-feature gating is in-action (mirroring upstream's
   `options.Enable*` checks), not a post-parse pass.
+  `ParserOptions` mirrors `parser.Options`, off by default; see
+  `docs/feature-flags.md`.
 
 ## Upstream sync
 

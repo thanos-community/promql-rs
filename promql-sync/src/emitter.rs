@@ -73,6 +73,9 @@ pub fn emit(g: &Grammar, sc: &Sidecar) -> Result<EmitResult> {
 
     // --- preamble ---
     out.push_str(&format!("%start {}\n", sc.start_symbol));
+    if let Some(param) = &sc.parse_param {
+        out.push_str(&format!("%parse-param {param}\n"));
+    }
     for p in &g.precedence {
         let kw = match p.assoc {
             Assoc::Left => "%left",
