@@ -1505,6 +1505,9 @@ mod tests {
         for query in [
             "sum by (pod)(rate(x[5m]))",
             "sum by (pod)(abs(rate(x[5m])))",
+            // A sign neither adds a node to `func` nor ends the `by`.
+            "sum by (pod)(-rate(x[5m]))",
+            "sum by (pod)(+rate(x[5m]))",
         ] {
             let hints = hints_of(query, range).await;
             assert_eq!(hints[0].func.as_deref(), Some("rate"), "{query}");
