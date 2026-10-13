@@ -1,0 +1,8 @@
+---
+source: promql-engine/tests/plan/selectors.rs
+expression: "http_requests_total{job=\"api\"}"
+---
+ProjectionExec: expr=[labels@2, samples@3, block_start@0, block_end@1]
+  AggregateExec: mode=SinglePartitioned, gby=[block_start@2, block_end@3, labels@0], aggr=[vector_selector(samples@1, 600000..1200000 step 30s, lookback 5m)], ordering_mode=Sorted
+    SeriesSetExec: http_requests_total{job="api"} 300000..1200000 window=5m step=30s, partitioning=Hash([labels@0], 1)
+      DataSourceExec: partitions=1, partition_sizes=[1]
