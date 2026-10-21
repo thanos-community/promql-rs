@@ -3,6 +3,13 @@ lockfile = true
 locked = true
 idiomatic_version_file_enable_tools = ["rust"]
 
+# rustup proxies (cargo, rust-analyzer) auto-install the toolchain from
+# rust-toolchain.toml and race with `mise install`, which leaves components
+# such as rustfmt marked installed without binaries ("not applicable").
+# Install only through `mise install` so profile and components apply once.
+[env]
+RUSTUP_AUTO_INSTALL = "0"
+
 [tools]
 # Explicit mbx invocations avoid duplicating the Rust version from rust-toolchain.toml.
 mr-boxington = "1.22.0"
