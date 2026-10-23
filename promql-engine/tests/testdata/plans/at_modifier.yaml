@@ -20,3 +20,18 @@ tests:
       Projection: labels{job, pod}
         SeriesEval: rate(samples[5m] @ 900000, 600000..1200000 step 30s) per series per block
           TableScan: http_requests_total
+
+  - name: an at modifier on predict linear
+    description: >
+      @ pins the sample window on the SeriesEval while the scalar horizon
+      stays beside it. The runtime still reanchors the regression on each
+      evaluation step; the plan only records the pinned window.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      predict_linear(http_requests_total[5m] @ 900, 3600)
+    plan: |
+      Projection: labels{job, pod}
+        SeriesEval: predict_linear(samples[5m] @ 900000, 3600, 600000..1200000 step 30s) per series per block
+          TableScan: http_requests_total

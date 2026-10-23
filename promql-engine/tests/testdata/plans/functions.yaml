@@ -142,6 +142,35 @@ tests:
         SeriesEval: count_over_time(samples[10m], 600000..1200000 step 30s) per series per block
           TableScan: http_requests_total
 
+  - name: predict linear
+    description: >
+      predict_linear is a range SeriesEval that carries its scalar horizon
+      beside the window. It drops __name__ like other range kernels, so
+      the labels are rebuilt field by field above it.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      predict_linear(http_requests_total[5m], 3600)
+    plan: |
+      Projection: labels{job, pod}
+        SeriesEval: predict_linear(samples[5m], 3600, 600000..1200000 step 30s) per series per block
+          TableScan: http_requests_total
+
+  - name: deriv
+    description: >
+      deriv is an ordinary one-arg range SeriesEval: same boundary as rate,
+      slope from linear_regression with intercept at the first sample.
+    load:
+      - http_requests_total{job="api", pod="api-1"} 0
+      - http_requests_total{job="web", pod="web-1"} 0
+    query: |
+      deriv(http_requests_total[5m])
+    plan: |
+      Projection: labels{job, pod}
+        SeriesEval: deriv(samples[5m], 600000..1200000 step 30s) per series per block
+          TableScan: http_requests_total
+
   - name: range function over chunks in four partitions
     description: >
       Four store partitions, each series whole in one of them and chunked
